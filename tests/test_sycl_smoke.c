@@ -5,7 +5,6 @@
 #include "ds4_gpu_mgpu.h"
 
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 
 #define CHECK(cond, msg)                                                    \

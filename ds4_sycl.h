@@ -1,5 +1,9 @@
 #pragma once
 
+/* Never create a local sycl/sycl.hpp in this tree.  Many Makefile rules
+ * compile with -I. (see rules for ds4_sycl.o, tests/test_sycl_smoke.o,
+ * and friends), so a project-local sycl/sycl.hpp would shadow the real
+ * SYCL header below and silently break every build that includes it. */
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
