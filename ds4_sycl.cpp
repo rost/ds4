@@ -83,7 +83,7 @@ sycl::queue &ds4_sycl_current_queue(void) {
 }
 
 extern "C" int ds4_gpu_init(void) {
-    if (g_initialised) return 0;
+    if (g_initialised) return 1;
 
     try {
         std::vector<sycl::device> gpus;
@@ -95,7 +95,7 @@ extern "C" int ds4_gpu_init(void) {
 
         if (gpus.empty()) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "no SYCL GPU device found\n");
-            return 1;
+            return 0;
         }
 
         /* Prefer the Level Zero backend when a device is exposed by more
@@ -121,14 +121,14 @@ extern "C" int ds4_gpu_init(void) {
                 g_devices.size(),
                 g_devices[0].dev.get_info<sycl::info::device::name>()
                     .c_str());
-        return 0;
+        return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "device init failed: %s\n",
                 e.what());
         g_devices.clear();
         g_current_tier = 0;
         g_initialised  = false;
-        return 1;
+        return 0;
     }
 }
 
@@ -214,39 +214,39 @@ extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) {
 
 extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset,
                                     const void *data, uint64_t bytes) {
-    if (tensor == nullptr || tensor->ptr == nullptr || data == nullptr) return 1;
+    if (tensor == nullptr || tensor->ptr == nullptr || data == nullptr) return 0;
     /* Overflow-safe: offset + bytes can wrap past UINT64_MAX. */
-    if (offset > tensor->bytes || bytes > tensor->bytes - offset) return 1;
-    if (bytes == 0) return 0;
+    if (offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (bytes == 0) return 1;
 
     sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
                                                           : g_current_tier);
     q.memcpy((char *)tensor->ptr + offset, data, bytes).wait();
-    return 0;
+    return 1;
 }
 
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset,
                                    void *data, uint64_t bytes) {
-    if (tensor == nullptr || tensor->ptr == nullptr || data == nullptr) return 1;
+    if (tensor == nullptr || tensor->ptr == nullptr || data == nullptr) return 0;
     /* Overflow-safe: offset + bytes can wrap past UINT64_MAX. */
-    if (offset > tensor->bytes || bytes > tensor->bytes - offset) return 1;
-    if (bytes == 0) return 0;
+    if (offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
+    if (bytes == 0) return 1;
 
     sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
                                                           : g_current_tier);
     q.memcpy(data, (const char *)tensor->ptr + offset, bytes).wait();
-    return 0;
+    return 1;
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                    const ds4_gpu_tensor *src, uint64_t src_offset,
                                    uint64_t bytes) {
-    if (dst == nullptr || src == nullptr) return 1;
-    if (dst->ptr == nullptr || src->ptr == nullptr) return 1;
+    if (dst == nullptr || src == nullptr) return 0;
+    if (dst->ptr == nullptr || src->ptr == nullptr) return 0;
     /* Overflow-safe on both sides. */
-    if (dst_offset > dst->bytes || bytes > dst->bytes - dst_offset) return 1;
-    if (src_offset > src->bytes || bytes > src->bytes - src_offset) return 1;
-    if (bytes == 0) return 0;
+    if (dst_offset > dst->bytes || bytes > dst->bytes - dst_offset) return 0;
+    if (src_offset > src->bytes || bytes > src->bytes - src_offset) return 0;
+    if (bytes == 0) return 1;
 
     /* Same-device copy only.  Cross-device transfer arrives with the mgpu
      * plan and routes through ds4_gpu_tensor_copy_xdev instead. */
@@ -254,18 +254,18 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
                                                         : g_current_tier);
     q.memcpy((char *)dst->ptr + dst_offset,
              (const char *)src->ptr + src_offset, bytes).wait();
-    return 0;
+    return 1;
 }
 
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
                                        uint64_t count) {
-    if (tensor == nullptr || tensor->ptr == nullptr) return 1;
+    if (tensor == nullptr || tensor->ptr == nullptr) return 0;
     /* Overflow-safe: count * sizeof(float) can wrap.  Divide instead. */
-    if (count > tensor->bytes / sizeof(float)) return 1;
-    if (count == 0) return 0;
+    if (count > tensor->bytes / sizeof(float)) return 0;
+    if (count == 0) return 1;
 
     sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
                                                           : g_current_tier);
     q.fill((float *)tensor->ptr, value, (size_t)count).wait();
-    return 0;
+    return 1;
 }
