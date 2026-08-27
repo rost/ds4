@@ -12,6 +12,7 @@
 /gguf/
 /core
 /core.*
+/.tmp/
 /tests/test_engine_mgpu_placement
 /tests/test_engine_mgpu_runtime
 /tests/test_engine_mgpu_refusal

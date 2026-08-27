@@ -57,12 +57,17 @@ ROCM_ARCH ?= gfx1151
 ROCM_HOST_CFLAGS ?= -fPIC
 ROCM_CFLAGS ?= -O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=$(ROCM_ARCH)
 ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
+ICPX ?= $(shell command -v icpx 2>/dev/null || echo /opt/intel/oneapi/compiler/2024.2/bin/icpx)
+SYCL_SRCS := $(wildcard sycl/*.hpp)
+SYCL_HOST_CFLAGS ?= -fPIC
+SYCL_CFLAGS ?= -fsycl -O3 -g -ffast-math -fno-finite-math-only -pthread -Wall -Wextra
+SYCL_LDLIBS ?= -fsycl -lm -pthread
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -156,6 +161,7 @@ help:
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
 	@echo "  make rocm                Alias for make strix-halo"
+	@echo "  make sycl                Build SYCL for Intel Arc GPUs"
 	@echo "  make test-mxfp4-rocm     Build and run the synthetic ROCm MXFP4 MoE test"
 	@echo "  make test-rocm           Core regression suite on ROCm-only hosts"
 	@echo "  make cpu                 Build CPU-only ./ds4, ./ds4-server, ./ds4-bench, ./ds4-eval, and ./ds4-agent"
@@ -186,6 +192,13 @@ strix-halo:
 		DS4_LINK_LIBS="$(ROCM_LDLIBS)"
 
 rocm: strix-halo
+
+sycl:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+		CORE_OBJS="ds4.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_sycl.o ds4_sycl_unavailable.o ds4_layer_pack.o" \
+		CFLAGS="$(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD" \
+		DS4_LINK="$(ICPX) $(SYCL_CFLAGS)" \
+		DS4_LINK_LIBS="$(SYCL_LDLIBS)"
 
 # Core regression suite for ROCm-only hosts: the CUDA-specific binaries
 # (tests/test_sampling, the CUDA session/mixed-batch oracles) are not part
@@ -373,6 +386,12 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
+
+ds4_sycl.o: ds4_sycl.cpp ds4_sycl.h ds4_gpu.h ds4_gpu_mgpu.h $(SYCL_SRCS)
+	$(ICPX) $(SYCL_CFLAGS) -c -o $@ ds4_sycl.cpp
+
+ds4_sycl_unavailable.o: ds4_sycl_unavailable.cpp
+	$(ICPX) $(SYCL_CFLAGS) -c -o $@ ds4_sycl_unavailable.cpp
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
