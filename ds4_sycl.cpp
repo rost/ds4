@@ -64,10 +64,12 @@ std::vector<sycl::device> ds4_sycl_dedup_devices(
 } /* namespace */
 
 /* Multi-GPU plumbing globals declared extern by ds4_gpu_mgpu.h and read
- * directly by ds4.c.  Not yet backed by real per-device state, so this
- * skeleton exposes a single logical tier with no peers, matching the
- * default ds4_rocm_compat.cu uses before ROCm's real device enumeration
- * runs. */
+ * directly by ds4.c.  Before ds4_gpu_init runs (or if it never runs) this
+ * exposes a single logical tier with no peers, matching the default
+ * ds4_rocm_compat.cu uses before ROCm's real device enumeration runs;
+ * ds4_gpu_init overwrites g_n_gpus and each g_gpu[].device_id with the
+ * real enumeration once it succeeds.  The stream/cublas/scratch/budget
+ * fields stay zeroed until the multi-GPU plan backs them. */
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
 int         g_n_gpus            = 1;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
@@ -142,6 +144,25 @@ extern "C" int ds4_gpu_init(void) {
                 ds4_sycl_device{d, sycl::queue(d, ds4_sycl_async_handler)});
         }
 
+        /* Keep g_n_gpus and g_gpu[].device_id in step with what was just
+         * enumerated: ds4.c reads these directly (see ds4.c's engine setup
+         * and multi-tier dispatch) and would otherwise still see the
+         * single-tier default declared below even when g_devices holds
+         * every physical GPU on the box.  Only device_id is meaningful
+         * here; stream, cublas, scratch and budget belong to the
+         * multi-GPU plan and stay zeroed. */
+        size_t n = g_devices.size();
+        if (n > (size_t)DS4_MAX_GPUS) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "%zu devices found, clamping to DS4_MAX_GPUS=%d\n", n,
+                    DS4_MAX_GPUS);
+            n = (size_t)DS4_MAX_GPUS;
+        }
+        g_n_gpus = (int)n;
+        for (int i = 0; i < g_n_gpus; i++) {
+            g_gpu[i].device_id = i;
+        }
+
         g_current_tier = 0;
         g_initialised  = true;
 
@@ -154,6 +175,7 @@ extern "C" int ds4_gpu_init(void) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "device init failed: %s\n",
                 e.what());
         g_devices.clear();
+        g_n_gpus       = 0;
         g_current_tier = 0;
         g_initialised  = false;
         return 0;
@@ -172,6 +194,7 @@ extern "C" int ds4_gpu_init(void) {
 extern "C" void ds4_gpu_cleanup(void) {
     for (ds4_sycl_device &d : g_devices) d.queue.wait();
     g_devices.clear();
+    g_n_gpus       = 0;
     g_current_tier = 0;
     g_initialised  = false;
 }
