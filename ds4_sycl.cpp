@@ -175,7 +175,8 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
                                                uint64_t offset,
                                                uint64_t bytes) {
     if (base == nullptr || base->ptr == nullptr) return nullptr;
-    if (offset + bytes > base->bytes) {
+    /* Overflow-safe: offset + bytes can wrap past UINT64_MAX. */
+    if (offset > base->bytes || bytes > base->bytes - offset) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "view %llu+%llu exceeds %llu bytes\n",
                 (unsigned long long)offset, (unsigned long long)bytes,
                 (unsigned long long)base->bytes);

@@ -38,6 +38,11 @@ int main(void) {
     CHECK(ds4_gpu_tensor_device(v) == ds4_gpu_tensor_device(t),
           "view did not inherit the base tensor device");
 
+    /* A view whose offset and length individually fit but whose sum wraps
+     * past UINT64_MAX must be rejected, not silently accepted. */
+    ds4_gpu_tensor *bad = ds4_gpu_tensor_view(t, 0xFFFFFFFFFFFFFF00ULL, 0x200ULL);
+    CHECK(bad == NULL, "view accepted an offset+length that overflows");
+
     ds4_gpu_tensor_free(v);
     ds4_gpu_tensor_free(t);
 
