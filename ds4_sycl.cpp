@@ -138,3 +138,75 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_current_tier = 0;
     g_initialised  = false;
 }
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
+    if (bytes == 0) return nullptr;
+
+    sycl::queue &q = ds4_sycl_current_queue();
+    void *ptr = sycl::malloc_device(bytes, q);
+    if (ptr == nullptr) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "malloc_device of %llu bytes failed\n",
+                (unsigned long long)bytes);
+        return nullptr;
+    }
+
+    /* owner 1 means this tensor must free ptr; device_id is the logical
+     * tier the allocation lives on. */
+    ds4_gpu_tensor *t = new ds4_gpu_tensor{ptr, bytes, 1, g_current_tier};
+    return t;
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
+    if (bytes == 0) return nullptr;
+
+    sycl::queue &q = ds4_sycl_current_queue();
+    void *ptr = sycl::malloc_shared(bytes, q);
+    if (ptr == nullptr) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "malloc_shared of %llu bytes failed\n",
+                (unsigned long long)bytes);
+        return nullptr;
+    }
+
+    ds4_gpu_tensor *t = new ds4_gpu_tensor{ptr, bytes, 1, g_current_tier};
+    return t;
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
+                                               uint64_t offset,
+                                               uint64_t bytes) {
+    if (base == nullptr || base->ptr == nullptr) return nullptr;
+    if (offset + bytes > base->bytes) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "view %llu+%llu exceeds %llu bytes\n",
+                (unsigned long long)offset, (unsigned long long)bytes,
+                (unsigned long long)base->bytes);
+        return nullptr;
+    }
+
+    /* owner 0 marks a non-owning view: free must not release the pointer.
+     * The view inherits the base tensor's tier. */
+    ds4_gpu_tensor *v = new ds4_gpu_tensor{(char *)base->ptr + offset, bytes,
+                                           0, base->device_id};
+    return v;
+}
+
+extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
+    if (tensor == nullptr) return;
+    if (tensor->owner != 0 && tensor->ptr != nullptr) {
+        sycl::free(tensor->ptr, ds4_sycl_queue(tensor->device_id));
+    }
+    delete tensor;
+}
+
+extern "C" uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
+    return tensor ? tensor->bytes : 0;
+}
+
+extern "C" void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
+    return tensor ? tensor->ptr : nullptr;
+}
+
+/* Declared in ds4_gpu_mgpu.h.  Returns the logical tier the allocation lives
+ * on, or -1 when untagged, which the engine treats as tier 0. */
+extern "C" int ds4_gpu_tensor_device(const ds4_gpu_tensor *t) {
+    return t ? t->device_id : -1;
+}

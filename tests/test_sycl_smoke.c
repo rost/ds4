@@ -2,6 +2,7 @@
  * allocation, and host/device round-trip.  Needs no model file. */
 
 #include "ds4_gpu.h"
+#include "ds4_gpu_mgpu.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,25 @@ int ds4_sycl_device_count(void);
 int main(void) {
     CHECK(ds4_gpu_init() == 0, "ds4_gpu_init returned nonzero");
     CHECK(ds4_sycl_device_count() >= 1, "no SYCL device enumerated");
+
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(4096);
+    CHECK(t != NULL, "ds4_gpu_tensor_alloc returned NULL");
+    CHECK(ds4_gpu_tensor_bytes(t) == 4096, "wrong tensor byte count");
+    CHECK(ds4_gpu_tensor_contents(t) != NULL, "tensor has no device pointer");
+
+    ds4_gpu_tensor *v = ds4_gpu_tensor_view(t, 1024, 512);
+    CHECK(v != NULL, "ds4_gpu_tensor_view returned NULL");
+    CHECK(ds4_gpu_tensor_bytes(v) == 512, "wrong view byte count");
+    CHECK((char *)ds4_gpu_tensor_contents(v) ==
+          (char *)ds4_gpu_tensor_contents(t) + 1024,
+          "view pointer is not base plus offset");
+    CHECK(ds4_gpu_tensor_device(t) == 0,
+          "allocation was not stamped with tier 0");
+    CHECK(ds4_gpu_tensor_device(v) == ds4_gpu_tensor_device(t),
+          "view did not inherit the base tensor device");
+
+    ds4_gpu_tensor_free(v);
+    ds4_gpu_tensor_free(t);
 
     fprintf(stderr, "  test_sycl_smoke OK (devices=%d)\n",
             ds4_sycl_device_count());

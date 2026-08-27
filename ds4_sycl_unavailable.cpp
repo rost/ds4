@@ -35,12 +35,8 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(...) { return 0; }
 extern "C" uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(...) { return 0; }
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(...) { return 0; }
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(...) { return 0; }
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(...) { return nullptr; }
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(...) { return nullptr; }
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(...) { return nullptr; }
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(...) { return nullptr; }
-extern "C" uint64_t ds4_gpu_tensor_bytes(...) { return 0; }
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(...) { return nullptr; }
 extern "C" uint64_t ds4_gpu_tier_free_vram(...) { return 0; }
 
 /* void returns. */
@@ -57,7 +53,6 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_set_ssd_streaming)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_set_streaming_expert_cache_budget)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_set_streaming_expert_cache_expert_bytes)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_stream_expert_cache_reset_route_hotness)
-SYCL_UNAVAILABLE_VOID(ds4_gpu_tensor_free)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_keepalive_pause)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_set_attn_head_split)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_suspend_expert_sharding)
@@ -245,7 +240,6 @@ SYCL_UNAVAILABLE_INT(ds4_gpu_tensor_copy_xdev3)
 SYCL_UNAVAILABLE_INT(ds4_gpu_tensor_copy_xdev3_default_dst)
 SYCL_UNAVAILABLE_INT(ds4_gpu_tensor_copy_xdev_default)
 SYCL_UNAVAILABLE_INT(ds4_gpu_tensor_copy_xdev_ordered)
-SYCL_UNAVAILABLE_INT(ds4_gpu_tensor_device)
 SYCL_UNAVAILABLE_INT(ds4_gpu_tensor_fill_f32)
 SYCL_UNAVAILABLE_INT(ds4_gpu_tensor_read)
 SYCL_UNAVAILABLE_INT(ds4_gpu_tensor_wait_xdev)
