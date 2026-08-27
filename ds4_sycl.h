@@ -17,13 +17,10 @@ struct ds4_sycl_device {
     sycl::queue  queue;
 };
 
-/* Layout must match the ROCm and CUDA definition exactly.  owner is the
- * logical tier that owns ptr, or -1 for a non-owning view. */
-struct ds4_gpu_tensor {
-    void    *ptr;
-    uint64_t bytes;
-    int      owner;
-};
+/* ds4_gpu_tensor itself is not defined here: it comes from the single
+ * authoritative definition in ds4_gpu_mgpu.h (four fields: ptr, bytes,
+ * owner, device_id), guarded by DS4_GPU_TENSOR_DEFINED.  ds4_sycl.cpp
+ * includes that header directly. */
 
 /* These two are called from C test code, so they need C linkage. */
 extern "C" int ds4_sycl_device_count(void);

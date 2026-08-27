@@ -1,30 +1,10 @@
 #include "ds4_sycl.h"
 
 #include "ds4_gpu.h"
+#include "ds4_gpu_mgpu.h"
 
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
-
-/* Mirrors ds4_gpu_ctx from ds4_gpu_mgpu.h field-for-field.  That header
- * cannot be included here: its struct ds4_gpu_tensor definition (four
- * fields, with device_id) conflicts with the three-field definition in
- * ds4_sycl.h that this backend uses, the same reason ds4_rocm.cu keeps its
- * own local ds4_gpu_tensor instead of including ds4_gpu_mgpu.h.  Keep this
- * layout in sync with ds4_gpu_ctx if that changes. */
-struct ds4_sycl_gpu_ctx {
-    int      device_id;
-    void    *stream;
-    void    *cublas;
-    int      cublas_ready;
-    void    *scratch;
-    uint64_t scratch_bytes;
-    uint64_t budget_bytes;
-    uint64_t used_bytes;
-    void    *boundary_event;
-};
-
-constexpr int kMaxGpus = 16; /* mirrors DS4_MAX_GPUS from ds4_gpu_mgpu.h */
 
 namespace {
 
@@ -39,9 +19,9 @@ bool                         g_initialised  = false;
  * skeleton exposes a single logical tier with no peers, matching the
  * default ds4_rocm_compat.cu uses before ROCm's real device enumeration
  * runs. */
-ds4_sycl_gpu_ctx g_gpu[kMaxGpus] = {};
-int              g_n_gpus       = 1;
-int              g_gpu_peer_ok[kMaxGpus][kMaxGpus] = {{1}};
+ds4_gpu_ctx g_gpu[DS4_MAX_GPUS] = {};
+int         g_n_gpus            = 1;
+int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS] = {{1}};
 
 extern "C" int ds4_sycl_device_count(void) {
     return (int)g_devices.size();
