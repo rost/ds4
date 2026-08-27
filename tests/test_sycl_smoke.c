@@ -43,6 +43,38 @@ int main(void) {
     ds4_gpu_tensor *bad = ds4_gpu_tensor_view(t, 0xFFFFFFFFFFFFFF00ULL, 0x200ULL);
     CHECK(bad == NULL, "view accepted an offset+length that overflows");
 
+    float src[16];
+    float dst[16];
+    for (int i = 0; i < 16; i++) src[i] = (float)i * 1.5f;
+    memset(dst, 0, sizeof(dst));
+
+    CHECK(ds4_gpu_tensor_write(t, 0, src, sizeof(src)) == 0,
+          "ds4_gpu_tensor_write failed");
+    CHECK(ds4_gpu_tensor_read(t, 0, dst, sizeof(dst)) == 0,
+          "ds4_gpu_tensor_read failed");
+    CHECK(memcmp(src, dst, sizeof(src)) == 0,
+          "round-trip data mismatch");
+
+    ds4_gpu_tensor *t2 = ds4_gpu_tensor_alloc(4096);
+    CHECK(t2 != NULL, "second alloc returned NULL");
+    CHECK(ds4_gpu_tensor_copy(t2, 0, t, 0, sizeof(src)) == 0,
+          "ds4_gpu_tensor_copy failed");
+    memset(dst, 0, sizeof(dst));
+    CHECK(ds4_gpu_tensor_read(t2, 0, dst, sizeof(dst)) == 0,
+          "read after copy failed");
+    CHECK(memcmp(src, dst, sizeof(src)) == 0,
+          "device to device copy mismatch");
+
+    CHECK(ds4_gpu_tensor_fill_f32(t2, 2.5f, 16) == 0,
+          "ds4_gpu_tensor_fill_f32 failed");
+    CHECK(ds4_gpu_tensor_read(t2, 0, dst, sizeof(dst)) == 0,
+          "read after fill failed");
+    for (int i = 0; i < 16; i++) {
+        CHECK(dst[i] == 2.5f, "fill_f32 produced wrong value");
+    }
+
+    ds4_gpu_tensor_free(t2);
+
     ds4_gpu_tensor_free(v);
     ds4_gpu_tensor_free(t);
 
