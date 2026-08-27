@@ -5,7 +5,9 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <string>
 
 namespace {
@@ -13,6 +15,18 @@ namespace {
 std::vector<ds4_sycl_device> g_devices;
 int                          g_current_tier = 0;
 bool                         g_initialised  = false;
+
+/* Installed on every queue so asynchronous errors are not silently
+ * discarded.  Rethrowing here (rather than logging and swallowing) means
+ * a caller synchronising with wait_and_throw() sees the error as a C++
+ * exception at the call site, where the surrounding try/catch (see the
+ * tensor alloc/free/transfer functions below) logs it and returns the
+ * correct failure value for that entry's convention. */
+void ds4_sycl_async_handler(sycl::exception_list exceptions) {
+    for (const std::exception_ptr &e : exceptions) {
+        std::rethrow_exception(e);
+    }
+}
 
 /* Identifies a physical device independent of which backend or runtime
  * exposed it.  The device UUID is authoritative when the platform reports
@@ -67,6 +81,19 @@ extern "C" int ds4_sycl_current_tier(void) {
 }
 
 sycl::queue &ds4_sycl_queue(int tier) {
+    /* g_devices can legitimately be empty (init never ran, init failed, or
+     * cleanup already ran), and this function returns a reference so it has
+     * no value it can use to signal that.  Every real caller (alloc, free,
+     * transfer) checks g_devices.empty() itself before reaching here and
+     * returns its own failure value instead of calling in; a caller that
+     * reaches this branch anyway is a bug in this file, not a recoverable
+     * runtime condition, so fail loudly here instead of indexing an empty
+     * vector. */
+    if (g_devices.empty()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "ds4_sycl_queue called with no device initialised\n");
+        abort();
+    }
     /* Out-of-range tiers indicate an engine bug rather than a recoverable
      * condition, but returning tier 0 keeps the skeleton from indexing past
      * the end of the vector while later plans build out real tier routing. */
@@ -111,7 +138,8 @@ extern "C" int ds4_gpu_init(void) {
                                                                     : preferred;
 
         for (const sycl::device &d : ds4_sycl_dedup_devices(chosen)) {
-            g_devices.push_back(ds4_sycl_device{d, sycl::queue(d)});
+            g_devices.push_back(
+                ds4_sycl_device{d, sycl::queue(d, ds4_sycl_async_handler)});
         }
 
         g_current_tier = 0;
@@ -132,6 +160,15 @@ extern "C" int ds4_gpu_init(void) {
     }
 }
 
+/* Ordering contract: every ds4_gpu_tensor allocated through this backend
+ * must be freed with ds4_gpu_tensor_free before ds4_gpu_cleanup runs.
+ * Cleanup does not track or free live USM allocations itself, matching
+ * ROCm's ds4_gpu_cleanup, which releases its own internal caches but never
+ * frees caller-owned tensors either; tensor lifetime is the caller's
+ * responsibility on every backend.  A tensor freed after cleanup does not
+ * corrupt memory: ds4_gpu_tensor_free (like every other entry point here)
+ * checks g_devices.empty() first and logs-and-leaks the device pointer
+ * instead of calling into a torn-down queue. */
 extern "C" void ds4_gpu_cleanup(void) {
     for (ds4_sycl_device &d : g_devices) d.queue.wait();
     g_devices.clear();
@@ -140,35 +177,56 @@ extern "C" void ds4_gpu_cleanup(void) {
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
-    if (bytes == 0) return nullptr;
-
-    sycl::queue &q = ds4_sycl_current_queue();
-    void *ptr = sycl::malloc_device(bytes, q);
-    if (ptr == nullptr) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "malloc_device of %llu bytes failed\n",
-                (unsigned long long)bytes);
+    /* Match ROCm (rocm/ds4_rocm_runtime.cuh): a zero-size request still
+     * returns a real, freeable one-byte allocation rather than NULL, which
+     * would otherwise read as allocation failure. */
+    if (bytes == 0) bytes = 1;
+    if (g_devices.empty()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_alloc with no device initialised\n");
         return nullptr;
     }
 
-    /* owner 1 means this tensor must free ptr; device_id is the logical
-     * tier the allocation lives on. */
-    ds4_gpu_tensor *t = new ds4_gpu_tensor{ptr, bytes, 1, g_current_tier};
-    return t;
+    try {
+        sycl::queue &q = ds4_sycl_current_queue();
+        void *ptr = sycl::malloc_device(bytes, q);
+        if (ptr == nullptr) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "malloc_device of %llu bytes failed\n",
+                    (unsigned long long)bytes);
+            return nullptr;
+        }
+
+        /* owner 1 means this tensor must free ptr; device_id is the logical
+         * tier the allocation lives on. */
+        ds4_gpu_tensor *t = new ds4_gpu_tensor{ptr, bytes, 1, g_current_tier};
+        return t;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_alloc failed: %s\n", e.what());
+        return nullptr;
+    }
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
-    if (bytes == 0) return nullptr;
-
-    sycl::queue &q = ds4_sycl_current_queue();
-    void *ptr = sycl::malloc_shared(bytes, q);
-    if (ptr == nullptr) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "malloc_shared of %llu bytes failed\n",
-                (unsigned long long)bytes);
+    if (bytes == 0) bytes = 1;
+    if (g_devices.empty()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_alloc_managed with no device initialised\n");
         return nullptr;
     }
 
-    ds4_gpu_tensor *t = new ds4_gpu_tensor{ptr, bytes, 1, g_current_tier};
-    return t;
+    try {
+        sycl::queue &q = ds4_sycl_current_queue();
+        void *ptr = sycl::malloc_shared(bytes, q);
+        if (ptr == nullptr) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "malloc_shared of %llu bytes failed\n",
+                    (unsigned long long)bytes);
+            return nullptr;
+        }
+
+        ds4_gpu_tensor *t = new ds4_gpu_tensor{ptr, bytes, 1, g_current_tier};
+        return t;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_alloc_managed failed: %s\n", e.what());
+        return nullptr;
+    }
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
@@ -193,7 +251,20 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
 extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (tensor == nullptr) return;
     if (tensor->owner != 0 && tensor->ptr != nullptr) {
-        sycl::free(tensor->ptr, ds4_sycl_queue(tensor->device_id));
+        /* See the ordering contract on ds4_gpu_cleanup: a tensor freed
+         * after cleanup has no live queue to free through.  Log and leak
+         * rather than indexing the empty device vector. */
+        if (g_devices.empty()) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "tensor_free after cleanup; leaking device pointer\n");
+        } else {
+            try {
+                sycl::free(tensor->ptr, ds4_sycl_queue(tensor->device_id));
+            } catch (const sycl::exception &e) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_free failed: %s\n",
+                        e.what());
+            }
+        }
     }
     delete tensor;
 }
@@ -218,11 +289,20 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset,
     /* Overflow-safe: offset + bytes can wrap past UINT64_MAX. */
     if (offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (bytes == 0) return 1;
+    if (g_devices.empty()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_write with no device initialised\n");
+        return 0;
+    }
 
-    sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
-                                                          : g_current_tier);
-    q.memcpy((char *)tensor->ptr + offset, data, bytes).wait();
-    return 1;
+    try {
+        sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
+                                                              : g_current_tier);
+        q.memcpy((char *)tensor->ptr + offset, data, bytes).wait_and_throw();
+        return 1;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_write failed: %s\n", e.what());
+        return 0;
+    }
 }
 
 extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset,
@@ -231,11 +311,20 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     /* Overflow-safe: offset + bytes can wrap past UINT64_MAX. */
     if (offset > tensor->bytes || bytes > tensor->bytes - offset) return 0;
     if (bytes == 0) return 1;
+    if (g_devices.empty()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_read with no device initialised\n");
+        return 0;
+    }
 
-    sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
-                                                          : g_current_tier);
-    q.memcpy(data, (const char *)tensor->ptr + offset, bytes).wait();
-    return 1;
+    try {
+        sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
+                                                              : g_current_tier);
+        q.memcpy(data, (const char *)tensor->ptr + offset, bytes).wait_and_throw();
+        return 1;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_read failed: %s\n", e.what());
+        return 0;
+    }
 }
 
 extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
@@ -248,13 +337,33 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
     if (src_offset > src->bytes || bytes > src->bytes - src_offset) return 0;
     if (bytes == 0) return 1;
 
-    /* Same-device copy only.  Cross-device transfer arrives with the mgpu
-     * plan and routes through ds4_gpu_tensor_copy_xdev instead. */
-    sycl::queue &q = ds4_sycl_queue(dst->device_id >= 0 ? dst->device_id
-                                                        : g_current_tier);
-    q.memcpy((char *)dst->ptr + dst_offset,
-             (const char *)src->ptr + src_offset, bytes).wait();
-    return 1;
+    /* Same-device copy only.  A cross-tier pair is a caller bug: raw USM
+     * memcpy across contexts is undefined behaviour, not merely slow.
+     * Cross-device transfer arrives with the mgpu plan and routes through
+     * ds4_gpu_tensor_copy_xdev instead. */
+    const int dst_tier = dst->device_id >= 0 ? dst->device_id : g_current_tier;
+    const int src_tier = src->device_id >= 0 ? src->device_id : g_current_tier;
+    if (dst_tier != src_tier) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "tensor_copy: cross-device copy (dst tier %d, src tier %d) "
+                "not supported; use ds4_gpu_tensor_copy_xdev\n",
+                dst_tier, src_tier);
+        return 0;
+    }
+    if (g_devices.empty()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_copy with no device initialised\n");
+        return 0;
+    }
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(dst_tier);
+        q.memcpy((char *)dst->ptr + dst_offset,
+                 (const char *)src->ptr + src_offset, bytes).wait_and_throw();
+        return 1;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_copy failed: %s\n", e.what());
+        return 0;
+    }
 }
 
 extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
@@ -263,9 +372,18 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
     /* Overflow-safe: count * sizeof(float) can wrap.  Divide instead. */
     if (count > tensor->bytes / sizeof(float)) return 0;
     if (count == 0) return 1;
+    if (g_devices.empty()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_fill_f32 with no device initialised\n");
+        return 0;
+    }
 
-    sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
-                                                          : g_current_tier);
-    q.fill((float *)tensor->ptr, value, (size_t)count).wait();
-    return 1;
+    try {
+        sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
+                                                              : g_current_tier);
+        q.fill((float *)tensor->ptr, value, (size_t)count).wait_and_throw();
+        return 1;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_fill_f32 failed: %s\n", e.what());
+        return 0;
+    }
 }
