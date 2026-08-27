@@ -67,7 +67,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl
+.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -392,6 +392,15 @@ ds4_sycl.o: ds4_sycl.cpp ds4_sycl.h ds4_gpu.h ds4_gpu_mgpu.h $(SYCL_SRCS)
 
 ds4_sycl_unavailable.o: ds4_sycl_unavailable.cpp
 	$(ICPX) $(SYCL_CFLAGS) -c -o $@ ds4_sycl_unavailable.cpp
+
+tests/test_sycl_smoke.o: tests/test_sycl_smoke.c ds4_gpu.h
+	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
+
+tests/test_sycl_smoke: tests/test_sycl_smoke.o ds4_sycl.o ds4_sycl_unavailable.o
+	$(ICPX) $(SYCL_CFLAGS) -o $@ $^ $(SYCL_LDLIBS)
+
+test-sycl-smoke: tests/test_sycl_smoke
+	./tests/test_sycl_smoke
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
