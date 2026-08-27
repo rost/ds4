@@ -3,14 +3,49 @@
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace {
 
 std::vector<ds4_sycl_device> g_devices;
 int                          g_current_tier = 0;
 bool                         g_initialised  = false;
+
+/* Identifies a physical device independent of which backend or runtime
+ * exposed it.  The device UUID is authoritative when the platform reports
+ * it; the device name is the fallback, which is sufficient because two
+ * runtimes fronting the same card report the same name. */
+std::string ds4_sycl_device_identity(const sycl::device &d) {
+    if (d.has(sycl::aspect::ext_intel_device_info_uuid)) {
+        auto uuid = d.get_info<sycl::ext::intel::info::device::uuid>();
+        return std::string(reinterpret_cast<const char *>(uuid.data()),
+                            uuid.size());
+    }
+    return d.get_info<sycl::info::device::name>();
+}
+
+/* Backend preference (Level Zero over OpenCL) is not sufficient on its own
+ * to guarantee one entry per physical card: this host has two OpenCL
+ * runtimes installed concurrently, and nothing prevents either backend
+ * from exposing the same GPU more than once under different driver state.
+ * Dedupe by physical identity so a doubled card never ends up with two
+ * independent queues, which would silently corrupt tier routing once tiers
+ * map to real devices. */
+std::vector<sycl::device> ds4_sycl_dedup_devices(
+    const std::vector<sycl::device> &devices) {
+    std::vector<sycl::device> unique;
+    std::vector<std::string>  seen;
+    for (const sycl::device &d : devices) {
+        std::string id = ds4_sycl_device_identity(d);
+        if (std::find(seen.begin(), seen.end(), id) != seen.end()) continue;
+        seen.push_back(id);
+        unique.push_back(d);
+    }
+    return unique;
+}
 
 } /* namespace */
 
@@ -50,41 +85,51 @@ sycl::queue &ds4_sycl_current_queue(void) {
 extern "C" int ds4_gpu_init(void) {
     if (g_initialised) return 0;
 
-    std::vector<sycl::device> gpus;
-    for (const sycl::platform &p : sycl::platform::get_platforms()) {
-        for (const sycl::device &d : p.get_devices()) {
-            if (d.is_gpu()) gpus.push_back(d);
+    try {
+        std::vector<sycl::device> gpus;
+        for (const sycl::platform &p : sycl::platform::get_platforms()) {
+            for (const sycl::device &d : p.get_devices()) {
+                if (d.is_gpu()) gpus.push_back(d);
+            }
         }
-    }
 
-    if (gpus.empty()) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "no SYCL GPU device found\n");
+        if (gpus.empty()) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "no SYCL GPU device found\n");
+            return 1;
+        }
+
+        /* Prefer the Level Zero backend when a device is exposed by more
+         * than one platform, which is the normal case on Intel: the same
+         * physical GPU appears under both OpenCL and Level Zero. */
+        std::vector<sycl::device> preferred;
+        for (const sycl::device &d : gpus) {
+            if (d.get_backend() == sycl::backend::ext_oneapi_level_zero) {
+                preferred.push_back(d);
+            }
+        }
+        const std::vector<sycl::device> &chosen = preferred.empty() ? gpus
+                                                                    : preferred;
+
+        for (const sycl::device &d : ds4_sycl_dedup_devices(chosen)) {
+            g_devices.push_back(ds4_sycl_device{d, sycl::queue(d)});
+        }
+
+        g_current_tier = 0;
+        g_initialised  = true;
+
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "%zu device(s), using %s\n",
+                g_devices.size(),
+                g_devices[0].dev.get_info<sycl::info::device::name>()
+                    .c_str());
+        return 0;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "device init failed: %s\n",
+                e.what());
+        g_devices.clear();
+        g_current_tier = 0;
+        g_initialised  = false;
         return 1;
     }
-
-    /* Prefer the Level Zero backend when a device is exposed by more than
-     * one platform, which is the normal case on Intel: the same physical GPU
-     * appears under both OpenCL and Level Zero. */
-    std::vector<sycl::device> preferred;
-    for (const sycl::device &d : gpus) {
-        if (d.get_backend() == sycl::backend::ext_oneapi_level_zero) {
-            preferred.push_back(d);
-        }
-    }
-    const std::vector<sycl::device> &chosen = preferred.empty() ? gpus
-                                                                : preferred;
-
-    for (const sycl::device &d : chosen) {
-        g_devices.push_back(ds4_sycl_device{d, sycl::queue(d)});
-    }
-
-    g_current_tier = 0;
-    g_initialised  = true;
-
-    fprintf(stderr, DS4_GPU_LOG_PREFIX "%zu device(s), using %s\n",
-            g_devices.size(),
-            g_devices[0].dev.get_info<sycl::info::device::name>().c_str());
-    return 0;
 }
 
 extern "C" void ds4_gpu_cleanup(void) {
