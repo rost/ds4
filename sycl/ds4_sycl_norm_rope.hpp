@@ -15,6 +15,12 @@
 
 #include "ds4_sycl_common.hpp"
 
+/* Not reliably defined by <cmath> under -fsycl; ds4.c:369-371 carries the
+ * same guard for the CPU build. */
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 namespace {
 
 /* The work-group size is FIXED at 256 to match the CUDA launch geometry
@@ -23,6 +29,15 @@ namespace {
  * over here.  The tree reduction below depends on this being a power of
  * two. */
 constexpr size_t kRmsNormGroup = 256;
+
+/* YaRN ramp helper, from rocm/ds4_rocm_norm_rope.cuh:246-249
+ * (rope_yarn_ramp_dev).  Indexed by the CHANNEL index i0 = pair * 2, not
+ * by the pair index: the division by two below undoes that before
+ * comparing against the correction dims. */
+static inline float sycl_rope_yarn_ramp(float low, float high, int i0) {
+    const float y = ((float)(i0 / 2) - low) / sycl::fmax(0.001f, high - low);
+    return 1.0f - sycl::fmin(1.0f, sycl::fmax(0.0f, y));
+}
 
 }  // namespace
 
@@ -416,4 +431,255 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok,
         return 0;
     }
     return 1;
+}
+
+/* Fused head RMS-norm plus DeepSeek partial RoPE, one work-group per
+ * (token, head) row, matching ROCm's head_rms_norm_rope_tail_kernel
+ * (rocm/ds4_rocm_norm_rope.cuh:105-172) and its launcher
+ * (rocm/ds4_rocm_norm_rope.cuh:523-530).  Shares the reduction shape used
+ * throughout this file: fixed 256 work-group, strided accumulate, tree
+ * reduction, then a strided pass over the row.
+ *
+ * PARTIAL ROPE, READ CAREFULLY: the leading n_nope = head_dim - n_rot
+ * channels are scaled ONLY, in the loop below.  The trailing n_rot
+ * channels are NOT touched by that loop; their scale is applied inside
+ * the rotation loop, at the point each pair is read.  Scaling the whole
+ * row here and then rotating would DOUBLE-SCALE the tail -- a smooth
+ * magnitude error that looks entirely plausible on inspection. */
+extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow, float eps) {
+    uint64_t rows64 = 0;
+    if (n_rot > head_dim || (n_rot & 1u) ||
+        !sycl_u64_mul_checked(n_tok, n_head, &rows64) || rows64 > UINT32_MAX ||
+        !sycl_tensor_has_elems3(x, n_tok, n_head, head_dim, sizeof(float))) {
+        return 0;
+    }
+    if (rows64 == 0u || head_dim == 0u) return 1;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(x->device_id);
+        float         *px   = (float *)x->ptr;
+        const size_t   rows = (size_t)rows64;
+
+        q.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> partial(
+                    sycl::range<1>(kRmsNormGroup), h);
+            h.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(rows * kRmsNormGroup),
+                                  sycl::range<1>(kRmsNormGroup)),
+                [=](sycl::nd_item<1> it) {
+                    const size_t row = it.get_group(0);
+                    const size_t lid = it.get_local_id(0);
+                    const size_t lsz = it.get_local_range(0);
+                    const uint32_t t = (uint32_t)(row / n_head);
+
+                    float *xr = px + row * head_dim;
+
+                    float sum = 0.0f;
+                    for (size_t i = lid; i < head_dim; i += lsz) {
+                        const float v = xr[i];
+                        sum += v * v;
+                    }
+                    /* Every work-item writes its slot unconditionally; see
+                     * the long comment on the equivalent line in
+                     * ds4_gpu_rms_norm_plain_rows_tensor above. */
+                    partial[lid] = sum;
+                    it.barrier(sycl::access::fence_space::local_space);
+                    for (size_t s = lsz / 2; s > 0; s >>= 1) {
+                        if (lid < s) partial[lid] += partial[lid + s];
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+                    const float scale =
+                            sycl::rsqrt(partial[0] / (float)head_dim + eps);
+
+                    /* See the function comment above: this loop scales
+                     * ONLY the leading n_nope channels.  The tail is
+                     * scaled inside the rotation loop below, not here. */
+                    const uint32_t n_nope = head_dim - n_rot;
+                    for (size_t i = lid; i < n_nope; i += lsz) {
+                        xr[i] *= scale;
+                    }
+
+                    /* Correction dims are recomputed by every work-item,
+                     * matching the CUDA source, which does not gate this
+                     * behind threadIdx.x == 0.  Keep it redundant. */
+                    float corr0 = 0.0f, corr1 = 0.0f;
+                    if (ext_factor != 0.0f) {
+                        const float denom = 2.0f * sycl::log(freq_base);
+                        corr0 = sycl::floor((float)n_rot *
+                                sycl::log((float)n_ctx_orig /
+                                          (beta_fast * 2.0f * (float)M_PI)) / denom);
+                        corr1 = sycl::ceil((float)n_rot *
+                                sycl::log((float)n_ctx_orig /
+                                          (beta_slow * 2.0f * (float)M_PI)) / denom);
+                        corr0 = sycl::fmax(0.0f, corr0);
+                        corr1 = sycl::fmin((float)(n_rot - 1), corr1);
+                    }
+
+                    const float theta_scale =
+                            sycl::pow(freq_base, -2.0f / (float)n_rot);
+
+                    for (size_t pair = lid; pair < n_rot / 2; pair += lsz) {
+                        const uint32_t i = (uint32_t)pair * 2u;
+                        /* Direct power, NOT iterative accumulation.  ds4's
+                         * CPU reference accumulates (ds4.c:10273); every GPU
+                         * backend uses this form.  Mathematically identical,
+                         * not bit-identical.  Do not "fix" this to match the
+                         * CPU: it would diverge from Metal, CUDA and ROCm at
+                         * once. */
+                        const float theta_extrap =
+                                (float)(pos0 + t) *
+                                sycl::pow(theta_scale, (float)pair);
+                        const float theta_interp = freq_scale * theta_extrap;
+                        float theta  = theta_interp;
+                        float mscale = attn_factor;
+                        if (ext_factor != 0.0f) {
+                            const float ramp_mix =
+                                    sycl_rope_yarn_ramp(corr0, corr1, (int)i) *
+                                    ext_factor;
+                            theta = theta_interp * (1.0f - ramp_mix) +
+                                    theta_extrap * ramp_mix;
+                            mscale *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
+                        }
+                        float c = sycl::cos(theta) * mscale;
+                        float s = sycl::sin(theta) * mscale;
+                        if (inverse) s = -s;
+
+                        float *tail = xr + n_nope;
+                        const float x0 = tail[i]     * scale;
+                        const float x1 = tail[i + 1] * scale;
+                        tail[i]     = x0 * c - x1 * s;
+                        tail[i + 1] = x0 * s + x1 * c;
+                    }
+                });
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "head_rms_norm_rope_tail failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* Flat pair-parallel DeepSeek partial RoPE with no reduction, matching
+ * ROCm's rope_tail_kernel (rocm/ds4_rocm_norm_rope.cuh:251-300) and its
+ * stride-aware launcher cuda_rope_tail_stride_tensor
+ * (rocm/ds4_rocm_norm_rope.cuh:603-609).  STRUCTURALLY DIFFERENT from
+ * ds4_gpu_head_rms_norm_rope_tail_tensor above, not the same kernel with
+ * the norm stripped out: there is no work-group per row, no local
+ * accessor, no barrier and no `scale` (nothing was normalised).  Instead
+ * one work-item is launched per rotation pair, and the flat id is
+ * decomposed into (pair, head, token) inside the kernel.
+ *
+ * pos_stride multiplies the token index in the angle
+ * (pos0 + t * pos_stride), not just pos0 itself.  This function stays
+ * static and keeps pos_stride as an explicit parameter, separate from the
+ * public ds4_gpu_rope_tail_tensor wrapper below, because the
+ * compressor calls this stride variant directly with pos_stride != 1. */
+static int sycl_rope_tail_stride_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t pos_stride,
+        uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast,
+        float beta_slow) {
+    if (n_rot > head_dim || (n_rot & 1u) ||
+        !sycl_tensor_has_elems3(x, n_tok, n_head, head_dim, sizeof(float))) {
+        return 0;
+    }
+    const uint32_t pairs = n_tok * n_head * (n_rot / 2u);
+    if (pairs == 0u) return 1;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(x->device_id);
+        float       *px    = (float *)x->ptr;
+        const size_t group = kRmsNormGroup;
+        const size_t grid  = ((size_t)pairs + group - 1) / group * group;
+
+        q.submit([&](sycl::handler &h) {
+            h.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(grid),
+                                  sycl::range<1>(group)),
+                [=](sycl::nd_item<1> it) {
+                    const size_t gid = it.get_global_id(0);
+                    if (gid >= (size_t)pairs) return;
+
+                    const uint32_t half   = n_rot / 2u;
+                    const uint32_t pair   = (uint32_t)gid % half;
+                    const uint32_t tmp    = (uint32_t)gid / half;
+                    const uint32_t h      = tmp % n_head;
+                    const uint32_t t      = tmp / n_head;
+                    const uint32_t n_nope = head_dim - n_rot;
+                    const uint32_t i      = pair * 2u;
+
+                    float corr0 = 0.0f, corr1 = 0.0f;
+                    if (ext_factor != 0.0f) {
+                        const float denom = 2.0f * sycl::log(freq_base);
+                        corr0 = sycl::floor((float)n_rot *
+                                sycl::log((float)n_ctx_orig /
+                                          (beta_fast * 2.0f * (float)M_PI)) / denom);
+                        corr1 = sycl::ceil((float)n_rot *
+                                sycl::log((float)n_ctx_orig /
+                                          (beta_slow * 2.0f * (float)M_PI)) / denom);
+                        corr0 = sycl::fmax(0.0f, corr0);
+                        corr1 = sycl::fmin((float)(n_rot - 1), corr1);
+                    }
+
+                    const float theta_scale =
+                            sycl::pow(freq_base, -2.0f / (float)n_rot);
+                    /* Direct power, NOT iterative accumulation; see the
+                     * matching comment in the fused kernel above. */
+                    const float theta_extrap =
+                            (float)(pos0 + t * pos_stride) *
+                            sycl::pow(theta_scale, (float)pair);
+                    const float theta_interp = freq_scale * theta_extrap;
+                    float theta  = theta_interp;
+                    float mscale = attn_factor;
+                    if (ext_factor != 0.0f) {
+                        const float ramp_mix =
+                                sycl_rope_yarn_ramp(corr0, corr1, (int)i) *
+                                ext_factor;
+                        theta = theta_interp * (1.0f - ramp_mix) +
+                                theta_extrap * ramp_mix;
+                        mscale *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
+                    }
+                    float c = sycl::cos(theta) * mscale;
+                    float s = sycl::sin(theta) * mscale;
+                    if (inverse) s = -s;
+
+                    /* No `scale`: nothing was normalised on this path, so
+                     * the pair is read and rotated as-is. */
+                    float *tail = px +
+                            ((uint64_t)t * n_head + h) * head_dim + n_nope;
+                    const float x0 = tail[i];
+                    const float x1 = tail[i + 1];
+                    tail[i]     = x0 * c - x1 * s;
+                    tail[i + 1] = x0 * s + x1 * c;
+                });
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "rope_tail failed: %s\n",
+                e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* Thin wrapper over the stride variant above with pos_stride = 1, matching
+ * ROCm's ds4_gpu_rope_tail_tensor (rocm/ds4_rocm_norm_rope.cuh:610-612). */
+extern "C" int ds4_gpu_rope_tail_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t n_ctx_orig, bool inverse,
+        float freq_base, float freq_scale, float ext_factor,
+        float attn_factor, float beta_fast, float beta_slow) {
+    return sycl_rope_tail_stride_tensor(x, n_tok, n_head, head_dim, n_rot,
+                                        pos0, 1u, n_ctx_orig, inverse,
+                                        freq_base, freq_scale, ext_factor,
+                                        attn_factor, beta_fast, beta_slow);
 }

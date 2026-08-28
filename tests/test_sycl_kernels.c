@@ -11,6 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #define CHECK(cond, msg)                                                    \
     do {                                                                    \
         if (!(cond)) {                                                      \
@@ -909,6 +913,315 @@ static int test_dsv4_qkv_rms_norm_rows(void) {
     return 0;
 }
 
+/* Oracle for rope_yarn_ramp, ds4.c:10209-10212, and shared by both RoPE
+ * oracles below.  Indexed by the channel index i0 = pair * 2. */
+static float oracle_rope_yarn_ramp(float low, float high, int i0) {
+    const float y = ((float)(i0 / 2) - low) / fmaxf(0.001f, high - low);
+    return 1.0f - fminf(1.0f, fmaxf(0.0f, y));
+}
+
+/* Oracle mirrors rope_tail_ext_inplace, ds4.c:10228-10276, reached via
+ * rope_tail_layer_inplace, ds4.c:10292-10323, specialised to ONE head's
+ * head_dim-wide row (ds4.c's version loops over n_head itself; each head
+ * resets theta_extrap to `pos` independently, so operating one row at a
+ * time here is equivalent).
+ *
+ * DELIBERATE DIVERGENCE FROM THE GPU: this oracle accumulates the angle
+ * ITERATIVELY, theta_extrap *= theta_scale per pair (ds4.c:10273), matching
+ * the CPU reference exactly.  Every GPU backend (Metal, CUDA, ROCm, and
+ * this SYCL port) instead computes theta_extrap = pos * pow(theta_scale,
+ * pair) directly.  The two forms are mathematically identical but not
+ * bit-identical; the caller's tolerance absorbs the resulting ULP-level
+ * drift.  This is a pre-existing cross-backend property of ds4, not a
+ * SYCL defect, and the kernel must NOT be changed to match this oracle's
+ * form. */
+static void oracle_rope_tail_row(float *row, uint32_t head_dim, uint32_t n_rot,
+                                 uint32_t pos, uint32_t n_ctx_orig,
+                                 float freq_base, float freq_scale,
+                                 float ext_factor, float attn_factor,
+                                 float beta_fast, float beta_slow,
+                                 int inverse) {
+    if (n_rot == 0u) return;
+    const uint32_t n_nope = head_dim - n_rot;
+    const float theta_scale = powf(freq_base, -2.0f / (float)n_rot);
+    const float sin_sign = inverse ? -1.0f : 1.0f;
+    float corr0 = 0.0f, corr1 = 0.0f;
+    if (ext_factor != 0.0f) {
+        const float denom = 2.0f * logf(freq_base);
+        const float start = floorf((float)n_rot *
+                logf((float)n_ctx_orig / (beta_fast * 2.0f * (float)M_PI)) / denom);
+        const float end = ceilf((float)n_rot *
+                logf((float)n_ctx_orig / (beta_slow * 2.0f * (float)M_PI)) / denom);
+        corr0 = fmaxf(0.0f, start);
+        corr1 = fminf((float)(n_rot - 1), end);
+    }
+
+    float *tail = row + n_nope;
+    float theta_extrap = (float)pos;
+    for (uint32_t i = 0; i < n_rot; i += 2) {
+        const float theta_interp = freq_scale * theta_extrap;
+        float theta = theta_interp;
+        float mscale = attn_factor;
+        if (ext_factor != 0.0f) {
+            const float ramp_mix =
+                    oracle_rope_yarn_ramp(corr0, corr1, (int)i) * ext_factor;
+            theta = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+            mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+        }
+        const float c = cosf(theta) * mscale;
+        const float s = sin_sign * sinf(theta) * mscale;
+        const float x0 = tail[i];
+        const float x1 = tail[i + 1];
+        tail[i]     = x0 * c - x1 * s;
+        tail[i + 1] = x0 * s + x1 * c;
+        theta_extrap *= theta_scale;
+    }
+}
+
+/* ds4_gpu_rope_tail_tensor: the flat, pair-parallel, no-reduction RoPE
+ * kernel.  N_HEAD > 1 and N_TOK > 1 both hold so the kernel's own
+ * decomposition of the flat id into (pair, head, token) is genuinely
+ * exercised; a transposed decomposition would still pass with either at
+ * 1.  HEAD_DIM > N_ROT exercises the scale-only... except this kernel has
+ * no scale at all, so it exercises the leading channels being left
+ * completely untouched, which is the flat path's equivalent property. */
+static int test_rope_tail(void) {
+    enum { N_TOK = 3, N_HEAD = 2, HEAD_DIM = 24, N_ROT = 16,
+           N_NOPE = HEAD_DIM - N_ROT, TOTAL = N_TOK * N_HEAD * HEAD_DIM };
+    const uint32_t POS0 = 5;
+    const uint32_t N_CTX_ORIG = 4096;
+    const float FREQ_BASE = 10000.0f;
+    const float BETA_FAST = 32.0f;
+    const float BETA_SLOW = 1.0f;
+    const float ATTN_FACTOR = 1.0f;
+    /* c/s divergence between the iterative oracle and the GPU's
+     * direct-power form measured at these parameters is on the order of
+     * 1e-7; this tolerance leaves two orders of magnitude of margin. */
+    const double TOL = 1e-4;
+
+    struct { float freq_scale; float ext_factor; int inverse; } cases[] = {
+        {1.0f, 0.0f, 0}, /* plain interpolation, forward */
+        {1.0f, 0.0f, 1}, /* plain interpolation, inverse */
+        {0.5f, 1.0f, 0}, /* YaRN correction active, forward */
+        {0.5f, 1.0f, 1}, /* YaRN correction active, inverse */
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        float x[TOTAL], got[TOTAL], want_row[HEAD_DIM];
+        for (int i = 0; i < TOTAL; i++) x[i] = ((float)(i % 13) - 6.0f) * 0.2f;
+
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+        CHECK(tx != NULL, "rope_tail: allocation failed");
+        CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+              "rope_tail: write");
+
+        CHECK(ds4_gpu_rope_tail_tensor(tx, N_TOK, N_HEAD, HEAD_DIM, N_ROT,
+                                       POS0, N_CTX_ORIG, cases[ci].inverse,
+                                       FREQ_BASE, cases[ci].freq_scale,
+                                       cases[ci].ext_factor, ATTN_FACTOR,
+                                       BETA_FAST, BETA_SLOW) != 0,
+              "rope_tail: call");
+        CHECK(ds4_gpu_tensor_read(tx, 0, got, sizeof(got)) != 0,
+              "rope_tail: read");
+
+        for (int t = 0; t < N_TOK; t++) {
+            for (int h = 0; h < N_HEAD; h++) {
+                const int base = (t * N_HEAD + h) * HEAD_DIM;
+                const float *row_x   = &x[base];
+                const float *row_got = &got[base];
+
+                /* No `scale`: the leading n_nope channels must be
+                 * BYTE-IDENTICAL to the input.  A kernel that scaled them
+                 * (borrowing the fused kernel's behaviour by mistake)
+                 * would fail here. */
+                for (int c = 0; c < N_NOPE; c++) {
+                    CHECK(row_got[c] == row_x[c],
+                          "rope_tail: leading channels must be untouched");
+                }
+
+                memcpy(want_row, row_x, sizeof(want_row));
+                oracle_rope_tail_row(want_row, HEAD_DIM, N_ROT, POS0 + (uint32_t)t,
+                                     N_CTX_ORIG, FREQ_BASE, cases[ci].freq_scale,
+                                     cases[ci].ext_factor, ATTN_FACTOR,
+                                     BETA_FAST, BETA_SLOW, cases[ci].inverse);
+                for (int c = N_NOPE; c < HEAD_DIM; c++) {
+                    CHECK_CLOSE(row_got[c], want_row[c], TOL,
+                                "rope_tail: rotated tail mismatch");
+                }
+            }
+        }
+
+        ds4_gpu_tensor_free(tx);
+    }
+
+    /* n_rot == 0 has zero pairs and must succeed without modifying x,
+     * matching the pairs == 0 early-out. */
+    {
+        float x[TOTAL], got[TOTAL];
+        for (int i = 0; i < TOTAL; i++) x[i] = ((float)(i % 13) - 6.0f) * 0.2f;
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+        CHECK(tx != NULL, "rope_tail: n_rot=0 allocation failed");
+        CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+              "rope_tail: n_rot=0 write");
+        CHECK(ds4_gpu_rope_tail_tensor(tx, N_TOK, N_HEAD, HEAD_DIM, 0, POS0,
+                                       N_CTX_ORIG, false, FREQ_BASE, 1.0f,
+                                       0.0f, 1.0f, BETA_FAST, BETA_SLOW) != 0,
+              "rope_tail: n_rot=0 must succeed");
+        CHECK(ds4_gpu_tensor_read(tx, 0, got, sizeof(got)) != 0,
+              "rope_tail: n_rot=0 read");
+        CHECK(memcmp(x, got, sizeof(x)) == 0,
+              "rope_tail: n_rot=0 must leave the tensor untouched");
+        ds4_gpu_tensor_free(tx);
+    }
+
+    /* An odd n_rot must be rejected: the kernel forms pairs, and an odd
+     * count would read one element past the tail. */
+    {
+        ds4_gpu_tensor *t = ds4_gpu_tensor_alloc((uint64_t)TOTAL * sizeof(float));
+        CHECK(t != NULL, "rope_tail: odd n_rot allocation failed");
+        CHECK(ds4_gpu_rope_tail_tensor(t, N_TOK, N_HEAD, HEAD_DIM, N_ROT - 1,
+                                       POS0, N_CTX_ORIG, false, FREQ_BASE,
+                                       1.0f, 0.0f, 1.0f, BETA_FAST,
+                                       BETA_SLOW) == 0,
+              "rope_tail: odd n_rot must be rejected");
+
+        /* n_rot > head_dim must also be rejected. */
+        CHECK(ds4_gpu_rope_tail_tensor(t, N_TOK, N_HEAD, HEAD_DIM,
+                                       HEAD_DIM + 2, POS0, N_CTX_ORIG, false,
+                                       FREQ_BASE, 1.0f, 0.0f, 1.0f, BETA_FAST,
+                                       BETA_SLOW) == 0,
+              "rope_tail: n_rot > head_dim must be rejected");
+        ds4_gpu_tensor_free(t);
+    }
+
+    /* A tensor smaller than n_tok * n_head * head_dim floats must be
+     * rejected. */
+    {
+        ds4_gpu_tensor *small = ds4_gpu_tensor_alloc(sizeof(float) * 4);
+        CHECK(small != NULL, "rope_tail: small allocation failed");
+        CHECK(ds4_gpu_rope_tail_tensor(small, N_TOK, N_HEAD, HEAD_DIM, N_ROT,
+                                       POS0, N_CTX_ORIG, false, FREQ_BASE,
+                                       1.0f, 0.0f, 1.0f, BETA_FAST,
+                                       BETA_SLOW) == 0,
+              "rope_tail: undersized tensor must be rejected");
+        ds4_gpu_tensor_free(small);
+    }
+
+    fprintf(stderr, "  test_rope_tail OK\n");
+    return 0;
+}
+
+/* ds4_gpu_head_rms_norm_rope_tail_tensor: the fused, one-work-group-per-row
+ * kernel.  Validated against the COMPOSED oracle: head RMS-norm first
+ * (oracle_head_rms_norm_inplace with n_head=1, applied to one row at a
+ * time), then RoPE on the now-scaled row, matching the GPU's own "scale
+ * everything, then rotate the scaled tail" ordering -- the fused kernel
+ * never stores an unscaled tail anywhere, so composing the two oracles in
+ * this order is exactly equivalent to the kernel's single fused pass. */
+static int test_head_rms_norm_rope_tail(void) {
+    enum { N_TOK = 2, N_HEAD = 3, HEAD_DIM = 24, N_ROT = 16,
+           TOTAL = N_TOK * N_HEAD * HEAD_DIM };
+    const uint32_t POS0 = 5;
+    const uint32_t N_CTX_ORIG = 4096;
+    const float FREQ_BASE = 10000.0f;
+    const float BETA_FAST = 32.0f;
+    const float BETA_SLOW = 1.0f;
+    const float ATTN_FACTOR = 1.0f;
+    const float EPS = 1e-5f;
+    const double TOL = 1e-4;
+
+    struct { float freq_scale; float ext_factor; int inverse; } cases[] = {
+        {1.0f, 0.0f, 0},
+        {1.0f, 0.0f, 1},
+        {0.5f, 1.0f, 0},
+        {0.5f, 1.0f, 1},
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        float x[TOTAL], got[TOTAL], want_row[HEAD_DIM];
+
+        /* Each (token, head) pair gets a different magnitude, exactly as
+         * test_head_rms_norm does, so a kernel that mixed up rows would
+         * fail rather than pass by coincidence. */
+        for (int t = 0; t < N_TOK; t++) {
+            for (int h = 0; h < N_HEAD; h++) {
+                const float mag = (float)(h + 1) * (float)(t + 2);
+                float *dst = &x[(t * N_HEAD + h) * HEAD_DIM];
+                for (int i = 0; i < HEAD_DIM; i++) {
+                    dst[i] = ((float)(i % 9) - 4.0f) * 0.1f * mag;
+                }
+            }
+        }
+
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+        CHECK(tx != NULL, "head_rms_rope: allocation failed");
+        CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+              "head_rms_rope: write");
+
+        CHECK(ds4_gpu_head_rms_norm_rope_tail_tensor(
+                  tx, N_TOK, N_HEAD, HEAD_DIM, N_ROT, POS0, N_CTX_ORIG,
+                  cases[ci].inverse, FREQ_BASE, cases[ci].freq_scale,
+                  cases[ci].ext_factor, ATTN_FACTOR, BETA_FAST, BETA_SLOW,
+                  EPS) != 0,
+              "head_rms_rope: call");
+        CHECK(ds4_gpu_tensor_read(tx, 0, got, sizeof(got)) != 0,
+              "head_rms_rope: read");
+
+        for (int t = 0; t < N_TOK; t++) {
+            for (int h = 0; h < N_HEAD; h++) {
+                const int base = (t * N_HEAD + h) * HEAD_DIM;
+                memcpy(want_row, &x[base], sizeof(want_row));
+                oracle_head_rms_norm_inplace(want_row, 1, HEAD_DIM, EPS);
+                oracle_rope_tail_row(want_row, HEAD_DIM, N_ROT, POS0 + (uint32_t)t,
+                                     N_CTX_ORIG, FREQ_BASE, cases[ci].freq_scale,
+                                     cases[ci].ext_factor, ATTN_FACTOR,
+                                     BETA_FAST, BETA_SLOW, cases[ci].inverse);
+                for (int c = 0; c < HEAD_DIM; c++) {
+                    CHECK_CLOSE(got[base + c], want_row[c], TOL,
+                                "head_rms_rope: value mismatch");
+                }
+            }
+        }
+
+        ds4_gpu_tensor_free(tx);
+    }
+
+    /* An odd n_rot must be rejected. */
+    {
+        ds4_gpu_tensor *t = ds4_gpu_tensor_alloc((uint64_t)TOTAL * sizeof(float));
+        CHECK(t != NULL, "head_rms_rope: odd n_rot allocation failed");
+        CHECK(ds4_gpu_head_rms_norm_rope_tail_tensor(
+                  t, N_TOK, N_HEAD, HEAD_DIM, N_ROT - 1, POS0, N_CTX_ORIG,
+                  false, FREQ_BASE, 1.0f, 0.0f, 1.0f, BETA_FAST, BETA_SLOW,
+                  EPS) == 0,
+              "head_rms_rope: odd n_rot must be rejected");
+
+        /* n_rot > head_dim must also be rejected. */
+        CHECK(ds4_gpu_head_rms_norm_rope_tail_tensor(
+                  t, N_TOK, N_HEAD, HEAD_DIM, HEAD_DIM + 2, POS0, N_CTX_ORIG,
+                  false, FREQ_BASE, 1.0f, 0.0f, 1.0f, BETA_FAST, BETA_SLOW,
+                  EPS) == 0,
+              "head_rms_rope: n_rot > head_dim must be rejected");
+        ds4_gpu_tensor_free(t);
+    }
+
+    /* A tensor smaller than n_tok * n_head * head_dim floats must be
+     * rejected. */
+    {
+        ds4_gpu_tensor *small = ds4_gpu_tensor_alloc(sizeof(float) * 4);
+        CHECK(small != NULL, "head_rms_rope: small allocation failed");
+        CHECK(ds4_gpu_head_rms_norm_rope_tail_tensor(
+                  small, N_TOK, N_HEAD, HEAD_DIM, N_ROT, POS0, N_CTX_ORIG,
+                  false, FREQ_BASE, 1.0f, 0.0f, 1.0f, BETA_FAST, BETA_SLOW,
+                  EPS) == 0,
+              "head_rms_rope: undersized tensor must be rejected");
+        ds4_gpu_tensor_free(small);
+    }
+
+    fprintf(stderr, "  test_head_rms_norm_rope_tail OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_add() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -926,6 +1239,8 @@ int main(void) {
     if (test_add_rms_norm_weight() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_head_rms_norm() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dsv4_qkv_rms_norm_rows() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_head_rms_norm_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_kernels OK\n");
     return 0;
