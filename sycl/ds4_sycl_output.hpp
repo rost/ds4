@@ -194,3 +194,76 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
     }
     return 1;
 }
+
+extern "C" int ds4_gpu_directional_steering_project_tensor(
+        ds4_gpu_tensor *x, const ds4_gpu_tensor *directions, uint32_t layer,
+        uint32_t width, uint32_t rows, float scale) {
+    if (!x || !directions || width == 0u || rows == 0u) return 0;
+    if (!sycl_tensor_has_elems2(x, rows, width, sizeof(float))) return 0;
+
+    uint64_t dir_elems = 0;
+    if (!sycl_u64_mul_checked((uint64_t)layer + 1, width, &dir_elems)) return 0;
+    if (!sycl_tensor_has_f32(directions, dir_elems)) return 0;
+
+    /* A zero scale is a no-op that returns SUCCESS without launching,
+     * matching rocm/ds4_rocm_misc_launch.cuh:70 `if (scale == 0.0f) return 1;`.
+     * Do not remove this: launching a kernel that subtracts zero would give
+     * the same numbers but diverge behaviourally from every other backend. */
+    if (scale == 0.0f) return 1;
+    if (g_devices.empty()) return 0;
+
+    /* Largest power of two that is both <= 256 and <= width.  The local
+     * accessor and the reduction loop below must both use THIS value, not a
+     * hardcoded 256.
+     *
+     * ROCm writes the same computation as a downward halve from 256
+     * (rocm/ds4_rocm_misc_launch.cuh:72-73):
+     *     uint32_t nth = 256u; while (nth > width && nth > 1u) nth >>= 1;
+     * The upward form below is equivalent for every width (verified at
+     * width 300, 100 and 1) and is kept because it reads more directly.
+     * Either is correct; do not "fix" one into the other. */
+    size_t wg = 1;
+    while (wg * 2 <= 256 && wg * 2 <= (size_t)width) wg *= 2;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(x->device_id);
+        float       *px = (float *)x->ptr;
+        const float *pd = (const float *)directions->ptr + (size_t)layer * width;
+        const uint32_t w = width;
+
+        q.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> partial(sycl::range<1>(wg), h);
+            h.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>((size_t)rows * wg),
+                                  sycl::range<1>(wg)),
+                [=](sycl::nd_item<1> it) {
+                    const size_t row = it.get_group(0);
+                    const size_t lid = it.get_local_id(0);
+                    const size_t lsz = it.get_local_range(0);
+
+                    float acc = 0.0f;
+                    for (size_t i = lid; i < w; i += lsz) {
+                        acc += px[row * w + i] * pd[i];
+                    }
+                    partial[lid] = acc;
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    for (size_t s = lsz / 2; s > 0; s >>= 1) {
+                        if (lid < s) partial[lid] += partial[lid + s];
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+
+                    const float k = scale * partial[0];
+                    for (size_t i = lid; i < w; i += lsz) {
+                        px[row * w + i] -= k * pd[i];
+                    }
+                });
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "directional steering failed: %s\n",
+                e.what());
+        return 0;
+    }
+    return 1;
+}

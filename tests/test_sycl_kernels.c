@@ -222,11 +222,56 @@ static int test_output_hc_weights(void) {
     return 0;
 }
 
+/* Oracle mirrors cpu_directional_steering_project_rows, ds4.c:37054-37074:
+ * dot = sum_i x[row][i]*dir[layer][i]; then x[row][i] -= scale*dot*dir[i].
+ * The GPU reduces in tree order and the oracle sums sequentially, so the
+ * dot products differ in the last bits; the tolerance reflects that. */
+static int test_directional_steering(void) {
+    enum { WIDTH = 300, ROWS = 8, LAYER = 2, NLAYER = 4 };
+    const float scale = 0.5f;
+    float x[ROWS * WIDTH], dir[NLAYER * WIDTH], got[ROWS * WIDTH];
+    for (int i = 0; i < ROWS * WIDTH; i++) x[i] = ((float)(i % 17) - 8.0f) * 0.1f;
+    for (int i = 0; i < NLAYER * WIDTH; i++) dir[i] = ((float)(i % 11) - 5.0f) * 0.05f;
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *td = ds4_gpu_tensor_alloc(sizeof(dir));
+    CHECK(tx && td, "steering: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0, "steering: write x");
+    CHECK(ds4_gpu_tensor_write(td, 0, dir, sizeof(dir)) != 0, "steering: write dir");
+
+    CHECK(ds4_gpu_directional_steering_project_tensor(tx, td, LAYER, WIDTH,
+                                                      ROWS, scale) != 0,
+          "steering: call");
+
+    /* A zero scale must succeed without modifying x, matching ROCm's
+     * early-out at rocm/ds4_rocm_misc_launch.cuh:70. */
+    CHECK(ds4_gpu_directional_steering_project_tensor(tx, td, LAYER, WIDTH,
+                                                      ROWS, 0.0f) != 0,
+          "steering: zero scale must succeed");
+    CHECK(ds4_gpu_tensor_read(tx, 0, got, sizeof(got)) != 0, "steering: read");
+
+    const float *d = &dir[LAYER * WIDTH];
+    for (int r = 0; r < ROWS; r++) {
+        double dot = 0.0;
+        for (int i = 0; i < WIDTH; i++) dot += (double)x[r * WIDTH + i] * d[i];
+        for (int i = 0; i < WIDTH; i++) {
+            float want = x[r * WIDTH + i] - (float)(scale * dot) * d[i];
+            CHECK_CLOSE(got[r * WIDTH + i], want, 1e-4, "steering: value mismatch");
+        }
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(td);
+    fprintf(stderr, "  test_directional_steering OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_add() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_swiglu() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_output_hc_weights() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_directional_steering() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_kernels OK\n");
     return 0;

@@ -132,7 +132,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_decode_graphs_supported)
  * a successful cache install when nothing was cached. */
 SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_device_cache_support_tensors)
 SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_device_cache_tensors)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_directional_steering_project_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dspark_markov_argmax_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dsv4_fp8_kv_quantize_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dsv4_indexer_qat_tensor)
