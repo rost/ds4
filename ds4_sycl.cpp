@@ -474,3 +474,6 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
  * depend on ds4_sycl_output.hpp; its own sycl_device_scratch_guard use
  * comes from ds4_sycl_common.hpp, which it includes directly. */
 #include "sycl/ds4_sycl_embedding.hpp"
+
+/* Same scoping reason as the two includes above. */
+#include "sycl/ds4_sycl_norm_rope.hpp"

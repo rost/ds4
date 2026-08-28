@@ -8,6 +8,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define CHECK(cond, msg)                                                    \
@@ -498,6 +499,102 @@ static int test_embed_tokens_hc_clamp(void) {
     return 0;
 }
 
+/* Oracle mirrors rms_norm_no_weight, ds4.c:6754-6760:
+ *   scale = 1/sqrt(mean(x^2) + eps);  out[i] = x[i] * scale
+ * The CPU accumulates in double and the GPU tree-reduces in float, so
+ * expect ULP-level divergence at these row widths, not more. */
+static void oracle_rms_norm_plain(float *out, const float *x, int n, float eps) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += (double)x[i] * (double)x[i];
+    const float scale = 1.0f / sqrtf((float)(sum / (double)n) + eps);
+    for (int i = 0; i < n; i++) out[i] = x[i] * scale;
+}
+
+static int test_rms_norm_plain(void) {
+    /* WIDTHS deliberately spans below, at, and above the fixed 256 work
+     * group.  A width below 256 is the case that catches a port which
+     * fails to initialise every local slot. */
+    const int widths[] = {1, 17, 255, 256, 257, 1024};
+    const float eps = 1e-5f;
+
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        const int n = widths[wi];
+        float *x    = (float *)malloc((size_t)n * sizeof(float));
+        float *got  = (float *)malloc((size_t)n * sizeof(float));
+        float *want = (float *)malloc((size_t)n * sizeof(float));
+        CHECK(x && got && want, "rms_plain: host allocation failed");
+
+        for (int i = 0; i < n; i++) x[i] = ((float)(i % 13) - 6.0f) * 0.25f;
+        oracle_rms_norm_plain(want, x, n, eps);
+
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
+        ds4_gpu_tensor *to = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
+        CHECK(tx && to, "rms_plain: device allocation failed");
+        CHECK(ds4_gpu_tensor_write(tx, 0, x, (uint64_t)n * sizeof(float)) != 0,
+              "rms_plain: write");
+        CHECK(ds4_gpu_rms_norm_plain_tensor(to, tx, (uint32_t)n, eps) != 0,
+              "rms_plain: call");
+        CHECK(ds4_gpu_tensor_read(to, 0, got, (uint64_t)n * sizeof(float)) != 0,
+              "rms_plain: read");
+        for (int i = 0; i < n; i++) {
+            CHECK_CLOSE(got[i], want[i], 1e-4, "rms_plain: value mismatch");
+        }
+
+        ds4_gpu_tensor_free(tx);
+        ds4_gpu_tensor_free(to);
+        free(x); free(got); free(want);
+    }
+
+    /* Zero length is SUCCESS and returns nonzero, matching
+     * rocm/ds4_rocm_norm_rope.cuh:414 `if (n == 0u) return 1;`. */
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(64);
+    CHECK(t != NULL, "rms_plain: alloc for n=0 case");
+    CHECK(ds4_gpu_rms_norm_plain_tensor(t, t, 0, eps) != 0,
+          "rms_plain: n=0 must succeed");
+    /* An output too small for n floats must be rejected. */
+    CHECK(ds4_gpu_rms_norm_plain_tensor(t, t, 1024, eps) == 0,
+          "rms_plain: undersized tensor must be rejected");
+    ds4_gpu_tensor_free(t);
+
+    fprintf(stderr, "  test_rms_norm_plain OK\n");
+    return 0;
+}
+
+static int test_rms_norm_plain_rows(void) {
+    enum { N = 300, ROWS = 5 };
+    const float eps = 1e-5f;
+    float x[N * ROWS], got[N * ROWS], want[N];
+
+    for (int i = 0; i < N * ROWS; i++) x[i] = ((float)(i % 23) - 11.0f) * 0.1f;
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tx && to, "rms_plain_rows: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0, "rms_plain_rows: write");
+    CHECK(ds4_gpu_rms_norm_plain_rows_tensor(to, tx, N, ROWS, eps) != 0,
+          "rms_plain_rows: call");
+    CHECK(ds4_gpu_tensor_read(to, 0, got, sizeof(got)) != 0, "rms_plain_rows: read");
+
+    /* Each row must be normalised independently.  Rows are given different
+     * magnitudes above, so a kernel that normalised across the whole buffer
+     * instead of per row would fail here while passing a single-row test. */
+    for (int r = 0; r < ROWS; r++) {
+        oracle_rms_norm_plain(want, &x[r * N], N, eps);
+        for (int i = 0; i < N; i++) {
+            CHECK_CLOSE(got[r * N + i], want[i], 1e-4,
+                        "rms_plain_rows: value mismatch");
+        }
+    }
+
+    CHECK(ds4_gpu_rms_norm_plain_rows_tensor(to, tx, N, 0, eps) != 0,
+          "rms_plain_rows: rows=0 must succeed");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(to);
+    fprintf(stderr, "  test_rms_norm_plain_rows OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_add() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -508,6 +605,8 @@ int main(void) {
     if (test_embed_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_embed_tokens_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_embed_tokens_hc_clamp() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_rms_norm_plain() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_rms_norm_plain_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_kernels OK\n");
     return 0;
