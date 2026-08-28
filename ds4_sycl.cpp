@@ -461,3 +461,10 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
         return 0;
     }
 }
+
+/* Included at the end of this file, not with the includes at the top:
+ * kernel entry points in ds4_sycl_output.hpp reference g_devices (declared
+ * in the anonymous namespace opened above at the top of this file) and
+ * ds4_sycl_queue (defined above), so this header must come after both are
+ * in scope.  Do not move it up to join the other includes. */
+#include "sycl/ds4_sycl_output.hpp"

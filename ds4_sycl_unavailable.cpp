@@ -77,9 +77,7 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_set_attn_head_split)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_suspend_expert_sharding)
 
 /* int returns. */
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add3_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add_rms_norm_weight_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add_xdev_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_argmax_tensor)
 /* ds4_gpu_args_probe_auto_cuda: 0 on success, nonzero on failure (see

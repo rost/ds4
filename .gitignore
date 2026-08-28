@@ -32,6 +32,7 @@
 /tests/test_q4k_dot
 /tests/test_sampling
 /tests/test_sycl_smoke
+/tests/test_sycl_kernels
 *.o
 *.dSYM/
 __pycache__/
