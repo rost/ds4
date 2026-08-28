@@ -77,7 +77,6 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_set_attn_head_split)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_suspend_expert_sharding)
 
 /* int returns. */
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add_rms_norm_weight_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add_xdev_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_argmax_tensor)
 /* ds4_gpu_args_probe_auto_cuda: 0 on success, nonzero on failure (see
@@ -220,8 +219,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_register_model_map_no_copy)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_register_support_map)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_repeat_hc_rows_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_repeat_hc_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_rms_norm_weight_rows_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_rms_norm_weight_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_rope_tail_decode_rows_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_rope_tail_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_batch_owned_tensor)

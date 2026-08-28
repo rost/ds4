@@ -595,6 +595,169 @@ static int test_rms_norm_plain_rows(void) {
     return 0;
 }
 
+/* Oracle mirrors rms_norm_weight, ds4.c:6763-6769: identical to
+ * oracle_rms_norm_plain above plus a per-channel out[i] *= w[i]. */
+static void oracle_rms_norm_weight(float *out, const float *x, const float *w,
+                                   int n, float eps) {
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += (double)x[i] * (double)x[i];
+    const float scale = 1.0f / sqrtf((float)(sum / (double)n) + eps);
+    for (int i = 0; i < n; i++) out[i] = x[i] * scale * w[i];
+}
+
+static int test_rms_norm_weight(void) {
+    const int widths[] = {1, 17, 255, 256, 257, 1024};
+    const float eps = 1e-5f;
+
+    for (size_t wi = 0; wi < sizeof(widths) / sizeof(widths[0]); wi++) {
+        const int n = widths[wi];
+        float *x    = (float *)malloc((size_t)n * sizeof(float));
+        float *w    = (float *)malloc((size_t)n * sizeof(float));
+        float *got  = (float *)malloc((size_t)n * sizeof(float));
+        float *want = (float *)malloc((size_t)n * sizeof(float));
+        CHECK(x && w && got && want, "rms_weight: host allocation failed");
+
+        for (int i = 0; i < n; i++) {
+            x[i] = ((float)(i % 13) - 6.0f) * 0.25f;
+            w[i] = ((float)(i % 7) + 1.0f) * 0.3f;
+        }
+        oracle_rms_norm_weight(want, x, w, n, eps);
+
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
+        ds4_gpu_tensor *to = ds4_gpu_tensor_alloc((uint64_t)n * sizeof(float));
+        CHECK(tx && to, "rms_weight: device allocation failed");
+        CHECK(ds4_gpu_tensor_write(tx, 0, x, (uint64_t)n * sizeof(float)) != 0,
+              "rms_weight: write");
+        CHECK(ds4_gpu_rms_norm_weight_tensor(to, tx, w,
+                                             (uint64_t)n * sizeof(float), 0,
+                                             (uint32_t)n, eps) != 0,
+              "rms_weight: call");
+        CHECK(ds4_gpu_tensor_read(to, 0, got, (uint64_t)n * sizeof(float)) != 0,
+              "rms_weight: read");
+        for (int i = 0; i < n; i++) {
+            CHECK_CLOSE(got[i], want[i], 1e-4, "rms_weight: value mismatch");
+        }
+
+        ds4_gpu_tensor_free(tx);
+        ds4_gpu_tensor_free(to);
+        free(x); free(w); free(got); free(want);
+    }
+
+    /* Zero length is SUCCESS, matching rocm/ds4_rocm_norm_rope.cuh:429. */
+    float model_dummy[1] = {1.0f};
+    ds4_gpu_tensor *t = ds4_gpu_tensor_alloc(64);
+    CHECK(t != NULL, "rms_weight: alloc for n=0 case");
+    CHECK(ds4_gpu_rms_norm_weight_tensor(t, t, model_dummy,
+                                         sizeof(model_dummy), 0, 0,
+                                         eps) != 0,
+          "rms_weight: n=0 must succeed");
+
+    /* An out-of-range weight_offset must be rejected. */
+    CHECK(ds4_gpu_rms_norm_weight_tensor(t, t, model_dummy,
+                                         sizeof(model_dummy),
+                                         sizeof(model_dummy), 1, eps) == 0,
+          "rms_weight: out-of-range weight_offset must be rejected");
+    ds4_gpu_tensor_free(t);
+
+    fprintf(stderr, "  test_rms_norm_weight OK\n");
+    return 0;
+}
+
+static int test_rms_norm_weight_rows(void) {
+    enum { N = 300, ROWS = 5 };
+    const float eps = 1e-5f;
+    float x[N * ROWS], w[N], got[N * ROWS], want[N];
+
+    for (int i = 0; i < N * ROWS; i++) x[i] = ((float)(i % 23) - 11.0f) * 0.1f;
+    for (int i = 0; i < N; i++) w[i] = ((float)(i % 5) + 1.0f) * 0.2f;
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *to = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tx && to, "rms_weight_rows: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "rms_weight_rows: write");
+    CHECK(ds4_gpu_rms_norm_weight_rows_tensor(to, tx, w, sizeof(w), 0, N,
+                                              ROWS, eps) != 0,
+          "rms_weight_rows: call");
+    CHECK(ds4_gpu_tensor_read(to, 0, got, sizeof(got)) != 0,
+          "rms_weight_rows: read");
+
+    for (int r = 0; r < ROWS; r++) {
+        oracle_rms_norm_weight(want, &x[r * N], w, N, eps);
+        for (int i = 0; i < N; i++) {
+            CHECK_CLOSE(got[r * N + i], want[i], 1e-4,
+                        "rms_weight_rows: value mismatch");
+        }
+    }
+
+    CHECK(ds4_gpu_rms_norm_weight_rows_tensor(to, tx, w, sizeof(w), 0, N, 0,
+                                              eps) != 0,
+          "rms_weight_rows: rows=0 must succeed");
+
+    /* An out-of-range weight_offset must be rejected. */
+    CHECK(ds4_gpu_rms_norm_weight_rows_tensor(to, tx, w, sizeof(w),
+                                              sizeof(w), N, ROWS, eps) == 0,
+          "rms_weight_rows: out-of-range weight_offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(to);
+    fprintf(stderr, "  test_rms_norm_weight_rows OK\n");
+    return 0;
+}
+
+/* ds4_gpu_add_rms_norm_weight_tensor has no kernel of its own: it composes
+ * ds4_gpu_add_tensor and ds4_gpu_rms_norm_weight_tensor
+ * (rocm/ds4_rocm_norm_rope.cuh:451-469).  Validate against those two oracle
+ * steps run separately, and assert sum_out as well as norm_out: a kernel
+ * that computed the norm correctly but never published the elementwise sum
+ * would otherwise pass. */
+static int test_add_rms_norm_weight(void) {
+    enum { N = 200 };
+    const float eps = 1e-5f;
+    float a[N], b[N], w[N], want_sum[N], want_norm[N];
+    float got_sum[N], got_norm[N];
+
+    for (int i = 0; i < N; i++) {
+        a[i] = ((float)(i % 19) - 9.0f) * 0.15f;
+        b[i] = ((float)(i % 11) - 5.0f) * 0.1f;
+        w[i] = ((float)(i % 6) + 1.0f) * 0.25f;
+        want_sum[i] = a[i] + b[i];
+    }
+    oracle_rms_norm_weight(want_norm, want_sum, w, N, eps);
+
+    ds4_gpu_tensor *ta = ds4_gpu_tensor_alloc(sizeof(a));
+    ds4_gpu_tensor *tb = ds4_gpu_tensor_alloc(sizeof(b));
+    ds4_gpu_tensor *tsum = ds4_gpu_tensor_alloc(sizeof(got_sum));
+    ds4_gpu_tensor *tnorm = ds4_gpu_tensor_alloc(sizeof(got_norm));
+    CHECK(ta && tb && tsum && tnorm, "add_rms_weight: allocation failed");
+    CHECK(ds4_gpu_tensor_write(ta, 0, a, sizeof(a)) != 0,
+          "add_rms_weight: write a");
+    CHECK(ds4_gpu_tensor_write(tb, 0, b, sizeof(b)) != 0,
+          "add_rms_weight: write b");
+
+    CHECK(ds4_gpu_add_rms_norm_weight_tensor(tnorm, tsum, ta, tb, w,
+                                             sizeof(w), 0, N, eps) != 0,
+          "add_rms_weight: call");
+    CHECK(ds4_gpu_tensor_read(tsum, 0, got_sum, sizeof(got_sum)) != 0,
+          "add_rms_weight: read sum");
+    CHECK(ds4_gpu_tensor_read(tnorm, 0, got_norm, sizeof(got_norm)) != 0,
+          "add_rms_weight: read norm");
+
+    for (int i = 0; i < N; i++) {
+        CHECK_CLOSE(got_sum[i], want_sum[i], 1e-4,
+                    "add_rms_weight: sum_out mismatch");
+        CHECK_CLOSE(got_norm[i], want_norm[i], 1e-4,
+                    "add_rms_weight: norm_out mismatch");
+    }
+
+    ds4_gpu_tensor_free(ta);
+    ds4_gpu_tensor_free(tb);
+    ds4_gpu_tensor_free(tsum);
+    ds4_gpu_tensor_free(tnorm);
+    fprintf(stderr, "  test_add_rms_norm_weight OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_add() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -607,6 +770,9 @@ int main(void) {
     if (test_embed_tokens_hc_clamp() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_rms_norm_plain() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_rms_norm_plain_rows() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_rms_norm_weight() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_rms_norm_weight_rows() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_add_rms_norm_weight() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_kernels OK\n");
     return 0;
