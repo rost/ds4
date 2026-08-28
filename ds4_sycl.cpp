@@ -468,3 +468,7 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
  * ds4_sycl_queue (defined above), so this header must come after both are
  * in scope.  Do not move it up to join the other includes. */
 #include "sycl/ds4_sycl_output.hpp"
+
+/* Same scoping reason as ds4_sycl_output.hpp above; also reuses that
+ * header's sycl_device_scratch_guard, so must be included after it. */
+#include "sycl/ds4_sycl_embedding.hpp"
