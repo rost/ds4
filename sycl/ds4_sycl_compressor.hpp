@@ -34,6 +34,25 @@
 
 #include <cmath>
 
+/* Forward declaration of sycl/ds4_sycl_norm_rope.hpp's stride-aware RoPE
+ * launcher.  It keeps internal linkage (`static`), so this declaration must
+ * repeat that, but C++ permits declare-then-define for an internal-linkage
+ * function within one translation unit: ds4_sycl.cpp includes
+ * ds4_sycl_norm_rope.hpp before this header today, which would make the
+ * declaration merely redundant, but a forward declaration removes the
+ * dependency on that order rather than documenting it, and a missing
+ * definition at link time fails loudly instead of silently compiling
+ * against the wrong overload.  Deliberately at FILE scope, matching the
+ * real definition: putting it inside the anonymous namespace below would
+ * declare a second, distinct entity with the same name and signature,
+ * which is ambiguous at the call site once both are visible. */
+static int sycl_rope_tail_stride_tensor(
+        ds4_gpu_tensor *x, uint32_t n_tok, uint32_t n_head, uint32_t head_dim,
+        uint32_t n_rot, uint32_t pos0, uint32_t pos_stride,
+        uint32_t n_ctx_orig, bool inverse, float freq_base, float freq_scale,
+        float ext_factor, float attn_factor, float beta_fast,
+        float beta_slow);
+
 namespace {
 
 /* Matches rocm/ds4_rocm_runtime.cuh:34 (DS4_ROCM_COMPRESSOR_MAX_RATIO).
@@ -393,4 +412,262 @@ extern "C" int ds4_gpu_compressor_update_tensor(
     }
 
     return ok;
+}
+
+/* Batched prefill entry: pools every complete `ratio`-token window of a
+ * whole prefill batch in one call, instead of decode's one-token-at-a-time
+ * ring walk above.  Matches ds4_gpu_compressor_prefill_tensor
+ * (rocm/ds4_rocm_compressor.cuh:328-439); the orchestration order there is
+ * load-bearing and is followed step for step:
+ *
+ *   1. Reset the ring: state_kv zeroed, state_score filled with -inf.  This
+ *      is ASYMMETRIC by design and is what the NaN guard in the pool
+ *      gather below exists to handle -- an all -inf candidate window must
+ *      be excluded from the softmax, not treated as a real zero-score
+ *      candidate (rocm/ds4_rocm_compressor.cuh:384-387).
+ *   2. Seed the tail rows so decode resumes from the same partial-window
+ *      state the streaming path would produce.  A three-way branch
+ *      (rocm/ds4_rocm_compressor.cuh:389-417):
+ *        - ratio == 4 and a previous window exists (cutoff >= ratio): copy
+ *          that whole previous window (source cutoff - ratio, `ratio` rows)
+ *          into the ring's low half.
+ *        - ratio == 4 and a trailing partial window exists (rem != 0):
+ *          copy it (source cutoff, `rem` rows) into the ring's high half.
+ *        - otherwise, a trailing partial window (rem != 0): copy it
+ *          (source cutoff, `rem` rows) into the ring from row 0.
+ *   3. When there is at least one complete window (n_comp != 0), pool each
+ *      one with a per-dimension softmax, then RMS-normalise and RoPE-rotate
+ *      the pooled rows, then optionally FP8-quantise them.
+ *
+ * When n_comp == 0 the entry seeds state and returns success without
+ * pooling: there is nothing yet to emit. */
+extern "C" int ds4_gpu_compressor_prefill_tensor(
+        ds4_gpu_tensor       *comp_cache,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *sc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                ratio,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        bool                    quantize_fp8,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps) {
+    if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
+        !sycl_compressor_shape_supported(head_dim, ratio) || n_tokens == 0u ||
+        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        !sycl_ape_type_supported(ape_type) || norm_type != 0u) {
+        return 0;
+    }
+
+    const uint32_t coff       = ratio == 4u ? 2u : 1u;
+    const uint32_t width      = coff * head_dim;
+    const uint32_t state_rows = coff * ratio;
+    const uint32_t n_comp     = n_tokens / ratio;
+    const uint32_t cutoff     = n_comp * ratio;
+    const uint32_t rem        = n_tokens - cutoff;
+
+    uint64_t kv_bytes = 0, state_bytes = 0, comp_bytes = 0, norm_bytes = 0;
+    const uint64_t ape_bytes = sycl_ape_2d_bytes(ape_type, width, ratio);
+    if (!sycl_u64_mul3_checked(n_tokens, width, sizeof(float), &kv_bytes) ||
+        !sycl_u64_mul3_checked(state_rows, width, sizeof(float), &state_bytes) ||
+        !sycl_u64_mul3_checked(n_comp, head_dim, sizeof(float), &comp_bytes) ||
+        !sycl_u64_mul_checked(head_dim, sizeof(float), &norm_bytes) ||
+        !sycl_model_range_fits(model_size, ape_offset, ape_bytes) ||
+        !sycl_model_range_fits(model_size, norm_offset, norm_bytes) ||
+        !sycl_tensor_has_bytes(kv, kv_bytes) || !sycl_tensor_has_bytes(sc, kv_bytes) ||
+        !sycl_tensor_has_bytes(state_kv, state_bytes) || !sycl_tensor_has_bytes(state_score, state_bytes) ||
+        (n_comp != 0u && !sycl_tensor_has_bytes(comp_cache, comp_bytes))) {
+        return 0;
+    }
+
+    const char *ape = sycl_model_range_ptr(model_map, ape_offset, ape_bytes,
+                                           model_size, "compressor_ape");
+    if (!ape) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(state_kv->device_id);
+
+        /* The APE table lives in the host mmap; stage it to device scratch
+         * under a guard, as every other entry in this file does.  Its
+         * lifetime spans both the tail seeding below and the pool gather
+         * further down, both of which read it. */
+        unsigned char *dape = sycl::malloc_device<unsigned char>((size_t)ape_bytes, q);
+        if (!dape) return 0;
+        sycl_device_scratch_guard dape_guard(q, dape);
+        q.memcpy(dape, ape, (size_t)ape_bytes).wait_and_throw();
+
+        float       *skv  = (float *)state_kv->ptr;
+        float       *ssc  = (float *)state_score->ptr;
+        const float *pkv  = (const float *)kv->ptr;
+        const float *psc  = (const float *)sc->ptr;
+        const uint32_t w    = width;
+        const uint32_t r    = ratio;
+        const uint32_t p0   = pos0;
+        const uint32_t type = ape_type;
+
+        /* Step 1: reset the ring.  Asymmetric on purpose -- see the
+         * function comment above. */
+        const uint64_t state_n = (uint64_t)state_rows * width;
+        q.memset(skv, 0, (size_t)(state_n * sizeof(float))).wait_and_throw();
+        q.parallel_for(sycl::range<1>((size_t)state_n), [=](sycl::id<1> gid) {
+            ssc[gid[0]] = -INFINITY;
+        });
+        q.wait_and_throw();
+
+        /* Step 2: seed the tail rows over an arbitrary contiguous source
+         * range, matching compressor_set_rows_kernel
+         * (rocm/ds4_rocm_compressor.cuh:27-52).  `phase` is the APE row
+         * index -- the row's true position modulo ratio -- which can differ
+         * from the destination row `dst0 + rr` the caller chooses. */
+        auto seed_rows = [&](uint32_t src0, uint32_t dst0, uint32_t rows) {
+            const uint64_t n = (uint64_t)rows * w;
+            q.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> gid) {
+                const uint32_t rr  = (uint32_t)(gid / w);
+                const uint32_t j   = (uint32_t)(gid - (uint64_t)rr * w);
+                const uint32_t src = src0 + rr;
+                const uint32_t dst = dst0 + rr;
+                const uint32_t phase = (p0 + src) % r;
+                skv[(uint64_t)dst * w + j] = pkv[(uint64_t)src * w + j];
+                ssc[(uint64_t)dst * w + j] =
+                        psc[(uint64_t)src * w + j] +
+                        sycl_ape_value_dev(dape, type, w, phase, j);
+            });
+            q.wait_and_throw();
+        };
+
+        if (ratio == 4u) {
+            if (cutoff >= ratio) {
+                seed_rows(cutoff - ratio, 0u, ratio);
+            }
+            if (rem != 0u) {
+                seed_rows(cutoff, ratio, rem);
+            }
+        } else if (rem != 0u) {
+            seed_rows(cutoff, 0u, rem);
+        }
+
+        /* Step 3: pool every complete window, then normalise and rotate. */
+        if (n_comp != 0u) {
+            float *comp = (float *)comp_cache->ptr;
+            const uint32_t hd = head_dim;
+            const uint32_t nc = n_comp;
+            const uint64_t n  = (uint64_t)hd * nc;
+
+            q.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> gid) {
+                const uint32_t d = (uint32_t)(gid % hd);
+                const uint32_t c = (uint32_t)(gid / hd);
+
+                /* Private per-work-item arrays, sized to the max-ratio
+                 * constant: no local_accessor, no barrier, no tree
+                 * reduction, matching compressor_prefill_pool_kernel
+                 * (rocm/ds4_rocm_compressor.cuh:54-119). */
+                float vals[kCompressorMaxRatio];
+                float scores[kCompressorMaxRatio];
+                float max_s = -INFINITY;
+                uint32_t n_cand = 0;
+
+                if (r == 4u) {
+                    /* Previous window (low lane, column d), only once one
+                     * exists.  With no previous window (c == 0) these
+                     * candidates are simply absent rather than gathered as
+                     * -inf: mathematically identical, since an all -inf
+                     * half would contribute exactly zero softmax weight
+                     * anyway, but it avoids reading state_kv/state_score
+                     * here at all -- this kernel pools straight from the
+                     * raw kv/sc batch, not from the ring. */
+                    if (c > 0u) {
+                        const uint32_t base = (c - 1u) * r;
+                        for (uint32_t rr = 0; rr < 4u; rr++) {
+                            const uint32_t t = base + rr;
+                            const uint32_t phase = (p0 + t) % r;
+                            const float ape_v = sycl_ape_value_dev(dape, type, w, phase, d);
+                            vals[n_cand] = pkv[(uint64_t)t * w + d];
+                            scores[n_cand] = psc[(uint64_t)t * w + d] + ape_v;
+                            max_s = sycl::fmax(max_s, scores[n_cand]);
+                            n_cand++;
+                        }
+                    }
+                    /* Current window (high lane, column head_dim + d). */
+                    const uint32_t base = c * r;
+                    for (uint32_t rr = 0; rr < 4u; rr++) {
+                        const uint32_t t = base + rr;
+                        const uint32_t phase = (p0 + t) % r;
+                        const float ape_v = sycl_ape_value_dev(dape, type, w, phase, hd + d);
+                        vals[n_cand] = pkv[(uint64_t)t * w + hd + d];
+                        scores[n_cand] = psc[(uint64_t)t * w + hd + d] + ape_v;
+                        max_s = sycl::fmax(max_s, scores[n_cand]);
+                        n_cand++;
+                    }
+                } else {
+                    const uint32_t base = c * r;
+                    for (uint32_t rr = 0; rr < r; rr++) {
+                        const uint32_t t = base + rr;
+                        const uint32_t phase = (p0 + t) % r;
+                        const float ape_v = sycl_ape_value_dev(dape, type, w, phase, d);
+                        vals[n_cand] = pkv[(uint64_t)t * w + d];
+                        scores[n_cand] = psc[(uint64_t)t * w + d] + ape_v;
+                        max_s = sycl::fmax(max_s, scores[n_cand]);
+                        n_cand++;
+                    }
+                }
+
+                float den = 0.0f, acc = 0.0f;
+                /* Same NaN guard as the decode-time pool above: without it,
+                 * an all -inf candidate set hits `inf - inf` and resolves
+                 * to NaN instead of the required exact 0. */
+                if (max_s > -INFINITY) {
+                    for (uint32_t i = 0; i < n_cand; i++) {
+                        const float wgt = sycl::exp(scores[i] - max_s);
+                        den += wgt;
+                        acc += vals[i] * wgt;
+                    }
+                }
+                comp[(uint64_t)c * hd + d] = den != 0.0f ? acc / den : 0.0f;
+            });
+            q.wait_and_throw();
+        }
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor_prefill failed: %s\n", e.what());
+        return 0;
+    }
+
+    if (n_comp == 0u) return 1;
+
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache, model_map,
+                                             model_size, norm_offset, head_dim,
+                                             n_comp, rms_eps)) {
+        return 0;
+    }
+    /* pos_stride = ratio, NOT 1: compressed rows sit `ratio` tokens apart in
+     * position space, so row c's angle must use pos0 + c * ratio.  This is
+     * exactly why the stride variant stays separate from the public
+     * ds4_gpu_rope_tail_tensor wrapper (pos_stride == 1) -- decode's
+     * one-row-at-a-time update above never needed a stride other than 1,
+     * but this batched entry does. */
+    if (n_rot != 0u && !sycl_rope_tail_stride_tensor(comp_cache, n_comp, 1u, head_dim,
+                                                      n_rot, pos0, ratio, n_ctx_orig, false,
+                                                      freq_base, freq_scale, ext_factor,
+                                                      attn_factor, beta_fast, beta_slow)) {
+        return 0;
+    }
+    if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) {
+        return 0;
+    }
+    return 1;
 }

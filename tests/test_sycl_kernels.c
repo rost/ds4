@@ -2188,6 +2188,297 @@ static int test_compressor_update(void) {
     return 0;
 }
 
+/* Mirrors compressor_finish_prefill_state_cpu, ds4.c:12407-12427: after a
+ * from-scratch prefill, clear whichever ring rows the trailing partial
+ * window's per-token stores never touched, so decode resumes from the same
+ * partial-window state the streaming path would have produced.  Rows the
+ * tail actually wrote are left alone.  ds4.c's function has no pos0
+ * parameter: it is only ever reached with pos0 == 0 (ds4.c:28119's
+ * zero_prefix gate is a precondition for calling the batched GPU prefill
+ * entry this test drives), so this oracle assumes pos0 == 0 too. */
+static void oracle_compressor_finish_prefill(float *state_kv, float *state_score,
+                                             uint32_t head_dim, uint32_t ratio,
+                                             uint32_t n_tokens) {
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+    const uint32_t rem = n_tokens % ratio;
+    const uint32_t clear_start = ratio == 4u ? ratio + rem : rem;
+    const uint32_t clear_end = ratio == 4u ? 2u * ratio : ratio;
+    for (uint32_t row = clear_start; row < clear_end; row++) {
+        for (uint32_t j = 0; j < width; j++) {
+            state_kv[(uint64_t)row * width + j] = 0.0f;
+            state_score[(uint64_t)row * width + j] = -INFINITY;
+        }
+    }
+}
+
+/* The central deliverable tested here: ds4_gpu_compressor_prefill_tensor has no
+ * CPU counterpart with a matching signature.  ds4's own CPU prefill never
+ * batches the compressor either: it always loops per token
+ * (prefill_layer_major_cpu, ds4.c:13757, reaching compressor_decode_one via
+ * ds4.c:13107, :13125, :13342, :13360).  So the oracle here IS that
+ * per-token loop, built entirely from the already-validated oracles
+ * above (oracle_compressor_store, oracle_compressor_pool,
+ * oracle_rms_norm_weight, oracle_rope_tail_row), run once per position from
+ * pos0 == 0 to n_tokens - 1 with a fresh state ring (state_kv zeroed,
+ * state_score -inf, matching rocm/ds4_rocm_compressor.cuh:384-387), taking
+ * the emitted row at every ratio boundary and applying the ratio == 4 shift
+ * exactly as oracle_compressor_pool's caller does above.  pos0 == 0 matches
+ * the only configuration ds4.c ever calls this entry with (see the finish
+ * oracle's comment above), which is what lets the final ring be compared
+ * against oracle_compressor_finish_prefill directly.
+ *
+ * ape_type is fixed at F32 (0): the batched entry's ape/norm handling is
+ * identical to the already-covered store and update entries regardless of
+ * ape_type, so re-sweeping all three here would not exercise anything new. */
+static int run_compressor_prefill_case(uint32_t head_dim, uint32_t ratio,
+                                       uint32_t n_tokens, uint32_t n_rot,
+                                       const char *tag) {
+    const float RMS_EPS = 1e-5f;
+    const uint32_t N_CTX_ORIG = 4096u;
+    const float FREQ_BASE = 10000.0f, FREQ_SCALE = 1.0f, EXT_FACTOR = 0.0f;
+    const float ATTN_FACTOR = 1.0f, BETA_FAST = 32.0f, BETA_SLOW = 1.0f;
+
+    const uint32_t coff       = ratio == 4u ? 2u : 1u;
+    const uint32_t width      = coff * head_dim;
+    const uint32_t state_rows = coff * ratio;
+    const uint32_t n_comp     = n_tokens / ratio;
+
+    float *kv = (float *)malloc((size_t)n_tokens * width * sizeof(float));
+    float *sc = (float *)malloc((size_t)n_tokens * width * sizeof(float));
+    float *norm_w = (float *)malloc((size_t)head_dim * sizeof(float));
+    float *state_kv = (float *)malloc((size_t)state_rows * width * sizeof(float));
+    float *state_score = (float *)malloc((size_t)state_rows * width * sizeof(float));
+    float *comp_want = n_comp ? (float *)malloc((size_t)n_comp * head_dim * sizeof(float)) : NULL;
+    CHECK(kv && sc && norm_w && state_kv && state_score && (n_comp == 0 || comp_want),
+          "compressor_prefill: host allocation failed");
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t j = 0; j < width; j++) {
+            kv[(uint64_t)t * width + j] = (float)(t * 37u + j * 11u + 5u) * 0.25f;
+            sc[(uint64_t)t * width + j] = (float)((int)(t * 19u) - (int)(j * 3u) - 7);
+        }
+    }
+    for (uint32_t d = 0; d < head_dim; d++) norm_w[d] = (float)(d % 5u + 1u) * 0.2f;
+
+    const uint64_t ape_offset = 16;
+    const uint64_t norm_offset = ape_offset + (uint64_t)width * ratio * sizeof(float);
+    const uint64_t model_size = norm_offset + (uint64_t)head_dim * sizeof(float);
+    unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+    CHECK(model != NULL, "compressor_prefill: model allocation failed");
+    oracle_fill_ape(model + ape_offset, /*ape_type=*/0u, width, ratio);
+    memcpy(model + norm_offset, norm_w, (size_t)head_dim * sizeof(float));
+
+    /* Step 1: fresh ring, asymmetric init. */
+    for (uint32_t i = 0; i < state_rows * width; i++) {
+        state_kv[i] = 0.0f;
+        state_score[i] = -INFINITY;
+    }
+
+    uint32_t emitted = 0;
+    for (uint32_t pos = 0; pos < n_tokens; pos++) {
+        oracle_compressor_store(state_kv, state_score, kv + (uint64_t)pos * width,
+                                sc + (uint64_t)pos * width, model + ape_offset,
+                                /*ape_type=*/0u, width, ratio, pos, 1u);
+        if (((pos + 1u) % ratio) != 0u) continue;
+
+        float pool_want[256], normed_want[256];
+        oracle_compressor_pool(pool_want, state_kv, state_score, head_dim, ratio);
+        oracle_rms_norm_weight(normed_want, pool_want, norm_w, (int)head_dim, RMS_EPS);
+        const uint32_t comp_pos = pos + 1u - ratio;
+        oracle_rope_tail_row(normed_want, head_dim, n_rot, comp_pos, N_CTX_ORIG,
+                             FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR,
+                             BETA_FAST, BETA_SLOW, /*inverse=*/0);
+        memcpy(comp_want + (uint64_t)emitted * head_dim, normed_want,
+               (size_t)head_dim * sizeof(float));
+        emitted++;
+
+        if (ratio == 4u) {
+            for (uint32_t r = 0; r < 4u; r++) {
+                memcpy(&state_kv[(uint64_t)r * width], &state_kv[(uint64_t)(4u + r) * width],
+                       (size_t)width * sizeof(float));
+                memcpy(&state_score[(uint64_t)r * width], &state_score[(uint64_t)(4u + r) * width],
+                       (size_t)width * sizeof(float));
+            }
+            for (uint32_t r = 0; r < 4u; r++) {
+                memcpy(&state_kv[(uint64_t)(4u + r) * width], &state_kv[(uint64_t)r * width],
+                       (size_t)width * sizeof(float));
+                memcpy(&state_score[(uint64_t)(4u + r) * width], &state_score[(uint64_t)r * width],
+                       (size_t)width * sizeof(float));
+            }
+        }
+    }
+    CHECK(emitted == n_comp, "compressor_prefill: oracle emit count mismatch");
+
+    /* Post-prefill state cleanup: clear whatever the tail never wrote. */
+    oracle_compressor_finish_prefill(state_kv, state_score, head_dim, ratio, n_tokens);
+
+    ds4_gpu_tensor *tkv  = ds4_gpu_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));
+    ds4_gpu_tensor *tsc  = ds4_gpu_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));
+    ds4_gpu_tensor *tskv = ds4_gpu_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+    ds4_gpu_tensor *tssc = ds4_gpu_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc((uint64_t)(n_comp ? n_comp : 1u) * head_dim * sizeof(float));
+    CHECK(tkv && tsc && tskv && tssc && tcomp, "compressor_prefill: device allocation failed");
+
+    CHECK(ds4_gpu_tensor_write(tkv, 0, kv, (uint64_t)n_tokens * width * sizeof(float)) != 0,
+          "compressor_prefill: write kv");
+    CHECK(ds4_gpu_tensor_write(tsc, 0, sc, (uint64_t)n_tokens * width * sizeof(float)) != 0,
+          "compressor_prefill: write sc");
+
+    /* Sentinel-seed the state and comp_cache tensors: the entry must
+     * reinitialise state itself (step 1), and must leave comp_cache alone
+     * beyond row n_comp when n_comp == 0. */
+    {
+        float *sentinel_state = (float *)malloc((size_t)state_rows * width * sizeof(float));
+        CHECK(sentinel_state != NULL, "compressor_prefill: sentinel allocation failed");
+        for (uint32_t i = 0; i < state_rows * width; i++) sentinel_state[i] = 123456.0f;
+        CHECK(ds4_gpu_tensor_write(tskv, 0, sentinel_state, (uint64_t)state_rows * width * sizeof(float)) != 0,
+              "compressor_prefill: seed state_kv sentinel");
+        CHECK(ds4_gpu_tensor_write(tssc, 0, sentinel_state, (uint64_t)state_rows * width * sizeof(float)) != 0,
+              "compressor_prefill: seed state_score sentinel");
+        free(sentinel_state);
+    }
+    {
+        const uint32_t comp_alloc_rows = n_comp ? n_comp : 1u;
+        float *sentinel_comp = (float *)malloc((size_t)comp_alloc_rows * head_dim * sizeof(float));
+        CHECK(sentinel_comp != NULL, "compressor_prefill: comp sentinel allocation failed");
+        for (uint32_t i = 0; i < comp_alloc_rows * head_dim; i++) sentinel_comp[i] = -999.0f;
+        CHECK(ds4_gpu_tensor_write(tcomp, 0, sentinel_comp, (uint64_t)comp_alloc_rows * head_dim * sizeof(float)) != 0,
+              "compressor_prefill: seed comp sentinel");
+        free(sentinel_comp);
+    }
+
+    CHECK(ds4_gpu_compressor_prefill_tensor(
+              tcomp, tskv, tssc, tkv, tsc,
+              model, model_size, ape_offset, /*ape_type=*/0u,
+              norm_offset, /*norm_type=*/0u, head_dim, ratio,
+              /*pos0=*/0u, n_tokens, n_rot, N_CTX_ORIG,
+              /*quantize_fp8=*/false, FREQ_BASE, FREQ_SCALE, EXT_FACTOR,
+              ATTN_FACTOR, BETA_FAST, BETA_SLOW, RMS_EPS) != 0,
+          "compressor_prefill: call");
+
+    float *got_kv = (float *)malloc((size_t)state_rows * width * sizeof(float));
+    float *got_score = (float *)malloc((size_t)state_rows * width * sizeof(float));
+    float *got_comp = n_comp ? (float *)malloc((size_t)n_comp * head_dim * sizeof(float)) : NULL;
+    CHECK(got_kv && got_score && (n_comp == 0 || got_comp), "compressor_prefill: readback allocation failed");
+    CHECK(ds4_gpu_tensor_read(tskv, 0, got_kv, (uint64_t)state_rows * width * sizeof(float)) != 0,
+          "compressor_prefill: read state_kv");
+    CHECK(ds4_gpu_tensor_read(tssc, 0, got_score, (uint64_t)state_rows * width * sizeof(float)) != 0,
+          "compressor_prefill: read state_score");
+    if (n_comp) {
+        CHECK(ds4_gpu_tensor_read(tcomp, 0, got_comp, (uint64_t)n_comp * head_dim * sizeof(float)) != 0,
+              "compressor_prefill: read comp");
+    }
+
+    for (uint32_t i = 0; i < n_comp * head_dim; i++) {
+        CHECK_CLOSE(got_comp[i], comp_want[i], 1e-2, "compressor_prefill: emitted row mismatch");
+    }
+    for (uint32_t i = 0; i < state_rows * width; i++) {
+        if (state_score[i] == -INFINITY) {
+            CHECK(got_score[i] == -INFINITY, "compressor_prefill: cleared score row mismatch");
+            CHECK(got_kv[i] == 0.0f, "compressor_prefill: cleared kv row mismatch");
+        } else {
+            CHECK(got_kv[i] == state_kv[i], "compressor_prefill: final ring kv mismatch");
+            CHECK_CLOSE(got_score[i], state_score[i], 1e-3, "compressor_prefill: final ring score mismatch");
+        }
+    }
+
+    fprintf(stderr, "  run_compressor_prefill_case(%s) OK\n", tag);
+
+    ds4_gpu_tensor_free(tkv); ds4_gpu_tensor_free(tsc);
+    ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+    free(kv); free(sc); free(norm_w); free(state_kv); free(state_score);
+    free(comp_want); free(got_kv); free(got_score); free(got_comp);
+    free(model);
+    return 0;
+}
+
+/* Step 4's central deliverable: the batched prefill entry, checked against
+ * the per-token driver above.  head_dim = 4 keeps N_ROT = 2 valid (n_rot
+ * must be even and <= head_dim) while staying small enough for the 256-wide
+ * scratch buffers in run_compressor_prefill_case. */
+static int test_compressor_prefill(void) {
+    /* General ratio: n_tokens = 7, ratio = 3 -> n_comp = 2, rem = 1 != 0,
+     * so the trailing partial window's tail-seed branch runs. */
+    if (run_compressor_prefill_case(/*head_dim=*/4u, /*ratio=*/3u,
+                                    /*n_tokens=*/7u, /*n_rot=*/2u,
+                                    "general ratio, rem != 0") != 0) {
+        return 1;
+    }
+
+    /* ratio == 4: n_tokens = 11 -> n_comp = 2, cutoff = 8 >= ratio (the
+     * PREVIOUS-window seed branch runs, pulling window 1's raw tokens
+     * rather than window 0's), and rem = 3 != 0 (the CURRENT-window tail
+     * seed branch also runs, into rows 4..6, leaving row 7 to be cleared). */
+    if (run_compressor_prefill_case(/*head_dim=*/4u, /*ratio=*/4u,
+                                    /*n_tokens=*/11u, /*n_rot=*/2u,
+                                    "ratio == 4, cutoff >= ratio and rem != 0") != 0) {
+        return 1;
+    }
+
+    /* n_comp == 0: n_tokens = 2 < ratio = 3.  The entry must seed state and
+     * return success without ever touching comp_cache. */
+    if (run_compressor_prefill_case(/*head_dim=*/4u, /*ratio=*/3u,
+                                    /*n_tokens=*/2u, /*n_rot=*/2u,
+                                    "n_comp == 0") != 0) {
+        return 1;
+    }
+
+    /* Validation and failure-propagation checks. */
+    {
+        enum { HEAD_DIM = 4, RATIO = 3, WIDTH = HEAD_DIM, STATE_ROWS = RATIO, N_TOKENS = 6 };
+        float kv[N_TOKENS * WIDTH] = {0}, sc[N_TOKENS * WIDTH] = {0};
+        const uint64_t ape_offset = 16;
+        const uint64_t norm_offset = ape_offset + (uint64_t)WIDTH * RATIO * sizeof(float);
+        const uint64_t model_size = norm_offset + (uint64_t)HEAD_DIM * sizeof(float);
+        unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+        CHECK(model != NULL, "compressor_prefill: model allocation failed (validation)");
+
+        ds4_gpu_tensor *tkv  = ds4_gpu_tensor_alloc(sizeof(kv));
+        ds4_gpu_tensor *tsc  = ds4_gpu_tensor_alloc(sizeof(sc));
+        ds4_gpu_tensor *tskv = ds4_gpu_tensor_alloc((uint64_t)STATE_ROWS * WIDTH * sizeof(float));
+        ds4_gpu_tensor *tssc = ds4_gpu_tensor_alloc((uint64_t)STATE_ROWS * WIDTH * sizeof(float));
+        ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc((uint64_t)(N_TOKENS / RATIO) * HEAD_DIM * sizeof(float));
+        CHECK(tkv && tsc && tskv && tssc && tcomp, "compressor_prefill: device allocation failed (validation)");
+        CHECK(ds4_gpu_tensor_write(tkv, 0, kv, sizeof(kv)) != 0, "compressor_prefill: write kv (validation)");
+        CHECK(ds4_gpu_tensor_write(tsc, 0, sc, sizeof(sc)) != 0, "compressor_prefill: write sc (validation)");
+
+        /* n_tokens == 0 must be rejected, matching the validation list at
+         * rocm/ds4_rocm_compressor.cuh:357. */
+        CHECK(ds4_gpu_compressor_prefill_tensor(
+                  tcomp, tskv, tssc, tkv, tsc, model, model_size,
+                  ape_offset, 0u, norm_offset, 0u, HEAD_DIM, RATIO,
+                  /*pos0=*/0u, /*n_tokens=*/0u, /*n_rot=*/0u, 4096u,
+                  false, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-5f) == 0,
+              "compressor_prefill: n_tokens == 0 must be rejected");
+
+        /* A non-zero norm_type must be rejected before any kernel launches. */
+        CHECK(ds4_gpu_compressor_prefill_tensor(
+                  tcomp, tskv, tssc, tkv, tsc, model, model_size,
+                  ape_offset, 0u, norm_offset, /*norm_type=*/1u, HEAD_DIM, RATIO,
+                  /*pos0=*/0u, N_TOKENS, /*n_rot=*/0u, 4096u,
+                  false, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-5f) == 0,
+              "compressor_prefill: non-zero norm_type must be rejected");
+
+        /* quantize_fp8 = true must propagate ds4_gpu_dsv4_fp8_kv_quantize_tensor's
+         * failure: that entry is still stubbed (implemented later), so this
+         * must fail rather than silently succeed. */
+        CHECK(ds4_gpu_compressor_prefill_tensor(
+                  tcomp, tskv, tssc, tkv, tsc, model, model_size,
+                  ape_offset, 0u, norm_offset, 0u, HEAD_DIM, RATIO,
+                  /*pos0=*/0u, N_TOKENS, /*n_rot=*/0u, 4096u,
+                  /*quantize_fp8=*/true, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-5f) == 0,
+              "compressor_prefill: quantize_fp8 must propagate the stubbed FP8 entry's failure");
+
+        ds4_gpu_tensor_free(tkv); ds4_gpu_tensor_free(tsc);
+        ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+        free(model);
+    }
+
+    fprintf(stderr, "  test_compressor_prefill OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_add() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -2210,6 +2501,7 @@ int main(void) {
     if (test_compressor_store() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_compressor_pool() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_compressor_update() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_compressor_prefill() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_kernels OK\n");
     return 0;
