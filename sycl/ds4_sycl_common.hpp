@@ -69,3 +69,39 @@ static inline const char *sycl_model_range_ptr(const void *model_map,
     }
     return (const char *)model_map + offset;
 }
+
+namespace {
+
+/* Frees a sycl::malloc_device allocation when it goes out of scope, on
+ * every exit path including an exception unwinding through the try block
+ * that owns it.  Without this, a throw between allocation and the
+ * matching sycl::free (a memcpy or kernel wait_and_throw failing) leaks
+ * device memory: the catch block returns before reaching the free.  This
+ * pattern recurs whenever an entry point stages small host-side data
+ * (scale/base vectors, quant tables, and similar) into a scratch device
+ * buffer ahead of a kernel launch, so later kernels doing the same thing
+ * should reuse this guard rather than a bare malloc_device/free pair. */
+struct sycl_device_scratch_guard {
+    sycl::queue &q;
+    void        *p;
+    sycl_device_scratch_guard(sycl::queue &queue, void *ptr) : q(queue), p(ptr) {}
+    ~sycl_device_scratch_guard() {
+        /* Destructors are implicitly noexcept: if sycl::free throws while
+         * we are already unwinding from another exception (e.g. the
+         * memcpy's wait_and_throw), an escaping exception here would call
+         * std::terminate instead of surfacing a clean failure.  There is
+         * no meaningful recovery from a failed free during unwinding, so
+         * log and swallow rather than let it propagate. */
+        if (!p) return;
+        try {
+            sycl::free(p, q);
+        } catch (const sycl::exception &e) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "device scratch free failed: %s\n", e.what());
+        }
+    }
+    sycl_device_scratch_guard(const sycl_device_scratch_guard &) = delete;
+    sycl_device_scratch_guard &operator=(const sycl_device_scratch_guard &) = delete;
+};
+
+}  // namespace

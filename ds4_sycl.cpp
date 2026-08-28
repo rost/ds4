@@ -469,6 +469,8 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
  * in scope.  Do not move it up to join the other includes. */
 #include "sycl/ds4_sycl_output.hpp"
 
-/* Same scoping reason as ds4_sycl_output.hpp above; also reuses that
- * header's sycl_device_scratch_guard, so must be included after it. */
+/* Same scoping reason as ds4_sycl_output.hpp above: kernel entry points
+ * here reference g_devices and ds4_sycl_queue.  This header does not
+ * depend on ds4_sycl_output.hpp; its own sycl_device_scratch_guard use
+ * comes from ds4_sycl_common.hpp, which it includes directly. */
 #include "sycl/ds4_sycl_embedding.hpp"
