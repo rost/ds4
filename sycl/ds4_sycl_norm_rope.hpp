@@ -67,7 +67,17 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out,
                      * therefore 0.  Matching
                      * rocm/ds4_rocm_norm_rope.cuh:11-12.  Writing only the
                      * slots that had work would tree-reduce uninitialised
-                     * local memory whenever width < 256. */
+                     * local memory whenever width < 256.
+                     *
+                     * This repo's SYCL tests cannot catch removal of this
+                     * write on the current hardware and driver stack,
+                     * where uninitialised local memory has been observed
+                     * to read as zero (Arc A770, Level Zero, oneAPI
+                     * 2025.3). Do not treat a passing test suite as
+                     * licence to remove it. The SYCL specification
+                     * guarantees no zero-initialisation, so the behaviour
+                     * may differ on other hardware, including the
+                     * Battlemage devices this backend targets. */
                     partial[lid] = sum;
                     it.barrier(sycl::access::fence_space::local_space);
 
