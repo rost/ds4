@@ -1,7 +1,11 @@
 #pragma once
 
 /* Argument-validation helpers shared by every SYCL kernel entry point.
- * These mirror the cuda_* family in rocm/ds4_rocm_runtime.cuh:376-530.
+ * This is a subset of the cuda_* family in rocm/ds4_rocm_runtime.cuh:376-530,
+ * ported as each helper is needed rather than all at once.  Known absent:
+ * cuda_u64_add_checked, cuda_tensor_has_elems3, cuda_tensor_has_f16 and
+ * cuda_tensor_has_u16.  None of the current entries need them; add the
+ * SYCL equivalent of one only when a later kernel actually requires it.
  * Every one is overflow-safe by construction: ds4 entry points receive
  * sizes from model metadata and must never compute a product or a range
  * that wraps. */
