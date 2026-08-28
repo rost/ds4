@@ -671,3 +671,322 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
     }
     return 1;
 }
+
+/* Ratio-4 replay: pools a batch of complete ratio-4 windows against a state
+ * ring the caller already primed, then resets and reseeds that ring for the
+ * next call.  Matches ds4_gpu_compressor_prefill_ratio4_replay_tensor
+ * (rocm/ds4_rocm_compressor.cuh:440-522).  Ratio is fixed at 4 -- there is
+ * no ratio parameter -- and both n_tokens and pos0 must be multiples of 4:
+ * every window is complete, so n_comp = n_tokens / 4 exactly, with no
+ * partial-window handling at all.
+ *
+ * THE ORCHESTRATION ORDER HERE IS INVERTED RELATIVE TO
+ * ds4_gpu_compressor_prefill_tensor ABOVE:
+ *
+ *   1. Pool every window FIRST, reading the incoming state ring as it
+ *      stands.  The replay flag on the pool gather (rocm/ds4_rocm_compressor.
+ *      cuh:54-119) selects, for window c == 0 only, lane 0's first four
+ *      candidates from the caller's state_kv/state_score rather than from
+ *      freshly computed kv/sc; every other window's candidates, and c == 0's
+ *      other four candidates, always come from kv/sc.  Then RMS-normalise,
+ *      RoPE-rotate, and optionally FP8-quantise the pooled rows.
+ *   2. Only THEN reset the ring (state_kv zeroed, state_score -inf) and
+ *      reseed it from this call's own trailing ratio-4 window
+ *      (prev_start = n_tokens - ratio), so the ring is ready for the next
+ *      replay call.
+ *
+ * Seeding first, mirroring the prefill entry's order, would destroy the
+ * very state the pool step reads for c == 0: the result would still look
+ * numerically plausible, because the freshly seeded rows hold real data,
+ * which is exactly why this must not be reordered to match prefill. */
+extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+        ds4_gpu_tensor       *comp_cache,
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const ds4_gpu_tensor *kv,
+        const ds4_gpu_tensor *sc,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint64_t                norm_offset,
+        uint32_t                norm_type,
+        uint32_t                head_dim,
+        uint32_t                pos0,
+        uint32_t                n_tokens,
+        uint32_t                n_rot,
+        uint32_t                n_ctx_orig,
+        bool                    quantize_fp8,
+        float                   freq_base,
+        float                   freq_scale,
+        float                   ext_factor,
+        float                   attn_factor,
+        float                   beta_fast,
+        float                   beta_slow,
+        float                   rms_eps) {
+    if (!comp_cache || !state_kv || !state_score || !kv || !sc || !model_map ||
+        head_dim == 0u || n_tokens == 0u || (n_tokens & 3u) != 0u || (pos0 & 3u) != 0u ||
+        n_rot > head_dim || (n_rot & 1u) != 0u ||
+        !sycl_ape_type_supported(ape_type) || norm_type != 0u) {
+        return 0;
+    }
+
+    const uint32_t ratio      = 4u;
+    const uint32_t width      = 2u * head_dim;
+    const uint32_t state_rows = 8u;
+    const uint32_t n_comp     = n_tokens / ratio;
+
+    uint64_t kv_bytes = 0, state_bytes = 0, comp_bytes = 0, norm_bytes = 0;
+    const uint64_t ape_bytes = sycl_ape_2d_bytes(ape_type, width, ratio);
+    if (!sycl_u64_mul3_checked(n_tokens, width, sizeof(float), &kv_bytes) ||
+        !sycl_u64_mul3_checked(state_rows, width, sizeof(float), &state_bytes) ||
+        !sycl_u64_mul3_checked(n_comp, head_dim, sizeof(float), &comp_bytes) ||
+        !sycl_u64_mul_checked(head_dim, sizeof(float), &norm_bytes) ||
+        !sycl_model_range_fits(model_size, ape_offset, ape_bytes) ||
+        !sycl_model_range_fits(model_size, norm_offset, norm_bytes) ||
+        !sycl_tensor_has_bytes(kv, kv_bytes) || !sycl_tensor_has_bytes(sc, kv_bytes) ||
+        !sycl_tensor_has_bytes(state_kv, state_bytes) || !sycl_tensor_has_bytes(state_score, state_bytes) ||
+        !sycl_tensor_has_bytes(comp_cache, comp_bytes)) {
+        return 0;
+    }
+
+    const char *ape = sycl_model_range_ptr(model_map, ape_offset, ape_bytes,
+                                           model_size, "compressor_ape");
+    if (!ape) return 0;
+    if (g_devices.empty()) return 0;
+
+    /* Step 1: pool every window against the ring as the caller passed it
+     * in, before anything here touches that ring. */
+    try {
+        sycl::queue &q = ds4_sycl_queue(state_kv->device_id);
+
+        unsigned char *dape = sycl::malloc_device<unsigned char>((size_t)ape_bytes, q);
+        if (!dape) return 0;
+        sycl_device_scratch_guard dape_guard(q, dape);
+        q.memcpy(dape, ape, (size_t)ape_bytes).wait_and_throw();
+
+        const float *skv  = (const float *)state_kv->ptr;
+        const float *ssc  = (const float *)state_score->ptr;
+        const float *pkv  = (const float *)kv->ptr;
+        const float *psc  = (const float *)sc->ptr;
+        float       *comp = (float *)comp_cache->ptr;
+        const uint32_t hd   = head_dim;
+        const uint32_t w    = width;
+        const uint32_t p0   = pos0;
+        const uint32_t type = ape_type;
+        const uint64_t n    = (uint64_t)hd * n_comp;
+
+        q.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> gid) {
+            const uint32_t d = (uint32_t)(gid % hd);
+            const uint32_t c = (uint32_t)(gid / hd);
+
+            /* Private per-work-item arrays, sized to the max-ratio
+             * constant: no local_accessor, no barrier, no tree reduction,
+             * matching compressor_prefill_pool_kernel
+             * (rocm/ds4_rocm_compressor.cuh:54-119). */
+            float vals[kCompressorMaxRatio];
+            float scores[kCompressorMaxRatio];
+            float max_s = -INFINITY;
+            uint32_t n_cand = 0;
+
+            if (c == 0u) {
+                /* Replay's defining read: the incoming ring, low lane,
+                 * column d -- NOT kv/sc, and NOT the high lane. */
+                for (uint32_t rr = 0; rr < 4u; rr++) {
+                    vals[n_cand] = skv[(uint64_t)rr * w + d];
+                    scores[n_cand] = ssc[(uint64_t)rr * w + d];
+                    max_s = sycl::fmax(max_s, scores[n_cand]);
+                    n_cand++;
+                }
+            } else {
+                const uint32_t base = (c - 1u) * 4u;
+                for (uint32_t rr = 0; rr < 4u; rr++) {
+                    const uint32_t t = base + rr;
+                    const uint32_t phase = (p0 + t) % 4u;
+                    const float ape_v = sycl_ape_value_dev(dape, type, w, phase, d);
+                    vals[n_cand] = pkv[(uint64_t)t * w + d];
+                    scores[n_cand] = psc[(uint64_t)t * w + d] + ape_v;
+                    max_s = sycl::fmax(max_s, scores[n_cand]);
+                    n_cand++;
+                }
+            }
+            /* Current window, high lane, column head_dim + d: always from
+             * kv/sc, regardless of c. */
+            const uint32_t base = c * 4u;
+            for (uint32_t rr = 0; rr < 4u; rr++) {
+                const uint32_t t = base + rr;
+                const uint32_t phase = (p0 + t) % 4u;
+                const float ape_v = sycl_ape_value_dev(dape, type, w, phase, hd + d);
+                vals[n_cand] = pkv[(uint64_t)t * w + hd + d];
+                scores[n_cand] = psc[(uint64_t)t * w + hd + d] + ape_v;
+                max_s = sycl::fmax(max_s, scores[n_cand]);
+                n_cand++;
+            }
+
+            float den = 0.0f, acc = 0.0f;
+            /* Same NaN guard as every other pool gather in this file: an
+             * all -inf candidate set must resolve to exactly 0, not NaN. */
+            if (max_s > -INFINITY) {
+                for (uint32_t i = 0; i < n_cand; i++) {
+                    const float wgt = sycl::exp(scores[i] - max_s);
+                    den += wgt;
+                    acc += vals[i] * wgt;
+                }
+            }
+            comp[(uint64_t)c * hd + d] = den != 0.0f ? acc / den : 0.0f;
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor_replay pool launch failed: %s\n", e.what());
+        return 0;
+    }
+
+    if (!ds4_gpu_rms_norm_weight_rows_tensor(comp_cache, comp_cache, model_map,
+                                             model_size, norm_offset, head_dim,
+                                             n_comp, rms_eps)) {
+        return 0;
+    }
+    /* pos_stride = ratio, matching the batched prefill entry above: row c's
+     * angle is pos0 + c * ratio. */
+    if (n_rot != 0u && !sycl_rope_tail_stride_tensor(comp_cache, n_comp, 1u, head_dim,
+                                                      n_rot, pos0, ratio, n_ctx_orig, false,
+                                                      freq_base, freq_scale, ext_factor,
+                                                      attn_factor, beta_fast, beta_slow)) {
+        return 0;
+    }
+    if (quantize_fp8 && !ds4_gpu_dsv4_fp8_kv_quantize_tensor(comp_cache, n_comp, head_dim, n_rot)) {
+        return 0;
+    }
+
+    /* Step 2: only now reset the ring and reseed it from this batch's own
+     * trailing ratio-4 window, readying it for the next replay call. */
+    try {
+        sycl::queue &q = ds4_sycl_queue(state_kv->device_id);
+
+        unsigned char *dape = sycl::malloc_device<unsigned char>((size_t)ape_bytes, q);
+        if (!dape) return 0;
+        sycl_device_scratch_guard dape_guard(q, dape);
+        q.memcpy(dape, ape, (size_t)ape_bytes).wait_and_throw();
+
+        float       *skv = (float *)state_kv->ptr;
+        float       *ssc = (float *)state_score->ptr;
+        const float *pkv = (const float *)kv->ptr;
+        const float *psc = (const float *)sc->ptr;
+        const uint32_t w    = width;
+        const uint32_t p0   = pos0;
+        const uint32_t type = ape_type;
+
+        const uint64_t state_n = (uint64_t)state_rows * width;
+        q.memset(skv, 0, (size_t)(state_n * sizeof(float))).wait_and_throw();
+        q.parallel_for(sycl::range<1>((size_t)state_n), [=](sycl::id<1> gid) {
+            ssc[gid[0]] = -INFINITY;
+        });
+        q.wait_and_throw();
+
+        const uint32_t prev_start = n_tokens - ratio;
+        const uint64_t n = (uint64_t)ratio * w;
+        q.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> gid) {
+            const uint32_t rr  = (uint32_t)(gid / w);
+            const uint32_t j   = (uint32_t)(gid - (uint64_t)rr * w);
+            const uint32_t src = prev_start + rr;
+            const uint32_t phase = (p0 + src) % 4u;
+            skv[(uint64_t)rr * w + j] = pkv[(uint64_t)src * w + j];
+            ssc[(uint64_t)rr * w + j] =
+                    psc[(uint64_t)src * w + j] +
+                    sycl_ape_value_dev(dape, type, w, phase, j);
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor_replay state seed failed: %s\n", e.what());
+        return 0;
+    }
+
+    return 1;
+}
+
+/* Ratio-4 state seed: the tail-seeding half of step 2 above, exposed
+ * standalone so a caller can prime a fresh ring from the last four raw
+ * tokens of a window without a full replay call.  Matches
+ * ds4_gpu_compressor_prefill_state_ratio4_tensor
+ * (rocm/ds4_rocm_compressor.cuh:523 onward): reset the whole 8-row ring,
+ * then seed rows 0..3 from kv_tail/sc_tail (always exactly ratio = 4 rows,
+ * hence no n_tokens parameter here), with each row's true position modulo
+ * 4 as its APE phase.  There is no partial-window handling and no pos0
+ * multiple-of-4 requirement: the tail is always a complete window by
+ * construction. */
+extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
+        ds4_gpu_tensor       *state_kv,
+        ds4_gpu_tensor       *state_score,
+        const ds4_gpu_tensor *kv_tail,
+        const ds4_gpu_tensor *sc_tail,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                ape_offset,
+        uint32_t                ape_type,
+        uint32_t                head_dim,
+        uint32_t                pos0) {
+    if (!state_kv || !state_score || !kv_tail || !sc_tail || !model_map ||
+        head_dim == 0u || !sycl_ape_type_supported(ape_type)) {
+        return 0;
+    }
+
+    const uint32_t ratio      = 4u;
+    const uint32_t width      = 2u * head_dim;
+    const uint32_t state_rows = 8u;
+
+    uint64_t tail_bytes = 0, state_bytes = 0;
+    const uint64_t ape_bytes = sycl_ape_2d_bytes(ape_type, width, ratio);
+    if (!sycl_u64_mul3_checked(ratio, width, sizeof(float), &tail_bytes) ||
+        !sycl_u64_mul3_checked(state_rows, width, sizeof(float), &state_bytes) ||
+        !sycl_model_range_fits(model_size, ape_offset, ape_bytes) ||
+        !sycl_tensor_has_bytes(kv_tail, tail_bytes) || !sycl_tensor_has_bytes(sc_tail, tail_bytes) ||
+        !sycl_tensor_has_bytes(state_kv, state_bytes) || !sycl_tensor_has_bytes(state_score, state_bytes)) {
+        return 0;
+    }
+
+    const char *ape = sycl_model_range_ptr(model_map, ape_offset, ape_bytes,
+                                           model_size, "compressor_ape");
+    if (!ape) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(state_kv->device_id);
+
+        unsigned char *dape = sycl::malloc_device<unsigned char>((size_t)ape_bytes, q);
+        if (!dape) return 0;
+        sycl_device_scratch_guard dape_guard(q, dape);
+        q.memcpy(dape, ape, (size_t)ape_bytes).wait_and_throw();
+
+        float       *skv = (float *)state_kv->ptr;
+        float       *ssc = (float *)state_score->ptr;
+        const float *pkv = (const float *)kv_tail->ptr;
+        const float *psc = (const float *)sc_tail->ptr;
+        const uint32_t w    = width;
+        const uint32_t p0   = pos0;
+        const uint32_t type = ape_type;
+
+        const uint64_t state_n = (uint64_t)state_rows * width;
+        q.memset(skv, 0, (size_t)(state_n * sizeof(float))).wait_and_throw();
+        q.parallel_for(sycl::range<1>((size_t)state_n), [=](sycl::id<1> gid) {
+            ssc[gid[0]] = -INFINITY;
+        });
+        q.wait_and_throw();
+
+        const uint64_t n = (uint64_t)ratio * w;
+        q.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> gid) {
+            const uint32_t rr = (uint32_t)(gid / w);
+            const uint32_t j  = (uint32_t)(gid - (uint64_t)rr * w);
+            const uint32_t phase = (p0 + rr) % 4u;
+            skv[(uint64_t)rr * w + j] = pkv[(uint64_t)rr * w + j];
+            ssc[(uint64_t)rr * w + j] =
+                    psc[(uint64_t)rr * w + j] +
+                    sycl_ape_value_dev(dape, type, w, phase, j);
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor state seed failed: %s\n", e.what());
+        return 0;
+    }
+
+    return 1;
+}

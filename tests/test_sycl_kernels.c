@@ -2479,6 +2479,333 @@ static int test_compressor_prefill(void) {
     return 0;
 }
 
+/* ds4_gpu_compressor_prefill_state_ratio4_tensor is the store-only half of
+ * ds4_gpu_compressor_prefill_ratio4_replay_tensor's own tail-reseed step,
+ * applied standalone to a tail of exactly four raw tokens, so it reuses
+ * the store oracle (oracle_compressor_store) directly rather than
+ * needing a new one.
+ *
+ * oracle_compressor_store's own ratio == 4 formula always writes a token
+ * into the HIGH half of an 8-row ring (dst_row = ratio + pos_mod), matching
+ * the live decode/store path.  This entry instead writes into the LOW half
+ * directly (rows 0..3), the shape ROCm's compressor_set_rows_kernel uses
+ * with dst0 == 0.  Choosing POS0 as a multiple of 4 makes phase(r) == r for
+ * r in 0..3, so oracle_compressor_store's high-half write for source row r
+ * lands at oracle row 4 + r with no permutation to reason about: the
+ * oracle's high half becomes exactly the device's expected low half, and
+ * the oracle's untouched low half (still at the 0 / -inf reset baseline)
+ * becomes exactly the device's expected high half. */
+static int test_compressor_prefill_state_ratio4(void) {
+    enum { HEAD_DIM = 5, RATIO = 4, WIDTH = 2 * HEAD_DIM, STATE_ROWS = 2 * RATIO, POS0 = 4 };
+
+    float kv_tail[RATIO * WIDTH], sc_tail[RATIO * WIDTH];
+    for (uint32_t t = 0; t < RATIO; t++) {
+        for (uint32_t j = 0; j < WIDTH; j++) {
+            kv_tail[t * WIDTH + j] = (float)(t * 50u + j * 3u + 1u);
+            sc_tail[t * WIDTH + j] = (float)((int)(t * 17u) - (int)(j * 2u) - 4);
+        }
+    }
+
+    const uint64_t ape_offset = 24;
+    const uint64_t ape_bytes = (uint64_t)WIDTH * RATIO * sizeof(float);
+    const uint64_t model_size = ape_offset + ape_bytes;
+    unsigned char *model = (unsigned char *)malloc((size_t)model_size);
+    CHECK(model != NULL, "compressor_state_ratio4: model allocation failed");
+    memset(model, 0xAA, (size_t)ape_offset);
+    oracle_fill_ape(model + ape_offset, /*ape_type=*/0u, WIDTH, RATIO);
+
+    float oracle_kv[STATE_ROWS * WIDTH], oracle_score[STATE_ROWS * WIDTH];
+    for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) {
+        oracle_kv[i] = 0.0f;
+        oracle_score[i] = -INFINITY;
+    }
+    oracle_compressor_store(oracle_kv, oracle_score, kv_tail, sc_tail,
+                            model + ape_offset, /*ape_type=*/0u, WIDTH, RATIO,
+                            POS0, /*n_tokens=*/RATIO);
+
+    float want_kv[STATE_ROWS * WIDTH], want_score[STATE_ROWS * WIDTH];
+    for (uint32_t r = 0; r < STATE_ROWS; r++) {
+        const uint32_t src_row = (r + RATIO) % STATE_ROWS;
+        for (uint32_t j = 0; j < WIDTH; j++) {
+            want_kv[r * WIDTH + j] = oracle_kv[src_row * WIDTH + j];
+            want_score[r * WIDTH + j] = oracle_score[src_row * WIDTH + j];
+        }
+    }
+
+    ds4_gpu_tensor *tkv_tail = ds4_gpu_tensor_alloc(sizeof(kv_tail));
+    ds4_gpu_tensor *tsc_tail = ds4_gpu_tensor_alloc(sizeof(sc_tail));
+    ds4_gpu_tensor *tskv = ds4_gpu_tensor_alloc((uint64_t)STATE_ROWS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *tssc = ds4_gpu_tensor_alloc((uint64_t)STATE_ROWS * WIDTH * sizeof(float));
+    CHECK(tkv_tail && tsc_tail && tskv && tssc,
+          "compressor_state_ratio4: device allocation failed");
+    CHECK(ds4_gpu_tensor_write(tkv_tail, 0, kv_tail, sizeof(kv_tail)) != 0,
+          "compressor_state_ratio4: write kv_tail");
+    CHECK(ds4_gpu_tensor_write(tsc_tail, 0, sc_tail, sizeof(sc_tail)) != 0,
+          "compressor_state_ratio4: write sc_tail");
+
+    {
+        float sentinel[STATE_ROWS * WIDTH];
+        for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) sentinel[i] = 123456.0f;
+        CHECK(ds4_gpu_tensor_write(tskv, 0, sentinel, sizeof(sentinel)) != 0,
+              "compressor_state_ratio4: seed state_kv sentinel");
+        CHECK(ds4_gpu_tensor_write(tssc, 0, sentinel, sizeof(sentinel)) != 0,
+              "compressor_state_ratio4: seed state_score sentinel");
+    }
+
+    CHECK(ds4_gpu_compressor_prefill_state_ratio4_tensor(
+              tskv, tssc, tkv_tail, tsc_tail, model, model_size,
+              ape_offset, /*ape_type=*/0u, HEAD_DIM, POS0) != 0,
+          "compressor_state_ratio4: call");
+
+    float got_kv[STATE_ROWS * WIDTH], got_score[STATE_ROWS * WIDTH];
+    CHECK(ds4_gpu_tensor_read(tskv, 0, got_kv, sizeof(got_kv)) != 0,
+          "compressor_state_ratio4: read state_kv");
+    CHECK(ds4_gpu_tensor_read(tssc, 0, got_score, sizeof(got_score)) != 0,
+          "compressor_state_ratio4: read state_score");
+
+    for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) {
+        CHECK(got_kv[i] == want_kv[i], "compressor_state_ratio4: state_kv mismatch");
+        if (want_score[i] == -INFINITY) {
+            CHECK(got_score[i] == -INFINITY, "compressor_state_ratio4: cleared score mismatch");
+        } else {
+            CHECK_CLOSE(got_score[i], want_score[i], 1e-3,
+                        "compressor_state_ratio4: state_score mismatch");
+        }
+    }
+
+    /* Validation: head_dim == 0 and an unsupported ape_type must both be
+     * rejected before any kernel launches. */
+    CHECK(ds4_gpu_compressor_prefill_state_ratio4_tensor(
+              tskv, tssc, tkv_tail, tsc_tail, model, model_size,
+              ape_offset, /*ape_type=*/0u, /*head_dim=*/0u, POS0) == 0,
+          "compressor_state_ratio4: head_dim == 0 must be rejected");
+    CHECK(ds4_gpu_compressor_prefill_state_ratio4_tensor(
+              tskv, tssc, tkv_tail, tsc_tail, model, model_size,
+              ape_offset, /*ape_type=*/2u, HEAD_DIM, POS0) == 0,
+          "compressor_state_ratio4: unsupported ape_type must be rejected");
+
+    ds4_gpu_tensor_free(tkv_tail); ds4_gpu_tensor_free(tsc_tail);
+    ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc);
+    free(model);
+
+    fprintf(stderr, "  test_compressor_prefill_state_ratio4 OK\n");
+    return 0;
+}
+
+/* ds4_gpu_compressor_prefill_ratio4_replay_tensor has NO CPU reference:
+ * ds4.c has no "replay" function at all, so unlike every other entry point
+ * in this file there is no oracle with matching semantics to port.  This
+ * test is validated against a state-continuation scenario it constructs
+ * itself instead: it runs the SAME per-token store/pool/shift driver used
+ * by run_compressor_prefill_case's oracle above, continuously, across the
+ * boundary the replay call is supposed to pick up at.  This is weaker
+ * evidence than the other four entries here get, and a future
+ * reader should treat it that way rather than assume CPU/GPU parity has
+ * been shown here the way it has for store, pool, update, and prefill.
+ *
+ * Positions 0 .. POS0 - 1 (two ratio-4 windows) are run first with a fresh
+ * ring, exactly as a real caller's prior prefill/replay call would have
+ * left it; the ring is snapshotted right after that (i.e. after the store,
+ * pool, and post-emission shift for position POS0 - 1 all complete) and
+ * that snapshot becomes the INCOMING state the replay call under test is
+ * given.  The driver then keeps running for positions POS0 ..
+ * POS0 + N_TOKENS - 1 without resetting anything, which is what makes
+ * window c == 0's candidates come from the ring (matching the replay
+ * flag's effect on compressor_prefill_pool_kernel,
+ * rocm/ds4_rocm_compressor.cuh:54-119) while later windows' candidates are
+ * mathematically identical whether read from the ring (as the driver does)
+ * or straight from kv/sc (as the real batched kernel does for c > 0):
+ * oracle_compressor_store copies values verbatim and adds APE with the same
+ * arithmetic either way.  Finally oracle_compressor_finish_prefill clears
+ * rows 4..7 exactly as replay's own reset-then-reseed step does, since
+ * n_tokens here is a multiple of 4 (rem == 0) regardless of pos0.
+ *
+ * N_TOKENS = 12 gives n_comp = 3 (n_comp == 1 would only exercise the
+ * c == 0 branch), and POS0 = 8 is a non-zero multiple of 4, both chosen
+ * deliberately. */
+static int test_compressor_prefill_ratio4_replay(void) {
+    enum {
+        HEAD_DIM = 4, RATIO = 4, WIDTH = 2 * HEAD_DIM, STATE_ROWS = 2 * RATIO,
+        POS0 = 8, N_TOKENS = 12, N_COMP = N_TOKENS / RATIO, N_ROT = 2,
+        TOTAL = POS0 + N_TOKENS
+    };
+    const float RMS_EPS = 1e-5f;
+    const uint32_t N_CTX_ORIG = 4096u;
+    const float FREQ_BASE = 10000.0f, FREQ_SCALE = 1.0f, EXT_FACTOR = 0.0f;
+    const float ATTN_FACTOR = 1.0f, BETA_FAST = 32.0f, BETA_SLOW = 1.0f;
+
+    /* kv includes a (t * j) % 7 interaction term, unlike the plain affine
+     * ramp run_compressor_prefill_case above uses: a purely affine kv makes
+     * every candidate row differ from every other only by a per-row
+     * additive constant, which RMS-normalisation almost entirely divides
+     * back out regardless of which candidate the softmax picks.  That
+     * degeneracy was verified empirically -- with the plain affine ramp,
+     * temporarily inverting this test's step order (see the master
+     * verification for this task) still passed, because the wrong
+     * candidate normalised to nearly the same vector as the right one. The
+     * interaction term breaks that: different dominant candidates now
+     * normalise to visibly different shapes. */
+    float kv[TOTAL * WIDTH], sc[TOTAL * WIDTH], norm_w[HEAD_DIM];
+    for (uint32_t t = 0; t < TOTAL; t++) {
+        for (uint32_t j = 0; j < WIDTH; j++) {
+            kv[t * WIDTH + j] = (float)(t * 37u + j * 11u + 5u) * 0.25f +
+                                 (float)((t * j) % 7u) * 2.0f;
+            sc[t * WIDTH + j] = (float)((int)(t * 19u) - (int)(j * 3u) - 7);
+        }
+    }
+    for (uint32_t d = 0; d < HEAD_DIM; d++) norm_w[d] = (float)(d % 5u + 1u) * 0.2f;
+
+    const uint64_t ape_offset = 16;
+    const uint64_t norm_offset = ape_offset + (uint64_t)WIDTH * RATIO * sizeof(float);
+    const uint64_t model_size = norm_offset + (uint64_t)HEAD_DIM * sizeof(float);
+    unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+    CHECK(model != NULL, "compressor_replay: model allocation failed");
+    oracle_fill_ape(model + ape_offset, /*ape_type=*/0u, WIDTH, RATIO);
+    memcpy(model + norm_offset, norm_w, (size_t)HEAD_DIM * sizeof(float));
+
+    float state_kv[STATE_ROWS * WIDTH], state_score[STATE_ROWS * WIDTH];
+    for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) {
+        state_kv[i] = 0.0f;
+        state_score[i] = -INFINITY;
+    }
+
+    float state_kv_in[STATE_ROWS * WIDTH], state_score_in[STATE_ROWS * WIDTH];
+    float comp_want[N_COMP * HEAD_DIM];
+    uint32_t emitted = 0;
+
+    for (uint32_t pos = 0; pos < TOTAL; pos++) {
+        oracle_compressor_store(state_kv, state_score, kv + (uint64_t)pos * WIDTH,
+                                sc + (uint64_t)pos * WIDTH, model + ape_offset,
+                                /*ape_type=*/0u, WIDTH, RATIO, pos, 1u);
+        if (((pos + 1u) % RATIO) == 0u) {
+            float pool_want[HEAD_DIM], normed_want[HEAD_DIM];
+            oracle_compressor_pool(pool_want, state_kv, state_score, HEAD_DIM, RATIO);
+            oracle_rms_norm_weight(normed_want, pool_want, norm_w, HEAD_DIM, RMS_EPS);
+            const uint32_t comp_pos = pos + 1u - RATIO;
+            oracle_rope_tail_row(normed_want, HEAD_DIM, N_ROT, comp_pos, N_CTX_ORIG,
+                                 FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR,
+                                 BETA_FAST, BETA_SLOW, /*inverse=*/0);
+            if (pos >= POS0) {
+                memcpy(comp_want + (uint64_t)emitted * HEAD_DIM, normed_want,
+                       (size_t)HEAD_DIM * sizeof(float));
+                emitted++;
+            }
+
+            for (uint32_t r = 0; r < 4u; r++) {
+                memcpy(&state_kv[(uint64_t)r * WIDTH], &state_kv[(uint64_t)(4u + r) * WIDTH],
+                       (size_t)WIDTH * sizeof(float));
+                memcpy(&state_score[(uint64_t)r * WIDTH], &state_score[(uint64_t)(4u + r) * WIDTH],
+                       (size_t)WIDTH * sizeof(float));
+            }
+            for (uint32_t r = 0; r < 4u; r++) {
+                memcpy(&state_kv[(uint64_t)(4u + r) * WIDTH], &state_kv[(uint64_t)r * WIDTH],
+                       (size_t)WIDTH * sizeof(float));
+                memcpy(&state_score[(uint64_t)(4u + r) * WIDTH], &state_score[(uint64_t)r * WIDTH],
+                       (size_t)WIDTH * sizeof(float));
+            }
+        }
+        if (pos == POS0 - 1u) {
+            memcpy(state_kv_in, state_kv, sizeof(state_kv));
+            memcpy(state_score_in, state_score, sizeof(state_score));
+        }
+    }
+    CHECK(emitted == N_COMP, "compressor_replay: oracle emit count mismatch");
+
+    /* Replay's own reset-then-reseed step clears whatever its tail window
+     * never wrote, exactly as the batched prefill entry's does; n_tokens
+     * here is this call's own N_TOKENS, not the driver's TOTAL. */
+    oracle_compressor_finish_prefill(state_kv, state_score, HEAD_DIM, RATIO, N_TOKENS);
+
+    ds4_gpu_tensor *tkv = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *tsc = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *tskv = ds4_gpu_tensor_alloc((uint64_t)STATE_ROWS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *tssc = ds4_gpu_tensor_alloc((uint64_t)STATE_ROWS * WIDTH * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc((uint64_t)N_COMP * HEAD_DIM * sizeof(float));
+    CHECK(tkv && tsc && tskv && tssc && tcomp, "compressor_replay: device allocation failed");
+
+    CHECK(ds4_gpu_tensor_write(tkv, 0, kv + (uint64_t)POS0 * WIDTH,
+                               (uint64_t)N_TOKENS * WIDTH * sizeof(float)) != 0,
+          "compressor_replay: write kv");
+    CHECK(ds4_gpu_tensor_write(tsc, 0, sc + (uint64_t)POS0 * WIDTH,
+                               (uint64_t)N_TOKENS * WIDTH * sizeof(float)) != 0,
+          "compressor_replay: write sc");
+    CHECK(ds4_gpu_tensor_write(tskv, 0, state_kv_in, sizeof(state_kv_in)) != 0,
+          "compressor_replay: write incoming state_kv");
+    CHECK(ds4_gpu_tensor_write(tssc, 0, state_score_in, sizeof(state_score_in)) != 0,
+          "compressor_replay: write incoming state_score");
+    {
+        float sentinel_comp[N_COMP * HEAD_DIM];
+        for (uint32_t i = 0; i < N_COMP * HEAD_DIM; i++) sentinel_comp[i] = -999.0f;
+        CHECK(ds4_gpu_tensor_write(tcomp, 0, sentinel_comp, sizeof(sentinel_comp)) != 0,
+              "compressor_replay: seed comp sentinel");
+    }
+
+    CHECK(ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+              tcomp, tskv, tssc, tkv, tsc,
+              model, model_size, ape_offset, /*ape_type=*/0u,
+              norm_offset, /*norm_type=*/0u, HEAD_DIM,
+              POS0, N_TOKENS, N_ROT, N_CTX_ORIG,
+              /*quantize_fp8=*/false, FREQ_BASE, FREQ_SCALE, EXT_FACTOR,
+              ATTN_FACTOR, BETA_FAST, BETA_SLOW, RMS_EPS) != 0,
+          "compressor_replay: call");
+
+    float got_comp[N_COMP * HEAD_DIM];
+    float got_kv[STATE_ROWS * WIDTH], got_score[STATE_ROWS * WIDTH];
+    CHECK(ds4_gpu_tensor_read(tcomp, 0, got_comp, sizeof(got_comp)) != 0,
+          "compressor_replay: read comp");
+    CHECK(ds4_gpu_tensor_read(tskv, 0, got_kv, sizeof(got_kv)) != 0,
+          "compressor_replay: read state_kv");
+    CHECK(ds4_gpu_tensor_read(tssc, 0, got_score, sizeof(got_score)) != 0,
+          "compressor_replay: read state_score");
+
+    for (uint32_t i = 0; i < N_COMP * HEAD_DIM; i++) {
+        CHECK_CLOSE(got_comp[i], comp_want[i], 1e-2, "compressor_replay: emitted row mismatch");
+    }
+    /* The state ring matters as much as the emission here: replay's whole
+     * purpose is leaving it correctly seeded for the next call, so a
+     * correct emission with a wrongly seeded ring must still fail. */
+    for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) {
+        if (state_score[i] == -INFINITY) {
+            CHECK(got_score[i] == -INFINITY, "compressor_replay: cleared score row mismatch");
+            CHECK(got_kv[i] == 0.0f, "compressor_replay: cleared kv row mismatch");
+        } else {
+            CHECK(got_kv[i] == state_kv[i], "compressor_replay: final ring kv mismatch");
+            CHECK_CLOSE(got_score[i], state_score[i], 1e-3, "compressor_replay: final ring score mismatch");
+        }
+    }
+
+    /* Validation: both n_tokens and pos0 must be multiples of 4, and
+     * n_tokens must be non-zero, unlike the general-ratio prefill entry. */
+    CHECK(ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+              tcomp, tskv, tssc, tkv, tsc, model, model_size,
+              ape_offset, 0u, norm_offset, 0u, HEAD_DIM,
+              POS0, /*n_tokens=*/0u, N_ROT, N_CTX_ORIG,
+              false, FREQ_BASE, FREQ_SCALE, EXT_FACTOR,
+              ATTN_FACTOR, BETA_FAST, BETA_SLOW, RMS_EPS) == 0,
+          "compressor_replay: n_tokens == 0 must be rejected");
+    CHECK(ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+              tcomp, tskv, tssc, tkv, tsc, model, model_size,
+              ape_offset, 0u, norm_offset, 0u, HEAD_DIM,
+              POS0, /*n_tokens=*/N_TOKENS + 1u, N_ROT, N_CTX_ORIG,
+              false, FREQ_BASE, FREQ_SCALE, EXT_FACTOR,
+              ATTN_FACTOR, BETA_FAST, BETA_SLOW, RMS_EPS) == 0,
+          "compressor_replay: n_tokens not a multiple of 4 must be rejected");
+    CHECK(ds4_gpu_compressor_prefill_ratio4_replay_tensor(
+              tcomp, tskv, tssc, tkv, tsc, model, model_size,
+              ape_offset, 0u, norm_offset, 0u, HEAD_DIM,
+              /*pos0=*/POS0 + 1u, N_TOKENS, N_ROT, N_CTX_ORIG,
+              false, FREQ_BASE, FREQ_SCALE, EXT_FACTOR,
+              ATTN_FACTOR, BETA_FAST, BETA_SLOW, RMS_EPS) == 0,
+          "compressor_replay: pos0 not a multiple of 4 must be rejected");
+
+    ds4_gpu_tensor_free(tkv); ds4_gpu_tensor_free(tsc);
+    ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+    free(model);
+
+    fprintf(stderr, "  test_compressor_prefill_ratio4_replay OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_add() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -2502,6 +2829,8 @@ int main(void) {
     if (test_compressor_pool() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_compressor_update() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_compressor_prefill() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_compressor_prefill_state_ratio4() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_compressor_prefill_ratio4_replay() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_kernels OK\n");
     return 0;
