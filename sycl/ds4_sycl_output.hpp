@@ -12,6 +12,28 @@
 
 #include "ds4_sycl_common.hpp"
 
+namespace {
+
+/* Frees a sycl::malloc_device allocation when it goes out of scope, on
+ * every exit path including an exception unwinding through the try block
+ * that owns it.  Without this, a throw between allocation and the
+ * matching sycl::free (a memcpy or kernel wait_and_throw failing) leaks
+ * device memory: the catch block returns before reaching the free.  This
+ * pattern recurs whenever an entry point stages small host-side data
+ * (scale/base vectors, quant tables, and similar) into a scratch device
+ * buffer ahead of a kernel launch, so later kernels doing the same thing
+ * should reuse this guard rather than a bare malloc_device/free pair. */
+struct sycl_device_scratch_guard {
+    sycl::queue &q;
+    void        *p;
+    sycl_device_scratch_guard(sycl::queue &queue, void *ptr) : q(queue), p(ptr) {}
+    ~sycl_device_scratch_guard() { if (p) sycl::free(p, q); }
+    sycl_device_scratch_guard(const sycl_device_scratch_guard &) = delete;
+    sycl_device_scratch_guard &operator=(const sycl_device_scratch_guard &) = delete;
+};
+
+}  // namespace
+
 extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
                                   const ds4_gpu_tensor *b, uint32_t n) {
     if (!sycl_tensor_has_f32(out, n) || !sycl_tensor_has_f32(a, n) ||
@@ -136,6 +158,7 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
         sycl::queue &q = ds4_sycl_queue(out->device_id);
         float *dbase = sycl::malloc_device<float>(n_hc, q);
         if (!dbase) return 0;
+        sycl_device_scratch_guard dbase_guard(q, dbase);
         q.memcpy(dbase, base_p, (size_t)row_bytes).wait_and_throw();
 
         float       *o  = (float *)out->ptr;
@@ -150,7 +173,6 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
             o[i] = 1.0f / (1.0f + sycl::exp(-z)) + eps;
         });
         q.wait_and_throw();
-        sycl::free(dbase, q);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "output_hc_weights failed: %s\n",
                 e.what());

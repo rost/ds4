@@ -165,6 +165,7 @@ static float oracle_sigmoid_stable(float x) {
 static int test_output_hc_weights(void) {
     enum { N_HC = 4, N_TOK = 64, N = N_HC * N_TOK };
     const float eps = 0.01f;
+    const size_t row_bytes = (size_t)N_HC * sizeof(float);
     float pre[N], got[N];
     for (int i = 0; i < N; i++) pre[i] = ((float)i / (float)N) * 4.0f - 2.0f;
 
@@ -193,6 +194,27 @@ static int test_output_hc_weights(void) {
                                            sizeof(model), sizeof(float),
                                            N_HC, eps) == 0,
           "hc_weights: out-of-range scale offset must be rejected");
+
+    /* An out tensor whose byte size is not an exact multiple of
+     * n_hc * sizeof(float) must be rejected: it cannot hold a whole
+     * number of HC rows.  rocm/ds4_rocm_hc_output_launch.cuh:213-218 is
+     * the authority for this guard. */
+    ds4_gpu_tensor *to_unaligned = ds4_gpu_tensor_alloc(row_bytes + 4);
+    CHECK(to_unaligned != NULL, "hc_weights: unaligned allocation failed");
+    CHECK(ds4_gpu_output_hc_weights_tensor(to_unaligned, tp, model,
+                                           sizeof(model), 0, sizeof(float),
+                                           N_HC, eps) == 0,
+          "hc_weights: non-row-aligned out size must be rejected");
+    ds4_gpu_tensor_free(to_unaligned);
+
+    /* A pre tensor smaller than out must be rejected: there is not
+     * enough input to cover every output element. */
+    ds4_gpu_tensor *tp_small = ds4_gpu_tensor_alloc(sizeof(pre) / 2);
+    CHECK(tp_small != NULL, "hc_weights: small pre allocation failed");
+    CHECK(ds4_gpu_output_hc_weights_tensor(to, tp_small, model, sizeof(model),
+                                           0, sizeof(float), N_HC, eps) == 0,
+          "hc_weights: undersized pre must be rejected");
+    ds4_gpu_tensor_free(tp_small);
 
     ds4_gpu_tensor_free(tp);
     ds4_gpu_tensor_free(to);
