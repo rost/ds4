@@ -113,12 +113,16 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_compressor_prefill_ratio4_replay_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_compressor_prefill_state_ratio4_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_compressor_prefill_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_compressor_update_tensor)
-/* Entry-specific convention, not the usual nonzero-means-success family:
- * 0 means capture committed and launched, -1 means capture failed (see
- * ds4_gpu.h).  -1 matches both ROCm's own stub (ds4_rocm_compat.cu) and
- * ds4.c's CPU-only fallback definitions of these same two functions,
- * which also return -1.  Returning the macro's usual 0 here would
- * falsely report a committed capture. */
+/* Entry-specific convention, not the usual nonzero-means-success family
+ * (see ds4_gpu.h). -1 matches both ROCm's own stub (ds4_rocm_compat.cu)
+ * and ds4.c's CPU-only fallback definitions of these same two functions,
+ * which also return -1:
+ *   ds4_gpu_decode_graph_begin: 1 = replayed, 0 = capturing, -1 = run
+ *     eagerly. -1 here means "no graph support, always run eagerly".
+ *   ds4_gpu_decode_graph_end: 0 = capture committed and launched,
+ *     -1 = capture failed (caller must re-encode the island eagerly).
+ *     Returning the macro's usual 0 here would falsely report a
+ *     committed capture. */
 extern "C" int ds4_gpu_decode_graph_begin(...) { return -1; }
 extern "C" int ds4_gpu_decode_graph_end(...) { return -1; }
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_decode_graphs_supported)

@@ -185,6 +185,19 @@ extern "C" int ds4_gpu_init(void) {
             g_gpu[i].device_id = i;
         }
 
+        /* g_n_gpus > 1 arms ds4.c's multi-tier dispatch paths (gated on
+         * g_n_gpus <= 1), but this backend's tensor alloc and current-device
+         * entries are still failing stubs, so those paths cannot work yet.
+         * One clear message at init time beats letting the caller discover
+         * this through a mysterious nullptr or set_current_device failure. */
+        if (g_n_gpus > 1) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "enumerated %d devices, but multi-GPU execution is not "
+                    "yet implemented in the SYCL backend; single-device use "
+                    "is expected until the multi-GPU work lands\n",
+                    g_n_gpus);
+        }
+
         g_current_tier = 0;
         g_initialised  = true;
 
