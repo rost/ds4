@@ -109,7 +109,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_commit_and_wait_selected_readback)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_compressor_prefill_ratio4_replay_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_compressor_prefill_state_ratio4_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_compressor_prefill_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_compressor_update_tensor)
 /* Entry-specific convention, not the usual nonzero-means-success family
  * (see ds4_gpu.h). -1 matches both ROCm's own stub (ds4_rocm_compat.cu)
  * and ds4.c's CPU-only fallback definitions of these same two functions,

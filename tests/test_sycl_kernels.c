@@ -1510,6 +1510,684 @@ static int test_compressor_store(void) {
     return 0;
 }
 
+/* The pool oracle: compressor_update_pool_kernel
+ * (rocm/ds4_rocm_compressor.cuh:121-160), which matches
+ * compressor_pool_decode_state (ds4.c:12452-12503) but expressed as an
+ * unconditional softmax rather than the CPU's early-out on the sentinel
+ * DS4_NEG_INF.  The `max_s > -INFINITY` guard below is NOT part of a
+ * byte-for-byte port of the CUDA loop: without it, an all -inf candidate
+ * set (the empty-softmax case this file tests) hits the IEEE `inf - inf`
+ * indeterminate form and resolves to NaN instead of 0. */
+static void oracle_compressor_pool(float *out, const float *state_kv,
+                                   const float *state_score,
+                                   uint32_t head_dim, uint32_t ratio) {
+    const uint32_t coff = ratio == 4u ? 2u : 1u;
+    const uint32_t width = coff * head_dim;
+
+    for (uint32_t d = 0; d < head_dim; d++) {
+        float vals[16], scores[16];
+        uint32_t n = 0;
+        float max_s = -INFINITY;
+
+        if (ratio == 4u) {
+            for (uint32_t r = 0; r < 4u; r++) {
+                vals[n] = state_kv[(uint64_t)r * width + d];
+                scores[n] = state_score[(uint64_t)r * width + d];
+                if (scores[n] > max_s) max_s = scores[n];
+                n++;
+            }
+            for (uint32_t r = 0; r < 4u; r++) {
+                vals[n] = state_kv[(uint64_t)(ratio + r) * width + head_dim + d];
+                scores[n] = state_score[(uint64_t)(ratio + r) * width + head_dim + d];
+                if (scores[n] > max_s) max_s = scores[n];
+                n++;
+            }
+        } else {
+            for (uint32_t r = 0; r < ratio; r++) {
+                vals[n] = state_kv[(uint64_t)r * width + d];
+                scores[n] = state_score[(uint64_t)r * width + d];
+                if (scores[n] > max_s) max_s = scores[n];
+                n++;
+            }
+        }
+
+        float den = 0.0f, acc = 0.0f;
+        if (max_s > -INFINITY) {
+            for (uint32_t i = 0; i < n; i++) {
+                const float w = expf(scores[i] - max_s);
+                den += w;
+                acc += vals[i] * w;
+            }
+        }
+        out[d] = den != 0.0f ? acc / den : 0.0f;
+    }
+}
+
+/* Step 1: the pool kernel driven in isolation through
+ * ds4_gpu_compressor_update_tensor with state_already_stored = true and
+ * n_rot = 0, so the store delegation and RoPE are both bypassed and only
+ * pooling plus the RMS weight normalisation run.  The reference calls this
+ * "the single most complex kernel in the four subsystems" and recommends
+ * proving it before trusting any orchestration around it. */
+static int test_compressor_pool(void) {
+    const float RMS_EPS = 1e-5f;
+
+    /* A1: general ratio (coff == 1), ratio = 3, head_dim = 4. */
+    {
+        enum { HEAD_DIM = 4, RATIO = 3, WIDTH = HEAD_DIM, STATE_ROWS = RATIO };
+        float state_kv[STATE_ROWS * WIDTH], state_score[STATE_ROWS * WIDTH];
+        float norm_w[HEAD_DIM], pool_want[HEAD_DIM], want[HEAD_DIM];
+
+        for (uint32_t r = 0; r < STATE_ROWS; r++) {
+            for (uint32_t c = 0; c < WIDTH; c++) {
+                state_kv[r * WIDTH + c] = 200.0f + (float)r * 20.0f + (float)c * 3.0f;
+                state_score[r * WIDTH + c] = 10.0f + (float)r * 4.0f + (float)c * 0.5f;
+            }
+        }
+        for (uint32_t d = 0; d < HEAD_DIM; d++) norm_w[d] = (float)(d % 3 + 1) * 0.4f;
+
+        oracle_compressor_pool(pool_want, state_kv, state_score, HEAD_DIM, RATIO);
+        oracle_rms_norm_weight(want, pool_want, norm_w, HEAD_DIM, RMS_EPS);
+
+        const uint64_t ape_offset = 16;
+        const uint64_t norm_offset = ape_offset + (uint64_t)WIDTH * RATIO * sizeof(float);
+        const uint64_t model_size = norm_offset + (uint64_t)HEAD_DIM * sizeof(float);
+        unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+        CHECK(model != NULL, "compressor_pool: model allocation failed (A1)");
+        memcpy(model + norm_offset, norm_w, sizeof(norm_w));
+
+        float kv_cur[WIDTH] = {0}, sc_cur[WIDTH] = {0};
+        float comp_sentinel[HEAD_DIM];
+        for (uint32_t d = 0; d < HEAD_DIM; d++) comp_sentinel[d] = -999.0f;
+
+        ds4_gpu_tensor *tkv_cur = ds4_gpu_tensor_alloc(sizeof(kv_cur));
+        ds4_gpu_tensor *tsc_cur = ds4_gpu_tensor_alloc(sizeof(sc_cur));
+        ds4_gpu_tensor *tskv    = ds4_gpu_tensor_alloc(sizeof(state_kv));
+        ds4_gpu_tensor *tssc    = ds4_gpu_tensor_alloc(sizeof(state_score));
+        ds4_gpu_tensor *tcomp   = ds4_gpu_tensor_alloc(sizeof(comp_sentinel));
+        CHECK(tkv_cur && tsc_cur && tskv && tssc && tcomp,
+              "compressor_pool: device allocation failed (A1)");
+
+        CHECK(ds4_gpu_tensor_write(tkv_cur, 0, kv_cur, sizeof(kv_cur)) != 0, "compressor_pool: write kv_cur (A1)");
+        CHECK(ds4_gpu_tensor_write(tsc_cur, 0, sc_cur, sizeof(sc_cur)) != 0, "compressor_pool: write sc_cur (A1)");
+        CHECK(ds4_gpu_tensor_write(tskv, 0, state_kv, sizeof(state_kv)) != 0, "compressor_pool: write state_kv (A1)");
+        CHECK(ds4_gpu_tensor_write(tssc, 0, state_score, sizeof(state_score)) != 0, "compressor_pool: write state_score (A1)");
+        CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_sentinel, sizeof(comp_sentinel)) != 0, "compressor_pool: write comp sentinel (A1)");
+
+        CHECK(ds4_gpu_compressor_update_tensor(
+                  tkv_cur, tsc_cur, tskv, tssc, tcomp,
+                  model, model_size, ape_offset, /*ape_type=*/0u,
+                  norm_offset, /*norm_type=*/0u, HEAD_DIM, RATIO,
+                  /*pos=*/5u, /*comp_row=*/0u, /*n_rot=*/0u,
+                  /*n_ctx_orig=*/4096u, /*freq_base=*/10000.0f, /*freq_scale=*/1.0f,
+                  /*ext_factor=*/0.0f, /*attn_factor=*/1.0f, /*beta_fast=*/32.0f,
+                  /*beta_slow=*/1.0f, RMS_EPS, /*state_already_stored=*/true,
+                  /*decode_one_token=*/false, /*defer_finalize=*/false) != 0,
+              "compressor_pool: call (A1)");
+
+        float got[HEAD_DIM], got_kv[STATE_ROWS * WIDTH], got_score[STATE_ROWS * WIDTH];
+        CHECK(ds4_gpu_tensor_read(tcomp, 0, got, sizeof(got)) != 0, "compressor_pool: read comp (A1)");
+        CHECK(ds4_gpu_tensor_read(tskv, 0, got_kv, sizeof(got_kv)) != 0, "compressor_pool: read state_kv (A1)");
+        CHECK(ds4_gpu_tensor_read(tssc, 0, got_score, sizeof(got_score)) != 0, "compressor_pool: read state_score (A1)");
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            CHECK_CLOSE(got[d], want[d], 1e-4, "compressor_pool: emitted value mismatch (A1)");
+        }
+        /* General ratio never shifts: the ring must be untouched. */
+        for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) {
+            CHECK(got_kv[i] == state_kv[i], "compressor_pool: ring kv mutated (A1)");
+            CHECK(got_score[i] == state_score[i], "compressor_pool: ring score mutated (A1)");
+        }
+
+        ds4_gpu_tensor_free(tkv_cur); ds4_gpu_tensor_free(tsc_cur);
+        ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+        free(model);
+    }
+
+    /* A2: ratio == 4, the asymmetric-lane gather.  The low ring rows carry
+     * one value range at column d (the low lane) and a POISONED,
+     * unmistakably different value range at column head_dim + d (a lane a
+     * correct low-row read never touches).  The high ring rows are the
+     * mirror image: genuine data at head_dim + d, poison at d.  A port
+     * that reads column d for both halves -- the sharpest trap in this
+     * task -- would pick up the high rows' poison instead of their
+     * genuine high-lane data, producing a visibly different, wrong
+     * result. */
+    {
+        enum { HEAD_DIM = 3, RATIO = 4, WIDTH = HEAD_DIM * 2, STATE_ROWS = RATIO * 2 };
+        float state_kv[STATE_ROWS * WIDTH], state_score[STATE_ROWS * WIDTH];
+
+        for (uint32_t r = 0; r < 4u; r++) {
+            for (uint32_t c = 0; c < WIDTH; c++) {
+                state_kv[r * WIDTH + c] = 100.0f + (float)r * 10.0f + (float)c;
+                state_score[r * WIDTH + c] = 5.0f + (float)r + 0.1f * (float)c;
+            }
+        }
+        for (uint32_t r = 0; r < 4u; r++) {
+            const uint32_t row = 4u + r;
+            for (uint32_t c = 0; c < WIDTH; c++) {
+                if (c < HEAD_DIM) {
+                    state_kv[row * WIDTH + c] = -500.0f - (float)r - (float)c;
+                    state_score[row * WIDTH + c] = -777.0f - (float)r - (float)c;
+                } else {
+                    const uint32_t d = c - HEAD_DIM;
+                    state_kv[row * WIDTH + c] = 700.0f + (float)r * 10.0f + (float)d;
+                    state_score[row * WIDTH + c] = 20.0f + (float)r + 0.1f * (float)d;
+                }
+            }
+        }
+
+        float norm_w[HEAD_DIM], pool_want[HEAD_DIM], want[HEAD_DIM];
+        for (uint32_t d = 0; d < HEAD_DIM; d++) norm_w[d] = (float)(d + 1) * 0.5f;
+        oracle_compressor_pool(pool_want, state_kv, state_score, HEAD_DIM, RATIO);
+        oracle_rms_norm_weight(want, pool_want, norm_w, HEAD_DIM, RMS_EPS);
+
+        const uint64_t ape_offset = 16;
+        const uint64_t norm_offset = ape_offset + (uint64_t)WIDTH * RATIO * sizeof(float);
+        const uint64_t model_size = norm_offset + (uint64_t)HEAD_DIM * sizeof(float);
+        unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+        CHECK(model != NULL, "compressor_pool: model allocation failed (A2)");
+        memcpy(model + norm_offset, norm_w, sizeof(norm_w));
+
+        float kv_cur[WIDTH] = {0}, sc_cur[WIDTH] = {0};
+        float comp_sentinel[HEAD_DIM];
+        for (uint32_t d = 0; d < HEAD_DIM; d++) comp_sentinel[d] = -999.0f;
+
+        ds4_gpu_tensor *tkv_cur = ds4_gpu_tensor_alloc(sizeof(kv_cur));
+        ds4_gpu_tensor *tsc_cur = ds4_gpu_tensor_alloc(sizeof(sc_cur));
+        ds4_gpu_tensor *tskv    = ds4_gpu_tensor_alloc(sizeof(state_kv));
+        ds4_gpu_tensor *tssc    = ds4_gpu_tensor_alloc(sizeof(state_score));
+        ds4_gpu_tensor *tcomp   = ds4_gpu_tensor_alloc(sizeof(comp_sentinel));
+        CHECK(tkv_cur && tsc_cur && tskv && tssc && tcomp,
+              "compressor_pool: device allocation failed (A2)");
+
+        CHECK(ds4_gpu_tensor_write(tkv_cur, 0, kv_cur, sizeof(kv_cur)) != 0, "compressor_pool: write kv_cur (A2)");
+        CHECK(ds4_gpu_tensor_write(tsc_cur, 0, sc_cur, sizeof(sc_cur)) != 0, "compressor_pool: write sc_cur (A2)");
+        CHECK(ds4_gpu_tensor_write(tskv, 0, state_kv, sizeof(state_kv)) != 0, "compressor_pool: write state_kv (A2)");
+        CHECK(ds4_gpu_tensor_write(tssc, 0, state_score, sizeof(state_score)) != 0, "compressor_pool: write state_score (A2)");
+        CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_sentinel, sizeof(comp_sentinel)) != 0, "compressor_pool: write comp sentinel (A2)");
+
+        CHECK(ds4_gpu_compressor_update_tensor(
+                  tkv_cur, tsc_cur, tskv, tssc, tcomp,
+                  model, model_size, ape_offset, /*ape_type=*/0u,
+                  norm_offset, /*norm_type=*/0u, HEAD_DIM, RATIO,
+                  /*pos=*/7u, /*comp_row=*/0u, /*n_rot=*/0u,
+                  /*n_ctx_orig=*/4096u, /*freq_base=*/10000.0f, /*freq_scale=*/1.0f,
+                  /*ext_factor=*/0.0f, /*attn_factor=*/1.0f, /*beta_fast=*/32.0f,
+                  /*beta_slow=*/1.0f, RMS_EPS, /*state_already_stored=*/true,
+                  /*decode_one_token=*/false, /*defer_finalize=*/false) != 0,
+              "compressor_pool: call (A2)");
+
+        float got[HEAD_DIM], got_kv[STATE_ROWS * WIDTH], got_score[STATE_ROWS * WIDTH];
+        CHECK(ds4_gpu_tensor_read(tcomp, 0, got, sizeof(got)) != 0, "compressor_pool: read comp (A2)");
+        CHECK(ds4_gpu_tensor_read(tskv, 0, got_kv, sizeof(got_kv)) != 0, "compressor_pool: read state_kv (A2)");
+        CHECK(ds4_gpu_tensor_read(tssc, 0, got_score, sizeof(got_score)) != 0, "compressor_pool: read state_score (A2)");
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            CHECK_CLOSE(got[d], want[d], 1e-4, "compressor_pool: emitted value mismatch (A2, ratio4 lanes)");
+        }
+
+        /* ratio == 4 always shifts on emit, even when the store step was
+         * skipped: rows 0..3 must become the OLD rows 4..7 verbatim (full
+         * width, both lanes, poison columns included), and rows 4..7 must
+         * be unchanged (the shift copies the high half onto itself too). */
+        for (uint32_t r = 0; r < 4u; r++) {
+            for (uint32_t c = 0; c < WIDTH; c++) {
+                const float want_kv_v = state_kv[(4u + r) * WIDTH + c];
+                const float want_sc_v = state_score[(4u + r) * WIDTH + c];
+                CHECK(got_kv[r * WIDTH + c] == want_kv_v, "compressor_pool: shifted low kv mismatch (A2)");
+                CHECK(got_score[r * WIDTH + c] == want_sc_v, "compressor_pool: shifted low score mismatch (A2)");
+                CHECK(got_kv[(4u + r) * WIDTH + c] == want_kv_v, "compressor_pool: high kv changed by shift (A2)");
+                CHECK(got_score[(4u + r) * WIDTH + c] == want_sc_v, "compressor_pool: high score changed by shift (A2)");
+            }
+        }
+
+        ds4_gpu_tensor_free(tkv_cur); ds4_gpu_tensor_free(tsc_cur);
+        ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+        free(model);
+    }
+
+    /* A3: every candidate score is -inf.  den must resolve to exactly 0,
+     * not NaN; a dropped guard here only manifests at sequence starts,
+     * where the ring genuinely holds nothing yet. */
+    {
+        enum { HEAD_DIM = 2, RATIO = 3, WIDTH = HEAD_DIM, STATE_ROWS = RATIO };
+        float state_kv[STATE_ROWS * WIDTH], state_score[STATE_ROWS * WIDTH];
+        for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) {
+            state_kv[i] = 42.0f;
+            state_score[i] = -INFINITY;
+        }
+        float norm_w[HEAD_DIM] = {1.0f, 1.0f};
+
+        const uint64_t ape_offset = 16;
+        const uint64_t norm_offset = ape_offset + (uint64_t)WIDTH * RATIO * sizeof(float);
+        const uint64_t model_size = norm_offset + (uint64_t)HEAD_DIM * sizeof(float);
+        unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+        CHECK(model != NULL, "compressor_pool: model allocation failed (A3)");
+        memcpy(model + norm_offset, norm_w, sizeof(norm_w));
+
+        float kv_cur[WIDTH] = {0}, sc_cur[WIDTH] = {0};
+        float comp_sentinel[HEAD_DIM] = {-999.0f, -999.0f};
+
+        ds4_gpu_tensor *tkv_cur = ds4_gpu_tensor_alloc(sizeof(kv_cur));
+        ds4_gpu_tensor *tsc_cur = ds4_gpu_tensor_alloc(sizeof(sc_cur));
+        ds4_gpu_tensor *tskv    = ds4_gpu_tensor_alloc(sizeof(state_kv));
+        ds4_gpu_tensor *tssc    = ds4_gpu_tensor_alloc(sizeof(state_score));
+        ds4_gpu_tensor *tcomp   = ds4_gpu_tensor_alloc(sizeof(comp_sentinel));
+        CHECK(tkv_cur && tsc_cur && tskv && tssc && tcomp,
+              "compressor_pool: device allocation failed (A3)");
+
+        CHECK(ds4_gpu_tensor_write(tkv_cur, 0, kv_cur, sizeof(kv_cur)) != 0, "compressor_pool: write kv_cur (A3)");
+        CHECK(ds4_gpu_tensor_write(tsc_cur, 0, sc_cur, sizeof(sc_cur)) != 0, "compressor_pool: write sc_cur (A3)");
+        CHECK(ds4_gpu_tensor_write(tskv, 0, state_kv, sizeof(state_kv)) != 0, "compressor_pool: write state_kv (A3)");
+        CHECK(ds4_gpu_tensor_write(tssc, 0, state_score, sizeof(state_score)) != 0, "compressor_pool: write state_score (A3)");
+        CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_sentinel, sizeof(comp_sentinel)) != 0, "compressor_pool: write comp sentinel (A3)");
+
+        CHECK(ds4_gpu_compressor_update_tensor(
+                  tkv_cur, tsc_cur, tskv, tssc, tcomp,
+                  model, model_size, ape_offset, /*ape_type=*/0u,
+                  norm_offset, /*norm_type=*/0u, HEAD_DIM, RATIO,
+                  /*pos=*/2u, /*comp_row=*/0u, /*n_rot=*/0u,
+                  /*n_ctx_orig=*/4096u, /*freq_base=*/10000.0f, /*freq_scale=*/1.0f,
+                  /*ext_factor=*/0.0f, /*attn_factor=*/1.0f, /*beta_fast=*/32.0f,
+                  /*beta_slow=*/1.0f, RMS_EPS, /*state_already_stored=*/true,
+                  /*decode_one_token=*/false, /*defer_finalize=*/false) != 0,
+              "compressor_pool: call (A3)");
+
+        float got[HEAD_DIM];
+        CHECK(ds4_gpu_tensor_read(tcomp, 0, got, sizeof(got)) != 0, "compressor_pool: read comp (A3)");
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            CHECK(got[d] == 0.0f, "compressor_pool: empty softmax must be exactly 0, not NaN (A3)");
+        }
+
+        ds4_gpu_tensor_free(tkv_cur); ds4_gpu_tensor_free(tsc_cur);
+        ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+        free(model);
+    }
+
+    fprintf(stderr, "  test_compressor_pool OK\n");
+    return 0;
+}
+
+/* Step 2: ds4_gpu_compressor_update_tensor is itself single-token, so it
+ * compares 1:1 against compressor_decode_one (ds4.c:12507-12602) with no
+ * loop needed.  Covers a non-emit position (store only), an emit boundary
+ * (store, pool, RMS weight norm and RoPE tail together), and for ratio ==
+ * 4 the post-emit shift that copies the high half of the ring into BOTH
+ * halves (rocm/ds4_rocm_compressor.cuh:162-172).  Every case asserts the
+ * full state ring after the call, not only the emitted row: a correct
+ * emission with a corrupted ring would pass otherwise and break the next
+ * token. */
+static int test_compressor_update(void) {
+    const float RMS_EPS = 1e-5f;
+    const uint32_t N_CTX_ORIG = 4096u;
+    const float FREQ_BASE = 10000.0f, FREQ_SCALE = 1.0f, EXT_FACTOR = 0.0f;
+    const float ATTN_FACTOR = 1.0f, BETA_FAST = 32.0f, BETA_SLOW = 1.0f;
+
+    /* B1: a non-emit position stores the current token into the ring and
+     * returns success without touching comp_cache. */
+    {
+        enum { HEAD_DIM = 4, RATIO = 3, WIDTH = HEAD_DIM, STATE_ROWS = RATIO };
+        const uint32_t POS = 3u; /* (3+1) % 3 == 1: not an emit boundary */
+        float state_kv[STATE_ROWS * WIDTH], state_score[STATE_ROWS * WIDTH];
+        float want_kv[STATE_ROWS * WIDTH], want_score[STATE_ROWS * WIDTH];
+        float kv_cur[WIDTH], sc_cur[WIDTH];
+
+        for (uint32_t r = 0; r < STATE_ROWS; r++) {
+            for (uint32_t c = 0; c < WIDTH; c++) {
+                state_kv[r * WIDTH + c] = 300.0f + (float)r * 20.0f + (float)c * 2.0f;
+                state_score[r * WIDTH + c] = 8.0f + (float)r * 3.0f + (float)c * 0.2f;
+            }
+        }
+        memcpy(want_kv, state_kv, sizeof(state_kv));
+        memcpy(want_score, state_score, sizeof(state_score));
+        for (uint32_t c = 0; c < WIDTH; c++) {
+            kv_cur[c] = 777.0f + (float)c;
+            sc_cur[c] = 333.0f + (float)c * 2.0f;
+        }
+
+        const uint64_t ape_offset = 16;
+        const uint64_t norm_offset = ape_offset + (uint64_t)WIDTH * RATIO * sizeof(float);
+        const uint64_t model_size = norm_offset + (uint64_t)HEAD_DIM * sizeof(float);
+        unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+        CHECK(model != NULL, "compressor_update: model allocation failed (B1)");
+        oracle_fill_ape(model + ape_offset, /*ape_type=*/0u, WIDTH, RATIO);
+        float norm_w[HEAD_DIM];
+        for (uint32_t d = 0; d < HEAD_DIM; d++) norm_w[d] = (float)(d + 1) * 0.25f;
+        memcpy(model + norm_offset, norm_w, sizeof(norm_w));
+
+        oracle_compressor_store(want_kv, want_score, kv_cur, sc_cur,
+                                model + ape_offset, 0u, WIDTH, RATIO, POS, 1u);
+
+        float comp_sentinel[HEAD_DIM];
+        for (uint32_t d = 0; d < HEAD_DIM; d++) comp_sentinel[d] = -999.0f;
+
+        ds4_gpu_tensor *tkv_cur = ds4_gpu_tensor_alloc(sizeof(kv_cur));
+        ds4_gpu_tensor *tsc_cur = ds4_gpu_tensor_alloc(sizeof(sc_cur));
+        ds4_gpu_tensor *tskv    = ds4_gpu_tensor_alloc(sizeof(state_kv));
+        ds4_gpu_tensor *tssc    = ds4_gpu_tensor_alloc(sizeof(state_score));
+        ds4_gpu_tensor *tcomp   = ds4_gpu_tensor_alloc(sizeof(comp_sentinel));
+        CHECK(tkv_cur && tsc_cur && tskv && tssc && tcomp,
+              "compressor_update: device allocation failed (B1)");
+
+        CHECK(ds4_gpu_tensor_write(tkv_cur, 0, kv_cur, sizeof(kv_cur)) != 0, "compressor_update: write kv_cur (B1)");
+        CHECK(ds4_gpu_tensor_write(tsc_cur, 0, sc_cur, sizeof(sc_cur)) != 0, "compressor_update: write sc_cur (B1)");
+        CHECK(ds4_gpu_tensor_write(tskv, 0, state_kv, sizeof(state_kv)) != 0, "compressor_update: write state_kv (B1)");
+        CHECK(ds4_gpu_tensor_write(tssc, 0, state_score, sizeof(state_score)) != 0, "compressor_update: write state_score (B1)");
+        CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_sentinel, sizeof(comp_sentinel)) != 0, "compressor_update: write comp sentinel (B1)");
+
+        CHECK(ds4_gpu_compressor_update_tensor(
+                  tkv_cur, tsc_cur, tskv, tssc, tcomp,
+                  model, model_size, ape_offset, /*ape_type=*/0u,
+                  norm_offset, /*norm_type=*/0u, HEAD_DIM, RATIO,
+                  POS, /*comp_row=*/0u, /*n_rot=*/0u,
+                  N_CTX_ORIG, FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR,
+                  BETA_FAST, BETA_SLOW, RMS_EPS, /*state_already_stored=*/false,
+                  /*decode_one_token=*/false, /*defer_finalize=*/false) != 0,
+              "compressor_update: call (B1, non-emit)");
+
+        float got_kv[STATE_ROWS * WIDTH], got_score[STATE_ROWS * WIDTH], got_comp[HEAD_DIM];
+        CHECK(ds4_gpu_tensor_read(tskv, 0, got_kv, sizeof(got_kv)) != 0, "compressor_update: read state_kv (B1)");
+        CHECK(ds4_gpu_tensor_read(tssc, 0, got_score, sizeof(got_score)) != 0, "compressor_update: read state_score (B1)");
+        CHECK(ds4_gpu_tensor_read(tcomp, 0, got_comp, sizeof(got_comp)) != 0, "compressor_update: read comp (B1)");
+
+        for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) {
+            CHECK(got_kv[i] == want_kv[i], "compressor_update: stored kv mismatch (B1)");
+            CHECK_CLOSE(got_score[i], want_score[i], 1e-3, "compressor_update: stored score mismatch (B1)");
+        }
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            CHECK(got_comp[d] == comp_sentinel[d], "compressor_update: comp_cache must be untouched on non-emit (B1)");
+        }
+
+        ds4_gpu_tensor_free(tkv_cur); ds4_gpu_tensor_free(tsc_cur);
+        ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+        free(model);
+    }
+
+    /* B2: an emit boundary, general ratio.  Store, pool, RMS weight norm
+     * and RoPE tail all run and are checked against one combined
+     * oracle. */
+    {
+        enum { HEAD_DIM = 4, RATIO = 3, WIDTH = HEAD_DIM, STATE_ROWS = RATIO,
+               N_ROT = 2, COMP_ROW = 1, COMP_ROWS = COMP_ROW + 1 };
+        const uint32_t POS = 2u; /* (2+1) % 3 == 0: emit */
+        float state_kv[STATE_ROWS * WIDTH], state_score[STATE_ROWS * WIDTH];
+        float want_kv[STATE_ROWS * WIDTH], want_score[STATE_ROWS * WIDTH];
+        float kv_cur[WIDTH], sc_cur[WIDTH];
+
+        for (uint32_t r = 0; r < STATE_ROWS; r++) {
+            for (uint32_t c = 0; c < WIDTH; c++) {
+                state_kv[r * WIDTH + c] = 50.0f + (float)r * 15.0f + (float)c;
+                state_score[r * WIDTH + c] = 3.0f + (float)r * 2.0f + (float)c * 0.3f;
+            }
+        }
+        memcpy(want_kv, state_kv, sizeof(state_kv));
+        memcpy(want_score, state_score, sizeof(state_score));
+        for (uint32_t c = 0; c < WIDTH; c++) {
+            kv_cur[c] = 900.0f + (float)c * 5.0f;
+            sc_cur[c] = 60.0f - (float)c;
+        }
+
+        const uint64_t ape_offset = 24;
+        const uint64_t norm_offset = ape_offset + (uint64_t)WIDTH * RATIO * sizeof(float);
+        const uint64_t model_size = norm_offset + (uint64_t)HEAD_DIM * sizeof(float);
+        unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+        CHECK(model != NULL, "compressor_update: model allocation failed (B2)");
+        oracle_fill_ape(model + ape_offset, 0u, WIDTH, RATIO);
+        float norm_w[HEAD_DIM];
+        for (uint32_t d = 0; d < HEAD_DIM; d++) norm_w[d] = (float)(d % 4 + 1) * 0.35f;
+        memcpy(model + norm_offset, norm_w, sizeof(norm_w));
+
+        oracle_compressor_store(want_kv, want_score, kv_cur, sc_cur,
+                                model + ape_offset, 0u, WIDTH, RATIO, POS, 1u);
+
+        float pool_want[HEAD_DIM], normed_want[HEAD_DIM];
+        oracle_compressor_pool(pool_want, want_kv, want_score, HEAD_DIM, RATIO);
+        oracle_rms_norm_weight(normed_want, pool_want, norm_w, HEAD_DIM, RMS_EPS);
+        const uint32_t comp_pos = POS + 1u - RATIO;
+        oracle_rope_tail_row(normed_want, HEAD_DIM, N_ROT, comp_pos, N_CTX_ORIG,
+                             FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR,
+                             BETA_FAST, BETA_SLOW, /*inverse=*/0);
+
+        float comp_sentinel[COMP_ROWS * HEAD_DIM];
+        for (uint32_t i = 0; i < COMP_ROWS * HEAD_DIM; i++) comp_sentinel[i] = -999.0f;
+
+        ds4_gpu_tensor *tkv_cur = ds4_gpu_tensor_alloc(sizeof(kv_cur));
+        ds4_gpu_tensor *tsc_cur = ds4_gpu_tensor_alloc(sizeof(sc_cur));
+        ds4_gpu_tensor *tskv    = ds4_gpu_tensor_alloc(sizeof(state_kv));
+        ds4_gpu_tensor *tssc    = ds4_gpu_tensor_alloc(sizeof(state_score));
+        ds4_gpu_tensor *tcomp   = ds4_gpu_tensor_alloc(sizeof(comp_sentinel));
+        CHECK(tkv_cur && tsc_cur && tskv && tssc && tcomp,
+              "compressor_update: device allocation failed (B2)");
+
+        CHECK(ds4_gpu_tensor_write(tkv_cur, 0, kv_cur, sizeof(kv_cur)) != 0, "compressor_update: write kv_cur (B2)");
+        CHECK(ds4_gpu_tensor_write(tsc_cur, 0, sc_cur, sizeof(sc_cur)) != 0, "compressor_update: write sc_cur (B2)");
+        CHECK(ds4_gpu_tensor_write(tskv, 0, state_kv, sizeof(state_kv)) != 0, "compressor_update: write state_kv (B2)");
+        CHECK(ds4_gpu_tensor_write(tssc, 0, state_score, sizeof(state_score)) != 0, "compressor_update: write state_score (B2)");
+        CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_sentinel, sizeof(comp_sentinel)) != 0, "compressor_update: write comp sentinel (B2)");
+
+        CHECK(ds4_gpu_compressor_update_tensor(
+                  tkv_cur, tsc_cur, tskv, tssc, tcomp,
+                  model, model_size, ape_offset, /*ape_type=*/0u,
+                  norm_offset, /*norm_type=*/0u, HEAD_DIM, RATIO,
+                  POS, COMP_ROW, N_ROT,
+                  N_CTX_ORIG, FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR,
+                  BETA_FAST, BETA_SLOW, RMS_EPS, /*state_already_stored=*/false,
+                  /*decode_one_token=*/false, /*defer_finalize=*/false) != 0,
+              "compressor_update: call (B2, emit)");
+
+        float got_kv[STATE_ROWS * WIDTH], got_score[STATE_ROWS * WIDTH];
+        float got_comp[COMP_ROWS * HEAD_DIM];
+        CHECK(ds4_gpu_tensor_read(tskv, 0, got_kv, sizeof(got_kv)) != 0, "compressor_update: read state_kv (B2)");
+        CHECK(ds4_gpu_tensor_read(tssc, 0, got_score, sizeof(got_score)) != 0, "compressor_update: read state_score (B2)");
+        CHECK(ds4_gpu_tensor_read(tcomp, 0, got_comp, sizeof(got_comp)) != 0, "compressor_update: read comp (B2)");
+
+        for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) {
+            CHECK(got_kv[i] == want_kv[i], "compressor_update: post-emit ring kv mismatch (B2)");
+            CHECK_CLOSE(got_score[i], want_score[i], 1e-3, "compressor_update: post-emit ring score mismatch (B2)");
+        }
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            CHECK_CLOSE(got_comp[COMP_ROW * HEAD_DIM + d], normed_want[d], 1e-3,
+                       "compressor_update: emitted row mismatch (B2)");
+        }
+        for (uint32_t i = 0; i < COMP_ROW * HEAD_DIM; i++) {
+            CHECK(got_comp[i] == comp_sentinel[i], "compressor_update: rows before comp_row must be untouched (B2)");
+        }
+
+        ds4_gpu_tensor_free(tkv_cur); ds4_gpu_tensor_free(tsc_cur);
+        ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+        free(model);
+    }
+
+    /* B3: ratio == 4, exercising the full store -> pool -> norm -> RoPE
+     * chain together with the post-emit shift.  The low ring rows and the
+     * high ring rows (and, within the high rows, the low vs. high lane
+     * columns) all carry visibly different values so a lane or row swap
+     * anywhere in the pipeline produces a detectably wrong answer, and the
+     * ring is checked in full afterward, not just the emitted row. */
+    {
+        enum { HEAD_DIM = 4, RATIO = 4, WIDTH = HEAD_DIM * 2, STATE_ROWS = RATIO * 2,
+               N_ROT = 2, COMP_ROW = 0, COMP_ROWS = COMP_ROW + 1 };
+        const uint32_t POS = 7u; /* pos % 4 == 3: last slot of the window; (7+1)%4==0: emit */
+        float state_kv[STATE_ROWS * WIDTH], state_score[STATE_ROWS * WIDTH];
+        float want_kv[STATE_ROWS * WIDTH], want_score[STATE_ROWS * WIDTH];
+        float kv_cur[WIDTH], sc_cur[WIDTH];
+
+        /* Low ring (rows 0..3): previous window.  Genuine data at column
+         * d < HEAD_DIM; poison at head_dim + d, which a correct low-row
+         * read never touches. */
+        for (uint32_t r = 0; r < 4u; r++) {
+            for (uint32_t c = 0; c < WIDTH; c++) {
+                if (c < HEAD_DIM) {
+                    state_kv[r * WIDTH + c] = 100.0f + (float)r * 10.0f + (float)c;
+                    state_score[r * WIDTH + c] = 5.0f + (float)r + 0.1f * (float)c;
+                } else {
+                    const uint32_t d = c - HEAD_DIM;
+                    state_kv[r * WIDTH + c] = -300.0f - (float)r - (float)d;
+                    state_score[r * WIDTH + c] = -666.0f - (float)r - (float)d;
+                }
+            }
+        }
+        /* High ring (rows 4..6): the first three tokens of the current
+         * window, already stored.  Poison at column d < HEAD_DIM, genuine
+         * data at head_dim + d. */
+        for (uint32_t r = 0; r < 3u; r++) {
+            const uint32_t row = 4u + r;
+            for (uint32_t c = 0; c < WIDTH; c++) {
+                if (c < HEAD_DIM) {
+                    state_kv[row * WIDTH + c] = -500.0f - (float)r - (float)c;
+                    state_score[row * WIDTH + c] = -777.0f - (float)r - (float)c;
+                } else {
+                    const uint32_t d = c - HEAD_DIM;
+                    state_kv[row * WIDTH + c] = 700.0f + (float)r * 10.0f + (float)d;
+                    state_score[row * WIDTH + c] = 20.0f + (float)r + 0.1f * (float)d;
+                }
+            }
+        }
+        /* Row 7 (the fourth slot of the window) is not pre-seeded: this
+         * call's store fills it from kv_cur/sc_cur. */
+        for (uint32_t c = 0; c < WIDTH; c++) {
+            state_kv[7 * WIDTH + c] = 0.0f;
+            state_score[7 * WIDTH + c] = 0.0f;
+        }
+        memcpy(want_kv, state_kv, sizeof(state_kv));
+        memcpy(want_score, state_score, sizeof(state_score));
+        for (uint32_t c = 0; c < WIDTH; c++) {
+            kv_cur[c] = c < HEAD_DIM ? (-800.0f - (float)c) : (750.0f + (float)(c - HEAD_DIM));
+            sc_cur[c] = c < HEAD_DIM ? (-888.0f - (float)c) : (25.0f + (float)(c - HEAD_DIM));
+        }
+
+        const uint64_t ape_offset = 32;
+        const uint64_t norm_offset = ape_offset + (uint64_t)WIDTH * RATIO * sizeof(float);
+        const uint64_t model_size = norm_offset + (uint64_t)HEAD_DIM * sizeof(float);
+        unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+        CHECK(model != NULL, "compressor_update: model allocation failed (B3)");
+        oracle_fill_ape(model + ape_offset, 0u, WIDTH, RATIO);
+        float norm_w[HEAD_DIM];
+        for (uint32_t d = 0; d < HEAD_DIM; d++) norm_w[d] = (float)(d + 2) * 0.3f;
+        memcpy(model + norm_offset, norm_w, sizeof(norm_w));
+
+        oracle_compressor_store(want_kv, want_score, kv_cur, sc_cur,
+                                model + ape_offset, 0u, WIDTH, RATIO, POS, 1u);
+
+        float pool_want[HEAD_DIM], normed_want[HEAD_DIM];
+        oracle_compressor_pool(pool_want, want_kv, want_score, HEAD_DIM, RATIO);
+        oracle_rms_norm_weight(normed_want, pool_want, norm_w, HEAD_DIM, RMS_EPS);
+        const uint32_t comp_pos = POS + 1u - RATIO;
+        oracle_rope_tail_row(normed_want, HEAD_DIM, N_ROT, comp_pos, N_CTX_ORIG,
+                             FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR,
+                             BETA_FAST, BETA_SLOW, /*inverse=*/0);
+
+        /* The expected post-shift ring: rows 0..3 become the OLD rows
+         * 4..7 (i.e. want_kv/want_score after the store above, before any
+         * shift); rows 4..7 stay the same. */
+        float want_shifted_kv[STATE_ROWS * WIDTH], want_shifted_score[STATE_ROWS * WIDTH];
+        memcpy(want_shifted_kv, want_kv, sizeof(want_kv));
+        memcpy(want_shifted_score, want_score, sizeof(want_score));
+        for (uint32_t r = 0; r < 4u; r++) {
+            memcpy(&want_shifted_kv[r * WIDTH], &want_kv[(4u + r) * WIDTH], WIDTH * sizeof(float));
+            memcpy(&want_shifted_score[r * WIDTH], &want_score[(4u + r) * WIDTH], WIDTH * sizeof(float));
+        }
+
+        float comp_sentinel[COMP_ROWS * HEAD_DIM];
+        for (uint32_t i = 0; i < COMP_ROWS * HEAD_DIM; i++) comp_sentinel[i] = -999.0f;
+
+        ds4_gpu_tensor *tkv_cur = ds4_gpu_tensor_alloc(sizeof(kv_cur));
+        ds4_gpu_tensor *tsc_cur = ds4_gpu_tensor_alloc(sizeof(sc_cur));
+        ds4_gpu_tensor *tskv    = ds4_gpu_tensor_alloc(sizeof(state_kv));
+        ds4_gpu_tensor *tssc    = ds4_gpu_tensor_alloc(sizeof(state_score));
+        ds4_gpu_tensor *tcomp   = ds4_gpu_tensor_alloc(sizeof(comp_sentinel));
+        CHECK(tkv_cur && tsc_cur && tskv && tssc && tcomp,
+              "compressor_update: device allocation failed (B3)");
+
+        CHECK(ds4_gpu_tensor_write(tkv_cur, 0, kv_cur, sizeof(kv_cur)) != 0, "compressor_update: write kv_cur (B3)");
+        CHECK(ds4_gpu_tensor_write(tsc_cur, 0, sc_cur, sizeof(sc_cur)) != 0, "compressor_update: write sc_cur (B3)");
+        CHECK(ds4_gpu_tensor_write(tskv, 0, state_kv, sizeof(state_kv)) != 0, "compressor_update: write state_kv (B3)");
+        CHECK(ds4_gpu_tensor_write(tssc, 0, state_score, sizeof(state_score)) != 0, "compressor_update: write state_score (B3)");
+        CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_sentinel, sizeof(comp_sentinel)) != 0, "compressor_update: write comp sentinel (B3)");
+
+        CHECK(ds4_gpu_compressor_update_tensor(
+                  tkv_cur, tsc_cur, tskv, tssc, tcomp,
+                  model, model_size, ape_offset, /*ape_type=*/0u,
+                  norm_offset, /*norm_type=*/0u, HEAD_DIM, RATIO,
+                  POS, COMP_ROW, N_ROT,
+                  N_CTX_ORIG, FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR,
+                  BETA_FAST, BETA_SLOW, RMS_EPS, /*state_already_stored=*/false,
+                  /*decode_one_token=*/false, /*defer_finalize=*/false) != 0,
+              "compressor_update: call (B3, ratio4 emit + shift)");
+
+        float got_kv[STATE_ROWS * WIDTH], got_score[STATE_ROWS * WIDTH];
+        float got_comp[COMP_ROWS * HEAD_DIM];
+        CHECK(ds4_gpu_tensor_read(tskv, 0, got_kv, sizeof(got_kv)) != 0, "compressor_update: read state_kv (B3)");
+        CHECK(ds4_gpu_tensor_read(tssc, 0, got_score, sizeof(got_score)) != 0, "compressor_update: read state_score (B3)");
+        CHECK(ds4_gpu_tensor_read(tcomp, 0, got_comp, sizeof(got_comp)) != 0, "compressor_update: read comp (B3)");
+
+        for (uint32_t d = 0; d < HEAD_DIM; d++) {
+            CHECK_CLOSE(got_comp[COMP_ROW * HEAD_DIM + d], normed_want[d], 1e-3,
+                       "compressor_update: emitted row mismatch (B3, ratio4)");
+        }
+        for (uint32_t i = 0; i < STATE_ROWS * WIDTH; i++) {
+            CHECK(got_kv[i] == want_shifted_kv[i], "compressor_update: post-shift ring kv mismatch (B3)");
+            CHECK_CLOSE(got_score[i], want_shifted_score[i], 1e-3, "compressor_update: post-shift ring score mismatch (B3)");
+        }
+
+        ds4_gpu_tensor_free(tkv_cur); ds4_gpu_tensor_free(tsc_cur);
+        ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+        free(model);
+    }
+
+    /* Validation: an odd n_rot, n_rot > head_dim, and a non-zero norm_type
+     * must all be rejected before any kernel launches
+     * (rocm/ds4_rocm_compressor.cuh:272-279). */
+    {
+        enum { HEAD_DIM = 4, RATIO = 3, WIDTH = HEAD_DIM, STATE_ROWS = RATIO };
+        float state_kv[STATE_ROWS * WIDTH] = {0}, state_score[STATE_ROWS * WIDTH] = {0};
+        float kv_cur[WIDTH] = {0}, sc_cur[WIDTH] = {0}, comp[HEAD_DIM] = {0};
+        const uint64_t ape_offset = 16;
+        const uint64_t norm_offset = ape_offset + (uint64_t)WIDTH * RATIO * sizeof(float);
+        const uint64_t model_size = norm_offset + (uint64_t)HEAD_DIM * sizeof(float);
+        unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+        CHECK(model != NULL, "compressor_update: model allocation failed (validation)");
+
+        ds4_gpu_tensor *tkv_cur = ds4_gpu_tensor_alloc(sizeof(kv_cur));
+        ds4_gpu_tensor *tsc_cur = ds4_gpu_tensor_alloc(sizeof(sc_cur));
+        ds4_gpu_tensor *tskv    = ds4_gpu_tensor_alloc(sizeof(state_kv));
+        ds4_gpu_tensor *tssc    = ds4_gpu_tensor_alloc(sizeof(state_score));
+        ds4_gpu_tensor *tcomp   = ds4_gpu_tensor_alloc(sizeof(comp));
+        CHECK(tkv_cur && tsc_cur && tskv && tssc && tcomp,
+              "compressor_update: device allocation failed (validation)");
+        CHECK(ds4_gpu_tensor_write(tskv, 0, state_kv, sizeof(state_kv)) != 0, "compressor_update: write state_kv (validation)");
+        CHECK(ds4_gpu_tensor_write(tssc, 0, state_score, sizeof(state_score)) != 0, "compressor_update: write state_score (validation)");
+
+        CHECK(ds4_gpu_compressor_update_tensor(
+                  tkv_cur, tsc_cur, tskv, tssc, tcomp, model, model_size,
+                  ape_offset, 0u, norm_offset, 0u, HEAD_DIM, RATIO,
+                  /*pos=*/2u, /*comp_row=*/0u, /*n_rot=*/1u, N_CTX_ORIG,
+                  FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR, BETA_FAST,
+                  BETA_SLOW, RMS_EPS, true, false, false) == 0,
+              "compressor_update: odd n_rot must be rejected");
+        CHECK(ds4_gpu_compressor_update_tensor(
+                  tkv_cur, tsc_cur, tskv, tssc, tcomp, model, model_size,
+                  ape_offset, 0u, norm_offset, 0u, HEAD_DIM, RATIO,
+                  /*pos=*/2u, /*comp_row=*/0u, /*n_rot=*/HEAD_DIM + 2u, N_CTX_ORIG,
+                  FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR, BETA_FAST,
+                  BETA_SLOW, RMS_EPS, true, false, false) == 0,
+              "compressor_update: n_rot > head_dim must be rejected");
+        CHECK(ds4_gpu_compressor_update_tensor(
+                  tkv_cur, tsc_cur, tskv, tssc, tcomp, model, model_size,
+                  ape_offset, 0u, norm_offset, /*norm_type=*/1u, HEAD_DIM, RATIO,
+                  /*pos=*/2u, /*comp_row=*/0u, /*n_rot=*/0u, N_CTX_ORIG,
+                  FREQ_BASE, FREQ_SCALE, EXT_FACTOR, ATTN_FACTOR, BETA_FAST,
+                  BETA_SLOW, RMS_EPS, true, false, false) == 0,
+              "compressor_update: non-zero norm_type must be rejected");
+
+        ds4_gpu_tensor_free(tkv_cur); ds4_gpu_tensor_free(tsc_cur);
+        ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
+        free(model);
+    }
+
+    fprintf(stderr, "  test_compressor_update OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_add() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1530,6 +2208,8 @@ int main(void) {
     if (test_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_head_rms_norm_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_compressor_store() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_compressor_pool() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_compressor_update() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_kernels OK\n");
     return 0;
