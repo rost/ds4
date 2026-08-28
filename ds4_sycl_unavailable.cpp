@@ -122,8 +122,14 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_compressor_update_tensor)
 extern "C" int ds4_gpu_decode_graph_begin(...) { return -1; }
 extern "C" int ds4_gpu_decode_graph_end(...) { return -1; }
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_decode_graphs_supported)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_device_cache_support_tensors)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_device_cache_tensors)
+/* ds4_gpu_device_cache_tensors / ds4_gpu_device_cache_support_tensors:
+ * 0 means success, a positive value is a distinct error code (see
+ * ds4_cuda.cu:3947 and ds4_cuda.cu:4103). ds4.c:56888 and ds4.c:57069
+ * both check "if (rc != 0) ... failed". Do not switch these back to
+ * SYCL_UNAVAILABLE_NONZERO_OK: that would stub them to 0, which reports
+ * a successful cache install when nothing was cached. */
+SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_device_cache_support_tensors)
+SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_device_cache_tensors)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_directional_steering_project_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dspark_markov_argmax_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dsv4_fp8_kv_quantize_tensor)
