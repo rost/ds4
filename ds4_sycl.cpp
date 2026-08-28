@@ -477,3 +477,6 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
 
 /* Same scoping reason as the two includes above. */
 #include "sycl/ds4_sycl_norm_rope.hpp"
+
+/* Same scoping reason as the includes above. */
+#include "sycl/ds4_sycl_compressor.hpp"

@@ -1222,6 +1222,294 @@ static int test_head_rms_norm_rope_tail(void) {
     return 0;
 }
 
+/* Half-precision bit decode, standard IEEE754 binary16 -> binary32,
+ * including the subnormal case.  Needed because a SYCL half type is not
+ * available in a plain C test (same reason cited at test_embed_f16 above);
+ * this is the decode counterpart of the round-trip-through-known-bit-
+ * patterns encoding technique used throughout this file. */
+static float oracle_half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp  = (uint32_t)(h >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)h & 0x3FFu;
+    uint32_t bits;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign;
+        } else {
+            int e = -1;
+            do { mant <<= 1; e++; } while ((mant & 0x400u) == 0u);
+            mant &= 0x3FFu;
+            bits = sign | ((uint32_t)(127 - 15 - e) << 23) | (mant << 13);
+        }
+    } else if (exp == 0x1Fu) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/* oracle_ape_value(model, ape_type, width, row, col): the APE accessor
+ * later compressor tasks reuse.  `model` points directly at the start of
+ * the APE table (offset already applied), matching how the GPU side reads
+ * model_ape_value_dev(..., width, row, col) as row * width + col
+ * (rocm/ds4_rocm_norm_rope.cuh:366-378); ds4's CPU reads the same element
+ * via tensor_2d_value(model, ape, j, pos_mod) (ds4.c:7882-7887), which is
+ * tensor_1d_value(y * dim[0] + x).  These address the same element.
+ * ape_type is restricted to 0 = F32, 1 = F16, 8 = Q8_0
+ * (rocm/ds4_rocm_compressor.cuh:181-183); the Q8_0 branch uses the same
+ * 32-value, 34-byte block layout (2-byte little-endian F16 scale then 32
+ * int8) as test_embed_q8_0 above. */
+static float oracle_ape_value(const unsigned char *model, uint32_t ape_type,
+                              uint32_t width, uint32_t row, uint32_t col) {
+    if (ape_type == 1u) {
+        const uint16_t *p = (const uint16_t *)model;
+        return oracle_half_to_float(p[(uint64_t)row * width + col]);
+    }
+    if (ape_type == 8u) {
+        const uint64_t row_bytes = ((uint64_t)width + 31u) / 32u * 34u;
+        const unsigned char *blk =
+                model + (uint64_t)row * row_bytes + (uint64_t)(col / 32u) * 34u;
+        const uint16_t raw = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
+        const float scale = oracle_half_to_float(raw);
+        const signed char q = (signed char)blk[2 + (col % 32u)];
+        return scale * (float)q;
+    }
+    const float *p = (const float *)model;
+    return p[(uint64_t)row * width + col];
+}
+
+/* Fills an ape_type-encoded table of `rows` rows by `width` columns with a
+ * value distinguishable per (row, col), so a transposed or misindexed read
+ * produces a visibly wrong value rather than a coincidental match.  The F16
+ * branch is restricted to the 8 exactly-representable small integers used
+ * by test_embed_f16 above, for the same reason: no float-to-half encoder
+ * exists in this C test, so the oracle must stay exact by construction
+ * rather than by rounding agreement with the kernel. */
+static void oracle_fill_ape(unsigned char *dst, uint32_t ape_type,
+                            uint32_t width, uint32_t rows) {
+    static const uint16_t kHalfSmallInt[8] = {
+        0x0000, /* 0.0 */ 0x3C00, /* 1.0 */ 0x4000, /* 2.0 */ 0x4200, /* 3.0 */
+        0x4400, /* 4.0 */ 0x4500, /* 5.0 */ 0x4600, /* 6.0 */ 0x4700  /* 7.0 */
+    };
+    if (ape_type == 0u) {
+        float *p = (float *)dst;
+        for (uint32_t r = 0; r < rows; r++) {
+            for (uint32_t c = 0; c < width; c++) {
+                p[(uint64_t)r * width + c] = (float)((int)(r * 13u + c * 7u) - 20);
+            }
+        }
+        return;
+    }
+    if (ape_type == 1u) {
+        uint16_t *p = (uint16_t *)dst;
+        for (uint32_t r = 0; r < rows; r++) {
+            for (uint32_t c = 0; c < width; c++) {
+                p[(uint64_t)r * width + c] = kHalfSmallInt[(r * 3u + c * 5u) % 8u];
+            }
+        }
+        return;
+    }
+    /* Q8_0: `rows` independent row blocks, each ceil(width/32) blocks of
+     * 32 values / 34 bytes.  Scale is fixed at exactly 1.0 (0x3C00) so the
+     * dequantised value equals the stored int8 exactly. */
+    const uint64_t row_bytes = ((uint64_t)width + 31u) / 32u * 34u;
+    for (uint32_t r = 0; r < rows; r++) {
+        for (uint32_t c = 0; c < width; c += 32u) {
+            unsigned char *blk = dst + (uint64_t)r * row_bytes + (uint64_t)(c / 32u) * 34u;
+            blk[0] = 0x00; blk[1] = 0x3C;
+            for (uint32_t i = 0; i < 32u && c + i < width; i++) {
+                blk[2 + i] = (unsigned char)(signed char)((r * width + c + i) % 15u - 7);
+            }
+        }
+    }
+}
+
+/* The store oracle: the store half of compressor_decode_one
+ * (ds4.c:12549-12554), whose ring math is at ds4.c:12521-12524, applied
+ * per token in a batch rather than one token at a time. */
+static void oracle_compressor_store(float *state_kv, float *state_score,
+                                    const float *kv, const float *sc,
+                                    const unsigned char *ape, uint32_t ape_type,
+                                    uint32_t width, uint32_t ratio,
+                                    uint32_t pos0, uint32_t n_tokens) {
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t pos_mod = (pos0 + t) % ratio;
+        const uint32_t dst_row = (ratio == 4u) ? ratio + pos_mod : pos_mod;
+        for (uint32_t j = 0; j < width; j++) {
+            state_kv[(uint64_t)dst_row * width + j] = kv[(uint64_t)t * width + j];
+            state_score[(uint64_t)dst_row * width + j] =
+                    sc[(uint64_t)t * width + j] +
+                    oracle_ape_value(ape, ape_type, width, pos_mod, j);
+        }
+    }
+}
+
+/* Runs one (ape_type, ratio) combination of test_compressor_store below:
+ * builds kv/sc/ape inputs, seeds the state tensors with a sentinel so any
+ * row the kernel does not touch is provably untouched, calls the entry
+ * under test, and compares every state row against oracle_compressor_store.
+ * `head_dim` and `ratio` are caller-chosen so this same body covers both
+ * the general-ratio and the ratio == 4 destination-row path. */
+static int oracle_compressor_store_case(uint32_t ape_type, uint32_t head_dim,
+                                        uint32_t ratio, uint32_t pos0,
+                                        uint32_t n_tokens, uint64_t ape_offset) {
+    const uint32_t coff       = ratio == 4u ? 2u : 1u;
+    const uint32_t width      = coff * head_dim;
+    const uint32_t state_rows = coff * ratio;
+    const uint64_t ape_bytes =
+            ape_type == 0u ? (uint64_t)width * ratio * sizeof(float) :
+            ape_type == 1u ? (uint64_t)width * ratio * sizeof(uint16_t) :
+                             (uint64_t)ratio * (((uint64_t)width + 31u) / 32u * 34u);
+    const uint64_t model_size = ape_offset + ape_bytes;
+
+    float *kv    = (float *)malloc((size_t)n_tokens * width * sizeof(float));
+    float *sc    = (float *)malloc((size_t)n_tokens * width * sizeof(float));
+    float *want_kv    = (float *)malloc((size_t)state_rows * width * sizeof(float));
+    float *want_score = (float *)malloc((size_t)state_rows * width * sizeof(float));
+    float *got_kv     = (float *)malloc((size_t)state_rows * width * sizeof(float));
+    float *got_score  = (float *)malloc((size_t)state_rows * width * sizeof(float));
+    unsigned char *model = (unsigned char *)malloc((size_t)model_size);
+    CHECK(kv && sc && want_kv && want_score && got_kv && got_score && model,
+          "compressor_store: host allocation failed");
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t j = 0; j < width; j++) {
+            kv[(uint64_t)t * width + j] = (float)(t * 1000u + j * 10u + 3u);
+            sc[(uint64_t)t * width + j] = (float)((int)(t * 100u) - (int)(j * 2u) - 5);
+        }
+    }
+    /* Sentinel padding before ape_offset: an implementation that ignores
+     * ape_offset and reads from the start of the model buffer would decode
+     * this instead of the real table and produce a visibly wrong score. */
+    memset(model, 0xAA, (size_t)ape_offset);
+    oracle_fill_ape(model + ape_offset, ape_type, width, ratio);
+
+    /* Sentinel state rows: for ratio == 4 only the high half (rows
+     * ratio..2*ratio-1) should ever be written.  Seeding the whole buffer
+     * with a value no oracle row produces lets the post-call comparison
+     * prove the low half was left alone, not just that the high half is
+     * correct. */
+    for (uint32_t i = 0; i < state_rows * width; i++) {
+        want_kv[i] = want_score[i] = -999.0f;
+    }
+    oracle_compressor_store(want_kv, want_score, kv, sc, model + ape_offset,
+                            ape_type, width, ratio, pos0, n_tokens);
+
+    ds4_gpu_tensor *tkv    = ds4_gpu_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));
+    ds4_gpu_tensor *tsc    = ds4_gpu_tensor_alloc((uint64_t)n_tokens * width * sizeof(float));
+    ds4_gpu_tensor *tskv   = ds4_gpu_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+    ds4_gpu_tensor *tssc   = ds4_gpu_tensor_alloc((uint64_t)state_rows * width * sizeof(float));
+    CHECK(tkv && tsc && tskv && tssc, "compressor_store: device allocation failed");
+
+    CHECK(ds4_gpu_tensor_write(tkv, 0, kv, (uint64_t)n_tokens * width * sizeof(float)) != 0,
+          "compressor_store: write kv");
+    CHECK(ds4_gpu_tensor_write(tsc, 0, sc, (uint64_t)n_tokens * width * sizeof(float)) != 0,
+          "compressor_store: write sc");
+    CHECK(ds4_gpu_tensor_write(tskv, 0, want_kv, (uint64_t)state_rows * width * sizeof(float)) != 0,
+          "compressor_store: seed state_kv sentinel");
+    CHECK(ds4_gpu_tensor_write(tssc, 0, want_score, (uint64_t)state_rows * width * sizeof(float)) != 0,
+          "compressor_store: seed state_score sentinel");
+
+    CHECK(ds4_gpu_compressor_store_batch_tensor(
+              tkv, tsc, tskv, tssc, model, model_size, ape_offset, ape_type,
+              head_dim, ratio, pos0, n_tokens) != 0,
+          "compressor_store: call");
+
+    CHECK(ds4_gpu_tensor_read(tskv, 0, got_kv, (uint64_t)state_rows * width * sizeof(float)) != 0,
+          "compressor_store: read state_kv");
+    CHECK(ds4_gpu_tensor_read(tssc, 0, got_score, (uint64_t)state_rows * width * sizeof(float)) != 0,
+          "compressor_store: read state_score");
+
+    for (uint32_t i = 0; i < state_rows * width; i++) {
+        CHECK(got_kv[i] == want_kv[i], "compressor_store: state_kv mismatch");
+        CHECK_CLOSE(got_score[i], want_score[i], 1e-3,
+                    "compressor_store: state_score mismatch");
+    }
+
+    ds4_gpu_tensor_free(tkv);
+    ds4_gpu_tensor_free(tsc);
+    ds4_gpu_tensor_free(tskv);
+    ds4_gpu_tensor_free(tssc);
+    free(kv); free(sc); free(want_kv); free(want_score);
+    free(got_kv); free(got_score); free(model);
+    return 0;
+}
+
+/* ds4_gpu_compressor_store_batch_tensor has no ds4.c call site: it is
+ * invoked backend-internally by ds4_gpu_compressor_update_tensor with
+ * n_tokens = 1 (rocm/ds4_rocm_compressor.cuh:292-298), never by ds4.c
+ * directly.  This entry point is tested here directly against
+ * oracle_compressor_store for all three permitted ape_type values, and
+ * for both the general-ratio and the ratio == 4 destination-row path
+ * (they compute dst_row differently; covering only one would prove only
+ * half the entry).  pos0 is non-zero and not a multiple of ratio in both
+ * cases, so the modular ring wrap is genuinely exercised rather than
+ * hidden by tokens landing at rows 0..n_tokens-1 in order. */
+static int test_compressor_store(void) {
+    const uint32_t ape_types[] = {0u, 1u, 8u};
+
+    for (size_t i = 0; i < sizeof(ape_types) / sizeof(ape_types[0]); i++) {
+        const uint32_t ape_type = ape_types[i];
+
+        /* General ratio: coff == 1, dst_row == pos_mod.  ratio = 3,
+         * pos0 = 8 (8 % 3 == 2, non-zero and not a multiple of 3), and
+         * n_tokens == ratio so the three tokens sweep the whole ring
+         * exactly once: pos_mod goes 2, 0, 1, wrapping from the last row
+         * back to the first partway through the batch. */
+        if (oracle_compressor_store_case(ape_type, /*head_dim=*/5u, /*ratio=*/3u,
+                                         /*pos0=*/8u, /*n_tokens=*/3u,
+                                         /*ape_offset=*/16u) != 0) {
+            return 1;
+        }
+
+        /* ratio == 4: coff == 2, dst_row == ratio + pos_mod, landing in the
+         * HIGH half (rows 4..7) of the 8-row ring; the low half (rows
+         * 0..3) must be left untouched.  pos0 = 6 (6 % 4 == 2, non-zero
+         * and not a multiple of 4); pos_mod goes 2, 3, 0, 1, again
+         * wrapping mid-batch. */
+        if (oracle_compressor_store_case(ape_type, /*head_dim=*/5u, /*ratio=*/4u,
+                                         /*pos0=*/6u, /*n_tokens=*/4u,
+                                         /*ape_offset=*/16u) != 0) {
+            return 1;
+        }
+    }
+
+    /* An unsupported ape_type must be rejected (rocm/ds4_rocm_compressor.cuh:
+     * 181-183 permits only 0, 1 and 8). */
+    {
+        enum { HEAD_DIM = 5, RATIO = 3, WIDTH = HEAD_DIM, N_TOKENS = 3 };
+        unsigned char model[WIDTH * RATIO * sizeof(float)];
+        memset(model, 0, sizeof(model));
+        ds4_gpu_tensor *tkv  = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * WIDTH * sizeof(float));
+        ds4_gpu_tensor *tsc  = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * WIDTH * sizeof(float));
+        ds4_gpu_tensor *tskv = ds4_gpu_tensor_alloc((uint64_t)RATIO * WIDTH * sizeof(float));
+        ds4_gpu_tensor *tssc = ds4_gpu_tensor_alloc((uint64_t)RATIO * WIDTH * sizeof(float));
+        CHECK(tkv && tsc && tskv && tssc,
+              "compressor_store: allocation failed (unsupported ape_type case)");
+        CHECK(ds4_gpu_compressor_store_batch_tensor(
+                  tkv, tsc, tskv, tssc, model, sizeof(model), 0, /*ape_type=*/2u,
+                  HEAD_DIM, RATIO, 8u, N_TOKENS) == 0,
+              "compressor_store: unsupported ape_type must be rejected");
+        /* n_tokens == 0 must also be rejected: unlike most entries in this
+         * backend, zero-sized work is not success here, matching the
+         * validation list at rocm/ds4_rocm_compressor.cuh:204-208. */
+        CHECK(ds4_gpu_compressor_store_batch_tensor(
+                  tkv, tsc, tskv, tssc, model, sizeof(model), 0, 0u,
+                  HEAD_DIM, RATIO, 8u, 0u) == 0,
+              "compressor_store: n_tokens == 0 must be rejected");
+        ds4_gpu_tensor_free(tkv);
+        ds4_gpu_tensor_free(tsc);
+        ds4_gpu_tensor_free(tskv);
+        ds4_gpu_tensor_free(tssc);
+    }
+
+    fprintf(stderr, "  test_compressor_store OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_add() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1241,6 +1529,7 @@ int main(void) {
     if (test_dsv4_qkv_rms_norm_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_head_rms_norm_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_compressor_store() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_kernels OK\n");
     return 0;
