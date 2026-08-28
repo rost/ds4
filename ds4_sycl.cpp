@@ -16,16 +16,38 @@ std::vector<ds4_sycl_device> g_devices;
 int                          g_current_tier = 0;
 bool                         g_initialised  = false;
 
+/* Set for the duration of ds4_gpu_cleanup.  ~sycl::queue invokes this
+ * translation unit's async handler for any error still pending when the
+ * queue is destroyed; g_devices.clear() in ds4_gpu_cleanup destroys every
+ * queue, and a handler that rethrows during that destruction would escape
+ * a noexcept destructor and call std::terminate.  While this flag is set
+ * the handler logs instead of rethrowing (see ds4_sycl_async_handler); it
+ * also covers the namespace-scope g_devices destructor run at process
+ * exit, since that also invokes the handler. */
+bool g_tearing_down = false;
+
 /* Installed on every queue so asynchronous errors are not silently
  * discarded.  Rethrowing here (rather than logging and swallowing) means
  * a caller synchronising with wait_and_throw() sees the error as a C++
  * exception at the call site, where the surrounding try/catch (see the
  * tensor alloc/free/transfer functions below) logs it and returns the
- * correct failure value for that entry's convention. */
+ * correct failure value for that entry's convention.  Every exception in
+ * the list is logged before the first is rethrown so a caller who never
+ * synchronises again does not silently lose the others.  While
+ * g_tearing_down is set (see ds4_gpu_cleanup) the handler only logs: a
+ * queue destructor is noexcept, and rethrowing out of it terminates the
+ * process. */
 void ds4_sycl_async_handler(sycl::exception_list exceptions) {
+    std::exception_ptr first = nullptr;
     for (const std::exception_ptr &e : exceptions) {
-        std::rethrow_exception(e);
+        try {
+            std::rethrow_exception(e);
+        } catch (const sycl::exception &ex) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "async error: %s\n", ex.what());
+        }
+        if (!first) first = e;
     }
+    if (first && !g_tearing_down) std::rethrow_exception(first);
 }
 
 /* Identifies a physical device independent of which backend or runtime
@@ -190,13 +212,29 @@ extern "C" int ds4_gpu_init(void) {
  * responsibility on every backend.  A tensor freed after cleanup does not
  * corrupt memory: ds4_gpu_tensor_free (like every other entry point here)
  * checks g_devices.empty() first and logs-and-leaks the device pointer
- * instead of calling into a torn-down queue. */
+ * instead of calling into a torn-down queue.
+ *
+ * Teardown safety: g_tearing_down is set for the duration of this function
+ * so ds4_sycl_async_handler logs rather than rethrows, then each queue is
+ * drained with wait_and_throw() (not the plain wait() used elsewhere) so
+ * any pending async error surfaces here, inside a try/catch that logs and
+ * swallows it, rather than escaping ~sycl::queue during g_devices.clear()
+ * and calling std::terminate out of that noexcept destructor. */
 extern "C" void ds4_gpu_cleanup(void) {
-    for (ds4_sycl_device &d : g_devices) d.queue.wait();
+    g_tearing_down = true;
+    for (ds4_sycl_device &d : g_devices) {
+        try {
+            d.queue.wait_and_throw();
+        } catch (const sycl::exception &e) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "cleanup: async error during "
+                    "teardown: %s\n", e.what());
+        }
+    }
     g_devices.clear();
     g_n_gpus       = 0;
     g_current_tier = 0;
     g_initialised  = false;
+    g_tearing_down = false;
 }
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes) {
