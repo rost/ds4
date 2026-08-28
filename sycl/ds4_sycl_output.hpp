@@ -27,7 +27,21 @@ struct sycl_device_scratch_guard {
     sycl::queue &q;
     void        *p;
     sycl_device_scratch_guard(sycl::queue &queue, void *ptr) : q(queue), p(ptr) {}
-    ~sycl_device_scratch_guard() { if (p) sycl::free(p, q); }
+    ~sycl_device_scratch_guard() {
+        /* Destructors are implicitly noexcept: if sycl::free throws while
+         * we are already unwinding from another exception (e.g. the
+         * memcpy's wait_and_throw), an escaping exception here would call
+         * std::terminate instead of surfacing a clean failure.  There is
+         * no meaningful recovery from a failed free during unwinding, so
+         * log and swallow rather than let it propagate. */
+        if (!p) return;
+        try {
+            sycl::free(p, q);
+        } catch (const sycl::exception &e) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "device scratch free failed: %s\n", e.what());
+        }
+    }
     sycl_device_scratch_guard(const sycl_device_scratch_guard &) = delete;
     sycl_device_scratch_guard &operator=(const sycl_device_scratch_guard &) = delete;
 };
