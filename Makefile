@@ -387,8 +387,16 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
+# -iquote (not -I.) on purpose: sycl/ds4_sycl_common.hpp's quoted
+# #include "ds4_gpu_mgpu.h" needs the repo root on the search path, but
+# ds4_sycl.cpp is the file that does #include <sycl/sycl.hpp> (see the
+# "never create a local sycl/sycl.hpp" invariant in ds4_sycl.h). -I. would
+# extend the angle-bracket search path too, letting a repo-local
+# sycl/sycl.hpp shadow the real oneAPI header for exactly this
+# compilation. -iquote only extends the quoted-include search path, so it
+# fixes the header lookup without arming that shadow.
 ds4_sycl.o: ds4_sycl.cpp ds4_sycl.h ds4_gpu.h ds4_gpu_mgpu.h $(SYCL_SRCS)
-	$(ICPX) $(SYCL_CFLAGS) -I. -c -o $@ ds4_sycl.cpp
+	$(ICPX) $(SYCL_CFLAGS) -iquote . -c -o $@ ds4_sycl.cpp
 
 ds4_sycl_unavailable.o: ds4_sycl_unavailable.cpp
 	$(ICPX) $(SYCL_CFLAGS) -c -o $@ ds4_sycl_unavailable.cpp
