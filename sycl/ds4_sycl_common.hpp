@@ -3,12 +3,11 @@
 /* Argument-validation helpers shared by every SYCL kernel entry point.
  * This is a subset of the cuda_* family in rocm/ds4_rocm_runtime.cuh:376-530,
  * ported as each helper is needed rather than all at once.  Known absent:
- * cuda_u64_add_checked, cuda_tensor_has_elems3, cuda_tensor_has_f16 and
- * cuda_tensor_has_u16.  None of the current entries need them; add the
- * SYCL equivalent of one only when a later kernel actually requires it.
- * Every one is overflow-safe by construction: ds4 entry points receive
- * sizes from model metadata and must never compute a product or a range
- * that wraps. */
+ * cuda_u64_add_checked, cuda_tensor_has_f16 and cuda_tensor_has_u16.  None
+ * of the current entries need them; add the SYCL equivalent of one only
+ * when a later kernel actually requires it.  Every one is overflow-safe by
+ * construction: ds4 entry points receive sizes from model metadata and
+ * must never compute a product or a range that wraps. */
 
 #include "ds4_gpu_mgpu.h"
 
@@ -43,6 +42,16 @@ static inline int sycl_tensor_has_elems2(const ds4_gpu_tensor *t, uint64_t a,
                                          uint64_t b, uint64_t elem_size) {
     uint64_t bytes = 0;
     return sycl_u64_mul3_checked(a, b, elem_size, &bytes) &&
+           sycl_tensor_has_bytes(t, bytes);
+}
+
+static inline int sycl_tensor_has_elems3(const ds4_gpu_tensor *t, uint64_t a,
+                                         uint64_t b, uint64_t c,
+                                         uint64_t elem_size) {
+    uint64_t ab = 0, elems = 0, bytes = 0;
+    return sycl_u64_mul_checked(a, b, &ab) &&
+           sycl_u64_mul_checked(ab, c, &elems) &&
+           sycl_u64_mul_checked(elems, elem_size, &bytes) &&
            sycl_tensor_has_bytes(t, bytes);
 }
 

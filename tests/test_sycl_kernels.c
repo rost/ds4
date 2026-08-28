@@ -758,6 +758,157 @@ static int test_add_rms_norm_weight(void) {
     return 0;
 }
 
+/* Oracle mirrors head_rms_norm_inplace, ds4.c:6772-6781: normalises each
+ * head's head_dim slice independently within one token's n_head*head_dim
+ * block. */
+static void oracle_head_rms_norm_inplace(float *x, int n_head, int head_dim,
+                                         float eps) {
+    for (int h = 0; h < n_head; h++) {
+        float *head = x + (size_t)h * head_dim;
+        double ss = 0.0;
+        for (int i = 0; i < head_dim; i++) ss += (double)head[i] * head[i];
+        const float scale = 1.0f / sqrtf((float)(ss / (double)head_dim) + eps);
+        for (int i = 0; i < head_dim; i++) head[i] *= scale;
+    }
+}
+
+static int test_head_rms_norm(void) {
+    enum { N_TOK = 3, N_HEAD = 4, HEAD_DIM = 65 };
+    const float eps = 1e-5f;
+    float x[N_TOK * N_HEAD * HEAD_DIM];
+    float want[N_TOK * N_HEAD * HEAD_DIM];
+    float got[N_TOK * N_HEAD * HEAD_DIM];
+
+    /* Each (token, head) pair gets a different magnitude, so a kernel that
+     * normalised across heads instead of within each, or across the whole
+     * buffer instead of per (token, head), fails rather than passing by
+     * coincidence. */
+    for (int t = 0; t < N_TOK; t++) {
+        for (int h = 0; h < N_HEAD; h++) {
+            const float mag = (float)(h + 1) * (float)(t + 2);
+            float *dst = &x[(t * N_HEAD + h) * HEAD_DIM];
+            for (int i = 0; i < HEAD_DIM; i++) {
+                dst[i] = ((float)(i % 9) - 4.0f) * 0.1f * mag;
+            }
+        }
+    }
+    memcpy(want, x, sizeof(x));
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    CHECK(tx != NULL, "head_rms_norm: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "head_rms_norm: write");
+    CHECK(ds4_gpu_head_rms_norm_tensor(tx, N_TOK, N_HEAD, HEAD_DIM, eps) != 0,
+          "head_rms_norm: call");
+    CHECK(ds4_gpu_tensor_read(tx, 0, got, sizeof(got)) != 0,
+          "head_rms_norm: read");
+
+    for (int t = 0; t < N_TOK; t++) {
+        oracle_head_rms_norm_inplace(&want[t * N_HEAD * HEAD_DIM], N_HEAD,
+                                     HEAD_DIM, eps);
+    }
+    for (int i = 0; i < N_TOK * N_HEAD * HEAD_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-4, "head_rms_norm: value mismatch");
+    }
+
+    CHECK(ds4_gpu_head_rms_norm_tensor(tx, N_TOK, N_HEAD, 0, eps) != 0,
+          "head_rms_norm: head_dim=0 must succeed");
+    CHECK(ds4_gpu_head_rms_norm_tensor(tx, 0, N_HEAD, HEAD_DIM, eps) != 0,
+          "head_rms_norm: n_tok=0 must succeed");
+
+    ds4_gpu_tensor *small = ds4_gpu_tensor_alloc(4);
+    CHECK(small != NULL, "head_rms_norm: alloc for undersized case");
+    CHECK(ds4_gpu_head_rms_norm_tensor(small, 1, 1, HEAD_DIM, eps) == 0,
+          "head_rms_norm: undersized tensor must be rejected");
+    ds4_gpu_tensor_free(small);
+
+    ds4_gpu_tensor_free(tx);
+    fprintf(stderr, "  test_head_rms_norm OK\n");
+    return 0;
+}
+
+/* ds4_gpu_dsv4_qkv_rms_norm_rows_tensor runs rms_norm_weight
+ * (ds4.c:6763-6769) twice per row in one launch, with the Q and KV halves
+ * selecting their own width (rocm/ds4_rocm_norm_rope.cuh:47-81).  Q_N and
+ * KV_N are deliberately different: a port that computed the row stride
+ * before selecting the width, or that reused one width for both sides,
+ * would mis-index one half silently if the widths matched. */
+static int test_dsv4_qkv_rms_norm_rows(void) {
+    enum { ROWS = 4, Q_N = 192, KV_N = 96 };
+    const float eps = 1e-5f;
+    float q_x[ROWS * Q_N], kv_x[ROWS * KV_N];
+    float q_w[Q_N], kv_w[KV_N];
+    float q_got[ROWS * Q_N], kv_got[ROWS * KV_N];
+    float q_want[Q_N], kv_want[KV_N];
+
+    for (int i = 0; i < ROWS * Q_N; i++) {
+        q_x[i] = ((float)(i % 17) - 8.0f) * 0.1f;
+    }
+    for (int i = 0; i < ROWS * KV_N; i++) {
+        kv_x[i] = ((float)(i % 11) - 5.0f) * 0.2f;
+    }
+    for (int i = 0; i < Q_N; i++) q_w[i] = ((float)(i % 5) + 1.0f) * 0.3f;
+    for (int i = 0; i < KV_N; i++) kv_w[i] = ((float)(i % 3) + 1.0f) * 0.4f;
+
+    /* Concatenate both weight vectors into one host "model" buffer so the
+     * offsets exercised are real byte offsets rather than both being 0. */
+    unsigned char model[sizeof(q_w) + sizeof(kv_w)];
+    memcpy(model, q_w, sizeof(q_w));
+    memcpy(model + sizeof(q_w), kv_w, sizeof(kv_w));
+    const uint64_t q_off = 0;
+    const uint64_t kv_off = sizeof(q_w);
+
+    ds4_gpu_tensor *tqx = ds4_gpu_tensor_alloc(sizeof(q_x));
+    ds4_gpu_tensor *tqo = ds4_gpu_tensor_alloc(sizeof(q_got));
+    ds4_gpu_tensor *tkvx = ds4_gpu_tensor_alloc(sizeof(kv_x));
+    ds4_gpu_tensor *tkvo = ds4_gpu_tensor_alloc(sizeof(kv_got));
+    CHECK(tqx && tqo && tkvx && tkvo, "dsv4_qkv: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tqx, 0, q_x, sizeof(q_x)) != 0,
+          "dsv4_qkv: write q");
+    CHECK(ds4_gpu_tensor_write(tkvx, 0, kv_x, sizeof(kv_x)) != 0,
+          "dsv4_qkv: write kv");
+
+    CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+              tqo, tqx, model, sizeof(model), q_off, Q_N,
+              tkvo, tkvx, kv_off, KV_N, ROWS, eps) != 0,
+          "dsv4_qkv: call");
+
+    CHECK(ds4_gpu_tensor_read(tqo, 0, q_got, sizeof(q_got)) != 0,
+          "dsv4_qkv: read q");
+    CHECK(ds4_gpu_tensor_read(tkvo, 0, kv_got, sizeof(kv_got)) != 0,
+          "dsv4_qkv: read kv");
+
+    for (int r = 0; r < ROWS; r++) {
+        oracle_rms_norm_weight(q_want, &q_x[r * Q_N], q_w, Q_N, eps);
+        for (int i = 0; i < Q_N; i++) {
+            CHECK_CLOSE(q_got[r * Q_N + i], q_want[i], 1e-4,
+                        "dsv4_qkv: q value mismatch");
+        }
+        oracle_rms_norm_weight(kv_want, &kv_x[r * KV_N], kv_w, KV_N, eps);
+        for (int i = 0; i < KV_N; i++) {
+            CHECK_CLOSE(kv_got[r * KV_N + i], kv_want[i], 1e-4,
+                        "dsv4_qkv: kv value mismatch");
+        }
+    }
+
+    CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+              tqo, tqx, model, sizeof(model), q_off, Q_N,
+              tkvo, tkvx, kv_off, KV_N, 0, eps) != 0,
+          "dsv4_qkv: rows=0 must succeed");
+
+    CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+              tqo, tqx, model, sizeof(model), sizeof(model), Q_N,
+              tkvo, tkvx, kv_off, KV_N, ROWS, eps) == 0,
+          "dsv4_qkv: out-of-range q weight_offset must be rejected");
+
+    ds4_gpu_tensor_free(tqx);
+    ds4_gpu_tensor_free(tqo);
+    ds4_gpu_tensor_free(tkvx);
+    ds4_gpu_tensor_free(tkvo);
+    fprintf(stderr, "  test_dsv4_qkv_rms_norm_rows OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_add() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -773,6 +924,8 @@ int main(void) {
     if (test_rms_norm_weight() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_rms_norm_weight_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_add_rms_norm_weight() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_head_rms_norm() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dsv4_qkv_rms_norm_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_kernels OK\n");
     return 0;
