@@ -397,6 +397,56 @@ static void sycl_indexer_topk_kernel(sycl::nd_item<1> it, uint32_t *selected,
     }
 }
 
+/* The bitonic network shared by every top-k kernel below (pow2, the u16
+ * variant, and the tree-merge family added alongside it): XOR-swap
+ * exchange, direction from (i & k) == 0u, sycl_topk_score_better's
+ * ascending-index tie-break. Factored once here rather than left as five
+ * near-identical copies, since rocm/ds4_rocm_indexer.cuh's five bitonic
+ * kernels (indexer_topk_pow2_kernel, _pow2_u16_kernel, _chunk_pow2_kernel,
+ * _merge_pow2_kernel, _tree_merge_pow2_kernel) differ only in how `vals`/
+ * `idxs` are loaded beforehand and where the top_k winners are written
+ * afterward, never in the network itself; adding three more verbatim
+ * copies while porting the tree-merge path would have made this file's
+ * single largest correctness surface exist in five places instead of one.
+ * IndexT is uint32_t for every caller except the SORT_N == 8192 pow2
+ * variant, which uses uint16_t (see that kernel's own comment for why).
+ * Item is templated rather than fixed to sycl::nd_item<1> so this serves
+ * both the 1D single-block callers (pow2, pow2_u16, merge) and the 2D
+ * (token, chunk-or-group) callers (chunk, tree-merge) below: every caller
+ * only ever addresses dimension 0 for its local id and range, which is
+ * all the network itself needs regardless of how many grid dimensions
+ * the caller's own group indexing uses. */
+template <uint32_t SORT_N, typename IndexT, typename Item>
+static void sycl_bitonic_topk_network(Item it,
+                                      sycl::local_accessor<float, 1> vals,
+                                      sycl::local_accessor<IndexT, 1> idxs) {
+    const uint32_t tid = (uint32_t)it.get_local_id(0);
+    const uint32_t block_dim = (uint32_t)it.get_local_range(0);
+    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            for (uint32_t i = tid; i < SORT_N; i += block_dim) {
+                const uint32_t other = i ^ j;
+                if (other > i && other < SORT_N) {
+                    const float av = vals[i];
+                    const float bv = vals[other];
+                    const uint32_t ai = (uint32_t)idxs[i];
+                    const uint32_t bi = (uint32_t)idxs[other];
+                    const bool desc_half = (i & k) == 0u;
+                    const bool swap = desc_half ? sycl_topk_score_better(bv, bi, av, ai)
+                                                : sycl_topk_score_better(av, ai, bv, bi);
+                    if (swap) {
+                        vals[i] = bv;
+                        idxs[i] = (IndexT)bi;
+                        vals[other] = av;
+                        idxs[other] = (IndexT)ai;
+                    }
+                }
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+        }
+    }
+}
+
 /* Bitonic top-k, ported from indexer_topk_pow2_kernel<SORT_N>
  * (rocm/ds4_rocm_indexer.cuh:481-533), and standing in for
  * indexer_topk_1024_kernel at SORT_N == 1024 per the file-section comment
@@ -427,29 +477,7 @@ static void sycl_indexer_topk_pow2_kernel(
     }
     it.barrier(sycl::access::fence_space::local_space);
 
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += block_dim) {
-                const uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half ? sycl_topk_score_better(bv, bi, av, ai)
-                                                : sycl_topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = bi;
-                        vals[other] = av;
-                        idxs[other] = ai;
-                    }
-                }
-            }
-            it.barrier(sycl::access::fence_space::local_space);
-        }
-    }
+    sycl_bitonic_topk_network<SORT_N>(it, vals, idxs);
 
     for (uint32_t i = tid; i < top_k; i += block_dim) {
         selected[(uint64_t)t * top_k + i] = idxs[i];
@@ -459,17 +487,18 @@ static void sycl_indexer_topk_pow2_kernel(
 /* Bitonic top-k with uint16_t indices, ported from
  * indexer_topk_pow2_u16_kernel<SORT_N> (rocm/ds4_rocm_indexer.cuh:536-
  * 588), instantiated only at SORT_N == 8192. Identical network to
- * sycl_indexer_topk_pow2_kernel above; the only difference is the local
- * index array's element type, which is why this is a separate kernel
- * rather than a specialisation parametrised some other way -- ROCm
- * itself ports it as a distinct kernel for exactly this reason (halving
- * shared memory for the index array at the one width where the network
- * is wide enough for that to matter). The padding sentinel is
- * UINT16_MAX, not UINT32_MAX: at SORT_N == 8192 every real index fits in
- * 13 bits, so UINT16_MAX (65535) can never collide with one, and 8192 is
- * also the largest SORT_N this file instantiates, so a uint16_t index
- * never needs to represent more than 8191 -- an index above 65535 is
- * unreachable at this width by construction, not merely untested. */
+ * sycl_indexer_topk_pow2_kernel above (both now call
+ * sycl_bitonic_topk_network); the only difference is the local index
+ * array's element type, which is why this is a separate kernel rather
+ * than a specialisation parametrised some other way -- ROCm itself ports
+ * it as a distinct kernel for exactly this reason (halving shared memory
+ * for the index array at the one width where the network is wide enough
+ * for that to matter). The padding sentinel is UINT16_MAX, not
+ * UINT32_MAX: at SORT_N == 8192 every real index fits in 13 bits, so
+ * UINT16_MAX (65535) can never collide with one, and 8192 is also the
+ * largest SORT_N this file instantiates, so a uint16_t index never needs
+ * to represent more than 8191 -- an index above 65535 is unreachable at
+ * this width by construction, not merely untested. */
 template <uint32_t SORT_N>
 static void sycl_indexer_topk_pow2_u16_kernel(
         sycl::nd_item<1> it, sycl::local_accessor<float, 1> vals,
@@ -492,43 +521,323 @@ static void sycl_indexer_topk_pow2_u16_kernel(
     }
     it.barrier(sycl::access::fence_space::local_space);
 
-    for (uint32_t k = 2u; k <= SORT_N; k <<= 1u) {
-        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
-            for (uint32_t i = tid; i < SORT_N; i += block_dim) {
-                const uint32_t other = i ^ j;
-                if (other > i && other < SORT_N) {
-                    const float av = vals[i];
-                    const float bv = vals[other];
-                    const uint32_t ai = idxs[i];
-                    const uint32_t bi = idxs[other];
-                    const bool desc_half = (i & k) == 0u;
-                    const bool swap = desc_half ? sycl_topk_score_better(bv, bi, av, ai)
-                                                : sycl_topk_score_better(av, ai, bv, bi);
-                    if (swap) {
-                        vals[i] = bv;
-                        idxs[i] = (uint16_t)bi;
-                        vals[other] = av;
-                        idxs[other] = (uint16_t)ai;
-                    }
-                }
-            }
-            it.barrier(sycl::access::fence_space::local_space);
-        }
-    }
+    sycl_bitonic_topk_network<SORT_N>(it, vals, idxs);
 
     for (uint32_t i = tid; i < top_k; i += block_dim) {
         selected[(uint64_t)t * top_k + i] = idxs[i];
     }
 }
 
+/* Per-chunk partial top-k, ported from indexer_topk_chunk_pow2_kernel
+ * (rocm/ds4_rocm_indexer.cuh:591-650), instantiated only at SORT_N ==
+ * 4096. One work-group per (token, chunk) pair; the chunk's real range is
+ * [chunk_start, chunk_start + chunk_n), where chunk_n is capped to
+ * SORT_N so the last, possibly-partial chunk is still handled correctly.
+ * Writes its own top_k winners into a candidate scratch buffer, at
+ * `candidate_stride`-wide per-token stride, `chunk * top_k` into that
+ * token's row -- input to sycl_indexer_topk_tree_merge_pow2_kernel or
+ * sycl_indexer_topk_merge_pow2_kernel below. */
+template <uint32_t SORT_N>
+static void sycl_indexer_topk_chunk_pow2_kernel(
+        sycl::nd_item<2> it, sycl::local_accessor<float, 1> vals,
+        sycl::local_accessor<uint32_t, 1> idxs, uint32_t *candidates,
+        const float *scores, uint32_t n_comp, uint32_t n_tokens, uint32_t top_k,
+        uint32_t candidate_stride) {
+    const uint32_t t = (uint32_t)it.get_group(0);
+    const uint32_t chunk = (uint32_t)it.get_group(1);
+    const uint32_t tid = (uint32_t)it.get_local_id(0);
+    const uint32_t block_dim = (uint32_t)it.get_local_range(0);
+    if (t >= n_tokens) return;
+
+    const uint32_t chunk_start = chunk * SORT_N;
+    if (chunk_start >= n_comp) return;
+    const uint32_t chunk_n = n_comp - chunk_start < SORT_N ? n_comp - chunk_start : SORT_N;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    for (uint32_t i = tid; i < SORT_N; i += block_dim) {
+        if (i < chunk_n) {
+            vals[i] = row[chunk_start + i];
+            idxs[i] = chunk_start + i;
+        } else {
+            vals[i] = -INFINITY;
+            idxs[i] = UINT32_MAX;
+        }
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+
+    sycl_bitonic_topk_network<SORT_N>(it, vals, idxs);
+
+    uint32_t *out = candidates + (uint64_t)t * candidate_stride + chunk * top_k;
+    for (uint32_t i = tid; i < top_k; i += block_dim) out[i] = idxs[i];
+}
+
+/* Final merge, ported from indexer_topk_merge_pow2_kernel
+ * (rocm/ds4_rocm_indexer.cuh:653-710), instantiated only at SORT_N ==
+ * 4096: re-sorts `candidate_count` candidate indices (each already a
+ * genuine comp-row index, looked back up in `scores` to recover its
+ * value) and writes the final top_k winners to `selected`, the same
+ * output tensor sycl_indexer_topk_pow2_kernel writes for the single-block
+ * widths. An out-of-range candidate index (>= n_comp, meaning an unfilled
+ * slot from a partial final chunk one level down) is treated the same as
+ * this file's other padding: -INFINITY, so it cannot win a comparison
+ * against a real candidate. */
+template <uint32_t SORT_N>
+static void sycl_indexer_topk_merge_pow2_kernel(
+        sycl::nd_item<1> it, sycl::local_accessor<float, 1> vals,
+        sycl::local_accessor<uint32_t, 1> idxs, uint32_t *selected,
+        const uint32_t *candidates, const float *scores, uint32_t n_comp,
+        uint32_t n_tokens, uint32_t top_k, uint32_t candidate_count,
+        uint32_t candidate_stride) {
+    const uint32_t t = (uint32_t)it.get_group(0);
+    const uint32_t tid = (uint32_t)it.get_local_id(0);
+    const uint32_t block_dim = (uint32_t)it.get_local_range(0);
+    if (t >= n_tokens) return;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride;
+    for (uint32_t i = tid; i < SORT_N; i += block_dim) {
+        uint32_t idx = UINT32_MAX;
+        float v = -INFINITY;
+        if (i < candidate_count) {
+            idx = cand[i];
+            if (idx < n_comp) v = row[idx];
+        }
+        vals[i] = v;
+        idxs[i] = idx;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+
+    sycl_bitonic_topk_network<SORT_N>(it, vals, idxs);
+
+    for (uint32_t i = tid; i < top_k; i += block_dim) {
+        selected[(uint64_t)t * top_k + i] = idxs[i];
+    }
+}
+
+/* Intermediate tree-merge level, ported from
+ * indexer_topk_tree_merge_pow2_kernel (rocm/ds4_rocm_indexer.cuh:713-781),
+ * instantiated only at SORT_N == 4096: combines up to `merge_group`
+ * consecutive candidate sets (each already top_k-wide, from a prior chunk
+ * or tree level) into one re-sorted top_k-wide set at the next level, the
+ * same candidate-index-then-value-lookup shape as the final merge above.
+ * One work-group per (token, output group); `group` selects which
+ * `merge_group`-wide span of input sets this work-group reduces, and
+ * `set_count` caps that span for the last, possibly-partial group. */
+template <uint32_t SORT_N>
+static void sycl_indexer_topk_tree_merge_pow2_kernel(
+        sycl::nd_item<2> it, sycl::local_accessor<float, 1> vals,
+        sycl::local_accessor<uint32_t, 1> idxs, uint32_t *out,
+        const uint32_t *candidates, const float *scores, uint32_t n_comp,
+        uint32_t n_tokens, uint32_t top_k, uint32_t n_sets, uint32_t merge_group,
+        uint32_t candidate_stride, uint32_t out_stride) {
+    const uint32_t t = (uint32_t)it.get_group(0);
+    const uint32_t group = (uint32_t)it.get_group(1);
+    const uint32_t tid = (uint32_t)it.get_local_id(0);
+    const uint32_t block_dim = (uint32_t)it.get_local_range(0);
+    if (t >= n_tokens) return;
+
+    const uint32_t set0 = group * merge_group;
+    if (set0 >= n_sets) return;
+    uint32_t set_count = n_sets - set0;
+    if (set_count > merge_group) set_count = merge_group;
+    const uint32_t candidate_count = set_count * top_k;
+
+    const float *row = scores + (uint64_t)t * n_comp;
+    const uint32_t *cand = candidates + (uint64_t)t * candidate_stride + set0 * top_k;
+    for (uint32_t i = tid; i < SORT_N; i += block_dim) {
+        uint32_t idx = UINT32_MAX;
+        float v = -INFINITY;
+        if (i < candidate_count) {
+            idx = cand[i];
+            if (idx < n_comp) v = row[idx];
+        }
+        vals[i] = v;
+        idxs[i] = idx;
+    }
+    it.barrier(sycl::access::fence_space::local_space);
+
+    sycl_bitonic_topk_network<SORT_N>(it, vals, idxs);
+
+    uint32_t *dst = out + (uint64_t)t * out_stride + group * top_k;
+    for (uint32_t i = tid; i < top_k; i += block_dim) dst[i] = idxs[i];
+}
+
+/* Plain 512-wide ascending bitonic sort of int32 values, ported from
+ * indexed_topk_sort_512_asc_kernel (rocm/ds4_rocm_indexer.cuh:783-814).
+ * NOT part of ds4_gpu_indexer_topk_tensor's dispatch: this sorts a list
+ * of already-selected indices into ascending order for the attention
+ * subsystem's consumption (attention_launch.cuh:540), a separate plan.
+ * Unlike every kernel above, this network carries no separate index
+ * array and no tie-break helper: it sorts the int32 VALUES themselves
+ * (here, comp-row indices produced by a prior top-k pass) directly, with
+ * plain integer comparisons standing in for topk_score_better since there
+ * is nothing left to break a tie on when the value being sorted IS the
+ * index. */
+static void sycl_indexed_topk_sort_512_asc_kernel(sycl::nd_item<1> it,
+                                                   sycl::local_accessor<int32_t, 1> rows,
+                                                   int32_t *dst, const int32_t *src,
+                                                   uint32_t n_tokens) {
+    const uint32_t t = (uint32_t)it.get_group(0);
+    const uint32_t tid = (uint32_t)it.get_local_id(0);
+    if (t >= n_tokens || tid >= 512u) return;
+
+    const int32_t *src_row = src + (uint64_t)t * 512u;
+    int32_t *dst_row = dst + (uint64_t)t * 512u;
+    rows[tid] = src_row[tid];
+    it.barrier(sycl::access::fence_space::local_space);
+
+    for (uint32_t k = 2u; k <= 512u; k <<= 1u) {
+        for (uint32_t j = k >> 1u; j > 0u; j >>= 1u) {
+            const uint32_t other = tid ^ j;
+            if (other > tid && other < 512u) {
+                const int32_t a = rows[tid];
+                const int32_t b = rows[other];
+                const bool up = (tid & k) == 0u;
+                if ((up && a > b) || (!up && a < b)) {
+                    rows[tid] = b;
+                    rows[other] = a;
+                }
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+        }
+    }
+
+    dst_row[tid] = rows[tid];
+}
+
+/* Tree-merge path for n_comp > 8192 with top_k in {512, 1024, 2048},
+ * ported from the generic chunk+merge dispatch at
+ * rocm/ds4_rocm_indexer.cuh:1091-1152. `chunk_n` is fixed at 4096 (ROCm's
+ * own constant): each chunk gets its own top_k-wide partial winner list
+ * via sycl_indexer_topk_chunk_pow2_kernel<4096>, `merge_group` (= chunk_n
+ * / top_k, e.g. 8 at top_k == 512) consecutive candidate sets are folded
+ * together per tree level via sycl_indexer_topk_tree_merge_pow2_kernel
+ * <4096> until at most merge_group sets remain, and
+ * sycl_indexer_topk_merge_pow2_kernel<4096> produces the final top_k into
+ * `selected`. All three kernel families read `scores` directly to look up
+ * a candidate's value, so scratch only ever needs to hold candidate
+ * INDICES, not values.
+ *
+ * Scratch is one flat device buffer holding every tree level
+ * back-to-back, `n_tokens * level_stride` uint32 elements per level,
+ * exactly mirroring ROCm's own single cuda_tmp_alloc plus pointer
+ * arithmetic between levels: `cur` advances past the whole previous
+ * level's `n_tokens * cur_stride` elements when moving to the next.
+ * Every multiplication here is overflow-checked, per this file's
+ * (and spec 6l's sibling, spec-wide) requirement that model-derived size
+ * arithmetic never silently wrap; `n_chunks`/`n_sets` are bounded by
+ * n_comp and top_k, both already validated nonzero by the caller. */
+static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const float *pscores,
+                                         uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
+    constexpr uint32_t kSortN = 4096u;
+    constexpr uint32_t kThreads = 1024u;
+    const uint32_t n_chunks = (n_comp + kSortN - 1u) / kSortN;
+    const uint32_t merge_group = kSortN / top_k;
+
+    uint64_t candidate_stride64 = 0;
+    if (!sycl_u64_mul_checked(n_chunks, top_k, &candidate_stride64) ||
+        candidate_stride64 > UINT32_MAX) {
+        return 0;
+    }
+    const uint32_t candidate_stride = (uint32_t)candidate_stride64;
+
+    uint32_t n_sets = n_chunks;
+    uint64_t scratch_per_token = candidate_stride;
+    while (n_sets > merge_group) {
+        n_sets = (n_sets + merge_group - 1u) / merge_group;
+        uint64_t level_elems = 0, next_total = 0;
+        if (!sycl_u64_mul_checked(n_sets, top_k, &level_elems) ||
+            !sycl_u64_add_checked(scratch_per_token, level_elems, &next_total)) {
+            return 0;
+        }
+        scratch_per_token = next_total;
+    }
+    uint64_t scratch_elems = 0, scratch_bytes = 0;
+    if (!sycl_u64_mul_checked(n_tokens, scratch_per_token, &scratch_elems) ||
+        !sycl_u64_mul_checked(scratch_elems, sizeof(uint32_t), &scratch_bytes)) {
+        return 0;
+    }
+
+    uint32_t *scratch = sycl::malloc_device<uint32_t>((size_t)scratch_elems, dq);
+    if (!scratch) return 0;
+    sycl_device_scratch_guard guard(dq, scratch);
+
+    uint32_t *cur = scratch;
+    n_sets = n_chunks;
+    uint32_t cur_stride = candidate_stride;
+
+    /* Chunk stage: one work-group per (token, chunk), matching ROCm's
+     * dim3 grid_chunks(n_tokens, n_chunks, 1). */
+    dq.submit([&](sycl::handler &h) {
+        sycl::local_accessor<float, 1> vals(sycl::range<1>(kSortN), h);
+        sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(kSortN), h);
+        uint32_t *out = cur;
+        h.parallel_for(sycl::nd_range<2>(sycl::range<2>((size_t)n_tokens * kThreads, n_chunks),
+                                         sycl::range<2>(kThreads, 1)),
+                       [=](sycl::nd_item<2> it) {
+                           sycl_indexer_topk_chunk_pow2_kernel<kSortN>(
+                                   it, vals, idxs, out, pscores, n_comp, n_tokens, top_k,
+                                   candidate_stride);
+                       });
+    });
+
+    /* Tree levels: fold merge_group consecutive candidate sets together
+     * per level until at most merge_group sets remain, matching ROCm's
+     * dim3 grid_merge(n_tokens, next_sets, 1) per level. */
+    while (n_sets > merge_group) {
+        const uint32_t next_sets = (n_sets + merge_group - 1u) / merge_group;
+        const uint32_t next_stride = next_sets * top_k;
+        uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
+        const uint32_t prev_stride = cur_stride;
+        const uint32_t prev_sets = n_sets;
+        dq.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> vals(sycl::range<1>(kSortN), h);
+            sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(kSortN), h);
+            uint32_t *in = cur;
+            uint32_t *out = next;
+            h.parallel_for(
+                    sycl::nd_range<2>(sycl::range<2>((size_t)n_tokens * kThreads, next_sets),
+                                      sycl::range<2>(kThreads, 1)),
+                    [=](sycl::nd_item<2> it) {
+                        sycl_indexer_topk_tree_merge_pow2_kernel<kSortN>(
+                                it, vals, idxs, out, in, pscores, n_comp, n_tokens, top_k,
+                                prev_sets, merge_group, prev_stride, next_stride);
+                    });
+        });
+        cur = next;
+        n_sets = next_sets;
+        cur_stride = next_stride;
+    }
+
+    /* Final merge, one work-group per token, matching ROCm's
+     * <<<n_tokens, 1024>>>. */
+    {
+        const uint32_t candidate_count = n_sets * top_k;
+        const uint32_t final_stride = cur_stride;
+        uint32_t *final_cur = cur;
+        dq.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> vals(sycl::range<1>(kSortN), h);
+            sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(kSortN), h);
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * kThreads),
+                                             sycl::range<1>(kThreads)),
+                           [=](sycl::nd_item<1> it) {
+                               sycl_indexer_topk_merge_pow2_kernel<kSortN>(
+                                       it, vals, idxs, psel, final_cur, pscores, n_comp,
+                                       n_tokens, top_k, candidate_count, final_stride);
+                           });
+        });
+    }
+
+    dq.wait_and_throw();
+    return 1;
+}
+
 /* Ported from ds4_gpu_indexer_topk_tensor's dispatch cascade
  * (rocm/ds4_rocm_indexer.cuh:927-1157), CUB branches removed per the
- * section comment above. This covers every n_comp for top_k values
- * outside {512, 1024, 2048}, and n_comp <= 8192 for top_k in
- * {512, 1024, 2048}; n_comp > 8192 with top_k in {512, 1024, 2048} falls
- * to the brute-force kernel here too until the tree-merge path is added,
- * which is correct (the brute-force kernel handles any n_comp) but not
- * yet the fast path ROCm takes there. */
+ * section comment above. n_comp <= 8192 for top_k in {512, 1024, 2048}
+ * uses the single-block bitonic kernels; n_comp > 8192 there uses the
+ * tree-merge path; every other (n_comp, top_k) combination uses the
+ * brute-force fallback. */
 static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tensor *scores,
                                     uint32_t n_comp, uint32_t n_tokens, uint32_t top_k) {
     if (!selected || !scores || n_comp == 0 || n_tokens == 0 || top_k == 0 ||
@@ -596,6 +905,10 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
                                    });
                 });
             }
+        } else if (cascade_k) {
+            if (!sycl_indexer_topk_tree_launch(dq, psel, pscores, n_comp, n_tokens, top_k)) {
+                return 0;
+            }
         } else {
             dq.submit([&](sycl::handler &h) {
                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens),
@@ -622,6 +935,49 @@ extern "C" float ds4_sycl_test_e2m1fn_value(int code) {
 
 extern "C" float ds4_sycl_test_e2m1fn_dequant(float x) {
     return sycl_e2m1fn_dequant(x);
+}
+
+/* Test-only hook for indexed_topk_sort_512_asc_kernel: not part of any
+ * ds4_gpu.h entry (this kernel has no caller in this header;
+ * ds4_gpu_attention_indexed_mixed_batch_heads_tensor in
+ * ds4_sycl_attention.hpp consumes it, attention_launch.cuh:540). Exposed
+ * here so it is tested directly rather than left unexercised until that
+ * entry is ported, per explicit instruction to test the kernels this way.
+ * Returns nonzero on success, matching this file's other
+ * entries. `src` and `dst` are both n_tokens * 512 int32 tensors; `dst`
+ * may alias `src`'s tensor only if the caller accepts the same read-then-
+ * overwrite-after-barrier semantics the kernel itself has (each row loads
+ * fully into local memory before writing back). */
+extern "C" int ds4_sycl_test_indexed_topk_sort_512_asc(ds4_gpu_tensor *dst,
+                                                       const ds4_gpu_tensor *src,
+                                                       uint32_t n_tokens) {
+    if (!dst || !src || n_tokens == 0 ||
+        !sycl_tensor_has_elems2(dst, n_tokens, 512u, sizeof(int32_t)) ||
+        !sycl_tensor_has_elems2(src, n_tokens, 512u, sizeof(int32_t))) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &dq = ds4_sycl_queue(dst->device_id);
+        int32_t *pdst = (int32_t *)dst->ptr;
+        const int32_t *psrc = (const int32_t *)src->ptr;
+
+        dq.submit([&](sycl::handler &h) {
+            sycl::local_accessor<int32_t, 1> rows(sycl::range<1>(512), h);
+            h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * 512u),
+                                             sycl::range<1>(512)),
+                           [=](sycl::nd_item<1> it) {
+                               sycl_indexed_topk_sort_512_asc_kernel(it, rows, pdst, psrc,
+                                                                     n_tokens);
+                           });
+        });
+        dq.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "indexed topk sort 512 asc failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
 }
 
 /* Decode, n_tokens == 1. Matches rocm/ds4_rocm_indexer.cuh:883-894. */
@@ -727,12 +1083,11 @@ extern "C" int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
  * baseline DeepSeek V4 Flash's own forward pass. Left stubbed in
  * ds4_sycl_unavailable.cpp; see this file's header comment. */
 
-/* Top-k selection over indexer scores. n_comp > 8192 with top_k in
- * {512, 1024, 2048} currently runs the correct-but-slower brute-force
- * fallback rather than ROCm's tree-merge path; the tree-merge path is
- * added on top of this same entry once it lands. Matches
- * rocm/ds4_rocm_indexer.cuh:927-940's own validation and nonzero-success
- * polarity. */
+/* Top-k selection over indexer scores: single-block bitonic kernels for
+ * n_comp <= 8192, the tree-merge path for n_comp > 8192, both only for
+ * top_k in {512, 1024, 2048}, and the brute-force fallback for every
+ * other (n_comp, top_k) combination. Matches rocm/ds4_rocm_indexer.cuh:
+ * 927-940's own validation and nonzero-success polarity. */
 extern "C" int ds4_gpu_indexer_topk_tensor(ds4_gpu_tensor *selected,
                                            const ds4_gpu_tensor *scores,
                                            uint32_t n_comp, uint32_t n_tokens,

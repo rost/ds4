@@ -728,6 +728,140 @@ static int test_topk_rejections(void) {
     return 0;
 }
 
+/* ---- Tree-merge path tests (n_comp > 8192) -----------------------------
+ *
+ * indexer_allowed_decode_one's own oracle math is n_comp-agnostic, so
+ * run_topk_case/run_topk_tie_case above serve these unchanged; the
+ * n_comp values below are chosen specifically to exercise the tree
+ * dispatcher's own boundaries and level count, not to probe a different
+ * scoring formula. */
+
+/* Just above the single-block threshold: n_chunks = ceil(8193/4096) = 3,
+ * which is <= merge_group (4096/512 = 8), so this exercises the chunk
+ * stage plus the final merge with ZERO intermediate tree levels -- the
+ * boundary case immediately past where the width-8192 single-block
+ * kernel stops applying. */
+static int test_topk_tree_just_above_threshold(void) {
+    int failures = 0;
+    failures += run_topk_case("test_topk_tree_just_above_threshold", 8193, 512, 611, 0, NULL,
+                              NULL, NULL);
+    failures += run_topk_tie_case("test_topk_tree_just_above_threshold_ties", 8193, 512, 613,
+                                  9, 8, 8190, 17);
+    return failures;
+}
+
+/* n_chunks = 65 (n_comp = 65*4096 + 1), forcing n_sets = 65 after the
+ * chunk stage, which is > merge_group (8): level 1 folds 65 sets down to
+ * ceil(65/8) = 9, still > 8, so level 2 folds those 9 down to ceil(9/8)
+ * = 2 before the final merge -- genuinely TWO intermediate tree-merge
+ * levels, not the single-level case a smaller n_comp would exercise.
+ * The tie pair spans chunk 0 and chunk 63 (a large XOR, well-separated
+ * candidate-set membership) so the tie must survive being re-selected as
+ * a chunk winner, folded through two tree levels, and re-selected again
+ * in the final merge, rather than being resolved within one kernel call. */
+static int test_topk_tree_multi_level(void) {
+    const uint32_t n_comp = 65u * 4096u + 1u;
+    int failures = 0;
+    failures += run_topk_case("test_topk_tree_multi_level", n_comp, 512, 617, 0, NULL, NULL, NULL);
+    failures += run_topk_tie_case("test_topk_tree_multi_level_ties", n_comp, 512, 619, 100,
+                                  99, 262000, 5);
+    return failures;
+}
+
+/* ---- indexed_topk_sort_512_asc_kernel tests -----------------------------
+ *
+ * Not part of ds4_gpu_indexer_topk_tensor's dispatch and has no caller in
+ * this file (ds4_gpu_attention_indexed_mixed_batch_
+ * heads_tensor, sycl/ds4_sycl_attention.hpp, consumes it), so it is exercised directly through the
+ * ds4_sycl_test_indexed_topk_sort_512_asc test-only hook. */
+extern int ds4_sycl_test_indexed_topk_sort_512_asc(ds4_gpu_tensor *dst,
+                                                   const ds4_gpu_tensor *src,
+                                                   uint32_t n_tokens);
+
+static int oracle_i32_cmp(const void *a, const void *b) {
+    int32_t av = *(const int32_t *)a, bv = *(const int32_t *)b;
+    return (av > bv) - (av < bv);
+}
+
+static int run_sort512_case(const char *name, const int32_t *rows, uint32_t n_tokens) {
+    int32_t *want = (int32_t *)malloc((size_t)n_tokens * 512 * sizeof(int32_t));
+    CHECK(want != NULL, "sort512: host alloc");
+    memcpy(want, rows, (size_t)n_tokens * 512 * sizeof(int32_t));
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        qsort(&want[t * 512], 512, sizeof(int32_t), oracle_i32_cmp);
+    }
+
+    ds4_gpu_tensor *tsrc = ds4_gpu_tensor_alloc((uint64_t)n_tokens * 512 * sizeof(int32_t));
+    ds4_gpu_tensor *tdst = ds4_gpu_tensor_alloc((uint64_t)n_tokens * 512 * sizeof(int32_t));
+    CHECK(tsrc && tdst, "sort512: alloc");
+    CHECK(ds4_gpu_tensor_write(tsrc, 0, rows, (uint64_t)n_tokens * 512 * sizeof(int32_t)) != 0,
+          "sort512: write");
+    CHECK(ds4_sycl_test_indexed_topk_sort_512_asc(tdst, tsrc, n_tokens) != 0, "sort512: call");
+
+    int32_t *got = (int32_t *)malloc((size_t)n_tokens * 512 * sizeof(int32_t));
+    CHECK(got != NULL, "sort512: host alloc got");
+    CHECK(ds4_gpu_tensor_read(tdst, 0, got, (uint64_t)n_tokens * 512 * sizeof(int32_t)) != 0,
+          "sort512: read");
+
+    int fail = 0;
+    for (uint32_t i = 0; i < n_tokens * 512u; i++) {
+        if (got[i] != want[i]) {
+            fprintf(stderr, "FAIL: %s: slot %u got %d want %d\n", name, i, got[i], want[i]);
+            fail = 1;
+        }
+    }
+    ds4_gpu_tensor_free(tsrc);
+    ds4_gpu_tensor_free(tdst);
+    free(want);
+    free(got);
+    if (fail) return 1;
+    fprintf(stderr, "  %s OK\n", name);
+    return 0;
+}
+
+static int test_sort512_descending_input(void) {
+    int32_t rows[512];
+    for (int i = 0; i < 512; i++) rows[i] = 511 - i;
+    return run_sort512_case("test_sort512_descending_input", rows, 1);
+}
+
+/* Adversarial per spec 6i even though this kernel has no separate index
+ * to tie-break: many duplicate VALUES (the values being sorted here are
+ * themselves comp-row indices from a prior top-k pass, so duplicates are
+ * a realistic input shape), negative values, and both extremes of the
+ * int32 range, across two independent token rows in the same launch. */
+static int test_sort512_ties_and_extremes(void) {
+    int32_t rows[2 * 512];
+    for (int i = 0; i < 512; i++) {
+        uint32_t h = ((uint32_t)i * 2654435761u) ^ (uint32_t)(i << 5);
+        rows[i] = (int32_t)(h % 40u) - 20;
+    }
+    rows[0] = INT32_MAX;
+    rows[1] = INT32_MIN;
+    rows[2] = 0;
+    for (int i = 0; i < 512; i++) {
+        uint32_t h = ((uint32_t)i * 40503u + 7u) ^ (uint32_t)(i >> 2);
+        rows[512 + i] = (int32_t)(h % 8u) - 4;
+    }
+    return run_sort512_case("test_sort512_ties_and_extremes", rows, 2);
+}
+
+static int test_sort512_rejections(void) {
+    ds4_gpu_tensor *tsrc = ds4_gpu_tensor_alloc(256 * sizeof(int32_t));
+    ds4_gpu_tensor *tdst = ds4_gpu_tensor_alloc(512 * sizeof(int32_t));
+    CHECK(tsrc && tdst, "sort512_rejections: alloc");
+    CHECK(ds4_sycl_test_indexed_topk_sort_512_asc(tdst, tsrc, 1) == 0,
+          "sort512_rejections: undersized src");
+    CHECK(ds4_sycl_test_indexed_topk_sort_512_asc(tdst, tsrc, 0) == 0,
+          "sort512_rejections: zero n_tokens");
+    CHECK(ds4_sycl_test_indexed_topk_sort_512_asc(NULL, tsrc, 1) == 0,
+          "sort512_rejections: null dst");
+    ds4_gpu_tensor_free(tsrc);
+    ds4_gpu_tensor_free(tdst);
+    fprintf(stderr, "  test_sort512_rejections OK\n");
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -759,6 +893,13 @@ int main(void) {
     failures += test_topk_width_8192_u16();
     failures += test_topk_fallback_kernel();
     failures += test_topk_rejections();
+
+    failures += test_topk_tree_just_above_threshold();
+    failures += test_topk_tree_multi_level();
+
+    failures += test_sort512_descending_input();
+    failures += test_sort512_ties_and_extremes();
+    failures += test_sort512_rejections();
 
     ds4_gpu_cleanup();
 
