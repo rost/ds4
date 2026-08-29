@@ -771,7 +771,12 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
     uint32_t cur_stride = candidate_stride;
 
     /* Chunk stage: one work-group per (token, chunk), matching ROCm's
-     * dim3 grid_chunks(n_tokens, n_chunks, 1). */
+     * dim3 grid_chunks(n_tokens, n_chunks, 1). The tree-merge stage below
+     * reads `cur` (this stage's `out`), and every stage after that reads
+     * the previous stage's output the same way: separate q.submit() calls
+     * on the same out-of-order queue over raw USM give no automatic
+     * ordering between them, so each stage below waits before the next one
+     * that depends on it is submitted. */
     dq.submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> vals(sycl::range<1>(kSortN), h);
         sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(kSortN), h);
@@ -784,10 +789,13 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
                                    candidate_stride);
                        });
     });
+    dq.wait_and_throw();
 
     /* Tree levels: fold merge_group consecutive candidate sets together
      * per level until at most merge_group sets remain, matching ROCm's
-     * dim3 grid_merge(n_tokens, next_sets, 1) per level. */
+     * dim3 grid_merge(n_tokens, next_sets, 1) per level.  Each level reads
+     * the previous level's (or the chunk stage's) output, so it must wait
+     * before the next level, or the final merge, is submitted. */
     while (n_sets > merge_group) {
         const uint32_t next_sets = (n_sets + merge_group - 1u) / merge_group;
         const uint32_t next_stride = next_sets * top_k;
@@ -808,6 +816,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
                                 prev_sets, merge_group, prev_stride, next_stride);
                     });
         });
+        dq.wait_and_throw();
         cur = next;
         n_sets = next_sets;
         cur_stride = next_stride;

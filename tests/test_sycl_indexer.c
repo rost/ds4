@@ -768,6 +768,72 @@ static int test_topk_tree_multi_level(void) {
     return failures;
 }
 
+/* Contention-scale regression test for sycl_indexer_topk_tree_launch's own
+ * internal ordering (sycl/ds4_sycl_indexer.hpp): the chunk stage, each
+ * tree-merge level, and the final merge are separate kernel submissions on
+ * the same out-of-order queue, chained through the same scratch allocation
+ * with genuine read-after-write dependencies (each stage reads the
+ * previous stage's output). Every case above uses n_tokens == 1, which
+ * gives the final-merge stage exactly one work-group; this test uses many
+ * tokens so every stage, including the final merge, has many work-groups
+ * genuinely in flight at once, per design-spec section 6j: a launch too
+ * small to create contention will not expose a missing-ordering race even
+ * when one exists. Repeated REPS times per process run, since a race need
+ * not reproduce on every call. */
+static int test_topk_tree_multi_level_many_tokens(void) {
+    const uint32_t n_comp = 65u * 4096u + 1u; /* two tree-merge levels */
+    const uint32_t top_k = 512u;
+    const uint32_t n_tokens = 64u;
+    const int reps = 10;
+
+    float *scores = (float *)malloc((size_t)n_tokens * n_comp * sizeof(float));
+    uint32_t *want = (uint32_t *)malloc((size_t)n_tokens * top_k * sizeof(uint32_t));
+    uint32_t *got = (uint32_t *)malloc((size_t)n_tokens * top_k * sizeof(uint32_t));
+    CHECK(scores && want && got, "topk_tree_multi_level_many_tokens: host alloc failed");
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        fill_topk_scores(scores + (size_t)t * n_comp, n_comp, 1000u + t * 37u);
+        oracle_topk(want + (size_t)t * top_k, scores + (size_t)t * n_comp, n_comp, top_k);
+    }
+
+    ds4_gpu_tensor *tscores = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_comp * sizeof(float));
+    ds4_gpu_tensor *tsel = ds4_gpu_tensor_alloc((uint64_t)n_tokens * top_k * sizeof(uint32_t));
+    CHECK(tscores && tsel, "topk_tree_multi_level_many_tokens: device alloc failed");
+    CHECK(ds4_gpu_tensor_write(tscores, 0, scores,
+                               (uint64_t)n_tokens * n_comp * sizeof(float)) != 0,
+          "topk_tree_multi_level_many_tokens: write");
+
+    int fail = 0;
+    for (int rep = 0; rep < reps; rep++) {
+        CHECK(ds4_gpu_indexer_topk_tensor(tsel, tscores, n_comp, n_tokens, top_k) != 0,
+              "topk_tree_multi_level_many_tokens: call");
+        CHECK(ds4_gpu_tensor_read(tsel, 0, got,
+                                  (uint64_t)n_tokens * top_k * sizeof(uint32_t)) != 0,
+              "topk_tree_multi_level_many_tokens: read");
+        for (uint32_t t = 0; t < n_tokens; t++) {
+            for (uint32_t k = 0; k < top_k; k++) {
+                const uint32_t g = got[(size_t)t * top_k + k];
+                const uint32_t w = want[(size_t)t * top_k + k];
+                if (g != w) {
+                    fprintf(stderr,
+                            "FAIL: topk_tree_multi_level_many_tokens: rep %d token %u slot %u "
+                            "got %u want %u\n",
+                            rep, t, k, g, w);
+                    fail = 1;
+                }
+            }
+        }
+    }
+
+    ds4_gpu_tensor_free(tscores);
+    ds4_gpu_tensor_free(tsel);
+    free(scores);
+    free(want);
+    free(got);
+    if (fail) return 1;
+    fprintf(stderr, "  test_topk_tree_multi_level_many_tokens OK\n");
+    return 0;
+}
+
 /* ---- indexed_topk_sort_512_asc_kernel tests -----------------------------
  *
  * Not part of ds4_gpu_indexer_topk_tensor's dispatch and has no caller in
@@ -896,6 +962,7 @@ int main(void) {
 
     failures += test_topk_tree_just_above_threshold();
     failures += test_topk_tree_multi_level();
+    failures += test_topk_tree_multi_level_many_tokens();
 
     failures += test_sort512_descending_input();
     failures += test_sort512_ties_and_extremes();
