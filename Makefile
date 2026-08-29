@@ -529,7 +529,7 @@ tests/test_sycl_session_smoke: tests/test_sycl_session_smoke.o ds4_sycl_test_hoo
 
 test-sycl-session-smoke: tests/test_sycl_session_smoke
 	./tests/test_sycl_session_smoke
-tests/test_sycl_hc.o: tests/test_sycl_hc.c ds4_gpu.h ds4_gpu_mgpu.h
+
 tests/test_sycl_hc.o: tests/test_sycl_hc.c ds4_gpu.h ds4_gpu_mgpu.h tests/test_sycl_harness.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
 
