@@ -1396,6 +1396,228 @@ static int test_static_prefill_window_bound_refused(void) {
     return 0;
 }
 
+/* ds4_gpu_attention_prefill_raw_heads_tensor oracle. Established by tracing
+ * both ds4.c call sites (ds4.c:28575 and :29576) and the CPU reference,
+ * not by name: both sites pass raw_prefix_tokens or n_tokens tokens of a
+ * fresh, zero-prefix, ratio == 0 (no compression) sub-batch, with
+ * g->raw_window as the window bound. The CPU side of that same shape is
+ * layer_attention_prefix_batch_worker (ds4.c:12843-12903) with
+ * comp_counts == NULL (so comp_count is always 0 per its own
+ * `ctx->comp_counts ? ctx->comp_counts[t] : 0` ternary) and raw_cap ==
+ * g->raw_window: its `raw_count = min(t + 1, raw_cap)`,
+ * `raw_start = t + 1 - raw_count` is exactly
+ * rocm/attention_launch.cuh:234-332's raw-prefill shape (window != 0 &&
+ * t + 1 > window ? window : t + 1), confirming raw_cap and window are the
+ * same quantity in this reduced (no-compression) shape. This is the same
+ * math as oracle_attention_static_prefill above with n_comp forced to 0,
+ * reimplemented here with a scores buffer sized to n_tokens rather than a
+ * fixed 768: this oracle also has to cover the unbounded (window == 0)
+ * shape used to exercise the entry above the scalar fallback's 2048-key
+ * cap, where the fixed-size buffer would overflow. */
+static void oracle_attention_prefill_raw(
+        float *out_heads, const float *sinks, const float *q, const float *raw_kv,
+        uint32_t n_tokens, uint32_t window, uint32_t n_head, uint32_t head_dim) {
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    const uint32_t max_raw = (window != 0u && n_tokens > window) ? window : n_tokens;
+    float *scores = (float *)malloc((size_t)(max_raw ? max_raw : 1u) * sizeof(float));
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
+        const uint32_t raw_start = t + 1u - raw_count;
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+            float max_score = sinks[h];
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float *kv = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                scores[r] = dot * scale;
+                if (scores[r] > max_score) max_score = scores[r];
+            }
+            float *oh = out_heads + ((uint64_t)t * n_head + h) * head_dim;
+            memset(oh, 0, (size_t)head_dim * sizeof(float));
+            float denom = expf(sinks[h] - max_score);
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float w = expf(scores[r] - max_score);
+                denom += w;
+                const float *kv = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] /= denom;
+        }
+    }
+    free(scores);
+}
+
+/* Drives one ds4_gpu_attention_prefill_raw_heads_tensor call end to end
+ * against oracle_attention_prefill_raw, for arbitrary n_tokens/window/
+ * n_head/head_dim.  Shared by every raw-prefill shape test below so the
+ * small-window-static, GEMM and scalar-fallback code paths (all reached
+ * through this one entry, per its own gate) are exercised by one harness
+ * function rather than three near-duplicates. */
+static int prefill_raw_run_and_check(uint32_t n_tokens, uint32_t window,
+                                     uint32_t n_head, uint32_t head_dim,
+                                     double tol, const char *label) {
+    float *sinks = malloc((size_t)n_head * sizeof(float));
+    for (uint32_t h = 0; h < n_head; h++) sinks[h] = test_prand(h, 241u, 17u) * 2.0f;
+    const uint64_t qn = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t rawn = (uint64_t)n_tokens * head_dim;
+    float *q = malloc((size_t)qn * sizeof(float));
+    float *raw_kv = malloc((size_t)rawn * sizeof(float));
+    for (uint64_t i = 0; i < qn; i++) q[i] = test_prand((uint32_t)(i & 0xFFFFu), (uint32_t)(i >> 16), 242u);
+    for (uint64_t i = 0; i < rawn; i++) raw_kv[i] = test_prand((uint32_t)(i & 0xFFFFu), (uint32_t)(i >> 16), 243u);
+
+    dh_model model = dh_model_build(sinks, n_head);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc(rawn * sizeof(float));
+    CHECK(theads && tq && traw, "prefill raw: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, qn * sizeof(float)) != 0, "prefill raw: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, rawn * sizeof(float)) != 0, "prefill raw: raw_kv write failed");
+
+    CHECK(ds4_gpu_attention_prefill_raw_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw,
+              n_tokens, window, n_head, head_dim) != 0,
+          "prefill raw: launch failed");
+
+    float *got = malloc((size_t)qn * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, qn * sizeof(float)) != 0, "prefill raw: read failed");
+    float *want = malloc((size_t)qn * sizeof(float));
+    oracle_attention_prefill_raw(want, sinks, q, raw_kv, n_tokens, window, n_head, head_dim);
+    for (uint64_t i = 0; i < qn; i++) {
+        CHECK_CLOSE(got[i], want[i], tol, label);
+    }
+
+    free(sinks); free(q); free(raw_kv); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    return 0;
+}
+
+/* Small-window shape: window != 0 and window <= 256 (the entry's own hard
+ * validation cap), so (window != 0 ? window : n_tokens) <= 768 always
+ * holds and the small-window static fast path
+ * (attention_static_mixed_heads8_online_kernel, already ported for
+ * ds4_gpu_attention_prefill_static_mixed_heads_tensor, reused here with
+ * n_comp = 0, ratio = 1 exactly as rocm/attention_launch.cuh:245-260 does)
+ * is always taken whenever head_dim == 512 and window != 0.  n_head = 3,
+ * not a multiple of 8, so the online kernel's head_group/warp indexing is
+ * exercised across a partial final group. */
+static int test_prefill_raw_static_small_window(void) {
+    int rc = prefill_raw_run_and_check(6u, 3u, 3u, 512u, 1e-3,
+                                       "prefill raw static: heads mismatch");
+    if (rc != 0) return rc;
+    fprintf(stderr, "  test_prefill_raw_static_small_window OK\n");
+    return 0;
+}
+
+/* The central deliverable here: prefill above 2048 combined keys,
+ * which had NO correct path before oneMKL (the scalar fallback refuses
+ * above 2048 combined keys; see test_prefill_raw_window_validation for
+ * that refusal at the entry actually gated on it). window == 0 and
+ * n_tokens == 2100 skips the small-window static path
+ * (window != 0 ? window : n_tokens) <= 768 is false at n_tokens = 2100,
+ * head_dim == 512 forces the oneMKL cuBLAS-equivalent GEMM path
+ * (rocm/attention_launch.cuh:259-320): score GEMM, softmax, value GEMM,
+ * unpack. At the last token (t = 2099) raw_count = t + 1 = 2100 combined
+ * keys, comfortably above the 2048 cap that has no other correct path.
+ * n_head = 1 to keep the O(n_tokens^2 * head_dim) scalar CPU oracle's
+ * runtime reasonable at this n_tokens. */
+static int test_prefill_raw_gemm_long_context(void) {
+    int rc = prefill_raw_run_and_check(2100u, 0u, 1u, 512u, 1e-2,
+                                       "prefill raw GEMM long-context: heads mismatch");
+    if (rc != 0) return rc;
+    fprintf(stderr, "  test_prefill_raw_gemm_long_context OK\n");
+    return 0;
+}
+
+/* The static-vs-GEMM gate boundary with window == 0: n_tokens == 768 takes
+ * the static path ((window != 0 ? window : n_tokens) <= 768 is true at
+ * exactly 768), n_tokens == 769 takes the GEMM path.  Both must produce
+ * the same correct answer despite the different code path, so this is a
+ * genuine cross-path consistency check, not just a shape variant. */
+static int test_prefill_raw_gemm_boundary(void) {
+    int rc = prefill_raw_run_and_check(768u, 0u, 1u, 512u, 1e-3,
+                                       "prefill raw boundary (static side): heads mismatch");
+    if (rc != 0) return rc;
+    rc = prefill_raw_run_and_check(769u, 0u, 1u, 512u, 1e-2,
+                                   "prefill raw boundary (GEMM side): heads mismatch");
+    if (rc != 0) return rc;
+    fprintf(stderr, "  test_prefill_raw_gemm_boundary OK\n");
+    return 0;
+}
+
+/* n_head > 1 on the GEMM path specifically: every other GEMM-path test
+ * above uses n_head == 1 to keep the O(n_tokens^2) scalar CPU oracle fast,
+ * which means none of them can distinguish stride_a == 0 (the KV-broadcast
+ * case every head must share) from a stride_a that happens to be wrong,
+ * since a batch of size 1 never advances by its stride at all. n_tokens
+ * kept smaller here (800, still above the 768 static/GEMM boundary) so the
+ * n_head multiplier does not make the CPU oracle too slow. */
+static int test_prefill_raw_gemm_multi_head(void) {
+    int rc = prefill_raw_run_and_check(800u, 0u, 3u, 512u, 1e-2,
+                                       "prefill raw GEMM multi-head: heads mismatch");
+    if (rc != 0) return rc;
+    fprintf(stderr, "  test_prefill_raw_gemm_multi_head OK\n");
+    return 0;
+}
+
+/* head_dim != 512 forces the scalar attention_prefill_raw_kernel fallback:
+ * neither the small-window static path nor the GEMM path is gated on
+ * anything but head_dim == 512, so any other head_dim always falls
+ * through to it, regardless of window. Two shapes: window != 0 (bounded
+ * raw_count) and window == 0 with n_tokens <= 256 (the scalar fallback's
+ * own unbounded-causal allowance, per rocm/attention_launch.cuh:324's
+ * `window == 0 && n_tokens > 256` refusal). */
+static int test_prefill_raw_scalar_fallback(void) {
+    int rc = prefill_raw_run_and_check(10u, 4u, 2u, 64u, 1e-3,
+                                       "prefill raw scalar (windowed): heads mismatch");
+    if (rc != 0) return rc;
+    rc = prefill_raw_run_and_check(200u, 0u, 2u, 64u, 1e-3,
+                                   "prefill raw scalar (unbounded, small n_tokens): heads mismatch");
+    if (rc != 0) return rc;
+    fprintf(stderr, "  test_prefill_raw_scalar_fallback OK\n");
+    return 0;
+}
+
+/* Validation ported from rocm/attention_launch.cuh:235-241: window > 256 is
+ * refused outright regardless of every other argument (the reason the
+ * scalar fallback's fixed-size score staging is always safe: raw_count can
+ * never exceed 256 by the time any code path runs). Also covers the
+ * scalar fallback's own separate window == 0 && n_tokens > 256 refusal at
+ * a head_dim that cannot reach the GEMM path. */
+static int test_prefill_raw_window_validation(void) {
+    float sinks[2] = {0};
+    dh_model model = dh_model_build(sinks, 2u);
+    const uint32_t n_tokens = 4u;
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)n_tokens * 2u * 512u * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)n_tokens * 2u * 512u * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)n_tokens * 512u * sizeof(float));
+    CHECK(theads && tq && traw, "prefill raw window validation: alloc failed");
+
+    CHECK(ds4_gpu_attention_prefill_raw_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw,
+              n_tokens, /*window=*/257u, 2u, 512u) == 0,
+          "prefill raw window validation: window > 256 must be refused");
+    CHECK(ds4_gpu_attention_prefill_raw_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw,
+              n_tokens, /*window=*/256u, 2u, 512u) != 0,
+          "prefill raw window validation: window == 256 must be accepted");
+
+    ds4_gpu_tensor *theads_s = ds4_gpu_tensor_alloc((uint64_t)300u * 2u * 64u * sizeof(float));
+    ds4_gpu_tensor *tq_s = ds4_gpu_tensor_alloc((uint64_t)300u * 2u * 64u * sizeof(float));
+    ds4_gpu_tensor *traw_s = ds4_gpu_tensor_alloc((uint64_t)300u * 64u * sizeof(float));
+    CHECK(theads_s && tq_s && traw_s, "prefill raw window validation: scalar alloc failed");
+    CHECK(ds4_gpu_attention_prefill_raw_heads_tensor(
+              theads_s, model.bytes, model.size, model.sinks_offset, tq_s, traw_s,
+              /*n_tokens=*/300u, /*window=*/0u, 2u, /*head_dim=*/64u) == 0,
+          "prefill raw window validation: scalar fallback above 256 unbounded tokens must be refused");
+
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(theads_s); ds4_gpu_tensor_free(tq_s); ds4_gpu_tensor_free(traw_s);
+    free(model.bytes);
+    fprintf(stderr, "  test_prefill_raw_window_validation OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_store_raw_kv() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1416,6 +1638,12 @@ int main(void) {
     if (test_indexed_batch_validation() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_static_prefill_small_window() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_static_prefill_window_bound_refused() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_prefill_raw_static_small_window() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_prefill_raw_gemm_long_context() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_prefill_raw_gemm_boundary() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_prefill_raw_gemm_multi_head() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_prefill_raw_scalar_fallback() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_prefill_raw_window_validation() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_attention OK\n");
     return 0;

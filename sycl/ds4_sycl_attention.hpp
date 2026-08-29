@@ -1,25 +1,25 @@
 #pragma once
 
 /* DS4 SYCL attention: decode, batched decode, indexed decode against the
- * indexer's selection, and small-window static prefill. Ported from
- * rocm/ds4_rocm_attention.cuh (kernels) and
- * rocm/ds4_rocm_attention_launch.cuh (entry points).
+ * indexer's selection, and prefill (small-window static, raw-only GEMM and
+ * scalar, and mixed). Ported from rocm/ds4_rocm_attention.cuh (kernels)
+ * and rocm/ds4_rocm_attention_launch.cuh (entry points).
  *
  * Scope, and why it stops here: attention_launch.cuh has fourteen entries.
- * This header covers the seven that are decode-reachable and testable today
- * against a CPU oracle with no BLAS: ds4_gpu_store_raw_kv_tensor,
+ * This header covers the eight that are decode-reachable and testable
+ * today, or that oneMKL now unblocks: ds4_gpu_store_raw_kv_tensor,
  * ds4_gpu_kv_fp8_store_raw_tensor, ds4_gpu_attention_decode_heads_tensor,
  * ds4_gpu_attention_decode_raw_batch_heads_tensor,
  * ds4_gpu_attention_decode_mixed_batch_heads_tensor,
- * ds4_gpu_attention_indexed_mixed_batch_heads_tensor and
+ * ds4_gpu_attention_indexed_mixed_batch_heads_tensor,
+ * ds4_gpu_attention_prefill_raw_heads_tensor and
  * ds4_gpu_attention_prefill_static_mixed_heads_tensor.
  *
  * Deliberately NOT here:
- *   - The three prefill entries whose real fast path is
- *     cublasSgemmStridedBatched (attention_prefill_mixed_launch,
- *     ds4_gpu_attention_prefill_raw_heads_tensor): oneMKL is not installed,
- *     and the scalar fallback refuses above 2048 combined keys, so there is
- *     no correct path for long-context prefill yet.
+ *   - attention_prefill_mixed_launch's oneMKL-GEMM and tiled-GEMM paths
+ *     beyond the small-window static shape already ported for
+ *     ds4_gpu_attention_prefill_static_mixed_heads_tensor: a separate
+ *     extension of that same entry covers them.
  *   - The three output-projection entries
  *     (ds4_gpu_attention_output_q8_batch_f16_tensor,
  *     _q8_batch_tensor, _low_q8_tensor): they need the six-kernel
@@ -1622,6 +1622,339 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         dq.wait_and_throw();
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention indexed mixed launch failed: %s\n",
+                e.what());
+        return 0;
+    }
+    return 1;
+}
+
+namespace {
+
+/* attention_prefill_raw_softmax_kernel, attention.cuh:222-266: normalises
+ * one (token, head) row of the score GEMM's output in place, applying the
+ * causal/window mask and the sink logit bias. Consumes the score GEMM's
+ * output, so the caller must order this launch after that GEMM's returned
+ * event (see the ABI entry below). Reuses sycl_block_row_reduce for the
+ * block-wide max/sum, the same substitution used by every other reduction
+ * in this file. */
+static void sycl_attention_prefill_raw_softmax_kernel(
+        sycl::nd_item<2> it,
+        sycl::local_accessor<float, 1> reduce_scratch,
+        float *scores,
+        const float *sinks,
+        uint32_t n_tokens,
+        uint32_t window,
+        uint32_t n_keys) {
+    const uint32_t t = (uint32_t)it.get_group(0);
+    const uint32_t h = (uint32_t)it.get_group(1);
+    if (t >= n_tokens) return;
+    const uint32_t tid = (uint32_t)it.get_local_id(0);
+    const uint32_t block = (uint32_t)it.get_local_range(0);
+    float *row = scores + ((uint64_t)h * n_tokens + t) * n_keys;
+
+    float local_max = sinks[h];
+    for (uint32_t k = tid; k < n_keys; k += block) {
+        const bool valid = k <= t && (window == 0u || t - k < window);
+        const float s = valid ? row[k] : -INFINITY;
+        row[k] = s;
+        local_max = sycl::fmax(local_max, s);
+    }
+    const float max_s = sycl_block_row_reduce(
+            it, reduce_scratch, local_max,
+            [](float a, float b) { return sycl::fmax(a, b); });
+
+    float local_sum = 0.0f;
+    for (uint32_t k = tid; k < n_keys; k += block) {
+        const float p = sycl::isfinite(row[k]) ? sycl::exp(row[k] - max_s) : 0.0f;
+        row[k] = p;
+        local_sum += p;
+    }
+    if (tid == 0u) local_sum += sycl::exp(sinks[h] - max_s);
+    const float denom = sycl_block_row_reduce(
+            it, reduce_scratch, local_sum,
+            [](float a, float b) { return a + b; });
+
+    for (uint32_t k = tid; k < n_keys; k += block) row[k] /= denom;
+}
+
+/* attention_prefill_unpack_heads_kernel, attention.cuh:402-417: converts
+ * the value GEMM's per-head-major (head, token, dim) output layout back to
+ * ds4's (token, head, dim) heads layout, one work-item per output
+ * element. Consumes the value GEMM's output, so the caller must order this
+ * launch after that GEMM's returned event. Submits without waiting, like
+ * every other "_launch" helper in this file; the caller decides ordering. */
+static void sycl_attention_prefill_unpack_heads_launch(
+        sycl::queue &q, float *heads, const float *tmp,
+        uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
+    const uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
+    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+        const uint32_t d  = (uint32_t)(gid % head_dim);
+        const uint64_t qi = gid / head_dim;
+        const uint32_t h  = (uint32_t)(qi % n_head);
+        const uint32_t t  = (uint32_t)(qi / n_head);
+        heads[gid] = tmp[((uint64_t)h * n_tokens + t) * head_dim + d];
+    });
+}
+
+/* attention_prefill_raw_kernel, attention.cuh:86-141: the scalar fallback,
+ * one work-group per (token, head), reached whenever head_dim != 512 (the
+ * small-window static and GEMM paths below both require head_dim == 512).
+ * raw_count can never exceed 256 by the time this runs: the ABI entry's
+ * own validation rejects window > 256 outright, and separately refuses
+ * window == 0 with n_tokens > 256 before ever reaching this launch, so
+ * `scores`'s local accessor is sized to a fixed 256, exactly matching
+ * ROCm's own `__shared__ float scores[256]`, rather than dynamically to
+ * raw_count. */
+static void sycl_attention_prefill_raw_kernel(
+        sycl::nd_item<2> it,
+        sycl::local_accessor<float, 1> scores,
+        sycl::local_accessor<float, 1> reduce_scratch,
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const float *raw_kv,
+        uint32_t n_tokens,
+        uint32_t window,
+        uint32_t n_head,
+        uint32_t head_dim) {
+    const uint32_t t = (uint32_t)it.get_group(0);
+    const uint32_t h = (uint32_t)it.get_group(1);
+    if (t >= n_tokens || h >= n_head) return;
+    const uint32_t tid = (uint32_t)it.get_local_id(0);
+    const uint32_t block = (uint32_t)it.get_local_range(0);
+    const uint32_t raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
+    const uint32_t raw_start = t + 1u - raw_count;
+    const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+    const float scale = sycl::rsqrt((float)head_dim);
+
+    float local_max = sinks[h];
+    for (uint32_t r = tid; r < raw_count; r += block) {
+        const float *kv = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+        float dot = 0.0f;
+        for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+        scores[r] = dot * scale;
+        local_max = sycl::fmax(local_max, scores[r]);
+    }
+    const float max_s = sycl_block_row_reduce(
+            it, reduce_scratch, local_max,
+            [](float a, float b) { return sycl::fmax(a, b); });
+
+    float local_sum = 0.0f;
+    for (uint32_t r = tid; r < raw_count; r += block) {
+        const float w = sycl::exp(scores[r] - max_s);
+        scores[r] = w;
+        local_sum += w;
+    }
+    if (tid == 0u) local_sum += sycl::exp(sinks[h] - max_s);
+    const float denom = sycl_block_row_reduce(
+            it, reduce_scratch, local_sum,
+            [](float a, float b) { return a + b; });
+
+    float *oh = heads + ((uint64_t)t * n_head + h) * head_dim;
+    for (uint32_t d = tid; d < head_dim; d += block) {
+        float acc = 0.0f;
+        for (uint32_t r = 0; r < raw_count; r++) {
+            acc += raw_kv[(uint64_t)(raw_start + r) * head_dim + d] * scores[r];
+        }
+        oh[d] = acc / denom;
+    }
+}
+
+}  // namespace
+
+/* ds4_gpu_attention_prefill_raw_heads_tensor, attention_launch.cuh:234-332:
+ * raw-only prefill for a fresh, zero-prefix, ratio == 0 (no compression)
+ * sub-batch. Oracle and call-site tracing: tests/test_sycl_attention.c's
+ * header comment for the oracle-selection method this whole file follows;
+ * this entry's own oracle is layer_attention_prefix_batch_worker
+ * (ds4.c:12843-12903) with comp_counts == NULL, confirmed by tracing both
+ * of this entry's real ds4.c call sites (:28575, :29576), both of which
+ * pass a zero-prefix, ratio == 0 sub-batch with g->raw_window as window.
+ *
+ * Three code paths, gated exactly as ROCm's launcher gates them:
+ *
+ * 1. Small-window static (n_tokens > 1 && head_dim == 512 &&
+ *    (window != 0 ? window : n_tokens) <= 768): reuses
+ *    sycl_attention_static_mixed_heads8_online_kernel, already ported for
+ *    ds4_gpu_attention_prefill_static_mixed_heads_tensor below, with
+ *    n_comp = 0 and ratio = 1 exactly as ROCm's own raw-entry branch calls
+ *    it (attention_launch.cuh:245-260). Because this entry's own
+ *    validation rejects window > 256 outright, window != 0 always
+ *    satisfies the <= 768 bound, so this path is taken for every window != 0
+ *    call at head_dim == 512; only window == 0 can fall through past it.
+ * 2. The GEMM path (head_dim == 512, window == 0, n_tokens above the
+ *    static path's bound): oneMKL's gemm_batch, strided, broadcasting
+ *    raw_kv across every head via stride_a == 0 (the same KV table serves
+ *    every head; only Q differs per head). Two GEMMs and two dependent
+ *    kernels, in this exact order:
+ *      (a) score GEMM: scores = (1/sqrt(head_dim)) * K^T Q, batched over
+ *          n_head.
+ *      (b) softmax kernel, ordered after (a) by an explicit
+ *          wait_and_throw() on the GEMM's returned event before this
+ *          launch submits -- chosen over passing the event as a
+ *          dependency because every other multi-stage entry in this
+ *          backend already uses a trailing host wait between stages
+ *          (spec 6t's "self-waiting helpers" discipline), and this
+ *          entry's stages are strictly sequential with no independent work
+ *          to overlap in the meantime.
+ *      (c) value GEMM: out = V * scores, batched over n_head, again with
+ *          stride_a == 0 broadcasting raw_kv.
+ *      (d) unpack kernel, ordered after (c) the same way as (b) after (a).
+ *    This is the path that makes long-context prefill correct at all: the
+ *    scalar fallback below refuses whenever window == 0 && n_tokens > 256,
+ *    so before oneMKL there was no path here above 256 combined keys, let
+ *    alone 2048.
+ * 3. The scalar fallback (every other head_dim): attention_prefill_raw_kernel,
+ *    refusing window == 0 && n_tokens > 256 exactly as ROCm does, since
+ *    raw_count would otherwise exceed its fixed 256-wide local staging.
+ *
+ * attn_sinks staging site 5 of 6 (attention_launch.cuh:241, this entry's
+ * own sinks read). */
+extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t              n_tokens,
+        uint32_t              window,
+        uint32_t              n_head,
+        uint32_t              head_dim) {
+    if (!heads || !q || !raw_kv || !model_map ||
+        !sycl_model_range_fits(model_size, sinks_offset, (uint64_t)n_head * sizeof(float)) ||
+        !sycl_tensor_has_elems3(heads, n_tokens, n_head, head_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems3(q, n_tokens, n_head, head_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems2(raw_kv, n_tokens, head_dim, sizeof(float)) ||
+        window > 256u) {
+        return 0;
+    }
+    if (n_tokens == 0u || n_head == 0u || head_dim == 0u) return 1;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &dq = ds4_sycl_queue(heads->device_id);
+        const char *sinks_host = sycl_model_range_ptr(
+                model_map, sinks_offset, (uint64_t)n_head * sizeof(float), model_size,
+                "attn_sinks");
+        if (!sinks_host) return 0;
+        sycl_device_scratch_guard sinks_guard = sycl_stage_host_bytes(
+                dq, sinks_host, (uint64_t)n_head * sizeof(float));
+        if (!sinks_guard.p) return 0;
+        const float *psinks = (const float *)sinks_guard.p;
+
+        float       *pheads = (float *)heads->ptr;
+        const float *pq     = (const float *)q->ptr;
+        const float *praw   = (const float *)raw_kv->ptr;
+
+        const uint32_t window_bound = window != 0u ? window : n_tokens;
+        const bool small_window_static =
+                n_tokens > 1u && head_dim == 512u && (uint64_t)window_bound <= 768u;
+
+        if (small_window_static) {
+            const uint32_t grid_y = (n_head + 7u) / 8u;
+            dq.submit([&](sycl::handler &h) {
+                sycl::local_accessor<sycl::float4, 1> kv_shared(sycl::range<1>(4u * 128u), h);
+                sycl::local_accessor<float, 1> scores(sycl::range<1>(8u * 768u), h);
+                h.parallel_for(
+                        sycl::nd_range<2>(sycl::range<2>((size_t)n_tokens * 256u, grid_y),
+                                          sycl::range<2>(256u, 1u)),
+                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+                            sycl_attention_static_mixed_heads8_online_kernel(
+                                    it, kv_shared, scores, pheads, psinks, pq, praw, praw,
+                                    n_tokens, 0u, window, 1u, n_head, head_dim);
+                        });
+            });
+            dq.wait_and_throw();
+            return 1;
+        }
+
+        if (head_dim == 512u && n_tokens > 1u) {
+            const uint32_t n_keys = n_tokens;
+            uint64_t score_count = 0, out_count = 0, score_bytes = 0, out_bytes = 0;
+            if (!sycl_u64_mul3_checked(n_head, n_tokens, n_keys, &score_count) ||
+                !sycl_u64_mul3_checked(n_head, n_tokens, head_dim, &out_count) ||
+                !sycl_u64_mul_checked(score_count, sizeof(float), &score_bytes) ||
+                !sycl_u64_mul_checked(out_count, sizeof(float), &out_bytes)) {
+                return 0;
+            }
+
+            float *scores = sycl::malloc_device<float>((size_t)score_count, dq);
+            if (!scores) return 0;
+            sycl_device_scratch_guard scores_guard(dq, scores);
+            float *out_tmp = sycl::malloc_device<float>((size_t)out_count, dq);
+            if (!out_tmp) return 0;
+            sycl_device_scratch_guard out_guard(dq, out_tmp);
+
+            const float scale = 1.0f / sycl::sqrt((float)head_dim);
+            sycl::event ev1 = sycl_gemm_batch_f32(
+                    dq, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                    (int64_t)n_keys, (int64_t)n_tokens, (int64_t)head_dim,
+                    scale,
+                    praw, (int64_t)head_dim, 0,
+                    pq, (int64_t)((uint64_t)n_head * head_dim), (int64_t)head_dim,
+                    0.0f,
+                    scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * n_tokens),
+                    (int64_t)n_head);
+            ev1.wait_and_throw();
+
+            dq.submit([&](sycl::handler &h) {
+                sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(256u), h);
+                h.parallel_for(
+                        sycl::nd_range<2>(sycl::range<2>((size_t)n_tokens * 256u, n_head),
+                                          sycl::range<2>(256u, 1u)),
+                        [=](sycl::nd_item<2> it) {
+                            sycl_attention_prefill_raw_softmax_kernel(
+                                    it, reduce_scratch, scores, psinks, n_tokens, window,
+                                    n_keys);
+                        });
+            });
+            dq.wait_and_throw();
+
+            sycl::event ev2 = sycl_gemm_batch_f32(
+                    dq, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
+                    (int64_t)head_dim, (int64_t)n_tokens, (int64_t)n_keys,
+                    1.0f,
+                    praw, (int64_t)head_dim, 0,
+                    scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * n_tokens),
+                    0.0f,
+                    out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * n_tokens),
+                    (int64_t)n_head);
+            ev2.wait_and_throw();
+
+            sycl_attention_prefill_unpack_heads_launch(dq, pheads, out_tmp, n_tokens, n_head,
+                                                       head_dim);
+            dq.wait_and_throw();
+            return 1;
+        }
+
+        if (window == 0u && n_tokens > 256u) return 0;
+
+        dq.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> scores(sycl::range<1>(256u), h);
+            sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(128u), h);
+            h.parallel_for(
+                    sycl::nd_range<2>(sycl::range<2>((size_t)n_tokens * 128u, n_head),
+                                      sycl::range<2>(128u, 1u)),
+                    [=](sycl::nd_item<2> it) {
+                        sycl_attention_prefill_raw_kernel(
+                                it, scores, reduce_scratch, pheads, psinks, pq, praw,
+                                n_tokens, window, n_head, head_dim);
+                    });
+        });
+        dq.wait_and_throw();
+    } catch (const std::exception &e) {
+        /* std::exception, not sycl::exception: oneMKL's own exceptions
+         * (oneapi::mkl::invalid_argument and siblings, thrown synchronously
+         * by gemm_batch itself for a bad argument, not only from a later
+         * wait) derive from oneapi::mkl::exception -> std::exception, a
+         * different hierarchy from sycl::exception (which also derives from
+         * std::exception, so this one clause still catches both). Caught
+         * here, not found by inspection: an earlier version of this catch
+         * clause only caught sycl::exception, and an ablation that gave
+         * oneMKL a bad lda terminated the whole process instead of this
+         * entry returning its failure value. */
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "attention prefill raw launch failed: %s\n",
                 e.what());
         return 0;
     }

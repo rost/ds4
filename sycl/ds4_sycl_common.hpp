@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <vector>
 
 static inline int sycl_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
