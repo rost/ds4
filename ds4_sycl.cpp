@@ -622,3 +622,6 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
  * ds4_sycl_moe_launch.hpp the ABI entry points that dispatch to them. */
 #include "sycl/ds4_sycl_moe.hpp"
 #include "sycl/ds4_sycl_moe_launch.hpp"
+
+/* Same scoping reason as the includes above. */
+#include "sycl/ds4_sycl_hc.hpp"
