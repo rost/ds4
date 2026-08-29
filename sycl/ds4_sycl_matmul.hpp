@@ -246,13 +246,15 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
 
 /* ROCm's own entry (rocm/ds4_rocm_matmul.cuh:571-583) is dead code: every
  * one of its 8 parameters is cast to (void) and it unconditionally
- * `return 0;`.  It is uncalled anywhere reachable on a non-Apple build (the
- * only path to it is a CUDA-stub wrapper reached solely from Metal-decode-
- * graph orchestration in ds4.c), and ds4_gpu.h documents it in the same
- * "Dense Projections" section with the exact same signature shape as
- * ds4_gpu_matmul_q8_0_tensor above, with no "optional" framing
- * distinguishing it from a required primitive.  Rather than port a
- * permanently non-functional no-op, this entry is a real, correct Q8_0
+ * `return 0;`.  This entry is not a permanently non-functional no-op on
+ * every backend, though: ds4_metal.m implements it for real (delegating to
+ * ds4_gpu_matmul_q8_0_tensor for n_tok == 1), so it is a live ABI entry with
+ * a working implementation elsewhere, and ds4_gpu.h documents it in the
+ * "Dense Projections" section alongside the other required dense-matmul
+ * entries with no "optional"/fusion framing distinguishing it from a
+ * required primitive (contrast ds4_gpu_matmul_f16_pair_compressor_store_tensor,
+ * which ds4_gpu.h explicitly documents as "Optional Metal decode fusion").
+ * Rather than port ROCm's dead no-op, this entry is a real, correct Q8_0
  * dense matmul with the same validation, return polarity, and numerical
  * contract as ds4_gpu_matmul_q8_0_tensor, delegating to the same
  * sycl_q8_0_matmul_general helper.  This is a deliberate divergence from
@@ -328,7 +330,7 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
 /* Optional Metal decode fusion (paired projection plus recurrent
  * compressor-state store).  This backend has no such fused path; ROCm's
  * own implementation (rocm/ds4_rocm_matmul.cuh:933-965) is `(void)` on
- * every one of its 14 parameters then `return 0;`, a complete
+ * every one of its 15 parameters then `return 0;`, a complete
  * implementation of the tri-state contract's "optimized path unavailable"
  * branch (ds4_gpu.h), not a stub for something unfinished.  Ported
  * verbatim: touch nothing, decline. */

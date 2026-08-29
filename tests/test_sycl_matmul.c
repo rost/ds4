@@ -18,10 +18,15 @@
 #include <string.h>
 
 /* No SYCL half type is available in a plain C test, so weights are built
- * by hand-encoding IEEE754 binary16 bit patterns.  Restricted to exactly
- * representable small integers (the only values this file's test data
- * uses), so plain truncation of the mantissa is exact, not an
- * approximation. */
+ * by hand-encoding IEEE754 binary16 bit patterns.  This does plain
+ * truncation of the mantissa, not round-to-nearest, so it is not a general
+ * float-to-half conversion; some of this file's test inputs (for example
+ * test_encode_q8_0_row's 0.05f * (o + blk + 1)) are not exactly
+ * representable in binary16.  That is safe here specifically because the
+ * paired oracle decode function reads back the identical stored bit
+ * pattern, so both sides agree bit-for-bit regardless of whether truncation
+ * or rounding produced those bits, not because the inputs are exactly
+ * representable. */
 static uint16_t test_float_to_half(float f) {
     uint32_t bits;
     memcpy(&bits, &f, sizeof(bits));
@@ -129,7 +134,7 @@ static int test_matmul_f16_pair(void) {
 
 /* This backend has no fused Metal-style decode path, so this entry's only
  * defined behaviour here is "decline": rocm/ds4_rocm_matmul.cuh:933-965 is
- * `(void)` on all 14 parameters then `return 0;`, a real and complete
+ * `(void)` on all 15 parameters then `return 0;`, a real and complete
  * implementation of the tri-state contract's 0 branch (ds4_gpu.h,
  * ds4_gpu_matmul_f16_pair_compressor_store_tensor), not a placeholder for
  * an unimplemented stub.  The correct, complete test is: returns exactly

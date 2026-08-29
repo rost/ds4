@@ -27,7 +27,7 @@
  * ape_type is restricted to 0 = F32, 1 = F16, 8 = Q8_0
  * (rocm/ds4_rocm_compressor.cuh:181-183); the Q8_0 branch uses the same
  * 32-value, 34-byte block layout (2-byte little-endian F16 scale then 32
- * int8) as test_embed_q8_0 above. */
+ * int8) as test_embed_q8_0 in tests/test_sycl_embedding.c. */
 static float oracle_ape_value(const unsigned char *model, uint32_t ape_type,
                               uint32_t width, uint32_t row, uint32_t col) {
     if (ape_type == 1u) {
@@ -51,9 +51,10 @@ static float oracle_ape_value(const unsigned char *model, uint32_t ape_type,
  * value distinguishable per (row, col), so a transposed or misindexed read
  * produces a visibly wrong value rather than a coincidental match.  The F16
  * branch is restricted to the 8 exactly-representable small integers used
- * by test_embed_f16 above, for the same reason: no float-to-half encoder
- * exists in this C test, so the oracle must stay exact by construction
- * rather than by rounding agreement with the kernel. */
+ * by test_embed_f16 in tests/test_sycl_embedding.c, for the same reason:
+ * no float-to-half encoder exists in this C test, so the oracle must stay
+ * exact by construction rather than by rounding agreement with the
+ * kernel. */
 static void oracle_fill_ape(unsigned char *dst, uint32_t ape_type,
                             uint32_t width, uint32_t rows) {
     static const uint16_t kHalfSmallInt[8] = {
@@ -983,11 +984,12 @@ static void oracle_compressor_finish_prefill(float *state_kv, float *state_score
  * batches the compressor either: it always loops per token
  * (prefill_layer_major_cpu, ds4.c:13757, reaching compressor_decode_one via
  * ds4.c:13107, :13125, :13342, :13360).  So the oracle here IS that
- * per-token loop, built entirely from the already-validated oracles
- * above (oracle_compressor_store, oracle_compressor_pool,
- * oracle_rms_norm_weight, oracle_rope_tail_row), run once per position from
- * pos0 == 0 to n_tokens - 1 with a fresh state ring (state_kv zeroed,
- * state_score -inf, matching rocm/ds4_rocm_compressor.cuh:384-387), taking
+ * per-token loop, built entirely from the compressor-store oracles already
+ * validated above in this file (oracle_compressor_store,
+ * oracle_compressor_pool, oracle_rms_norm_weight, oracle_rope_tail_row), run
+ * once per position from pos0 == 0 to n_tokens - 1 with a fresh state ring
+ * (state_kv zeroed, state_score -inf, matching
+ * rocm/ds4_rocm_compressor.cuh:384-387), taking
  * the emitted row at every ratio boundary and applying the ratio == 4 shift
  * exactly as oracle_compressor_pool's caller does above.  pos0 == 0 matches
  * the only configuration ds4.c ever calls this entry with (see the finish
@@ -1248,8 +1250,8 @@ static int test_compressor_prefill(void) {
 /* ds4_gpu_compressor_prefill_state_ratio4_tensor is the store-only half of
  * ds4_gpu_compressor_prefill_ratio4_replay_tensor's own tail-reseed step,
  * applied standalone to a tail of exactly four raw tokens, so it reuses
- * the store oracle (oracle_compressor_store) directly rather than
- * needing a new one.
+ * the compressor-store oracle (oracle_compressor_store) defined above
+ * directly rather than needing a new one.
  *
  * oracle_compressor_store's own ratio == 4 formula always writes a token
  * into the HIGH half of an 8-row ring (dst_row = ratio + pos_mod), matching

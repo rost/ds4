@@ -85,9 +85,10 @@ static inline const char *sycl_model_range_ptr(const void *model_map,
 
 /* Q8_0 row layout: blocks of 32 values, 34 bytes per block, a little-endian
  * F16 scale in bytes 0-1 followed by 32 signed int8 values.  See
- * rocm/ds4_rocm_common.cuh:19-63.  Not yet used by any entry in this file;
- * added ahead of the Q8_0 matmul entries that need it so those entries do
- * not have to touch this file. */
+ * rocm/ds4_rocm_common.cuh:19-63.  This is the shared Q8_0 block-layout
+ * helper used by the Q8_0 matmul family in sycl/ds4_sycl_matmul.hpp; it
+ * lives here rather than duplicated per-entry so those entries do not each
+ * have to touch this file. */
 static inline int sycl_q8_0_row_bytes_checked(uint64_t in_dim, uint64_t *row_bytes) {
     if (!row_bytes) return 0;
     const uint64_t blocks = (in_dim + 31u) / 32u;

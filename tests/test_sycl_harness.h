@@ -37,8 +37,9 @@
 
 /* Half-precision bit decode, standard IEEE754 binary16 -> binary32,
  * including the subnormal case.  Needed because a SYCL half type is not
- * available in a plain C test (same reason cited at test_embed_f16 above);
- * this is the decode counterpart of the round-trip-through-known-bit-
+ * available in a plain C test (same reason cited at test_embed_f16 in
+ * tests/test_sycl_embedding.c); this is the decode counterpart of the
+ * round-trip-through-known-bit-
  * patterns encoding technique used throughout this file. */
 static inline float oracle_half_to_float(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
