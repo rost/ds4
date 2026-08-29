@@ -916,6 +916,198 @@ static int test_router_hash_mode_rejections(void) {
     return 0;
 }
 
+/* Batch score-mode selection over 5 tokens (not a multiple of 4, so the
+ * second and final work-group has only 1 real row out of 4), each with a
+ * distinct top-4 expert set so a bug that reads the wrong token's row (or
+ * always token 0's) cannot pass.  Output tensors are allocated with room
+ * for the full padded 8 rows the launch grid computes (2 groups x 4), even
+ * though only 5 are real: the trailing 3 padded rows must stay at their
+ * sentinel value, proving the entry never writes past n_tokens. */
+static int test_router_batch_score_mode(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 4, N_TOKENS = 5, N_PADDED = 8 };
+    /* logits is itself padded to N_PADDED rows, zero-filled beyond the real
+     * N_TOKENS: an ablation of the t >= n_tokens guard (see the ablation
+     * report) would otherwise read and write past the end of a tensor
+     * sized for exactly N_TOKENS rows, which is not a safe thing to run on
+     * real device memory even as a throwaway ablation. Padding every
+     * tensor here to the same N_PADDED capacity keeps that ablation
+     * in-bounds. */
+    float logits[N_PADDED][N_EXPERT];
+    memset(logits, 0, sizeof(logits));
+    for (uint32_t t = 0; t < N_TOKENS; t++) {
+        for (uint32_t e = 0; e < N_EXPERT; e++) logits[t][e] = -5.0f;
+        /* Token t's top-4 experts are t, t+50, t+100, t+150 (mod 256),
+         * each token's set disjoint from every other's. */
+        logits[t][t] = 10.0f;
+        logits[t][(t + 50) % N_EXPERT] = 9.0f;
+        logits[t][(t + 100) % N_EXPERT] = 8.0f;
+        logits[t][(t + 150) % N_EXPERT] = 7.0f;
+    }
+
+    ds4_gpu_tensor *tlogits = ds4_gpu_tensor_alloc((uint64_t)N_PADDED * N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *tselected = ds4_gpu_tensor_alloc((uint64_t)N_PADDED * N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *tweights = ds4_gpu_tensor_alloc((uint64_t)N_PADDED * N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *tprobs = ds4_gpu_tensor_alloc((uint64_t)N_PADDED * N_EXPERT * sizeof(float));
+    CHECK(tlogits && tselected && tweights && tprobs, "router: batch score allocation failed");
+    CHECK(ds4_gpu_tensor_write(tlogits, 0, logits, sizeof(logits)) != 0, "router: batch logits write failed");
+
+    int32_t sel_sentinel[N_PADDED * N_EXPERT_USED];
+    float w_sentinel[N_PADDED * N_EXPERT_USED];
+    float p_sentinel[N_PADDED * N_EXPERT];
+    for (uint32_t i = 0; i < N_PADDED * N_EXPERT_USED; i++) { sel_sentinel[i] = -999; w_sentinel[i] = -12345.0f; }
+    for (uint32_t i = 0; i < N_PADDED * N_EXPERT; i++) p_sentinel[i] = -12345.0f;
+    CHECK(ds4_gpu_tensor_write(tselected, 0, sel_sentinel, sizeof(sel_sentinel)) != 0, "router: batch selected sentinel write failed");
+    CHECK(ds4_gpu_tensor_write(tweights, 0, w_sentinel, sizeof(w_sentinel)) != 0, "router: batch weights sentinel write failed");
+    CHECK(ds4_gpu_tensor_write(tprobs, 0, p_sentinel, sizeof(p_sentinel)) != 0, "router: batch probs sentinel write failed");
+
+    CHECK(ds4_gpu_router_select_batch_tensor(
+              tselected, tweights, tprobs, /*model_map=*/"", /*model_size=*/0,
+              /*bias_offset=*/0, /*hash_offset=*/0, /*hash_rows=*/0,
+              /*n_expert_groups=*/0, /*n_group_used=*/0, /*has_bias=*/false, /*hash_mode=*/false,
+              tlogits, /*tokens=*/NULL, N_EXPERT, N_EXPERT_USED, 1.5f, N_TOKENS) != 0,
+          "router: batch score mode call failed");
+
+    int32_t got_selected[N_PADDED * N_EXPERT_USED];
+    float got_weights[N_PADDED * N_EXPERT_USED];
+    float got_probs[N_PADDED * N_EXPERT];
+    CHECK(ds4_gpu_tensor_read(tselected, 0, got_selected, sizeof(got_selected)) != 0, "router: batch selected read failed");
+    CHECK(ds4_gpu_tensor_read(tweights, 0, got_weights, sizeof(got_weights)) != 0, "router: batch weights read failed");
+    CHECK(ds4_gpu_tensor_read(tprobs, 0, got_probs, sizeof(got_probs)) != 0, "router: batch probs read failed");
+
+    for (uint32_t t = 0; t < N_TOKENS; t++) {
+        float want_probs[N_EXPERT];
+        oracle_router_probs(want_probs, logits[t], N_EXPERT);
+        for (uint32_t e = 0; e < N_EXPERT; e++) {
+            CHECK_CLOSE(got_probs[t * N_EXPERT + e], want_probs[e], 1e-5, "router: batch probs mismatch");
+        }
+        int32_t want_selected[N_EXPERT_USED];
+        float want_weights[N_EXPERT_USED];
+        oracle_topk_select(want_selected, want_weights, want_probs, NULL, 0, N_EXPERT, N_EXPERT_USED, 1.5f);
+        for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+            CHECK(got_selected[t * N_EXPERT_USED + j] == want_selected[j], "router: batch selected mismatch");
+            CHECK_CLOSE(got_weights[t * N_EXPERT_USED + j], want_weights[j], 1e-5, "router: batch weight mismatch");
+        }
+    }
+
+    for (uint32_t i = N_TOKENS * N_EXPERT_USED; i < N_PADDED * N_EXPERT_USED; i++) {
+        CHECK(got_selected[i] == -999, "router: padded selected row must stay untouched");
+        CHECK(got_weights[i] == -12345.0f, "router: padded weights row must stay untouched");
+    }
+    for (uint32_t i = N_TOKENS * N_EXPERT; i < N_PADDED * N_EXPERT; i++) {
+        CHECK(got_probs[i] == -12345.0f, "router: padded probs row must stay untouched");
+    }
+
+    free_router_tensors(tlogits, tselected, tweights, tprobs);
+    fprintf(stderr, "  test_router_batch_score_mode OK\n");
+    return 0;
+}
+
+/* Batch hash-mode selection: 5 tokens, a per-token tokens tensor {0..4},
+ * and a 5-row hash table with a distinct expert set per row, so a port
+ * that reads the wrong table row (or the same row for every token) cannot
+ * pass. */
+static int test_router_batch_hash_mode(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 4, N_TOKENS = 5, HASH_ROWS = 5 };
+    float logits[N_TOKENS][N_EXPERT];
+    for (uint32_t t = 0; t < N_TOKENS; t++) {
+        for (uint32_t e = 0; e < N_EXPERT; e++) logits[t][e] = 0.01f * (float)e - 1.0f + 0.03f * (float)t;
+    }
+
+    const int32_t hash_table[HASH_ROWS][N_EXPERT_USED] = {
+            {1, 2, 3, 4},
+            {10, 20, 30, 40},
+            {50, 60, 70, 80},
+            {90, 100, 110, 120},
+            {200, 210, 220, 230},
+    };
+    unsigned char model[sizeof(hash_table)];
+    memcpy(model, hash_table, sizeof(hash_table));
+
+    int32_t tokens[N_TOKENS] = {0, 1, 2, 3, 4};
+
+    ds4_gpu_tensor *tlogits = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *ttokens = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * sizeof(int32_t));
+    ds4_gpu_tensor *tselected = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *tweights = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *tprobs = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * N_EXPERT * sizeof(float));
+    CHECK(tlogits && ttokens && tselected && tweights && tprobs, "router: batch hash allocation failed");
+    CHECK(ds4_gpu_tensor_write(tlogits, 0, logits, sizeof(logits)) != 0, "router: batch hash logits write failed");
+    CHECK(ds4_gpu_tensor_write(ttokens, 0, tokens, sizeof(tokens)) != 0, "router: batch hash tokens write failed");
+
+    CHECK(ds4_gpu_router_select_batch_tensor(
+              tselected, tweights, tprobs, model, sizeof(model),
+              /*bias_offset=*/0, /*hash_offset=*/0, HASH_ROWS,
+              0, 0, /*has_bias=*/false, /*hash_mode=*/true,
+              tlogits, ttokens, N_EXPERT, N_EXPERT_USED, 1.5f, N_TOKENS) != 0,
+          "router: batch hash mode call failed");
+
+    int32_t got_selected[N_TOKENS * N_EXPERT_USED];
+    float got_weights[N_TOKENS * N_EXPERT_USED];
+    CHECK(ds4_gpu_tensor_read(tselected, 0, got_selected, sizeof(got_selected)) != 0, "router: batch hash selected read failed");
+    CHECK(ds4_gpu_tensor_read(tweights, 0, got_weights, sizeof(got_weights)) != 0, "router: batch hash weights read failed");
+
+    for (uint32_t t = 0; t < N_TOKENS; t++) {
+        float want_probs[N_EXPERT];
+        oracle_router_probs(want_probs, logits[t], N_EXPERT);
+        int32_t want_selected[N_EXPERT_USED];
+        float want_weights[N_EXPERT_USED];
+        oracle_hash_select(want_selected, want_weights, want_probs, hash_table[t], N_EXPERT, N_EXPERT_USED, 1.5f);
+        for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+            CHECK(got_selected[t * N_EXPERT_USED + j] == want_selected[j], "router: batch hash selected mismatch");
+            CHECK_CLOSE(got_weights[t * N_EXPERT_USED + j], want_weights[j], 1e-5, "router: batch hash weight mismatch");
+        }
+    }
+
+    /* Token 0 and token 4 must select different experts: a port that
+     * silently reads hash row 0 for every token cannot pass this. */
+    int differs = 0;
+    for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+        if (got_selected[0 * N_EXPERT_USED + j] != got_selected[4 * N_EXPERT_USED + j]) differs = 1;
+    }
+    CHECK(differs, "router: batch hash mode must select differently per token");
+
+    free_router_tensors(tlogits, tselected, tweights, tprobs);
+    ds4_gpu_tensor_free(ttokens);
+    fprintf(stderr, "  test_router_batch_hash_mode OK\n");
+    return 0;
+}
+
+/* n_tokens == 0 is a rejection (rocm/ds4_rocm_router.cuh:169), not a
+ * zero-work success; hash mode with a null tokens tensor must also be
+ * rejected, matching the batch launcher's cuda_tensor_has_i32(tokens,
+ * n_tokens) requirement whenever hash_mode is set. */
+static int test_router_batch_rejections(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 4, N_TOKENS = 2, HASH_ROWS = 2 };
+    float logits[N_TOKENS][N_EXPERT];
+    for (uint32_t t = 0; t < N_TOKENS; t++) {
+        for (uint32_t e = 0; e < N_EXPERT; e++) logits[t][e] = 0.01f * (float)e - 1.0f;
+    }
+    const int32_t hash_table[HASH_ROWS][N_EXPERT_USED] = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+    unsigned char model[sizeof(hash_table)];
+    memcpy(model, hash_table, sizeof(hash_table));
+
+    ds4_gpu_tensor *tlogits = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *tselected = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *tweights = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *tprobs = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * N_EXPERT * sizeof(float));
+    CHECK(tlogits && tselected && tweights && tprobs, "router: batch rejections allocation failed");
+    CHECK(ds4_gpu_tensor_write(tlogits, 0, logits, sizeof(logits)) != 0, "router: batch rejections logits write failed");
+
+    CHECK(ds4_gpu_router_select_batch_tensor(
+              tselected, tweights, tprobs, model, sizeof(model), 0, 0, 0, 0, 0, false, false,
+              tlogits, NULL, N_EXPERT, N_EXPERT_USED, 1.5f, /*n_tokens=*/0) == 0,
+          "router: n_tokens == 0 must be rejected");
+
+    CHECK(ds4_gpu_router_select_batch_tensor(
+              tselected, tweights, tprobs, model, sizeof(model), 0, 0, HASH_ROWS, 0, 0, false, true,
+              tlogits, /*tokens=*/NULL, N_EXPERT, N_EXPERT_USED, 1.5f, N_TOKENS) == 0,
+          "router: hash mode with null tokens must be rejected");
+
+    free_router_tensors(tlogits, tselected, tweights, tprobs);
+    fprintf(stderr, "  test_router_batch_rejections OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_router_softplus_branches() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -931,6 +1123,9 @@ int main(void) {
     if (test_router_hash_mode_out_of_range_expert() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_router_hash_mode_token_clamp() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_router_hash_mode_rejections() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_batch_score_mode() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_batch_hash_mode() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_batch_rejections() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_router OK\n");
     return 0;

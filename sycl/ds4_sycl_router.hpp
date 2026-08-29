@@ -13,9 +13,9 @@
  * lane dimension is a sub-group doing warp-style top-k via cross-lane
  * shuffles, and each of the 4 rows is an independent sub-group handling one
  * token.  ds4_gpu_router_select_tensor below launches exactly one such
- * work-group with n_tokens == 1 (only row 0 is used); the batch entry that
- * launches many work-groups over real per-token rows is a later addition to
- * this same kernel body.
+ * work-group with n_tokens == 1 (only row 0 is used); ds4_gpu_router_select_
+ * batch_tensor launches as many work-groups as n_tokens requires over real
+ * per-token rows, sharing this same kernel body.
  *
  * Hash-mode routing (selecting experts from a fixed per-token lookup table
  * instead of top-k, ignoring scores and bias entirely) is fully ported
@@ -267,6 +267,52 @@ static void sycl_router_select_launch(
     q.wait_and_throw();
 }
 
+/* Validates the bias/hash table shared by both router entries and resolves
+ * where its bytes come from in the host mmap, without touching the device.
+ * At most one of bias_bytes/hash_bytes is ever nonzero: ROCm only loads
+ * bias when has_bias && !hash_mode (rocm/ds4_rocm_router.cuh:130), and only
+ * loads hash when hash_mode, so the two entries below share a single
+ * scratch allocation sized by whichever one applies rather than needing
+ * one each. On success writes *out_scratch_bytes and *out_scratch_src
+ * (both zero/null if neither table is needed) and returns 1; returns 0 on
+ * any validation failure, in which case the caller must return 0 without
+ * touching either output. */
+static int sycl_router_resolve_bias_hash(
+        const void *model_map, uint64_t model_size, uint64_t bias_offset,
+        uint64_t hash_offset, uint32_t hash_rows, uint32_t active_n_expert,
+        uint32_t active_n_expert_used, bool has_bias, bool hash_mode,
+        uint64_t *out_scratch_bytes, const void **out_scratch_src) {
+    uint64_t bias_bytes = 0, hash_bytes = 0;
+    if (has_bias && !hash_mode) {
+        if (!sycl_u64_mul_checked(active_n_expert, sizeof(float), &bias_bytes) ||
+            !sycl_model_range_fits(model_size, bias_offset, bias_bytes)) {
+            return 0;
+        }
+    }
+    if (hash_mode) {
+        if (hash_rows == 0u ||
+            !sycl_u64_mul3_checked(hash_rows, active_n_expert_used, sizeof(int32_t), &hash_bytes) ||
+            !sycl_model_range_fits(model_size, hash_offset, hash_bytes)) {
+            return 0;
+        }
+    }
+
+    const char *bias_src = (has_bias && !hash_mode)
+            ? sycl_model_range_ptr(model_map, bias_offset, bias_bytes, model_size, "router_bias")
+            : nullptr;
+    if (has_bias && !hash_mode && !bias_src) return 0;
+
+    const char *hash_src = hash_mode
+            ? sycl_model_range_ptr(model_map, hash_offset, hash_bytes, model_size, "router_hash")
+            : nullptr;
+    if (hash_mode && !hash_src) return 0;
+
+    *out_scratch_bytes = (has_bias && !hash_mode) ? bias_bytes : (hash_mode ? hash_bytes : 0u);
+    *out_scratch_src = (has_bias && !hash_mode) ? (const void *)bias_src
+                     : (hash_mode ? (const void *)hash_src : nullptr);
+    return 1;
+}
+
 }  // namespace
 
 /* Single-token router selection: computes probs[n_expert] from logits, then
@@ -309,46 +355,20 @@ extern "C" int ds4_gpu_router_select_tensor(
         return 0;
     }
 
-    /* has_bias and hash_mode are never both staged: ROCm only loads bias
-     * when `has_bias && !hash_mode` (rocm/ds4_rocm_router.cuh:130), and
-     * only loads hash when hash_mode.  So at most one of bias_bytes/
-     * hash_bytes is ever nonzero below, and the two staging paths share a
-     * single scratch allocation rather than needing one each. */
-    uint64_t bias_bytes = 0, hash_bytes = 0;
-    if (has_bias && !hash_mode) {
-        if (!sycl_u64_mul_checked(active_n_expert, sizeof(float), &bias_bytes) ||
-            !sycl_model_range_fits(model_size, bias_offset, bias_bytes)) {
-            return 0;
-        }
-    }
-    if (hash_mode) {
-        if (hash_rows == 0u ||
-            !sycl_u64_mul3_checked(hash_rows, active_n_expert_used, sizeof(int32_t), &hash_bytes) ||
-            !sycl_model_range_fits(model_size, hash_offset, hash_bytes)) {
-            return 0;
-        }
+    uint64_t scratch_bytes = 0;
+    const void *scratch_src = nullptr;
+    if (!sycl_router_resolve_bias_hash(
+                model_map, model_size, bias_offset, hash_offset, hash_rows,
+                active_n_expert, active_n_expert_used, has_bias, hash_mode,
+                &scratch_bytes, &scratch_src)) {
+        return 0;
     }
     if (g_devices.empty()) return 0;
-
-    const char *bias_src = (has_bias && !hash_mode)
-            ? sycl_model_range_ptr(model_map, bias_offset, bias_bytes, model_size, "router_bias")
-            : nullptr;
-    if (has_bias && !hash_mode && !bias_src) return 0;
-
-    const char *hash_src = hash_mode
-            ? sycl_model_range_ptr(model_map, hash_offset, hash_bytes, model_size, "router_hash")
-            : nullptr;
-    if (hash_mode && !hash_src) return 0;
 
     const int32_t tok = (int32_t)token;
 
     try {
         sycl::queue &q = ds4_sycl_queue(selected->device_id);
-
-        const uint64_t scratch_bytes = (has_bias && !hash_mode) ? bias_bytes
-                                      : (hash_mode ? hash_bytes : 0u);
-        const void *scratch_src = (has_bias && !hash_mode) ? (const void *)bias_src
-                                 : (hash_mode ? (const void *)hash_src : nullptr);
 
         /* The bias/hash table lives in the host mmap; stage it to device
          * scratch under a guard, same as ds4_sycl_compressor.hpp's APE
@@ -381,6 +401,104 @@ extern "C" int ds4_gpu_router_select_tensor(
         }
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "router_select launch failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* Batch router selection: the same kernel as ds4_gpu_router_select_tensor
+ * above, over n_tokens real rows instead of one, four tokens per
+ * work-group.  Matches ds4_gpu_router_select_batch_tensor,
+ * rocm/ds4_rocm_router.cuh:167-233.  Differences from the single-token
+ * entry: a `tokens` tensor replaces the scalar token id (required, and
+ * validated as such, whenever hash_mode is set -- the kernel's own
+ * `tokens ? tokens[t] : token_scalar` ternary exists to serve the
+ * single-token entry above, which always passes a null tokens pointer;
+ * this entry never does), tensor shape validation is 2D
+ * (n_tokens x active_n_expert or active_n_expert_used) via
+ * sycl_tensor_has_elems2 rather than a flat element count, and
+ * n_tokens == 0 is itself a rejection (rocm/ds4_rocm_router.cuh:172), not
+ * a zero-work success. */
+extern "C" int ds4_gpu_router_select_batch_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *weights,
+        ds4_gpu_tensor       *probs,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                bias_offset,
+        uint64_t                hash_offset,
+        uint32_t                hash_rows,
+        uint32_t                n_expert_groups,
+        uint32_t                n_group_used,
+        bool                    has_bias,
+        bool                    hash_mode,
+        const ds4_gpu_tensor *logits,
+        const ds4_gpu_tensor *tokens,
+        uint32_t                n_expert,
+        uint32_t                n_expert_used,
+        float                   expert_weight_scale,
+        uint32_t                n_tokens) {
+    const uint32_t active_n_expert = n_expert != 0u ? n_expert : kSyclNExpert;
+    const uint32_t active_n_expert_used = n_expert_used != 0u ? n_expert_used : kSyclNExpertUsed;
+    const float active_scale = expert_weight_scale != 0.0f ? expert_weight_scale : kSyclExpertWeightScale;
+
+    if (!selected || !weights || !probs || !logits || !model_map || n_tokens == 0u ||
+        n_expert_groups > 1u || n_group_used > 0u ||
+        (active_n_expert != kSyclNExpert && active_n_expert != kSyclMaxNExpert) ||
+        active_n_expert_used > kSyclNExpertUsed ||
+        !(active_scale > 0.0f) ||
+        (hash_mode && !sycl_tensor_has_i32(tokens, n_tokens)) ||
+        !sycl_tensor_has_elems2(logits, n_tokens, active_n_expert, sizeof(float)) ||
+        !sycl_tensor_has_elems2(probs, n_tokens, active_n_expert, sizeof(float)) ||
+        !sycl_tensor_has_elems2(selected, n_tokens, active_n_expert_used, sizeof(int32_t)) ||
+        !sycl_tensor_has_elems2(weights, n_tokens, active_n_expert_used, sizeof(float))) {
+        return 0;
+    }
+
+    uint64_t scratch_bytes = 0;
+    const void *scratch_src = nullptr;
+    if (!sycl_router_resolve_bias_hash(
+                model_map, model_size, bias_offset, hash_offset, hash_rows,
+                active_n_expert, active_n_expert_used, has_bias, hash_mode,
+                &scratch_bytes, &scratch_src)) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(selected->device_id);
+
+        /* Same staging pattern as the single-token entry above: never a
+         * bare malloc_device/free pair. */
+        unsigned char *dscratch = nullptr;
+        if (scratch_bytes != 0u) {
+            dscratch = sycl::malloc_device<unsigned char>((size_t)scratch_bytes, q);
+            if (!dscratch) return 0;
+        }
+        sycl_device_scratch_guard scratch_guard(q, dscratch);
+        if (dscratch) {
+            q.memcpy(dscratch, scratch_src, (size_t)scratch_bytes).wait_and_throw();
+        }
+
+        const float   *dbias = (has_bias && !hash_mode) ? (const float *)dscratch : nullptr;
+        const int32_t *dhash = hash_mode ? (const int32_t *)dscratch : nullptr;
+        const int32_t *dtokens = tokens ? (const int32_t *)tokens->ptr : nullptr;
+
+        if (active_n_expert == kSyclMaxNExpert) {
+            sycl_router_select_launch<kSyclMaxNExpert>(
+                    q, (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                    dbias, dhash, (const float *)logits->ptr, dtokens, 0, hash_rows, n_tokens,
+                    active_n_expert_used, active_scale,
+                    (has_bias && !hash_mode) ? 1 : 0, hash_mode ? 1 : 0);
+        } else {
+            sycl_router_select_launch<kSyclNExpert>(
+                    q, (int32_t *)selected->ptr, (float *)weights->ptr, (float *)probs->ptr,
+                    dbias, dhash, (const float *)logits->ptr, dtokens, 0, hash_rows, n_tokens,
+                    active_n_expert_used, active_scale,
+                    (has_bias && !hash_mode) ? 1 : 0, hash_mode ? 1 : 0);
+        }
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "router_select_batch launch failed: %s\n", e.what());
         return 0;
     }
     return 1;
