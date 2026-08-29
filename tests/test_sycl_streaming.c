@@ -1,8 +1,11 @@
-/* Tests for the SYCL resident expert-streaming cache: LRU eviction, the
- * slab pool, its dedicated-allocation fallback, and seed_experts priority
- * selection.  Self-contained (does not use tests/test_sycl_harness.h,
- * which a sibling plan owns).  Needs no model file: the "model" is a
- * plain host byte array standing in for an mmapped weights file. */
+/* Tests for the SYCL expert-streaming caches: the resident cache's LRU
+ * eviction, slab pool and dedicated-allocation fallback, seed_experts
+ * priority selection, the selected-cache scratch buffer (begin_selected_load
+ * / seed_selected) and the batch-selected cache's host-side deduplication
+ * (prepare_selected_batch).  Self-contained (does not use
+ * tests/test_sycl_harness.h, used by other tests in this suite).  Needs no model
+ * file: the "model" is a plain host byte array standing in for an mmapped
+ * weights file. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -20,13 +23,23 @@
         }                                                                   \
     } while (0)
 
-/* Test-only side doors into sycl/ds4_sycl_streaming.hpp.  Neither is part
- * of ds4_gpu.h: this task's five ABI entries expose no way to read a
- * resident entry's bytes back or to reset the cache between tests. */
+/* Test-only side doors into sycl/ds4_sycl_streaming.hpp.  None of the
+ * streaming-cache ABI entries expose a resident entry's bytes, the selected
+ * scratch buffer's bytes, the resident-hit/miss counts, the batch dedup
+ * mapping, or a way to reset cache state between test cases. */
 extern int  ds4_sycl_stream_test_read_resident(uint32_t layer, int32_t expert,
                                                void *gate_out, void *up_out,
                                                void *down_out);
 extern void ds4_sycl_stream_test_reset(void);
+extern int  ds4_sycl_stream_test_read_selected(uint32_t slot, void *gate_out,
+                                               void *up_out, void *down_out);
+extern void ds4_sycl_stream_test_hit_miss(uint64_t *hits, uint64_t *misses);
+extern int  ds4_sycl_stream_test_batch_dedup(const int32_t *ids, uint32_t n_tokens,
+                                             uint32_t n_selected,
+                                             uint32_t n_total_expert,
+                                             int32_t *unique_ids_out,
+                                             uint32_t *unique_count_out,
+                                             uint32_t *compact_ids_out);
 
 enum { GATE_TAG = 0, UP_TAG = 101, DOWN_TAG = 202 };
 
@@ -423,6 +436,279 @@ static int test_budget_for_expert_size_ignores_bytes(void) {
     return 0;
 }
 
+/* ---- Selected and batch-selected scratch caches ---- */
+
+static int selected_slot_matches(unsigned char *model, int32_t expert,
+                                 uint32_t slot, uint64_t gate_offset,
+                                 uint64_t up_offset, uint64_t down_offset,
+                                 uint64_t gate_expert_bytes,
+                                 uint64_t down_expert_bytes) {
+    unsigned char *gate = (unsigned char *)malloc(gate_expert_bytes);
+    unsigned char *up = (unsigned char *)malloc(gate_expert_bytes);
+    unsigned char *down = (unsigned char *)malloc(down_expert_bytes);
+    int ok = gate && up && down &&
+             ds4_sycl_stream_test_read_selected(slot, gate, up, down);
+    if (ok) {
+        ok = memcmp(gate, model + gate_offset + (uint64_t)expert * gate_expert_bytes,
+                    gate_expert_bytes) == 0 &&
+             memcmp(up, model + up_offset + (uint64_t)expert * gate_expert_bytes,
+                    gate_expert_bytes) == 0 &&
+             memcmp(down, model + down_offset + (uint64_t)expert * down_expert_bytes,
+                    down_expert_bytes) == 0;
+    }
+    free(gate);
+    free(up);
+    free(down);
+    return ok;
+}
+
+/* begin_selected_load must copy every selected expert's bytes into the
+ * compacted per-slot scratch buffer, byte-for-byte, in selection order
+ * (not sorted, not deduplicated: the selected cache always holds exactly
+ * n_selected slots, one per input id, even if some ids repeat). */
+static int test_begin_selected_load_byte_content(void) {
+    ds4_sycl_stream_test_reset();
+    enum { N_EXPERT = 8, GATE_BYTES = 24, DOWN_BYTES = 16, LAYER = 0, BUDGET = 8 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+    int32_t selected[] = {3, 1, 5};
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 3) != 0,
+          "begin_selected_load: call failed");
+    CHECK(selected_slot_matches(model, 3, 0, gate_offset, up_offset, down_offset,
+                                GATE_BYTES, DOWN_BYTES),
+          "begin_selected_load: slot 0 (expert 3) content mismatch");
+    CHECK(selected_slot_matches(model, 1, 1, gate_offset, up_offset, down_offset,
+                                GATE_BYTES, DOWN_BYTES),
+          "begin_selected_load: slot 1 (expert 1) content mismatch");
+    CHECK(selected_slot_matches(model, 5, 2, gate_offset, up_offset, down_offset,
+                                GATE_BYTES, DOWN_BYTES),
+          "begin_selected_load: slot 2 (expert 5) content mismatch");
+    fprintf(stderr, "  test_begin_selected_load_byte_content OK\n");
+    return 0;
+}
+
+/* A selected id already resident in the resident cache must not trigger a
+ * new mmap-to-device admission copy: only the genuinely new id should
+ * count as a miss.  Proven with an internal counter, not by timing. */
+static int test_resident_hit_short_circuit(void) {
+    ds4_sycl_stream_test_reset();
+    enum { N_EXPERT = 8, GATE_BYTES = 16, DOWN_BYTES = 16, LAYER = 0, BUDGET = 8 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+
+    /* Pre-seed via seed_experts, which does not touch these
+     * counters: they are scoped to this entry's own admission loops
+     * (begin_selected_load / prepare_selected_batch) so a hit/miss here
+     * unambiguously reflects THIS entry's resident-cache-hit short
+     * circuit, not seed_experts'. */
+    int32_t pre[] = {2};
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, pre, NULL, 1) != 0,
+          "resident_hit: pre-seed failed");
+
+    uint64_t hits = 0, misses = 0;
+    ds4_sycl_stream_test_hit_miss(&hits, &misses);
+    CHECK(hits == 0 && misses == 0,
+          "resident_hit: counters must still be zero before begin_selected_load runs");
+
+    int32_t selected[] = {2, 6};
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 2) != 0,
+          "resident_hit: begin_selected_load failed");
+    ds4_sycl_stream_test_hit_miss(&hits, &misses);
+    CHECK(hits == 1, "resident_hit: already-resident expert 2 should register one hit");
+    CHECK(misses == 1, "resident_hit: new expert 6 should register exactly one new miss");
+    CHECK(selected_slot_matches(model, 2, 0, gate_offset, up_offset, down_offset,
+                                GATE_BYTES, DOWN_BYTES),
+          "resident_hit: slot 0 (expert 2, resident hit) content mismatch");
+    CHECK(selected_slot_matches(model, 6, 1, gate_offset, up_offset, down_offset,
+                                GATE_BYTES, DOWN_BYTES),
+          "resident_hit: slot 1 (expert 6, fresh admission) content mismatch");
+    fprintf(stderr, "  test_resident_hit_short_circuit OK\n");
+    return 0;
+}
+
+/* Independent CPU reimplementation of "first unique slot per expert,
+ * assigned in first-seen order", used as the oracle prepare_selected_batch
+ * must match. */
+static void cpu_batch_dedup_oracle(const int32_t *ids, uint32_t n_tokens,
+                                   uint32_t n_selected, int32_t *unique_ids_out,
+                                   uint32_t *unique_count_out,
+                                   uint32_t *compact_ids_out) {
+    int32_t  slot_of[512];
+    uint32_t unique_count = 0;
+    for (uint32_t i = 0; i < 512; i++) slot_of[i] = -1;
+    for (uint32_t i = 0; i < n_tokens * n_selected; i++) {
+        const int32_t expert = ids[i];
+        if (slot_of[expert] < 0) {
+            slot_of[expert] = (int32_t)unique_count;
+            unique_ids_out[unique_count] = expert;
+            unique_count++;
+        }
+        compact_ids_out[i] = (uint32_t)slot_of[expert];
+    }
+    *unique_count_out = unique_count;
+}
+
+/* Dedup correctness: heavy overlap between tokens, one token whose whole
+ * selection set duplicates an earlier token's exactly, and one token
+ * whose n_selected slots are all the same expert repeated.  Compares the
+ * implementation's dedup mapping against an independent CPU oracle,
+ * rather than only against hand-computed constants. */
+static int test_prepare_selected_batch_dedup(void) {
+    ds4_sycl_stream_test_reset();
+    enum { N_EXPERT = 8, GATE_BYTES = 8, DOWN_BYTES = 8, LAYER = 0, BUDGET = 8,
+           N_TOKENS = 4, N_SELECTED = 3 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+
+    /* token0: {1,2,3} (3 new uniques). token1: {2,3,4} (1 new: 4).
+     * token2: {1,1,1} (all duplicates of token0's expert 1, no new
+     * uniques). token3: {1,2,3} (whole set duplicates token0's exactly,
+     * no new uniques). */
+    int32_t ids[N_TOKENS * N_SELECTED] = {
+        1, 2, 3,
+        2, 3, 4,
+        1, 1, 1,
+        1, 2, 3};
+
+    int32_t  oracle_unique[N_EXPERT];
+    uint32_t oracle_count = 0;
+    uint32_t oracle_compact[N_TOKENS * N_SELECTED];
+    cpu_batch_dedup_oracle(ids, N_TOKENS, N_SELECTED, oracle_unique, &oracle_count,
+                          oracle_compact);
+    CHECK(oracle_count == 4, "batch_dedup: oracle itself miscomputed (test bug)");
+
+    int32_t  got_unique[N_EXPERT];
+    uint32_t got_count = 0;
+    uint32_t got_compact[N_TOKENS * N_SELECTED];
+    CHECK(ds4_sycl_stream_test_batch_dedup(ids, N_TOKENS, N_SELECTED, N_EXPERT,
+                                          got_unique, &got_count, got_compact) != 0,
+          "batch_dedup: dedup hook failed");
+    CHECK(got_count == oracle_count, "batch_dedup: unique_count mismatch vs oracle");
+    for (uint32_t i = 0; i < oracle_count; i++) {
+        CHECK(got_unique[i] == oracle_unique[i], "batch_dedup: unique_ids mismatch vs oracle");
+    }
+    for (uint32_t i = 0; i < N_TOKENS * N_SELECTED; i++) {
+        CHECK(got_compact[i] == oracle_compact[i], "batch_dedup: compact_ids mismatch vs oracle");
+    }
+
+    CHECK(ds4_gpu_stream_expert_cache_prepare_selected_batch(&table, ids, N_TOKENS,
+                                                             N_SELECTED) != 0,
+          "batch_dedup: prepare_selected_batch failed");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == oracle_count,
+          "batch_dedup: resident cache should hold exactly the unique experts");
+    CHECK(expert_resident_matches(model, LAYER, 4, gate_offset, up_offset, down_offset,
+                                  GATE_BYTES, DOWN_BYTES),
+          "batch_dedup: expert 4 content mismatch");
+    fprintf(stderr, "  test_prepare_selected_batch_dedup OK\n");
+    return 0;
+}
+
+/* A batch touching exactly DS4_SYCL_STREAM_MAX_N_EXPERT (384) distinct
+ * experts, the ceiling n_total_expert itself enforces, must still resolve
+ * correctly with no off-by-one in the unique-slot bookkeeping. */
+static int test_batch_near_ceiling(void) {
+    ds4_sycl_stream_test_reset();
+    enum { N_EXPERT = 384, GATE_BYTES = 4, DOWN_BYTES = 4, LAYER = 0, BUDGET = 400,
+           N_SELECTED = 8, N_TOKENS = N_EXPERT / N_SELECTED };
+    static unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+
+    static int32_t ids[N_TOKENS * N_SELECTED];
+    for (uint32_t i = 0; i < N_TOKENS * N_SELECTED; i++) ids[i] = (int32_t)i;
+
+    CHECK(ds4_gpu_stream_expert_cache_prepare_selected_batch(&table, ids, N_TOKENS,
+                                                             N_SELECTED) != 0,
+          "batch_ceiling: prepare_selected_batch failed at 384 unique experts");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == N_EXPERT,
+          "batch_ceiling: all 384 distinct experts should be resident");
+    CHECK(expert_resident_matches(model, LAYER, 383, gate_offset, up_offset, down_offset,
+                                  GATE_BYTES, DOWN_BYTES),
+          "batch_ceiling: last expert (383) content mismatch");
+    fprintf(stderr, "  test_batch_near_ceiling OK\n");
+    return 0;
+}
+
+/* Malformed inputs to the three batch-selected entries must fail (0), matching
+ * the same null-table/malformed-argument polarity verified above:
+ * rocm/ds4_rocm_current_api_compat.cuh's begin_selected_load, seed_selected
+ * and prepare_selected_batch wrappers all read "if (!table) return 0;". */
+static int test_task2_malformed_inputs_fail(void) {
+    ds4_sycl_stream_test_reset();
+    enum { N_EXPERT = 8, GATE_BYTES = 8, DOWN_BYTES = 8, LAYER = 0, BUDGET = 8 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+    int32_t selected[] = {0, 1};
+    int32_t batch_ids[] = {0, 1, 2, 3};
+
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(NULL, selected, 2) == 0,
+          "task2_malformed: null table (begin_selected_load) should fail");
+    CHECK(ds4_gpu_stream_expert_cache_seed_selected(NULL, selected, 2) == 0,
+          "task2_malformed: null table (seed_selected) should fail");
+    CHECK(ds4_gpu_stream_expert_cache_prepare_selected_batch(NULL, batch_ids, 2, 2) == 0,
+          "task2_malformed: null table (prepare_selected_batch) should fail");
+
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, NULL, 2) == 0,
+          "task2_malformed: null selected_ids should fail");
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 0) == 0,
+          "task2_malformed: n_selected == 0 should fail");
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, selected, 9) == 0,
+          "task2_malformed: n_selected > 8 should fail");
+    int32_t out_of_range[] = {0, (int32_t)N_EXPERT};
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, out_of_range, 2) == 0,
+          "task2_malformed: out-of-range selected id should fail");
+
+    CHECK(ds4_gpu_stream_expert_cache_prepare_selected_batch(&table, batch_ids, 1, 2) == 0,
+          "task2_malformed: n_tokens <= 1 should fail");
+    int32_t bad_batch_ids[] = {0, (int32_t)N_EXPERT, 1, 2};
+    CHECK(ds4_gpu_stream_expert_cache_prepare_selected_batch(&table, bad_batch_ids, 2, 2) == 0,
+          "task2_malformed: out-of-range batch expert id should fail");
+
+    fprintf(stderr, "  test_task2_malformed_inputs_fail OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_seed_fewer_than_budget() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -434,6 +720,11 @@ int main(void) {
     if (test_dedicated_allocation_fallback() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_reseed_resident_does_not_grow() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_budget_for_expert_size_ignores_bytes() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_begin_selected_load_byte_content() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_resident_hit_short_circuit() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_prepare_selected_batch_dedup() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_batch_near_ceiling() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_task2_malformed_inputs_fail() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_streaming OK\n");
     return 0;

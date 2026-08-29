@@ -39,6 +39,7 @@
 #include <vector>
 
 static constexpr uint32_t DS4_SYCL_STREAM_MAX_N_EXPERT = 384u;
+static constexpr uint32_t DS4_SYCL_STREAM_N_EXPERT_USED = 8u;
 
 struct sycl_stream_resident_expert {
     const void *model_map;
@@ -549,6 +550,360 @@ static int sycl_stream_resident_seed_experts(
     return 1;
 }
 
+/* Selected-expert scratch cache: one reusable compacted buffer holding
+ * the current decode step's up-to-DS4_SYCL_STREAM_N_EXPERT_USED selected
+ * experts' gate/up/down bytes, back to back in slot order.  Grow-only
+ * capacity, matching rocm/ds4_rocm_runtime.cuh:82-104 and
+ * cuda_stream_selected_ensure_buffers (:1036-1074), minus the
+ * pinned-host-staging and device-side pointer-array pieces this port
+ * does not need: see the "always resolve synchronously" note on
+ * sycl_stream_selected_load below for why. */
+struct sycl_stream_selected_cache {
+    int         loaded = 0;
+    const void *model_map = nullptr;
+    uint32_t    layer = 0;
+    uint32_t    n_total_expert = 0;
+    uint32_t    n_selected = 0;
+    uint64_t    gate_expert_bytes = 0;
+    uint64_t    down_expert_bytes = 0;
+    int32_t     selected_ids[DS4_SYCL_STREAM_N_EXPERT_USED] = {};
+    char       *gate = nullptr;
+    char       *up = nullptr;
+    char       *down = nullptr;
+    uint64_t    gate_capacity = 0;
+    uint64_t    down_capacity = 0;
+};
+
+static sycl_stream_selected_cache g_sycl_stream_selected;
+
+/* Resident-cache hit/miss counters, incremented only by the two
+ * admission loops below (selected load and batch prepare): a hit is a
+ * sycl_stream_resident_find success (no mmap-to-device copy needed), a
+ * miss is a sycl_stream_resident_alloc call (a genuine admission that
+ * does copy).  Test-only instrumentation proving the "a resident hit
+ * short-circuits re-copying" property; not part of the ABI. */
+static uint64_t g_sycl_stream_hits = 0;
+static uint64_t g_sycl_stream_misses = 0;
+
+static void sycl_stream_selected_release(sycl::queue &q) {
+    if (g_sycl_stream_selected.gate) {
+        try { sycl::free(g_sycl_stream_selected.gate, q); }
+        catch (const sycl::exception &ex) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "streaming selected cache release failed: %s\n", ex.what());
+        }
+    }
+    if (g_sycl_stream_selected.up) {
+        try { sycl::free(g_sycl_stream_selected.up, q); }
+        catch (const sycl::exception &ex) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "streaming selected cache release failed: %s\n", ex.what());
+        }
+    }
+    if (g_sycl_stream_selected.down) {
+        try { sycl::free(g_sycl_stream_selected.down, q); }
+        catch (const sycl::exception &ex) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "streaming selected cache release failed: %s\n", ex.what());
+        }
+    }
+    g_sycl_stream_selected = sycl_stream_selected_cache{};
+}
+
+static bool sycl_stream_selected_ensure_buffers(sycl::queue &q, uint64_t gate_bytes,
+                                                uint64_t down_bytes) {
+    if (gate_bytes == 0 || down_bytes == 0) return false;
+    if (g_sycl_stream_selected.gate_capacity < gate_bytes) {
+        if (g_sycl_stream_selected.gate) sycl::free(g_sycl_stream_selected.gate, q);
+        if (g_sycl_stream_selected.up) sycl::free(g_sycl_stream_selected.up, q);
+        g_sycl_stream_selected.gate = (char *)sycl::malloc_device((size_t)gate_bytes, q);
+        g_sycl_stream_selected.up = (char *)sycl::malloc_device((size_t)gate_bytes, q);
+        g_sycl_stream_selected.gate_capacity = 0;
+        if (!g_sycl_stream_selected.gate || !g_sycl_stream_selected.up) return false;
+        g_sycl_stream_selected.gate_capacity = gate_bytes;
+    }
+    if (g_sycl_stream_selected.down_capacity < down_bytes) {
+        if (g_sycl_stream_selected.down) sycl::free(g_sycl_stream_selected.down, q);
+        g_sycl_stream_selected.down = (char *)sycl::malloc_device((size_t)down_bytes, q);
+        g_sycl_stream_selected.down_capacity = 0;
+        if (!g_sycl_stream_selected.down) return false;
+        g_sycl_stream_selected.down_capacity = down_bytes;
+    }
+    return true;
+}
+
+/* Backs both ds4_gpu_stream_expert_cache_begin_selected_load and
+ * ds4_gpu_stream_expert_cache_seed_selected (ROCm's cuda_stream_selected_load,
+ * rocm/ds4_rocm_runtime.cuh:4041 onward).
+ *
+ * ROCm defers finishing this call (leaving g_stream_selected_pending.active
+ * set, building device-side pointer arrays instead of a compacted buffer)
+ * when every requested id is already resident, as a copy-avoidance
+ * optimisation consumed only by rocm/ds4_rocm_moe_launch.cuh's MoE-launch
+ * kernels (cuda_stream_selected_apply/_apply_split), entirely out of
+ * scope here.  That pending state IS set on a Flash-reachable path in
+ * ROCm (ds4.c's metal_graph_decode_cuda_selected_load, guarded
+ * "!DS4_ROCM_BUILD && !DS4_NO_GPU && !__APPLE__", calls begin_selected_load
+ * and never resolves it afterward), so "assume it is always inactive"
+ * would be wrong to assert blindly; the resolution here is to never
+ * create the pending state in the first place: this function always
+ * fully resolves before returning, unconditionally building the
+ * compacted buffer for every selected slot regardless of which were
+ * already resident.  This is a strict behavioural superset of ROCm
+ * (correct in every case ROCm is correct, at the cost of one avoidable
+ * device-to-device copy in the all-resident case, which has no consumer
+ * here to notice). */
+static int sycl_stream_selected_load(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        const int32_t *selected_ids, uint32_t n_total_expert, uint32_t n_selected,
+        uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (!model_map || !selected_ids || n_total_expert == 0 ||
+        n_total_expert > DS4_SYCL_STREAM_MAX_N_EXPERT || n_selected == 0 ||
+        n_selected > DS4_SYCL_STREAM_N_EXPERT_USED || gate_expert_bytes == 0 ||
+        down_expert_bytes == 0) {
+        return 0;
+    }
+
+    for (uint32_t i = 0; i < n_selected; i++) {
+        if (selected_ids[i] < 0 || (uint32_t)selected_ids[i] >= n_total_expert) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "streaming selected expert id %d outside 0..%u (layer=%u)\n",
+                    selected_ids[i], n_total_expert, layer);
+            return 0;
+        }
+    }
+
+    uint64_t gate_bytes = 0, down_bytes = 0;
+    if (!sycl_u64_mul_checked(n_selected, gate_expert_bytes, &gate_bytes) ||
+        !sycl_u64_mul_checked(n_selected, down_expert_bytes, &down_bytes)) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const uint64_t expert = (uint64_t)(uint32_t)selected_ids[i];
+        uint64_t       gate_rel = 0, down_rel = 0;
+        if (!sycl_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
+            !sycl_u64_mul_checked(expert, down_expert_bytes, &down_rel) ||
+            !sycl_model_range_fits(model_size, gate_offset + gate_rel, gate_expert_bytes) ||
+            !sycl_model_range_fits(model_size, up_offset + gate_rel, gate_expert_bytes) ||
+            !sycl_model_range_fits(model_size, down_offset + down_rel, down_expert_bytes)) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "streaming selected expert offset outside model map\n");
+            return 0;
+        }
+    }
+
+    sycl::queue &q = ds4_sycl_current_queue();
+    if (!sycl_stream_selected_ensure_buffers(q, gate_bytes, down_bytes)) return 0;
+
+    g_sycl_stream_selected.model_map = model_map;
+    g_sycl_stream_selected.layer = layer;
+    g_sycl_stream_selected.n_total_expert = n_total_expert;
+    g_sycl_stream_selected.n_selected = n_selected;
+    g_sycl_stream_selected.gate_expert_bytes = gate_expert_bytes;
+    g_sycl_stream_selected.down_expert_bytes = down_expert_bytes;
+    for (uint32_t i = 0; i < n_selected; i++) {
+        g_sycl_stream_selected.selected_ids[i] = selected_ids[i];
+    }
+
+    for (uint32_t i = 0; i < n_selected; i++) {
+        const int32_t expert_i = selected_ids[i];
+        int idx = sycl_stream_resident_find(model_map, layer, expert_i, gate_offset,
+                                            up_offset, down_offset, gate_expert_bytes,
+                                            down_expert_bytes);
+        if (idx >= 0) {
+            g_sycl_stream_resident[(size_t)idx].last_used = ++g_sycl_stream_resident_clock;
+            g_sycl_stream_hits++;
+            continue;
+        }
+
+        idx = sycl_stream_resident_alloc(q, model_map, layer, expert_i, selected_ids,
+                                         n_selected, gate_offset, up_offset, down_offset,
+                                         gate_expert_bytes, down_expert_bytes);
+        if (idx < 0) {
+            sycl_stream_resident_release_all(q);
+            return 0;
+        }
+        g_sycl_stream_misses++;
+
+        const uint64_t expert = (uint64_t)(uint32_t)expert_i;
+        uint64_t       gate_rel = 0, down_rel = 0;
+        if (!sycl_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
+            !sycl_u64_mul_checked(expert, down_expert_bytes, &down_rel)) {
+            sycl_stream_resident_release_all(q);
+            return 0;
+        }
+
+        sycl_stream_resident_expert &entry = g_sycl_stream_resident[(size_t)idx];
+        try {
+            q.memcpy(entry.gate, (const char *)model_map + gate_offset + gate_rel,
+                     gate_expert_bytes);
+            q.memcpy(entry.up, (const char *)model_map + up_offset + gate_rel,
+                     gate_expert_bytes);
+            q.memcpy(entry.down, (const char *)model_map + down_offset + down_rel,
+                     down_expert_bytes);
+            q.wait_and_throw();
+        } catch (const sycl::exception &ex) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected upload failed: %s\n",
+                    ex.what());
+            sycl_stream_resident_release_all(q);
+            return 0;
+        }
+    }
+
+    /* Unconditionally compact every slot (whether freshly admitted or
+     * already resident) into the scratch buffer, and bump last_used
+     * again for the ones that were only just looked up above, matching
+     * rocm/ds4_rocm_runtime.cuh:2966's clock bump inside
+     * cuda_stream_selected_compact_mask. */
+    try {
+        for (uint32_t i = 0; i < n_selected; i++) {
+            const int idx = sycl_stream_resident_find(
+                    model_map, layer, selected_ids[i], gate_offset, up_offset,
+                    down_offset, gate_expert_bytes, down_expert_bytes);
+            if (idx < 0) {
+                sycl_stream_resident_release_all(q);
+                return 0;
+            }
+            sycl_stream_resident_expert &entry = g_sycl_stream_resident[(size_t)idx];
+            entry.last_used = ++g_sycl_stream_resident_clock;
+            q.memcpy(g_sycl_stream_selected.gate + (uint64_t)i * gate_expert_bytes,
+                     entry.gate, gate_expert_bytes);
+            q.memcpy(g_sycl_stream_selected.up + (uint64_t)i * gate_expert_bytes,
+                     entry.up, gate_expert_bytes);
+            q.memcpy(g_sycl_stream_selected.down + (uint64_t)i * down_expert_bytes,
+                     entry.down, down_expert_bytes);
+        }
+        q.wait_and_throw();
+    } catch (const sycl::exception &ex) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected compact failed: %s\n",
+                ex.what());
+        sycl_stream_resident_release_all(q);
+        return 0;
+    }
+
+    g_sycl_stream_selected.loaded = 1;
+    return 1;
+}
+
+/* Pure host-side dedup: builds the map[expert] -> first-seen unique slot
+ * table and the flat compact_ids[token*n_selected] mapping, matching
+ * rocm/ds4_rocm_runtime.cuh:3109 onward's host-side loop (no device calls
+ * in this step, ports unchanged).  Bails out if a distinct
+ * (DS4_SYCL_STREAM_MAX_N_EXPERT + 1)th expert would be needed. */
+static bool sycl_stream_batch_dedup(const int32_t *ids, uint32_t n_tokens,
+                                    uint32_t n_selected, uint32_t n_total_expert,
+                                    std::vector<int32_t> &unique_ids_out,
+                                    std::vector<uint32_t> &compact_ids_out) {
+    uint64_t n_ids64 = (uint64_t)n_tokens * (uint64_t)n_selected;
+    std::vector<int32_t> slot_of(n_total_expert, -1);
+    unique_ids_out.clear();
+    compact_ids_out.assign((size_t)n_ids64, 0u);
+    for (uint64_t i = 0; i < n_ids64; i++) {
+        const int32_t expert = ids[i];
+        if (expert < 0 || (uint32_t)expert >= n_total_expert) return false;
+        int32_t slot = slot_of[(uint32_t)expert];
+        if (slot < 0) {
+            if (unique_ids_out.size() >= DS4_SYCL_STREAM_MAX_N_EXPERT) return false;
+            slot = (int32_t)unique_ids_out.size();
+            slot_of[(uint32_t)expert] = slot;
+            unique_ids_out.push_back(expert);
+        }
+        compact_ids_out[i] = (uint32_t)slot;
+    }
+    return !unique_ids_out.empty();
+}
+
+/* Backs ds4_gpu_stream_expert_cache_prepare_selected_batch (ROCm's
+ * cuda_stream_batch_selected_prepare_from_host, rocm/ds4_rocm_runtime.cuh:3109
+ * onward).  Does not build or upload the device-side pointer-array /
+ * pair_missing tables ROCm uploads for its MoE-launch consumer: no
+ * compute kernel here reads them.  What is tested here
+ * is the host-side dedup mapping (exposed via a test-only hook) and that
+ * every unique expert ends up resident with the right bytes. */
+static int sycl_stream_batch_selected_prepare(
+        const void *model_map, uint64_t model_size, uint32_t layer,
+        const int32_t *ids, uint32_t n_tokens, uint32_t n_total_expert,
+        uint32_t n_selected, uint64_t gate_offset, uint64_t up_offset,
+        uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    if (!model_map || !ids || n_tokens <= 1 || n_total_expert == 0 ||
+        n_total_expert > DS4_SYCL_STREAM_MAX_N_EXPERT || n_selected == 0 ||
+        n_selected > DS4_SYCL_STREAM_N_EXPERT_USED || gate_expert_bytes == 0 ||
+        down_expert_bytes == 0) {
+        return 0;
+    }
+
+    std::vector<int32_t>  unique_ids;
+    std::vector<uint32_t> compact_ids;
+    if (!sycl_stream_batch_dedup(ids, n_tokens, n_selected, n_total_expert, unique_ids,
+                                compact_ids)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "streaming batch selected dedup failed (layer=%u)\n", layer);
+        return 0;
+    }
+
+    for (int32_t expert_i : unique_ids) {
+        const uint64_t expert = (uint64_t)(uint32_t)expert_i;
+        uint64_t       gate_rel = 0, down_rel = 0;
+        if (!sycl_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
+            !sycl_u64_mul_checked(expert, down_expert_bytes, &down_rel) ||
+            !sycl_model_range_fits(model_size, gate_offset + gate_rel, gate_expert_bytes) ||
+            !sycl_model_range_fits(model_size, up_offset + gate_rel, gate_expert_bytes) ||
+            !sycl_model_range_fits(model_size, down_offset + down_rel, down_expert_bytes)) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "streaming batch selected expert offset outside model map\n");
+            return 0;
+        }
+    }
+
+    sycl::queue &q = ds4_sycl_current_queue();
+    for (int32_t expert_i : unique_ids) {
+        int idx = sycl_stream_resident_find(model_map, layer, expert_i, gate_offset,
+                                            up_offset, down_offset, gate_expert_bytes,
+                                            down_expert_bytes);
+        if (idx >= 0) {
+            g_sycl_stream_resident[(size_t)idx].last_used = ++g_sycl_stream_resident_clock;
+            g_sycl_stream_hits++;
+            continue;
+        }
+
+        idx = sycl_stream_resident_alloc(q, model_map, layer, expert_i,
+                                         unique_ids.data(), (uint32_t)unique_ids.size(),
+                                         gate_offset, up_offset, down_offset,
+                                         gate_expert_bytes, down_expert_bytes);
+        /* No release-whole-cache-on-failure here: ROCm's own failure path
+         * at this exact point (rocm/ds4_rocm_runtime.cuh:3288-3306) just
+         * breaks out and returns 0, unlike begin_selected_load's failure
+         * path, which does release.  Matched deliberately, not an
+         * oversight. */
+        if (idx < 0) return 0;
+        g_sycl_stream_misses++;
+
+        const uint64_t expert = (uint64_t)(uint32_t)expert_i;
+        uint64_t       gate_rel = 0, down_rel = 0;
+        if (!sycl_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
+            !sycl_u64_mul_checked(expert, down_expert_bytes, &down_rel)) {
+            return 0;
+        }
+
+        sycl_stream_resident_expert &entry = g_sycl_stream_resident[(size_t)idx];
+        try {
+            q.memcpy(entry.gate, (const char *)model_map + gate_offset + gate_rel,
+                     gate_expert_bytes);
+            q.memcpy(entry.up, (const char *)model_map + up_offset + gate_rel,
+                     gate_expert_bytes);
+            q.memcpy(entry.down, (const char *)model_map + down_offset + down_rel,
+                     down_expert_bytes);
+            q.wait_and_throw();
+        } catch (const sycl::exception &ex) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming batch selected upload failed: %s\n",
+                    ex.what());
+            return 0;
+        }
+    }
+    return 1;
+}
+
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_sycl_stream_cache_budget = experts;
 }
@@ -588,10 +943,52 @@ extern "C" int ds4_gpu_stream_expert_cache_seed_experts(
             table->down_expert_bytes);
 }
 
-/* Test-only side doors.  None of the five entries above expose the
- * resident cache's device-side pointers or a way to reset its state
- * between test cases, so tests need both.  Forward-declared only in
- * tests/test_sycl_streaming.c, never added to ds4_gpu.h. */
+extern "C" int ds4_gpu_stream_expert_cache_begin_selected_load(
+        const ds4_gpu_stream_expert_table *table, const int32_t *selected_ids,
+        uint32_t n_selected) {
+    /* Null table: hard failure, matching
+     * rocm/ds4_rocm_current_api_compat.cuh:199-215 ("if (!table) return
+     * 0;"); ds4.c's callers check "== 0" as failure. */
+    if (!table) return 0;
+    return sycl_stream_selected_load(
+            table->model_map, table->model_size, table->layer, selected_ids,
+            table->n_total_expert, n_selected, table->gate_offset, table->up_offset,
+            table->down_offset, table->gate_expert_bytes, table->down_expert_bytes);
+}
+
+/* ROCm's seed_selected wrapper is begin_selected_load followed by
+ * cuda_stream_selected_finish_pending_missing(0)
+ * (rocm/ds4_rocm_current_api_compat.cuh:178-197), and that finish step is
+ * a no-op whenever nothing is left pending.  Since
+ * sycl_stream_selected_load never leaves anything pending (see its
+ * comment above), the two entries are structurally identical here; this
+ * is a correct consequence of that design, not a missed distinction. */
+extern "C" int ds4_gpu_stream_expert_cache_seed_selected(
+        const ds4_gpu_stream_expert_table *table, const int32_t *selected_ids,
+        uint32_t n_selected) {
+    return ds4_gpu_stream_expert_cache_begin_selected_load(table, selected_ids,
+                                                           n_selected);
+}
+
+extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
+        const ds4_gpu_stream_expert_table *table, const int32_t *selected_ids,
+        uint32_t n_tokens, uint32_t n_selected) {
+    /* Null table: hard failure, matching
+     * rocm/ds4_rocm_current_api_compat.cuh:217-246 ("if (!table) return
+     * 0;"); ds4.c's callers check "!= 0" as success. */
+    if (!table) return 0;
+    return sycl_stream_batch_selected_prepare(
+            table->model_map, table->model_size, table->layer, selected_ids,
+            n_tokens, table->n_total_expert, n_selected, table->gate_offset,
+            table->up_offset, table->down_offset, table->gate_expert_bytes,
+            table->down_expert_bytes);
+}
+
+/* Test-only side doors.  None of the entries above expose the resident
+ * cache's or the selected cache's device-side bytes, the hit/miss
+ * counters, the batch dedup mapping, or a way to reset all of it between
+ * test cases.  Forward-declared only in tests/test_sycl_streaming.c,
+ * never added to ds4_gpu.h. */
 extern "C" int ds4_sycl_stream_test_read_resident(uint32_t layer, int32_t expert,
                                                   void *gate_out, void *up_out,
                                                   void *down_out) {
@@ -613,7 +1010,65 @@ extern "C" int ds4_sycl_stream_test_read_resident(uint32_t layer, int32_t expert
     return 0;
 }
 
+extern "C" int ds4_sycl_stream_test_read_selected(uint32_t slot, void *gate_out,
+                                                  void *up_out, void *down_out) {
+    if (!g_sycl_stream_selected.loaded || slot >= g_sycl_stream_selected.n_selected) {
+        return 0;
+    }
+    sycl::queue &q = ds4_sycl_current_queue();
+    const uint64_t gate_bytes = g_sycl_stream_selected.gate_expert_bytes;
+    const uint64_t down_bytes = g_sycl_stream_selected.down_expert_bytes;
+    try {
+        if (gate_out) {
+            q.memcpy(gate_out, g_sycl_stream_selected.gate + (uint64_t)slot * gate_bytes,
+                     gate_bytes);
+        }
+        if (up_out) {
+            q.memcpy(up_out, g_sycl_stream_selected.up + (uint64_t)slot * gate_bytes,
+                     gate_bytes);
+        }
+        if (down_out) {
+            q.memcpy(down_out, g_sycl_stream_selected.down + (uint64_t)slot * down_bytes,
+                     down_bytes);
+        }
+        q.wait_and_throw();
+    } catch (const sycl::exception &ex) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "stream test selected readback failed: %s\n",
+                ex.what());
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" void ds4_sycl_stream_test_hit_miss(uint64_t *hits, uint64_t *misses) {
+    if (hits) *hits = g_sycl_stream_hits;
+    if (misses) *misses = g_sycl_stream_misses;
+}
+
+extern "C" int ds4_sycl_stream_test_batch_dedup(
+        const int32_t *ids, uint32_t n_tokens, uint32_t n_selected,
+        uint32_t n_total_expert, int32_t *unique_ids_out, uint32_t *unique_count_out,
+        uint32_t *compact_ids_out) {
+    if (!ids || !unique_ids_out || !unique_count_out || !compact_ids_out) return 0;
+    std::vector<int32_t>  unique_ids;
+    std::vector<uint32_t> compact_ids;
+    if (!sycl_stream_batch_dedup(ids, n_tokens, n_selected, n_total_expert, unique_ids,
+                                compact_ids)) {
+        return 0;
+    }
+    for (size_t i = 0; i < unique_ids.size(); i++) unique_ids_out[i] = unique_ids[i];
+    *unique_count_out = (uint32_t)unique_ids.size();
+    for (size_t i = 0; i < compact_ids.size(); i++) compact_ids_out[i] = compact_ids[i];
+    return 1;
+}
+
 extern "C" void ds4_sycl_stream_test_reset(void) {
-    if (!g_devices.empty()) sycl_stream_resident_release_all(ds4_sycl_current_queue());
+    if (!g_devices.empty()) {
+        sycl::queue &q = ds4_sycl_current_queue();
+        sycl_stream_resident_release_all(q);
+        sycl_stream_selected_release(q);
+    }
     g_sycl_stream_cache_budget = 0;
+    g_sycl_stream_hits = 0;
+    g_sycl_stream_misses = 0;
 }
