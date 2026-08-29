@@ -44,6 +44,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Test-only hook, not declared in ds4_gpu.h: see its own comment in
+ * sycl/ds4_sycl_attention.hpp for why the tiled mixed-prefill path needs a
+ * forced-tile-size escape hatch to be testable at a tractable CPU-oracle
+ * scale. */
+int ds4_sycl_test_attention_prefill_mixed_tiled_forced(
+        ds4_gpu_tensor       *heads,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t              n_tokens,
+        uint32_t              n_comp,
+        uint32_t              window,
+        uint32_t              ratio,
+        uint32_t              n_head,
+        uint32_t              head_dim,
+        uint32_t              forced_tile_tokens);
+
 /* Deterministic hash-based pseudo-random float in [-1, 1]. Combines its
  * inputs with multiplication and xor-mixing (murmur-style finaliser) so the
  * result is not affine in any index, per spec 6f/6n: an affine generator
@@ -1363,36 +1383,78 @@ static int test_static_prefill_small_window(void) {
     return 0;
 }
 
-/* The window bound this entry enforces (window + n_comp <= 768): a call
- * exceeding it must be refused rather than silently computing anything,
- * since no cuBLAS path or scalar fallback is ported for this entry (see
- * this header's scope note). */
-static int test_static_prefill_window_bound_refused(void) {
-    float sinks[SP_N_HEAD] = {0};
-    dh_model model = dh_model_build(sinks, SP_N_HEAD);
-    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)SP_N_TOKENS * SP_N_HEAD * SP_HEAD_DIM * sizeof(float));
-    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)SP_N_TOKENS * SP_N_HEAD * SP_HEAD_DIM * sizeof(float));
-    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)SP_N_TOKENS * SP_HEAD_DIM * sizeof(float));
-    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc((uint64_t)SP_N_COMP * SP_HEAD_DIM * sizeof(float));
-    CHECK(theads && tq && traw && tcomp, "static prefill bound: alloc failed");
+/* Shapes that were refused before this entry's small-window-only scope was
+ * extended to the GEMM and scalar paths: window + n_comp > 768 (window =
+ * 800 here, well above the static path's own bound, but still small
+ * relative to n_tokens so the GEMM path's actual raw_count never gets near
+ * oracle_attention_static_prefill's fixed 769-wide scratch) now takes the
+ * GEMM path and must compute the correct answer, not merely succeed; and
+ * n_tokens == 1 at head_dim == 512 now takes the scalar fallback (neither
+ * the static nor the GEMM path accepts n_tokens == 1) and must also match
+ * the oracle. comp_kv_f16 remains genuinely unsupported: ROCm's own wrapper
+ * rejects it unconditionally before ever reaching attention_prefill_mixed_launch. */
+static int test_static_prefill_now_extended_shapes(void) {
+    float sinks[SP_N_HEAD];
+    for (uint32_t h = 0; h < SP_N_HEAD; h++) sinks[h] = test_prand(h, 341u, 23u) * 2.0f;
+    const uint64_t qn = (uint64_t)SP_N_TOKENS * SP_N_HEAD * SP_HEAD_DIM;
+    const uint64_t rawn = (uint64_t)SP_N_TOKENS * SP_HEAD_DIM;
+    const uint64_t compn = (uint64_t)SP_N_COMP * SP_HEAD_DIM;
+    float *q = malloc((size_t)qn * sizeof(float));
+    float *raw_kv = malloc((size_t)rawn * sizeof(float));
+    float *comp_kv = malloc((size_t)compn * sizeof(float));
+    for (uint64_t i = 0; i < qn; i++) q[i] = test_prand((uint32_t)i, 342u, 24u);
+    for (uint64_t i = 0; i < rawn; i++) raw_kv[i] = test_prand((uint32_t)i, 343u, 25u);
+    for (uint64_t i = 0; i < compn; i++) comp_kv[i] = test_prand((uint32_t)i, 344u, 26u);
 
+    dh_model model = dh_model_build(sinks, SP_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc(rawn * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc(compn * sizeof(float));
+    CHECK(theads && tq && traw && tcomp, "static prefill extended: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, qn * sizeof(float)) != 0, "static prefill extended: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, rawn * sizeof(float)) != 0, "static prefill extended: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, compn * sizeof(float)) != 0, "static prefill extended: comp_kv write failed");
+
+    float *got = malloc((size_t)qn * sizeof(float));
+    float *want = malloc((size_t)qn * sizeof(float));
+
+    /* window = 800 > 768: skips the static path, takes the GEMM path. */
     CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
               theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
-              SP_N_TOKENS, SP_N_COMP, /*window=*/800u, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM) == 0,
-          "static prefill bound: oversized window must be refused");
+              SP_N_TOKENS, SP_N_COMP, /*window=*/800u, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM) != 0,
+          "static prefill extended: GEMM-path shape (window=800) must now succeed");
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, qn * sizeof(float)) != 0,
+          "static prefill extended: read after GEMM-path call failed");
+    oracle_attention_static_prefill(want, sinks, q, raw_kv, SP_N_TOKENS, comp_kv, SP_N_COMP,
+                                    800u, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM);
+    for (uint64_t i = 0; i < qn; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-2, "static prefill extended: GEMM-path heads mismatch");
+    }
+
+    /* n_tokens == 1 at head_dim == 512: neither static nor GEMM accepts
+     * n_tokens == 1, so this takes the scalar fallback. */
     CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
               theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
-              /*n_tokens=*/1u, SP_N_COMP, SP_WINDOW, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM) == 0,
-          "static prefill bound: n_tokens == 1 must be refused (no cuBLAS/scalar fallback)");
+              /*n_tokens=*/1u, SP_N_COMP, SP_WINDOW, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM) != 0,
+          "static prefill extended: scalar-fallback shape (n_tokens=1) must now succeed");
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, (uint64_t)SP_N_HEAD * SP_HEAD_DIM * sizeof(float)) != 0,
+          "static prefill extended: read after scalar-fallback call failed");
+    oracle_attention_static_prefill(want, sinks, q, raw_kv, 1u, comp_kv, SP_N_COMP,
+                                    SP_WINDOW, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM);
+    for (uint64_t i = 0; i < (uint64_t)SP_N_HEAD * SP_HEAD_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-3, "static prefill extended: scalar-fallback heads mismatch");
+    }
+
     CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
               theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, /*comp_kv_f16=*/1u,
               SP_N_TOKENS, SP_N_COMP, SP_WINDOW, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM) == 0,
-          "static prefill bound: comp_kv_f16 must be rejected");
+          "static prefill extended: comp_kv_f16 must be rejected");
 
+    free(q); free(raw_kv); free(comp_kv); free(got); free(want); free(model.bytes);
     ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
     ds4_gpu_tensor_free(tcomp);
-    free(model.bytes);
-    fprintf(stderr, "  test_static_prefill_window_bound_refused OK\n");
+    fprintf(stderr, "  test_static_prefill_now_extended_shapes OK\n");
     return 0;
 }
 
@@ -1618,6 +1680,246 @@ static int test_prefill_raw_window_validation(void) {
     return 0;
 }
 
+/* Oracle for ds4_gpu_attention_prefill_static_mixed_heads_tensor at shapes
+ * beyond oracle_attention_static_prefill's fixed 769-wide scratch: same
+ * math (raw causal/window rows plus ratio-visible compressed rows, no
+ * comp_mask, since use_comp_mask is always false for every entry reachable
+ * in this port), scores buffer sized to the actual max combined-key count
+ * for this call rather than a fixed constant. */
+static void oracle_attention_prefill_mixed_dynamic(
+        float *out_heads, const float *sinks, const float *q, const float *raw_kv,
+        uint32_t n_tokens, const float *comp_kv, uint32_t n_comp, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    const uint32_t max_raw = (window != 0u && n_tokens > window) ? window : n_tokens;
+    const uint32_t max_score = max_raw + n_comp;
+    float *scores = (float *)malloc((size_t)(max_score ? max_score : 1u) * sizeof(float));
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
+        const uint32_t raw_start = t + 1u - raw_count;
+        uint32_t comp_count = 0u;
+        if (n_comp != 0u && ratio != 0u) {
+            comp_count = (t + 1u) / ratio;
+            if (comp_count > n_comp) comp_count = n_comp;
+        }
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+            float score_max = sinks[h];
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float *kv = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                scores[r] = dot * scale;
+                if (scores[r] > score_max) score_max = scores[r];
+            }
+            for (uint32_t c = 0; c < comp_count; c++) {
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                scores[raw_count + c] = dot * scale;
+                if (scores[raw_count + c] > score_max) score_max = scores[raw_count + c];
+            }
+            float *oh = out_heads + ((uint64_t)t * n_head + h) * head_dim;
+            memset(oh, 0, (size_t)head_dim * sizeof(float));
+            float denom = expf(sinks[h] - score_max);
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float w = expf(scores[r] - score_max);
+                denom += w;
+                const float *kv = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t c = 0; c < comp_count; c++) {
+                const float w = expf(scores[raw_count + c] - score_max);
+                denom += w;
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] /= denom;
+        }
+    }
+    free(scores);
+}
+
+/* n_head > 1 mixed-prefill GEMM-path shape (same reasoning as
+ * test_prefill_raw_gemm_multi_head above: n_head == 1 cannot distinguish
+ * stride_a == 0 from a broken broadcast). window == 0 with n_tokens = 800
+ * already skips the static path on its own (raw component alone exceeds
+ * 768), with a nonzero n_comp/ratio so the compressed side of the packed
+ * KV table and the ratio-visible-compressed-count arithmetic are
+ * genuinely exercised too, not just the raw side. */
+static int test_mixed_prefill_gemm_multi_head(void) {
+    const uint32_t n_tokens = 800u, n_comp = 40u, ratio = 4u, n_head = 3u, head_dim = 512u;
+    float sinks[3];
+    for (uint32_t h = 0; h < n_head; h++) sinks[h] = test_prand(h, 441u, 27u) * 2.0f;
+    const uint64_t qn = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t rawn = (uint64_t)n_tokens * head_dim;
+    const uint64_t compn = (uint64_t)n_comp * head_dim;
+    float *q = malloc((size_t)qn * sizeof(float));
+    float *raw_kv = malloc((size_t)rawn * sizeof(float));
+    float *comp_kv = malloc((size_t)compn * sizeof(float));
+    for (uint64_t i = 0; i < qn; i++) q[i] = test_prand((uint32_t)(i & 0xFFFFu), (uint32_t)(i >> 16), 442u);
+    for (uint64_t i = 0; i < rawn; i++) raw_kv[i] = test_prand((uint32_t)(i & 0xFFFFu), (uint32_t)(i >> 16), 443u);
+    for (uint64_t i = 0; i < compn; i++) comp_kv[i] = test_prand((uint32_t)i, 444u, 28u);
+
+    dh_model model = dh_model_build(sinks, n_head);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc(rawn * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc(compn * sizeof(float));
+    CHECK(theads && tq && traw && tcomp, "mixed GEMM multi-head: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, qn * sizeof(float)) != 0, "mixed GEMM multi-head: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, rawn * sizeof(float)) != 0, "mixed GEMM multi-head: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, compn * sizeof(float)) != 0, "mixed GEMM multi-head: comp_kv write failed");
+
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              n_tokens, n_comp, /*window=*/0u, ratio, n_head, head_dim) != 0,
+          "mixed GEMM multi-head: launch failed");
+
+    float *got = malloc((size_t)qn * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, qn * sizeof(float)) != 0, "mixed GEMM multi-head: read failed");
+    float *want = malloc((size_t)qn * sizeof(float));
+    oracle_attention_prefill_mixed_dynamic(want, sinks, q, raw_kv, n_tokens, comp_kv, n_comp,
+                                           0u, ratio, n_head, head_dim);
+    for (uint64_t i = 0; i < qn; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-2, "mixed GEMM multi-head: heads mismatch");
+    }
+
+    free(q); free(raw_kv); free(comp_kv); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp);
+    fprintf(stderr, "  test_mixed_prefill_gemm_multi_head OK\n");
+    return 0;
+}
+
+/* The tiled path, forced at a small shape via
+ * ds4_sycl_test_attention_prefill_mixed_tiled_forced (see that hook's own
+ * comment in sycl/ds4_sycl_attention.hpp for why the real 4 GiB threshold
+ * is impractical to reach with a verifiable CPU oracle). tile_tokens = 3
+ * against n_tokens = 10 forces 4 tiles (3+3+3+1), so both an exact-multiple
+ * tile and a short final tile are exercised, and the tile-boundary softmax
+ * masking (global_t = tile_start + t) is exercised at every tile. */
+static int test_mixed_prefill_tiled_forced(void) {
+    const uint32_t n_tokens = 10u, n_comp = 6u, ratio = 2u, n_head = 2u, head_dim = 512u;
+    const uint32_t forced_tile_tokens = 3u;
+    float sinks[2];
+    for (uint32_t h = 0; h < n_head; h++) sinks[h] = test_prand(h, 541u, 29u) * 2.0f;
+    const uint64_t qn = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t rawn = (uint64_t)n_tokens * head_dim;
+    const uint64_t compn = (uint64_t)n_comp * head_dim;
+    float *q = malloc((size_t)qn * sizeof(float));
+    float *raw_kv = malloc((size_t)rawn * sizeof(float));
+    float *comp_kv = malloc((size_t)compn * sizeof(float));
+    for (uint64_t i = 0; i < qn; i++) q[i] = test_prand((uint32_t)i, 542u, 30u);
+    for (uint64_t i = 0; i < rawn; i++) raw_kv[i] = test_prand((uint32_t)i, 543u, 31u);
+    for (uint64_t i = 0; i < compn; i++) comp_kv[i] = test_prand((uint32_t)i, 544u, 32u);
+
+    dh_model model = dh_model_build(sinks, n_head);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc(rawn * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc(compn * sizeof(float));
+    CHECK(theads && tq && traw && tcomp, "mixed tiled forced: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, qn * sizeof(float)) != 0, "mixed tiled forced: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, rawn * sizeof(float)) != 0, "mixed tiled forced: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, compn * sizeof(float)) != 0, "mixed tiled forced: comp_kv write failed");
+
+    CHECK(ds4_sycl_test_attention_prefill_mixed_tiled_forced(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp,
+              n_tokens, n_comp, /*window=*/0u, ratio, n_head, head_dim,
+              forced_tile_tokens) != 0,
+          "mixed tiled forced: launch failed");
+
+    float *got = malloc((size_t)qn * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, qn * sizeof(float)) != 0, "mixed tiled forced: read failed");
+    float *want = malloc((size_t)qn * sizeof(float));
+    oracle_attention_prefill_mixed_dynamic(want, sinks, q, raw_kv, n_tokens, comp_kv, n_comp,
+                                           0u, ratio, n_head, head_dim);
+    for (uint64_t i = 0; i < qn; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-3, "mixed tiled forced: heads mismatch");
+    }
+
+    free(q); free(raw_kv); free(comp_kv); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp);
+    fprintf(stderr, "  test_mixed_prefill_tiled_forced OK\n");
+    return 0;
+}
+
+/* head_dim != 512 forces the scalar attention_prefill_mixed_kernel
+ * fallback, with a genuine compressed side (unlike
+ * test_prefill_raw_scalar_fallback, which has no compressed rows at all
+ * since the raw-only entry never takes one). */
+static int test_mixed_prefill_scalar_fallback(void) {
+    const uint32_t n_tokens = 10u, n_comp = 8u, ratio = 2u, n_head = 2u, head_dim = 64u;
+    const uint32_t window = 5u;
+    float sinks[2];
+    for (uint32_t h = 0; h < n_head; h++) sinks[h] = test_prand(h, 641u, 33u) * 2.0f;
+    const uint64_t qn = (uint64_t)n_tokens * n_head * head_dim;
+    const uint64_t rawn = (uint64_t)n_tokens * head_dim;
+    const uint64_t compn = (uint64_t)n_comp * head_dim;
+    float *q = malloc((size_t)qn * sizeof(float));
+    float *raw_kv = malloc((size_t)rawn * sizeof(float));
+    float *comp_kv = malloc((size_t)compn * sizeof(float));
+    for (uint64_t i = 0; i < qn; i++) q[i] = test_prand((uint32_t)i, 642u, 34u);
+    for (uint64_t i = 0; i < rawn; i++) raw_kv[i] = test_prand((uint32_t)i, 643u, 35u);
+    for (uint64_t i = 0; i < compn; i++) comp_kv[i] = test_prand((uint32_t)i, 644u, 36u);
+
+    dh_model model = dh_model_build(sinks, n_head);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc(rawn * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc(compn * sizeof(float));
+    CHECK(theads && tq && traw && tcomp, "mixed scalar fallback: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, qn * sizeof(float)) != 0, "mixed scalar fallback: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, rawn * sizeof(float)) != 0, "mixed scalar fallback: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, compn * sizeof(float)) != 0, "mixed scalar fallback: comp_kv write failed");
+
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              n_tokens, n_comp, window, ratio, n_head, head_dim) != 0,
+          "mixed scalar fallback: launch failed");
+
+    float *got = malloc((size_t)qn * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, qn * sizeof(float)) != 0, "mixed scalar fallback: read failed");
+    float *want = malloc((size_t)qn * sizeof(float));
+    oracle_attention_prefill_mixed_dynamic(want, sinks, q, raw_kv, n_tokens, comp_kv, n_comp,
+                                           window, ratio, n_head, head_dim);
+    for (uint64_t i = 0; i < qn; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-3, "mixed scalar fallback: heads mismatch");
+    }
+
+    free(q); free(raw_kv); free(comp_kv); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp);
+    fprintf(stderr, "  test_mixed_prefill_scalar_fallback OK\n");
+    return 0;
+}
+
+/* Score-cap refusal ported from rocm/attention_launch.cuh:897-908: the
+ * scalar fallback (head_dim != 512) refuses outright above 2048 combined
+ * raw+compressed keys, since it has no correct path there (unlike the
+ * head_dim == 512 GEMM/tiled paths, which have no such cap). */
+static int test_mixed_prefill_score_cap_refused(void) {
+    float sinks[1] = {0};
+    dh_model model = dh_model_build(sinks, 1u);
+    const uint32_t n_tokens = 2100u, n_comp = 0u, head_dim = 64u;
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)n_tokens * head_dim * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)n_tokens * head_dim * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)n_tokens * head_dim * sizeof(float));
+    CHECK(theads && tq && traw, "mixed score cap: alloc failed");
+
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, NULL, 0u,
+              n_tokens, n_comp, /*window=*/0u, /*ratio=*/1u, 1u, head_dim) == 0,
+          "mixed score cap: above 2048 combined keys at head_dim != 512 must be refused");
+
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    free(model.bytes);
+    fprintf(stderr, "  test_mixed_prefill_score_cap_refused OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_store_raw_kv() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1637,13 +1939,17 @@ int main(void) {
     if (test_indexed_mixed_out_of_range_index() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_indexed_batch_validation() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_static_prefill_small_window() != 0) { ds4_gpu_cleanup(); return 1; }
-    if (test_static_prefill_window_bound_refused() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_static_prefill_now_extended_shapes() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_prefill_raw_static_small_window() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_prefill_raw_gemm_long_context() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_prefill_raw_gemm_boundary() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_prefill_raw_gemm_multi_head() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_prefill_raw_scalar_fallback() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_prefill_raw_window_validation() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_mixed_prefill_gemm_multi_head() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_mixed_prefill_tiled_forced() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_mixed_prefill_scalar_fallback() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_mixed_prefill_score_cap_refused() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_attention OK\n");
     return 0;

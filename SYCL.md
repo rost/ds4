@@ -309,9 +309,6 @@ plausible-looking wrong answer.
 
 ## Known gaps
 
-* **Long-context prefill attention** is in progress. oneMKL is now installed and
-  provides the batched GEMM the fast path needs; until that work lands, the
-  scalar fallback refuses above 2048 combined keys.
 * **Multi-GPU is written but unverified.** Tier switching, per-tier allocation,
   cross-device copies and per-tier streaming caches are all implemented, but
   this development machine has one GPU. In particular the peer-access
@@ -319,6 +316,10 @@ plausible-looking wrong answer.
   because CUDA's peer-access reporting lied on real hardware, and the target
   cards are two dies behind a PCIe switch, so it is the most likely thing to
   bite on first contact with the real machine.
+* **The streaming expert cache is implemented but not wired in.** Routed MoE's
+  three lookup hooks are hardcoded false and it stages weights fresh from the
+  host mmap on every call, so the cache, its eviction and its per-tier state
+  are correct, tested, and currently unused.
 * **No end-to-end run against real weights** has happened. Every subsystem is
   verified against a CPU oracle on synthetic data, which is real verification
   but is not the same as producing a token.
@@ -326,5 +327,7 @@ plausible-looking wrong answer.
   without waiting when evicting under memory pressure. A use-after-free shape
   that nothing on this hardware can test.
 * **Performance is untuned.** Weight staging is per call with no cross-call
-  cache, and no tuning result from the development A770 should be trusted for
-  the Battlemage target.
+  cache, oneMKL's `compute_mode` and the GEMM-versus-kernel dispatch
+  thresholds (the mixed-prefill tiled path's 4 GiB cap among them) are all at
+  their ROCm-literal defaults, and no tuning result from the development A770
+  should be trusted for the Battlemage target.
