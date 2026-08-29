@@ -371,3 +371,389 @@ extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_
     }
     return 1;
 }
+
+namespace {
+
+/* Shared per-output-element HC expand combine for the "general" (runtime
+ * n_hc, not compile-time-unrolled) kernels: covers hc_expand_kernel,
+ * hc_expand_half_kernel and hc_expand_add_half_kernel in ROCm terms
+ * (rocm/ds4_rocm_hc.cuh:74-164). The caller resolves block_v -- decoding
+ * F16 and/or adding block_add -- before calling in, since that is the
+ * only thing that differs between the three ROCm kernels; the combine
+ * math itself is identical across all of them. */
+static inline float sycl_hc_expand_general(float block_v, const float *post, const float *comb,
+                                           const float *residual_hc, uint32_t n_embd, uint32_t n_hc,
+                                           uint32_t post_stride, uint32_t comb_stride, uint64_t t,
+                                           uint32_t dst_hc, uint32_t d) {
+    float acc = block_v * post[(uint64_t)t * post_stride + dst_hc];
+    for (uint32_t src_hc = 0; src_hc < n_hc; src_hc++) {
+        const float comb_v = comb[(uint64_t)t * comb_stride + dst_hc + (uint64_t)src_hc * n_hc];
+        const float res_v =
+                residual_hc[t * (uint64_t)n_hc * n_embd + (uint64_t)src_hc * n_embd + d];
+        acc += comb_v * res_v;
+    }
+    return acc;
+}
+
+/* Shared n_hc == 4 unrolled combine for hc_expand4_kernel and its add/half
+ * siblings (rocm/ds4_rocm_hc.cuh:166-298): same math as
+ * sycl_hc_expand_general, specialised to a compile-time-unrolled 4-wide
+ * loop over one already-fetched 24-wide split row (pre | post | comb),
+ * matching ROCm's `sp + 4` (post) and `sp + 8` (comb) pointer offsets.
+ * The caller resolves bv the same way as sycl_hc_expand_general's block_v. */
+static inline void sycl_hc_expand4_write(float bv, const float *sp, float r0, float r1, float r2,
+                                         float r3, uint32_t n_embd, uint64_t hc_base, float *out_hc) {
+    const float *post = sp + 4;
+    const float *comb = sp + 8;
+    for (uint32_t dst = 0; dst < 4u; dst++) {
+        float acc = bv * post[dst];
+        acc += comb[0u * 4u + dst] * r0;
+        acc += comb[1u * 4u + dst] * r1;
+        acc += comb[2u * 4u + dst] * r2;
+        acc += comb[3u * 4u + dst] * r3;
+        out_hc[hc_base + (uint64_t)dst * n_embd] = acc;
+    }
+}
+
+}  // namespace
+
+/* Expands the sublayer output back into n_hc HC streams using separate
+ * post/comb tensors (not a packed split row).  Always uses the general
+ * kernel regardless of n_hc: ROCm has no n_hc == 4 specialisation for this
+ * entry (rocm/ds4_rocm_hc_output_launch.cuh:235-257 has no such branch).
+ * Ported with has_add == 0 (block_add unused), matching the ROCm launcher's
+ * own call, which passes block_out for both pointers. */
+extern "C" int ds4_gpu_hc_expand_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0, post_bytes = 0, comb_bytes = 0, comb_stride = 0;
+    if (!out_hc || !block_out || !residual_hc || !post || !comb ||
+        !sycl_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !sycl_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, n_hc, sizeof(float), &post_bytes) ||
+        !sycl_u64_mul_checked(n_hc, n_hc, &comb_stride) || comb_stride > UINT32_MAX ||
+        !sycl_u64_mul3_checked(n_tokens64, comb_stride, sizeof(float), &comb_bytes) ||
+        block_out->bytes < flat_bytes || residual_hc->bytes < hc_bytes ||
+        post->bytes < post_bytes || comb->bytes < comb_bytes) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+    const uint32_t hc = n_hc, embd = n_embd, cstride = (uint32_t)comb_stride;
+    const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
+        float       *ohc = (float *)out_hc->ptr;
+        const float *bo  = (const float *)block_out->ptr;
+        const float *res = (const float *)residual_hc->ptr;
+        const float *pp  = (const float *)post->ptr;
+        const float *cp  = (const float *)comb->ptr;
+
+        q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+            const uint64_t gid = gid_id[0];
+            const uint32_t d = (uint32_t)(gid % embd);
+            const uint64_t tmp = gid / embd;
+            const uint32_t dst_hc = (uint32_t)(tmp % hc);
+            const uint64_t t = tmp / hc;
+            const float block_v = bo[t * embd + d];
+            const float acc =
+                    sycl_hc_expand_general(block_v, pp, cp, res, embd, hc, hc, cstride, t, dst_hc, d);
+            ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* Expands using a packed split row (pre | post | comb) rather than
+ * separate post/comb tensors.  n_hc == 4 dispatches to the unrolled
+ * specialisation (hc_expand4_kernel); any other n_hc falls back to the
+ * general kernel with post/comb addressed by offsetting the split
+ * pointer, matching rocm/ds4_rocm_hc_output_launch.cuh:258-290 exactly:
+ * `base + n_hc` and `base + 2 * n_hc`, strided by mix_hc per row. */
+extern "C" int ds4_gpu_hc_expand_split_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
+    if (!out_hc || !block_out || !residual_hc || !split ||
+        !sycl_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !sycl_hc_mix_width(n_hc, &mix_hc64) ||
+        !sycl_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
+        block_out->bytes < flat_bytes || residual_hc->bytes < hc_bytes || split->bytes < split_bytes) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
+        float       *ohc = (float *)out_hc->ptr;
+        const float *bo  = (const float *)block_out->ptr;
+        const float *res = (const float *)residual_hc->ptr;
+        const float *sp0 = (const float *)split->ptr;
+        const uint32_t embd = n_embd;
+
+        if (n_hc == 4u) {
+            const uint64_t n = (uint64_t)n_tokens * n_embd;
+            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+                const uint64_t gid = gid_id[0];
+                const uint32_t d = (uint32_t)(gid % embd);
+                const uint64_t t = gid / embd;
+                const uint64_t td = t * embd + d;
+                const uint64_t hc_base = t * 4u * embd + d;
+                const float bv = bo[td];
+                const float r0 = res[hc_base + 0u * embd];
+                const float r1 = res[hc_base + 1u * embd];
+                const float r2 = res[hc_base + 2u * embd];
+                const float r3 = res[hc_base + 3u * embd];
+                sycl_hc_expand4_write(bv, sp0 + t * 24, r0, r1, r2, r3, embd, hc_base, ohc);
+            });
+        } else {
+            const uint32_t hc = n_hc;
+            const uint32_t mix_hc = (uint32_t)mix_hc64;
+            const float   *post = sp0 + hc;
+            const float   *comb = sp0 + 2u * hc;
+            const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+            q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+                const uint64_t gid = gid_id[0];
+                const uint32_t d = (uint32_t)(gid % embd);
+                const uint64_t tmp = gid / embd;
+                const uint32_t dst_hc = (uint32_t)(tmp % hc);
+                const uint64_t t = tmp / hc;
+                const float block_v = bo[t * embd + d];
+                const float acc = sycl_hc_expand_general(block_v, post, comb, res, embd, hc, mix_hc,
+                                                          mix_hc, t, dst_hc, d);
+                ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
+            });
+        }
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_split failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* As ds4_gpu_hc_expand_split_tensor, but block_out is F16.  Decode is
+ * lossless (design-spec section 6k), so sycl::bit_cast<sycl::half> is
+ * used directly rather than a ported bit-manipulation routine, which is
+ * only needed for the opposite (encode) direction -- a direction this
+ * file never performs (grep of rocm/ds4_rocm_hc.cuh finds __half2float at
+ * every F16 use site here and no __float2half anywhere). Ported from
+ * rocm/ds4_rocm_hc_output_launch.cuh:291-322. */
+extern "C" int ds4_gpu_hc_expand_split_half_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out_h, const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t n_tokens64 = 0, flat_half_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
+    if (!out_hc || !block_out_h || !residual_hc || !split ||
+        !sycl_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !sycl_hc_mix_width(n_hc, &mix_hc64) ||
+        !sycl_u64_mul3_checked(n_tokens64, n_embd, sizeof(uint16_t), &flat_half_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
+        block_out_h->bytes < flat_half_bytes || residual_hc->bytes < hc_bytes ||
+        split->bytes < split_bytes) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
+        float          *ohc = (float *)out_hc->ptr;
+        const uint16_t *bo  = (const uint16_t *)block_out_h->ptr;
+        const float    *res = (const float *)residual_hc->ptr;
+        const float    *sp0 = (const float *)split->ptr;
+        const uint32_t  embd = n_embd;
+
+        if (n_hc == 4u) {
+            const uint64_t n = (uint64_t)n_tokens * n_embd;
+            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+                const uint64_t gid = gid_id[0];
+                const uint32_t d = (uint32_t)(gid % embd);
+                const uint64_t t = gid / embd;
+                const uint64_t td = t * embd + d;
+                const uint64_t hc_base = t * 4u * embd + d;
+                const float bv = (float)sycl::bit_cast<sycl::half>(bo[td]);
+                const float r0 = res[hc_base + 0u * embd];
+                const float r1 = res[hc_base + 1u * embd];
+                const float r2 = res[hc_base + 2u * embd];
+                const float r3 = res[hc_base + 3u * embd];
+                sycl_hc_expand4_write(bv, sp0 + t * 24, r0, r1, r2, r3, embd, hc_base, ohc);
+            });
+        } else {
+            const uint32_t hc = n_hc;
+            const uint32_t mix_hc = (uint32_t)mix_hc64;
+            const float   *post = sp0 + hc;
+            const float   *comb = sp0 + 2u * hc;
+            const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+            q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+                const uint64_t gid = gid_id[0];
+                const uint32_t d = (uint32_t)(gid % embd);
+                const uint64_t tmp = gid / embd;
+                const uint32_t dst_hc = (uint32_t)(tmp % hc);
+                const uint64_t t = tmp / hc;
+                const float block_v = (float)sycl::bit_cast<sycl::half>(bo[t * embd + d]);
+                const float acc = sycl_hc_expand_general(block_v, post, comb, res, embd, hc, mix_hc,
+                                                          mix_hc, t, dst_hc, d);
+                ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
+            });
+        }
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_split_half failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* As ds4_gpu_hc_expand_split_tensor, but adds block_add (F32) to block_out
+ * before applying post/comb.  Ported from rocm/ds4_rocm_hc_output_launch.
+ * cuh:323-357. */
+extern "C" int ds4_gpu_hc_expand_add_split_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0, split_bytes = 0, mix_hc64 = 0;
+    if (!out_hc || !block_out || !block_add || !residual_hc || !split ||
+        !sycl_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !sycl_hc_mix_width(n_hc, &mix_hc64) ||
+        !sycl_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
+        block_out->bytes < flat_bytes || block_add->bytes < flat_bytes ||
+        residual_hc->bytes < hc_bytes || split->bytes < split_bytes) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
+        float       *ohc = (float *)out_hc->ptr;
+        const float *bo  = (const float *)block_out->ptr;
+        const float *ba  = (const float *)block_add->ptr;
+        const float *res = (const float *)residual_hc->ptr;
+        const float *sp0 = (const float *)split->ptr;
+        const uint32_t embd = n_embd;
+
+        if (n_hc == 4u) {
+            const uint64_t n = (uint64_t)n_tokens * n_embd;
+            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+                const uint64_t gid = gid_id[0];
+                const uint32_t d = (uint32_t)(gid % embd);
+                const uint64_t t = gid / embd;
+                const uint64_t td = t * embd + d;
+                const uint64_t hc_base = t * 4u * embd + d;
+                const float bv = bo[td] + ba[td];
+                const float r0 = res[hc_base + 0u * embd];
+                const float r1 = res[hc_base + 1u * embd];
+                const float r2 = res[hc_base + 2u * embd];
+                const float r3 = res[hc_base + 3u * embd];
+                sycl_hc_expand4_write(bv, sp0 + t * 24, r0, r1, r2, r3, embd, hc_base, ohc);
+            });
+        } else {
+            const uint32_t hc = n_hc;
+            const uint32_t mix_hc = (uint32_t)mix_hc64;
+            const float   *post = sp0 + hc;
+            const float   *comb = sp0 + 2u * hc;
+            const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+            q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+                const uint64_t gid = gid_id[0];
+                const uint32_t d = (uint32_t)(gid % embd);
+                const uint64_t tmp = gid / embd;
+                const uint32_t dst_hc = (uint32_t)(tmp % hc);
+                const uint64_t t = tmp / hc;
+                const float block_v = bo[t * embd + d] + ba[t * embd + d];
+                const float acc = sycl_hc_expand_general(block_v, post, comb, res, embd, hc, mix_hc,
+                                                          mix_hc, t, dst_hc, d);
+                ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
+            });
+        }
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_add_split failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* As ds4_gpu_hc_expand_add_split_tensor, but block_add is F16: decode then
+ * add.  Decode is lossless (design-spec section 6k), same reasoning as
+ * ds4_gpu_hc_expand_split_half_tensor above.  Ported from rocm/ds4_rocm_
+ * hc_output_launch.cuh:358-393. */
+extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add_h,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *split, uint32_t n_embd, uint32_t n_hc) {
+    uint64_t n_tokens64 = 0, flat_bytes = 0, flat_half_bytes = 0, hc_bytes = 0, split_bytes = 0,
+             mix_hc64 = 0;
+    if (!out_hc || !block_out || !block_add_h || !residual_hc || !split ||
+        !sycl_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !sycl_hc_mix_width(n_hc, &mix_hc64) ||
+        !sycl_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, n_embd, sizeof(uint16_t), &flat_half_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, mix_hc64, sizeof(float), &split_bytes) ||
+        block_out->bytes < flat_bytes || block_add_h->bytes < flat_half_bytes ||
+        residual_hc->bytes < hc_bytes || split->bytes < split_bytes) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
+        float          *ohc = (float *)out_hc->ptr;
+        const float    *bo  = (const float *)block_out->ptr;
+        const uint16_t *ba  = (const uint16_t *)block_add_h->ptr;
+        const float    *res = (const float *)residual_hc->ptr;
+        const float    *sp0 = (const float *)split->ptr;
+        const uint32_t  embd = n_embd;
+
+        if (n_hc == 4u) {
+            const uint64_t n = (uint64_t)n_tokens * n_embd;
+            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+                const uint64_t gid = gid_id[0];
+                const uint32_t d = (uint32_t)(gid % embd);
+                const uint64_t t = gid / embd;
+                const uint64_t td = t * embd + d;
+                const uint64_t hc_base = t * 4u * embd + d;
+                const float bv = bo[td] + (float)sycl::bit_cast<sycl::half>(ba[td]);
+                const float r0 = res[hc_base + 0u * embd];
+                const float r1 = res[hc_base + 1u * embd];
+                const float r2 = res[hc_base + 2u * embd];
+                const float r3 = res[hc_base + 3u * embd];
+                sycl_hc_expand4_write(bv, sp0 + t * 24, r0, r1, r2, r3, embd, hc_base, ohc);
+            });
+        } else {
+            const uint32_t hc = n_hc;
+            const uint32_t mix_hc = (uint32_t)mix_hc64;
+            const float   *post = sp0 + hc;
+            const float   *comb = sp0 + 2u * hc;
+            const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+            q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+                const uint64_t gid = gid_id[0];
+                const uint32_t d = (uint32_t)(gid % embd);
+                const uint64_t tmp = gid / embd;
+                const uint32_t dst_hc = (uint32_t)(tmp % hc);
+                const uint64_t t = tmp / hc;
+                const float block_v =
+                        bo[t * embd + d] + (float)sycl::bit_cast<sycl::half>(ba[t * embd + d]);
+                const float acc = sycl_hc_expand_general(block_v, post, comb, res, embd, hc, mix_hc,
+                                                          mix_hc, t, dst_hc, d);
+                ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
+            });
+        }
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_add_split_half_add failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}

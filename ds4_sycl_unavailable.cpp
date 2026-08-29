@@ -31,6 +31,12 @@
 /* Tensor parallelism is Metal-only, permanently out of scope. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_kslice_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_output_q8_tp_tensor)
+
+/* ds4_gpu_hc_expand_add_tensor does not appear in rocm/ds4_rocm_hc_output_
+ * launch.cuh or anywhere else under rocm/: it is implemented only in
+ * ds4_cuda.cu and ds4_metal.m (CUDA-and-Metal, not Metal-only as this
+ * comment previously said), so there is no ROCm structural reference to
+ * port from and this stub is permanently correct as-is. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_hc_expand_add_tensor)
 
 extern "C" uint64_t ds4_gpu_tp_big_gate_kick(...) { return 0; }
@@ -153,11 +159,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_store_compact_kv_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_store_indexer_k_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_value_project_typed_batch_heads_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_hc_expand_add_split_half_add_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_hc_expand_add_split_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_hc_expand_split_half_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_hc_expand_split_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_hc_expand_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_score_one_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_scores_decode_batch_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_scores_prefill_tensor)
