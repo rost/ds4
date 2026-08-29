@@ -23,8 +23,11 @@
  * already implemented in sycl/ds4_sycl_output.hpp; it is the worked
  * example for this file's mmap staging.  ds4_gpu_shared_down_hc_expand_
  * q8_0_tensor and ds4_gpu_matmul_q8_0_hc_expand_tensor (:394-443) delegate
- * to a fused Q8_0-matmul-plus-HC-expand kernel family that lives in
- * rocm/ds4_rocm_matmul.cuh, outside this file's scope, and remain stubbed. */
+ * to a fused Q8_0-matmul-plus-HC-expand kernel family that ROCm defines in
+ * rocm/ds4_rocm_matmul.cuh, outside this file's own kernel set; both
+ * entries are implemented here via sycl_matmul_q8_0_hc_expand_labeled,
+ * which reuses this file's HC-expand combine and sycl_q8_0_dequant from
+ * ds4_sycl_common.hpp rather than duplicating either. */
 
 #include "ds4_sycl_common.hpp"
 
@@ -756,6 +759,155 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
         return 0;
     }
     return 1;
+}
+
+/* Fuses a per-row Q8_0 dense matmul with the HC-expand combine above.
+ * Ported from ROCm's cuda_matmul_q8_0_hc_expand_tensor_labeled
+ * (rocm/ds4_rocm_matmul.cuh:690), which both
+ * ds4_gpu_matmul_q8_0_hc_expand_tensor and
+ * ds4_gpu_shared_down_hc_expand_q8_0_tensor below delegate to with
+ * `block_add` NULL or non-NULL respectively.  Only the dp4a/prequantised-
+ * activation fast path and the sharedx/warp tiling are not ported, the
+ * same declined-for-now perf tier as sycl_q8_0_matmul_general in
+ * sycl/ds4_sycl_matmul.hpp: this uses the identical shape-ungated scalar
+ * dot product, one work-item per output row.
+ *
+ * `block_add`, when non-NULL, is added into the raw matmul result BEFORE
+ * the HC-expand combine, matching ROCm's `has_add` branch; `block_out`
+ * always receives the RAW (pre-add) matmul result either way, also
+ * matching ROCm (`block_out[d] = acc;` runs before `block_v` picks up the
+ * addend). out_dim must equal n_embd: this fused family always produces
+ * exactly one HC-token-width row, the same requirement ROCm's own
+ * validation enforces. Single-token only (t == 0 throughout): every
+ * caller in ds4.c uses this for a decode-time projection, never a batch,
+ * and ROCm's own kernel carries no token loop or stride either. */
+static int sycl_matmul_q8_0_hc_expand_labeled(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc,
+        const char             *label) {
+    uint64_t row_bytes = 0, weight_bytes = 0, hc_bytes = 0, mix_hc64 = 0, split_bytes = 0;
+    if (!out_hc || !block_out || !x || !residual_hc || !split || !model_map ||
+        in_dim == 0u || out_dim == 0u || n_embd == 0u || n_hc == 0u ||
+        out_dim != (uint64_t)n_embd ||
+        !sycl_q8_0_row_bytes_checked(in_dim, &row_bytes) ||
+        !sycl_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !sycl_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !sycl_hc_mix_width(n_hc, &mix_hc64) ||
+        !sycl_u64_mul3_checked(n_hc, n_embd, sizeof(float), &hc_bytes) ||
+        !sycl_u64_mul_checked(mix_hc64, sizeof(float), &split_bytes) ||
+        !sycl_tensor_has_elems(x, in_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems(block_out, out_dim, sizeof(float)) ||
+        !sycl_tensor_has_bytes(residual_hc, hc_bytes) ||
+        !sycl_tensor_has_bytes(split, split_bytes) ||
+        !sycl_tensor_has_bytes(out_hc, hc_bytes) ||
+        (block_add && !sycl_tensor_has_elems(block_add, out_dim, sizeof(float)))) {
+        return 0;
+    }
+    const char *wptr = sycl_model_range_ptr(model_map, weight_offset, weight_bytes,
+                                            model_size, label ? label : "q8_0_hc_expand");
+    if (!wptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
+
+        unsigned char *dw = sycl::malloc_device<unsigned char>((size_t)weight_bytes, q);
+        if (!dw) return 0;
+        sycl_device_scratch_guard dw_guard(q, dw);
+        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
+
+        float         *ohc  = (float *)out_hc->ptr;
+        float         *bo   = (float *)block_out->ptr;
+        const float   *xp   = (const float *)x->ptr;
+        const float   *ba   = block_add ? (const float *)block_add->ptr : nullptr;
+        const float   *res  = (const float *)residual_hc->ptr;
+        const float   *sp0  = (const float *)split->ptr;
+        const uint32_t embd = n_embd;
+        const uint32_t hc   = n_hc;
+        const uint32_t mix_hc = (uint32_t)mix_hc64;
+        const float   *post = sp0 + hc;
+        const float   *comb = sp0 + 2u * hc;
+        const uint32_t out_d = (uint32_t)out_dim;
+        const uint32_t in_d  = (uint32_t)in_dim;
+        const uint64_t rbytes = row_bytes;
+        const bool has_add = block_add != nullptr;
+
+        q.parallel_for(sycl::range<1>(out_d), [=](sycl::id<1> gid_id) {
+            const uint32_t d = (uint32_t)gid_id[0];
+            const unsigned char *wr = dw + (uint64_t)d * rbytes;
+            float acc = 0.0f;
+            for (uint32_t k = 0; k < in_d; k++) {
+                acc += xp[k] * sycl_q8_0_dequant(wr, k);
+            }
+            bo[d] = acc;
+            const float block_v = has_add ? acc + ba[d] : acc;
+            for (uint32_t dst_hc = 0; dst_hc < hc; dst_hc++) {
+                const float v = sycl_hc_expand_general(block_v, post, comb, res,
+                                                       embd, hc, mix_hc, mix_hc,
+                                                       0u, dst_hc, d);
+                ohc[(uint64_t)dst_hc * embd + d] = v;
+            }
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "%s failed: %s\n",
+                label ? label : "matmul_q8_0_hc_expand", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return sycl_matmul_q8_0_hc_expand_labeled(out_hc, block_out, model_map,
+                                              model_size, weight_offset,
+                                              in_dim, out_dim, x, nullptr,
+                                              residual_hc, split, n_embd, n_hc,
+                                              "q8_hc_expand");
+}
+
+extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *shared_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return sycl_matmul_q8_0_hc_expand_labeled(out_hc, shared_out, model_map,
+                                              model_size, weight_offset,
+                                              in_dim, out_dim, shared_mid,
+                                              routed_out, residual_hc, split,
+                                              n_embd, n_hc,
+                                              "shared_down_hc_expand");
 }
 
 /* Fuses hc_split_sinkhorn_kernel and hc_weighted_sum_kernel into one launch,

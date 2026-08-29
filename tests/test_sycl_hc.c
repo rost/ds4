@@ -22,6 +22,10 @@
 
 enum { N_HC = 4, MIX_HC = 2 * N_HC + N_HC * N_HC /* 24 */ };
 
+/* n_embd for the fused matmul-plus-HC-expand tests below: this family
+ * requires out_dim == n_embd, so both dimensions share one constant. */
+enum { N_HC_EXPAND_EMBD = 12 };
+
 /* Matches hc_split_sinkhorn_one, ds4.c:9718-9814.  n_hc is fixed at 4 to
  * match the GPU kernel's own hardcoding (hc4_split_one never takes n_hc as
  * a parameter). out layout: [0,4) pre, [4,8) post, [8,24) comb, addressed
@@ -142,6 +146,58 @@ static ds4_gpu_tensor *alloc_write(const void *data, size_t bytes) {
  * purely affine test data. */
 static float fill_val(uint32_t i, uint32_t j) {
     return sinf((float)(i * 7 + j * 13 + 1)) * 0.7f + 0.05f * (float)((i * j) % 11);
+}
+
+/* Minimal local Q8_0 support for the fused matmul-plus-HC-expand tests
+ * below: an IEEE754 binary16 encoder (truncating, not round-to-nearest,
+ * exactly like tests/test_sycl_matmul.c's test_float_to_half; safe here
+ * for the same reason that file documents -- the oracle below decodes the
+ * identical stored bits via oracle_half_to_float, so both sides agree
+ * regardless of how those bits were produced), a row encoder carrying an
+ * (o, k) interaction term rather than a plain a*i + b so a row mixup or a
+ * dropped block stride shows up as a real mismatch, and a host-side dot
+ * product oracle matching sycl_q8_0_dequant in sycl/ds4_sycl_common.hpp. */
+static uint16_t hc_test_float_to_half(float f) {
+    uint32_t bits;
+    memcpy(&bits, &f, sizeof(bits));
+    uint32_t sign = (bits >> 16) & 0x8000u;
+    int32_t  exp  = (int32_t)((bits >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = bits & 0x7FFFFFu;
+    if (exp <= 0) return (uint16_t)sign;
+    if (exp >= 0x1F) return (uint16_t)(sign | 0x7C00u);
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+}
+
+static void hc_test_encode_q8_0_row(unsigned char *row, uint32_t in_dim, uint32_t o) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        unsigned char *bp = row + (size_t)blk * 34u;
+        const uint16_t braw = hc_test_float_to_half(0.03f * (float)(o + blk + 1u));
+        bp[0] = (unsigned char)(braw & 0xFFu);
+        bp[1] = (unsigned char)((braw >> 8) & 0xFFu);
+        for (uint32_t idx = 0; idx < 32u; idx++) {
+            const uint32_t k = blk * 32u + idx;
+            const int qv = (k < in_dim) ? (int)(((o + 1u) * (k + 5u)) % 11u) - 5 : 0;
+            bp[2 + idx] = (unsigned char)(signed char)qv;
+        }
+    }
+}
+
+static float hc_oracle_q8_0_dot(const float *x, const unsigned char *row, uint32_t in_dim) {
+    double sum = 0.0;
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        const unsigned char *bp = row + (size_t)blk * 34u;
+        const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+        const float scale = oracle_half_to_float(raw);
+        for (uint32_t idx = 0; idx < 32u; idx++) {
+            const uint32_t k = blk * 32u + idx;
+            if (k >= in_dim) break;
+            const signed char qv = (signed char)bp[2 + idx];
+            sum += (double)x[k] * (double)scale * (double)qv;
+        }
+    }
+    return (float)sum;
 }
 
 static int test_repeat_hc(void) {
@@ -889,6 +945,240 @@ static int test_hc_split_weighted_sum_norm_stress(void) {
     return 0;
 }
 
+/* ds4_gpu_matmul_q8_0_hc_expand_tensor: a Q8_0 dense matmul fused with the
+ * HC-expand combine (no addend), matching ROCm's cuda_matmul_q8_0_hc_
+ * expand_tensor_labeled (rocm/ds4_rocm_matmul.cuh:690) with block_add ==
+ * NULL. IN_DIM deliberately not a multiple of 32, exercising a partial
+ * final Q8_0 block, the same reasoning as test_matmul_q8_0 in
+ * tests/test_sycl_matmul.c. out_dim == N_EMBD, this fused family's own
+ * requirement.
+ *
+ * Verified two ways: against the composed CPU oracle (Q8_0 dot product,
+ * then hc_post_one), and differentially against this backend's own
+ * unfused composition, ds4_gpu_matmul_q8_0_tensor followed by
+ * ds4_gpu_hc_expand_split_tensor, on identical input -- the stronger test
+ * per the plan, since both are real implemented paths rather than one
+ * being a hand-transcribed oracle. */
+static int test_matmul_q8_0_hc_expand(void) {
+    enum { IN_DIM = 37 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)N_HC_EXPAND_EMBD * row_bytes;
+
+    unsigned char weights[N_HC_EXPAND_EMBD * 68]; /* row_bytes <= 2*34 here */
+    float x[IN_DIM];
+    float block_want[N_HC_EXPAND_EMBD];
+    float residual[N_HC * N_HC_EXPAND_EMBD];
+    float split[MIX_HC];
+    float hc_want[N_HC * N_HC_EXPAND_EMBD];
+
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        hc_test_encode_q8_0_row(weights + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) x[k] = (float)((k * 3u) % 9u) - 4.0f;
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        block_want[o] = hc_oracle_q8_0_dot(x, weights + (size_t)o * row_bytes, IN_DIM);
+    }
+    for (int h = 0; h < N_HC; h++) {
+        for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+            residual[h * N_HC_EXPAND_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 3.0f;
+        }
+    }
+    for (int i = 0; i < MIX_HC; i++) split[i] = fill_val(9u, (uint32_t)i + 40) * 0.5f;
+    oracle_hc_post_one(hc_want, block_want, residual, split + N_HC, split + 2 * N_HC,
+                       N_HC_EXPAND_EMBD, N_HC);
+
+    ds4_gpu_tensor *tx     = alloc_write(x, sizeof(x));
+    ds4_gpu_tensor *tres   = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tsplit = alloc_write(split, sizeof(split));
+    ds4_gpu_tensor *tblock = ds4_gpu_tensor_alloc(sizeof(block_want));
+    ds4_gpu_tensor *tout   = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tx && tres && tsplit && tblock && tout,
+          "matmul_q8_0_hc_expand: alloc failed");
+
+    CHECK(ds4_gpu_matmul_q8_0_hc_expand_tensor(
+              tout, tblock, weights, weight_bytes, 0, IN_DIM,
+              N_HC_EXPAND_EMBD, tx, tres, tsplit, N_HC_EXPAND_EMBD, N_HC) != 0,
+          "matmul_q8_0_hc_expand: call");
+
+    float block_got[N_HC_EXPAND_EMBD], hc_got[N_HC * N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tblock, 0, block_got, sizeof(block_got)) != 0,
+          "matmul_q8_0_hc_expand: read block_out");
+    CHECK(ds4_gpu_tensor_read(tout, 0, hc_got, sizeof(hc_got)) != 0,
+          "matmul_q8_0_hc_expand: read out_hc");
+    for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(block_got[i], block_want[i], 1e-2,
+                    "matmul_q8_0_hc_expand: block_out mismatch");
+    }
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_want[i], 1e-2,
+                    "matmul_q8_0_hc_expand: out_hc mismatch");
+    }
+
+    /* Differential: matmul_q8_0 then hc_expand_split, on the same weights,
+     * x, residual and split. */
+    ds4_gpu_tensor *tblock2 = ds4_gpu_tensor_alloc(sizeof(block_want));
+    ds4_gpu_tensor *tout2   = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tblock2 && tout2, "matmul_q8_0_hc_expand: differential alloc failed");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tblock2, weights, weight_bytes, 0,
+                                     IN_DIM, N_HC_EXPAND_EMBD, tx, 1) != 0,
+          "matmul_q8_0_hc_expand: differential matmul call");
+    CHECK(ds4_gpu_hc_expand_split_tensor(tout2, tblock2, tres, tsplit,
+                                         N_HC_EXPAND_EMBD, N_HC) != 0,
+          "matmul_q8_0_hc_expand: differential expand call");
+    float hc_diff[N_HC * N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout2, 0, hc_diff, sizeof(hc_diff)) != 0,
+          "matmul_q8_0_hc_expand: differential read");
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_diff[i], 1e-4,
+                    "matmul_q8_0_hc_expand: fused vs unfused composition "
+                    "mismatch");
+    }
+
+    /* Validation: out_dim must equal n_embd; a zero in_dim, an out-of-range
+     * weight offset, and an undersized out_hc must all be rejected. */
+    CHECK(ds4_gpu_matmul_q8_0_hc_expand_tensor(
+              tout, tblock, weights, weight_bytes, 0, IN_DIM,
+              N_HC_EXPAND_EMBD + 1u, tx, tres, tsplit, N_HC_EXPAND_EMBD,
+              N_HC) == 0,
+          "matmul_q8_0_hc_expand: out_dim != n_embd must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_hc_expand_tensor(
+              tout, tblock, weights, weight_bytes, 0, 0, N_HC_EXPAND_EMBD,
+              tx, tres, tsplit, N_HC_EXPAND_EMBD, N_HC) == 0,
+          "matmul_q8_0_hc_expand: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_hc_expand_tensor(
+              tout, tblock, weights, weight_bytes, weight_bytes, IN_DIM,
+              N_HC_EXPAND_EMBD, tx, tres, tsplit, N_HC_EXPAND_EMBD,
+              N_HC) == 0,
+          "matmul_q8_0_hc_expand: out-of-range weight offset must be "
+          "rejected");
+    ds4_gpu_tensor *small = ds4_gpu_tensor_alloc(sizeof(float) * 2);
+    CHECK(small != NULL, "matmul_q8_0_hc_expand: small allocation failed");
+    CHECK(ds4_gpu_matmul_q8_0_hc_expand_tensor(
+              small, tblock, weights, weight_bytes, 0, IN_DIM,
+              N_HC_EXPAND_EMBD, tx, tres, tsplit, N_HC_EXPAND_EMBD,
+              N_HC) == 0,
+          "matmul_q8_0_hc_expand: undersized out_hc must be rejected");
+    ds4_gpu_tensor_free(small);
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tblock);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tblock2);
+    ds4_gpu_tensor_free(tout2);
+    fprintf(stderr, "  test_matmul_q8_0_hc_expand OK\n");
+    return 0;
+}
+
+/* ds4_gpu_shared_down_hc_expand_q8_0_tensor: the same fused family with the
+ * routed-expert sum added into the matmul result BEFORE the HC-expand
+ * combine (ROCm's has_add branch).  Verified against the composed oracle
+ * and, per the plan, differentially against ds4_gpu_matmul_q8_0_tensor
+ * followed by ds4_gpu_hc_expand_add_split_tensor (the unfused add variant,
+ * not the plain one used above). */
+static int test_shared_down_hc_expand_q8_0(void) {
+    enum { IN_DIM = 20 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)N_HC_EXPAND_EMBD * row_bytes;
+
+    unsigned char weights[N_HC_EXPAND_EMBD * 34]; /* row_bytes == 34 here */
+    float x[IN_DIM];
+    float routed_out[N_HC_EXPAND_EMBD];
+    float block_want[N_HC_EXPAND_EMBD];
+    float residual[N_HC * N_HC_EXPAND_EMBD];
+    float split[MIX_HC];
+    float hc_want[N_HC * N_HC_EXPAND_EMBD];
+
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        hc_test_encode_q8_0_row(weights + (size_t)o * row_bytes, IN_DIM, o + 1u);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) x[k] = (float)((k * 5u + 1u) % 7u) - 3.0f;
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        routed_out[o] = fill_val(o, o + 2u) * 1.3f;
+        const float dot = hc_oracle_q8_0_dot(x, weights + (size_t)o * row_bytes, IN_DIM);
+        block_want[o] = dot + routed_out[o];
+    }
+    for (int h = 0; h < N_HC; h++) {
+        for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+            residual[h * N_HC_EXPAND_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 1.7f;
+        }
+    }
+    for (int i = 0; i < MIX_HC; i++) split[i] = fill_val(3u, (uint32_t)i + 60) * 0.4f;
+    oracle_hc_post_one(hc_want, block_want, residual, split + N_HC, split + 2 * N_HC,
+                       N_HC_EXPAND_EMBD, N_HC);
+
+    ds4_gpu_tensor *tx      = alloc_write(x, sizeof(x));
+    ds4_gpu_tensor *trouted = alloc_write(routed_out, sizeof(routed_out));
+    ds4_gpu_tensor *tres    = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tsplit  = alloc_write(split, sizeof(split));
+    ds4_gpu_tensor *tshared = ds4_gpu_tensor_alloc(sizeof(block_want));
+    ds4_gpu_tensor *tout    = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tx && trouted && tres && tsplit && tshared && tout,
+          "shared_down_hc_expand: alloc failed");
+
+    CHECK(ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+              tout, tshared, weights, weight_bytes, 0, IN_DIM,
+              N_HC_EXPAND_EMBD, tx, trouted, tres, tsplit,
+              N_HC_EXPAND_EMBD, N_HC) != 0,
+          "shared_down_hc_expand: call");
+
+    float hc_got[N_HC * N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout, 0, hc_got, sizeof(hc_got)) != 0,
+          "shared_down_hc_expand: read out_hc");
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_want[i], 1e-2,
+                    "shared_down_hc_expand: out_hc mismatch");
+    }
+
+    /* Differential: matmul_q8_0 into a scratch buffer, then the unfused
+     * add-variant expand entry, on the same inputs. */
+    ds4_gpu_tensor *tshared2 = ds4_gpu_tensor_alloc(sizeof(block_want));
+    ds4_gpu_tensor *tout2    = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tshared2 && tout2, "shared_down_hc_expand: differential alloc failed");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tshared2, weights, weight_bytes, 0,
+                                     IN_DIM, N_HC_EXPAND_EMBD, tx, 1) != 0,
+          "shared_down_hc_expand: differential matmul call");
+    CHECK(ds4_gpu_hc_expand_add_split_tensor(tout2, tshared2, trouted, tres,
+                                             tsplit, N_HC_EXPAND_EMBD,
+                                             N_HC) != 0,
+          "shared_down_hc_expand: differential expand call");
+    float hc_diff[N_HC * N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout2, 0, hc_diff, sizeof(hc_diff)) != 0,
+          "shared_down_hc_expand: differential read");
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_diff[i], 1e-4,
+                    "shared_down_hc_expand: fused vs unfused composition "
+                    "mismatch");
+    }
+
+    /* Validation: same shape as the plain entry's checks above. */
+    CHECK(ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+              tout, tshared, weights, weight_bytes, 0, IN_DIM,
+              N_HC_EXPAND_EMBD + 1u, tx, trouted, tres, tsplit,
+              N_HC_EXPAND_EMBD, N_HC) == 0,
+          "shared_down_hc_expand: out_dim != n_embd must be rejected");
+    CHECK(ds4_gpu_shared_down_hc_expand_q8_0_tensor(
+              tout, tshared, weights, weight_bytes, weight_bytes, IN_DIM,
+              N_HC_EXPAND_EMBD, tx, trouted, tres, tsplit,
+              N_HC_EXPAND_EMBD, N_HC) == 0,
+          "shared_down_hc_expand: out-of-range weight offset must be "
+          "rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(trouted);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tshared);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tshared2);
+    ds4_gpu_tensor_free(tout2);
+    fprintf(stderr, "  test_shared_down_hc_expand_q8_0 OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_repeat_hc() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -905,6 +1195,8 @@ int main(void) {
     if (test_hc_split_weighted_sum() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_split_weighted_sum_norm() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_split_weighted_sum_norm_stress() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0_hc_expand() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_shared_down_hc_expand_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_hc OK\n");
     return 0;
