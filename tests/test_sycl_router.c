@@ -611,6 +611,311 @@ static int test_router_rejections(void) {
     return 0;
 }
 
+/* Matches rocm/ds4_rocm_router.cuh:51-67: hash mode ignores scores
+ * entirely and looks up the expert set from row `token` of a
+ * hash_rows x n_expert_used int32 table, clamping an out-of-range token to
+ * row 0 and any out-of-range expert id to weight 0.0f (the id itself is
+ * still stored in `selected`, unconditionally, matching `sel[j] = e;`
+ * running before the range check). Weights normalise the UNBIASED prob of
+ * each selected id: bias is never applied in hash mode, since both
+ * launchers pass has_bias && !hash_mode into the kernel
+ * (rocm/ds4_rocm_router.cuh:157/:162 and :213/:229). */
+static void oracle_hash_select(
+        int32_t *selected_out, float *weight_out, const float *probs,
+        const int32_t *hash_row, uint32_t n_expert, uint32_t n_expert_used,
+        float scale) {
+    float sum = 0.0f;
+    for (uint32_t j = 0; j < n_expert_used; j++) {
+        int32_t e = hash_row[j];
+        selected_out[j] = e;
+        float v = (e >= 0 && (uint32_t)e < n_expert) ? probs[(uint32_t)e] : 0.0f;
+        weight_out[j] = v;
+        sum += v;
+    }
+    if (sum < 6.103515625e-5f) sum = 6.103515625e-5f;
+    for (uint32_t j = 0; j < n_expert_used; j++) weight_out[j] = weight_out[j] / sum * scale;
+}
+
+/* Shared allocation for the hash-mode tests below: four tensors sized for
+ * (n_expert, n_expert_used), with `logits` already written. */
+static int alloc_router_tensors(
+        uint32_t n_expert, uint32_t n_expert_used, const float *logits,
+        ds4_gpu_tensor **out_logits, ds4_gpu_tensor **out_selected,
+        ds4_gpu_tensor **out_weights, ds4_gpu_tensor **out_probs) {
+    *out_logits = ds4_gpu_tensor_alloc((uint64_t)n_expert * sizeof(float));
+    *out_selected = ds4_gpu_tensor_alloc((uint64_t)n_expert_used * sizeof(int32_t));
+    *out_weights = ds4_gpu_tensor_alloc((uint64_t)n_expert_used * sizeof(float));
+    *out_probs = ds4_gpu_tensor_alloc((uint64_t)n_expert * sizeof(float));
+    if (!*out_logits || !*out_selected || !*out_weights || !*out_probs) return 1;
+    if (ds4_gpu_tensor_write(*out_logits, 0, logits, (uint64_t)n_expert * sizeof(float)) == 0) return 1;
+    return 0;
+}
+
+static void free_router_tensors(ds4_gpu_tensor *l, ds4_gpu_tensor *s, ds4_gpu_tensor *w, ds4_gpu_tensor *p) {
+    ds4_gpu_tensor_free(l);
+    ds4_gpu_tensor_free(s);
+    ds4_gpu_tensor_free(w);
+    ds4_gpu_tensor_free(p);
+}
+
+/* Hash mode selects from a fixed per-token table and ignores scores
+ * entirely.  Uses logits whose unbiased top-4 is {0,1,2,3} so a run in
+ * score mode on the identical logits provably differs from the hash-mode
+ * result: a port that silently fell through to top-k could not pass this
+ * test.  The hash table is placed at a nonzero offset to also exercise
+ * hash_offset, and probs must still be fully written in hash mode. */
+static int test_router_hash_mode_basic(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 4, HASH_ROWS = 3, HASH_OFFSET = 64 };
+    float logits[N_EXPERT];
+    for (uint32_t i = 0; i < N_EXPERT; i++) logits[i] = -5.0f;
+    logits[0] = 10.0f;
+    logits[1] = 9.0f;
+    logits[2] = 8.0f;
+    logits[3] = 7.0f;
+    /* Row 1's selected experts (100,110,120,130) deliberately get distinct
+     * logits, not the uniform -5.0f every other non-top-4 expert shares:
+     * discovered while ablating this test (a uniform-corruption ablation
+     * of sprob, e.g. adding a constant offset to every entry, cancels out
+     * exactly under normalisation when all four selected probs are
+     * identical, per spec 6f's "normalisation erases scale/shift-only
+     * corruption" class of bug). With distinct logits the four selected
+     * probs differ, so any corruption that touches sprob uniformly still
+     * changes their relative weights after normalisation. */
+    logits[100] = -4.0f;
+    logits[110] = -4.5f;
+    logits[120] = -3.0f;
+    logits[130] = -5.5f;
+
+    const int32_t hash_table[HASH_ROWS][N_EXPERT_USED] = {
+            {50, 60, 70, 80},
+            {100, 110, 120, 130},
+            {5, 6, 7, 8},
+    };
+    unsigned char model[HASH_OFFSET + sizeof(hash_table)];
+    memset(model, 0, sizeof(model));
+    memcpy(model + HASH_OFFSET, hash_table, sizeof(hash_table));
+
+    ds4_gpu_tensor *tlogits, *tselected, *tweights, *tprobs;
+    CHECK(alloc_router_tensors(N_EXPERT, N_EXPERT_USED, logits, &tlogits, &tselected, &tweights, &tprobs) == 0,
+          "router: hash basic allocation failed");
+
+    CHECK(ds4_gpu_router_select_tensor(
+              tselected, tweights, tprobs, model, sizeof(model),
+              /*bias_offset=*/0, HASH_OFFSET, HASH_ROWS, /*token=*/1,
+              N_EXPERT, N_EXPERT_USED, 1.5f, 0, 0, /*has_bias=*/false, /*hash_mode=*/true, tlogits) != 0,
+          "router: hash mode call failed");
+
+    float got_probs[N_EXPERT];
+    int32_t got_selected[N_EXPERT_USED];
+    float got_weights[N_EXPERT_USED];
+    CHECK(ds4_gpu_tensor_read(tprobs, 0, got_probs, sizeof(got_probs)) != 0, "router: hash probs read failed");
+    CHECK(ds4_gpu_tensor_read(tselected, 0, got_selected, sizeof(got_selected)) != 0, "router: hash selected read failed");
+    CHECK(ds4_gpu_tensor_read(tweights, 0, got_weights, sizeof(got_weights)) != 0, "router: hash weights read failed");
+
+    float want_probs[N_EXPERT];
+    oracle_router_probs(want_probs, logits, N_EXPERT);
+    for (uint32_t i = 0; i < N_EXPERT; i++) {
+        CHECK_CLOSE(got_probs[i], want_probs[i], 1e-5, "router: hash mode probs mismatch (not fully written)");
+    }
+
+    int32_t want_selected[N_EXPERT_USED];
+    float want_weights[N_EXPERT_USED];
+    oracle_hash_select(want_selected, want_weights, want_probs, hash_table[1], N_EXPERT, N_EXPERT_USED, 1.5f);
+    for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+        CHECK(got_selected[j] == want_selected[j], "router: hash mode selected mismatch");
+        CHECK_CLOSE(got_weights[j], want_weights[j], 1e-5, "router: hash mode weight mismatch");
+    }
+
+    /* Score mode on the identical logits must pick a different set: the
+     * unbiased top-4 is {0,1,2,3}, nothing like hash row 1's {100,110,120,130}. */
+    ds4_gpu_tensor *tselected2 = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *tweights2 = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *tprobs2 = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT * sizeof(float));
+    CHECK(tselected2 && tweights2 && tprobs2, "router: hash basic score-mode allocation failed");
+    CHECK(ds4_gpu_router_select_tensor(
+              tselected2, tweights2, tprobs2, model, sizeof(model), 0, 0, 0, 0,
+              N_EXPERT, N_EXPERT_USED, 1.5f, 0, 0, false, /*hash_mode=*/false, tlogits) != 0,
+          "router: score mode call failed");
+    int32_t score_selected[N_EXPERT_USED];
+    CHECK(ds4_gpu_tensor_read(tselected2, 0, score_selected, sizeof(score_selected)) != 0,
+          "router: score mode selected read failed");
+    int differs = 0;
+    for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+        if (score_selected[j] != got_selected[j]) differs = 1;
+    }
+    CHECK(differs, "router: hash mode and score mode must select differently on identical logits");
+    ds4_gpu_tensor_free(tselected2);
+    ds4_gpu_tensor_free(tweights2);
+    ds4_gpu_tensor_free(tprobs2);
+
+    free_router_tensors(tlogits, tselected, tweights, tprobs);
+    fprintf(stderr, "  test_router_hash_mode_basic OK\n");
+    return 0;
+}
+
+/* Bias must have zero effect in hash mode, even when has_bias is true and
+ * bias_offset is itself out of range: since has_bias && !hash_mode gates
+ * all bias staging and validation, an invalid bias_offset must not be
+ * rejected either, which is itself evidence bias is never touched. */
+static int test_router_hash_mode_bias_ignored(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 4, HASH_ROWS = 1 };
+    float logits[N_EXPERT];
+    for (uint32_t i = 0; i < N_EXPERT; i++) logits[i] = 0.02f * (float)i - 2.0f;
+
+    const int32_t hash_row[N_EXPERT_USED] = {10, 20, 30, 40};
+    unsigned char model[sizeof(hash_row)];
+    memcpy(model, hash_row, sizeof(hash_row));
+
+    ds4_gpu_tensor *tlogits, *tselected, *tweights, *tprobs;
+    CHECK(alloc_router_tensors(N_EXPERT, N_EXPERT_USED, logits, &tlogits, &tselected, &tweights, &tprobs) == 0,
+          "router: hash bias allocation failed");
+
+    /* bias_offset == sizeof(model) leaves zero room for a bias table, which
+     * would be rejected if has_bias && !hash_mode staging ever ran. */
+    CHECK(ds4_gpu_router_select_tensor(
+              tselected, tweights, tprobs, model, sizeof(model),
+              /*bias_offset=*/sizeof(model), /*hash_offset=*/0, HASH_ROWS, /*token=*/0,
+              N_EXPERT, N_EXPERT_USED, 1.5f, 0, 0, /*has_bias=*/true, /*hash_mode=*/true, tlogits) != 0,
+          "router: hash mode with has_bias=true and an out-of-range bias_offset must still succeed");
+
+    float got_weights[N_EXPERT_USED];
+    CHECK(ds4_gpu_tensor_read(tweights, 0, got_weights, sizeof(got_weights)) != 0,
+          "router: hash bias weights read failed");
+
+    float want_probs[N_EXPERT];
+    oracle_router_probs(want_probs, logits, N_EXPERT);
+    int32_t want_selected[N_EXPERT_USED];
+    float want_weights[N_EXPERT_USED];
+    oracle_hash_select(want_selected, want_weights, want_probs, hash_row, N_EXPERT, N_EXPERT_USED, 1.5f);
+    for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+        CHECK_CLOSE(got_weights[j], want_weights[j], 1e-5,
+                    "router: hash mode weight must equal the unbiased-prob oracle regardless of has_bias");
+    }
+
+    free_router_tensors(tlogits, tselected, tweights, tprobs);
+    fprintf(stderr, "  test_router_hash_mode_bias_ignored OK\n");
+    return 0;
+}
+
+/* An out-of-range expert id in the hash row (negative, or >= n_expert)
+ * must contribute weight 0.0f and must not crash; the id itself is still
+ * copied into `selected` unconditionally, matching ROCm's `sel[j] = e;`
+ * running before the range check. */
+static int test_router_hash_mode_out_of_range_expert(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 4, HASH_ROWS = 1 };
+    float logits[N_EXPERT];
+    for (uint32_t i = 0; i < N_EXPERT; i++) logits[i] = 0.01f * (float)i - 1.5f;
+
+    const int32_t hash_row[N_EXPERT_USED] = {5, -3, N_EXPERT, 10};
+    unsigned char model[sizeof(hash_row)];
+    memcpy(model, hash_row, sizeof(hash_row));
+
+    ds4_gpu_tensor *tlogits, *tselected, *tweights, *tprobs;
+    CHECK(alloc_router_tensors(N_EXPERT, N_EXPERT_USED, logits, &tlogits, &tselected, &tweights, &tprobs) == 0,
+          "router: hash out-of-range allocation failed");
+
+    CHECK(ds4_gpu_router_select_tensor(
+              tselected, tweights, tprobs, model, sizeof(model), 0, 0, HASH_ROWS, 0,
+              N_EXPERT, N_EXPERT_USED, 1.5f, 0, 0, false, true, tlogits) != 0,
+          "router: hash mode with out-of-range ids must still succeed");
+
+    int32_t got_selected[N_EXPERT_USED];
+    float got_weights[N_EXPERT_USED];
+    CHECK(ds4_gpu_tensor_read(tselected, 0, got_selected, sizeof(got_selected)) != 0,
+          "router: hash out-of-range selected read failed");
+    CHECK(ds4_gpu_tensor_read(tweights, 0, got_weights, sizeof(got_weights)) != 0,
+          "router: hash out-of-range weights read failed");
+
+    CHECK(got_selected[1] == -3 && got_selected[2] == N_EXPERT,
+          "router: out-of-range ids must still be copied into selected verbatim");
+    CHECK(got_weights[1] == 0.0f, "router: negative expert id must contribute weight 0.0");
+    CHECK(got_weights[2] == 0.0f, "router: expert id == n_expert must contribute weight 0.0");
+
+    float want_probs[N_EXPERT];
+    oracle_router_probs(want_probs, logits, N_EXPERT);
+    int32_t want_selected[N_EXPERT_USED];
+    float want_weights[N_EXPERT_USED];
+    oracle_hash_select(want_selected, want_weights, want_probs, hash_row, N_EXPERT, N_EXPERT_USED, 1.5f);
+    for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+        CHECK(got_selected[j] == want_selected[j], "router: hash out-of-range selected mismatch");
+        CHECK_CLOSE(got_weights[j], want_weights[j], 1e-5, "router: hash out-of-range weight mismatch");
+    }
+
+    free_router_tensors(tlogits, tselected, tweights, tprobs);
+    fprintf(stderr, "  test_router_hash_mode_out_of_range_expert OK\n");
+    return 0;
+}
+
+/* A token id at or beyond hash_rows must clamp to row 0, matching
+ * `if (tok < 0 || (uint32_t)tok >= hash_rows) tok = 0;`. */
+static int test_router_hash_mode_token_clamp(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 4, HASH_ROWS = 3 };
+    float logits[N_EXPERT];
+    for (uint32_t i = 0; i < N_EXPERT; i++) logits[i] = 0.01f * (float)i - 1.0f;
+
+    const int32_t hash_table[HASH_ROWS][N_EXPERT_USED] = {
+            {1, 2, 3, 4},
+            {11, 12, 13, 14},
+            {21, 22, 23, 24},
+    };
+    unsigned char model[sizeof(hash_table)];
+    memcpy(model, hash_table, sizeof(hash_table));
+
+    ds4_gpu_tensor *tlogits, *tselected, *tweights, *tprobs;
+    CHECK(alloc_router_tensors(N_EXPERT, N_EXPERT_USED, logits, &tlogits, &tselected, &tweights, &tprobs) == 0,
+          "router: hash clamp allocation failed");
+
+    /* token == hash_rows + 50 is well out of range; it must clamp to 0, not
+     * be rejected. */
+    CHECK(ds4_gpu_router_select_tensor(
+              tselected, tweights, tprobs, model, sizeof(model), 0, 0, HASH_ROWS,
+              /*token=*/HASH_ROWS + 50u,
+              N_EXPERT, N_EXPERT_USED, 1.5f, 0, 0, false, true, tlogits) != 0,
+          "router: out-of-range token must clamp, not be rejected");
+
+    int32_t got_selected[N_EXPERT_USED];
+    CHECK(ds4_gpu_tensor_read(tselected, 0, got_selected, sizeof(got_selected)) != 0,
+          "router: hash clamp selected read failed");
+    for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+        CHECK(got_selected[j] == hash_table[0][j], "router: out-of-range token must clamp to row 0");
+    }
+
+    free_router_tensors(tlogits, tselected, tweights, tprobs);
+    fprintf(stderr, "  test_router_hash_mode_token_clamp OK\n");
+    return 0;
+}
+
+/* hash_rows == 0 and a hash_offset whose range exceeds model_size must
+ * both be rejected, matching rocm/ds4_rocm_router.cuh:142-150. */
+static int test_router_hash_mode_rejections(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 4, HASH_ROWS = 2 };
+    float logits[N_EXPERT];
+    for (uint32_t i = 0; i < N_EXPERT; i++) logits[i] = 0.01f * (float)i - 1.0f;
+
+    const int32_t hash_table[HASH_ROWS][N_EXPERT_USED] = {{1, 2, 3, 4}, {5, 6, 7, 8}};
+    unsigned char model[sizeof(hash_table)];
+    memcpy(model, hash_table, sizeof(hash_table));
+
+    ds4_gpu_tensor *tlogits, *tselected, *tweights, *tprobs;
+    CHECK(alloc_router_tensors(N_EXPERT, N_EXPERT_USED, logits, &tlogits, &tselected, &tweights, &tprobs) == 0,
+          "router: hash rejections allocation failed");
+
+    CHECK(ds4_gpu_router_select_tensor(
+              tselected, tweights, tprobs, model, sizeof(model), 0, 0, /*hash_rows=*/0, 0,
+              N_EXPERT, N_EXPERT_USED, 1.5f, 0, 0, false, true, tlogits) == 0,
+          "router: hash_rows == 0 must be rejected");
+
+    CHECK(ds4_gpu_router_select_tensor(
+              tselected, tweights, tprobs, model, sizeof(model), 0,
+              /*hash_offset=*/sizeof(model), HASH_ROWS, 0,
+              N_EXPERT, N_EXPERT_USED, 1.5f, 0, 0, false, true, tlogits) == 0,
+          "router: hash_offset leaving no room for the table must be rejected");
+
+    free_router_tensors(tlogits, tselected, tweights, tprobs);
+    fprintf(stderr, "  test_router_hash_mode_rejections OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_router_softplus_branches() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -621,6 +926,11 @@ int main(void) {
     if (test_router_n_expert_used_zero_default() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_router_sum_floor() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_router_rejections() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_hash_mode_basic() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_hash_mode_bias_ignored() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_hash_mode_out_of_range_expert() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_hash_mode_token_clamp() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_hash_mode_rejections() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_router OK\n");
     return 0;

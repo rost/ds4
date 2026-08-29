@@ -18,17 +18,18 @@
  * this same kernel body.
  *
  * Hash-mode routing (selecting experts from a fixed per-token lookup table
- * instead of top-k) is structurally present in the kernel below, ported
- * from ROCm alongside the top-k path, but is not exercised by this file's
- * launcher, which always calls with hash_mode == false: hash-mode support
- * in ds4_gpu_router_select_tensor's validation and staging is a later
- * addition.
+ * instead of top-k, ignoring scores and bias entirely) is fully ported
+ * from ROCm alongside the top-k path: the kernel's hash-mode branch, and
+ * ds4_gpu_router_select_tensor's hash validation, model-range checking and
+ * device staging of the hash table, are all real, not stubs.  See
+ * rocm/ds4_rocm_router.cuh:49-67 for the kernel side and :141-150 for the
+ * launcher's hash validation.
  *
  * Entry is NONZERO-means-success, per the return-value convention note in
  * the design spec section 3a: verified directly against the ds4.c call
- * sites (ds4.c:23851, ds4.c:30037, ds4.c:65036, all `ok = ds4_gpu_
- * router_select_tensor(...)` used as a truthy bool) and against ROCm's own
- * validation-failure `return 0` shape.
+ * site (ds4.c:23851, `ok = ds4_gpu_router_select_tensor(...)` used as a
+ * truthy bool; the sibling batch entry's call sites are ds4.c:30037 and
+ * ds4.c:65036) and against ROCm's own validation-failure `return 0` shape.
  *
  * Barrier scope and early-exit shape (binding on any future addition to
  * this kernel body): the ROCm kernel's __syncwarp() between writing sprob
@@ -177,6 +178,22 @@ static void sycl_router_select_launch(
                                 for (uint32_t j = 0; j < n_expert_used; j++) {
                                     const int32_t e = row[j];
                                     sel_row[j] = e;
+                                    /* Out-of-range hash ids must contribute weight 0.0, matching
+                                     * rocm/ds4_rocm_router.cuh:60.  This guard's upper bound could
+                                     * not be proven necessary by ablation on this hardware: with
+                                     * only one active row (the single-token entry always launches
+                                     * with n_tokens == 1), removing the upper bound makes an
+                                     * out-of-range id spill into an adjacent row of sprob that no
+                                     * lane in this launch ever wrote, and per spec 6b uninitialised
+                                     * local memory reads as zero on this Arc A770 / Level Zero /
+                                     * oneAPI 2025.3 stack, so the spillover reads back as 0.0
+                                     * anyway and the removal is invisible here.  The lower bound
+                                     * (e >= 0) was not even attempted: casting a negative id to
+                                     * uint32_t and indexing with it reads far outside sprob's
+                                     * backing allocation, which is not safe to run even as a
+                                     * throwaway ablation.  Both halves of the guard stay, backed by
+                                     * the ROCm source and this reasoning rather than by a test that
+                                     * can discriminate on this hardware. */
                                     const float v = (e >= 0 && (uint32_t)e < N_EXPERT)
                                             ? sprob[row_in_block][(uint32_t)e] : 0.0f;
                                     w_row[j] = v;
