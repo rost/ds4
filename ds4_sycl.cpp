@@ -696,3 +696,8 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
 
 /* Same scoping reason as the includes above. */
 #include "sycl/ds4_sycl_indexer.hpp"
+
+/* Same scoping reason as the includes above. Must come after
+ * ds4_sycl_fp8_kv.hpp (reuses its raw-KV batch store and FP8 quantiser) and
+ * ds4_sycl_indexer.hpp (reuses its indexed_topk_sort_512_asc_kernel port). */
+#include "sycl/ds4_sycl_attention.hpp"

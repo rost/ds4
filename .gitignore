@@ -46,6 +46,7 @@
 /tests/test_sycl_hc
 /tests/test_sycl_mgpu
 /tests/test_sycl_indexer
+/tests/test_sycl_attention
 *.o
 *.dSYM/
 __pycache__/
