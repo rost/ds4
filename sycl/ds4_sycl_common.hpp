@@ -21,9 +21,19 @@ static inline int sycl_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
     return 1;
 }
 
+/* Maps onto rocm/ds4_rocm_moe_launch.cuh:1-4 (routed_moe_u64_add_checked).
+ * Used by the MoE scratch-layout arithmetic and by the streaming cache's
+ * per-expert offset validation. */
 static inline int sycl_u64_add_checked(uint64_t a, uint64_t b, uint64_t *out) {
-    if (!out || b > UINT64_MAX - a) return 0;
+    if (!out || a > UINT64_MAX - b) return 0;
     *out = a + b;
+    return 1;
+}
+
+/* Maps onto rocm/ds4_rocm_moe_launch.cuh:6-9 (routed_moe_align256_checked). */
+static inline int sycl_align256_checked(uint64_t v, uint64_t *out) {
+    if (!out || v > UINT64_MAX - 255ull) return 0;
+    *out = (v + 255ull) & ~(uint64_t)255ull;
     return 1;
 }
 

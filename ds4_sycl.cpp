@@ -495,6 +495,7 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
 /* Same scoping reason as the includes above: the resident expert cache
  * entry points reference g_devices and ds4_sycl_current_queue. */
 #include "sycl/ds4_sycl_streaming.hpp"
+<<<<<<< HEAD
 /* Same scoping reason as the includes above. */
 #include "sycl/ds4_sycl_matmul.hpp"
 /* Same scoping reason as the includes above. */
@@ -507,3 +508,10 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
  * general path calls ds4_gpu_matmul_q8_0_pair_tensor and
  * ds4_gpu_swiglu_tensor above, both of which must already be defined. */
 #include "sycl/ds4_sycl_shared_expert.hpp"
+=======
+
+/* Same scoping reason as the includes above.  Kernels before launcher:
+ * ds4_sycl_moe.hpp defines the routed-MoE kernels and internal helpers,
+ * ds4_sycl_moe_launch.hpp the ABI entry points that dispatch to them. */
+#include "sycl/ds4_sycl_moe.hpp"
+>>>>>>> f3faaa8 (feat(sycl): add moe counting sort for token expert pairs)
