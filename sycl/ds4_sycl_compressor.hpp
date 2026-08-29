@@ -86,9 +86,9 @@ static inline uint64_t sycl_ape_2d_bytes(uint32_t type, uint64_t width, uint64_t
  * holding exactly the ape_type's encoding of a `width`-wide, `ratio`-row
  * table; `row`/`col` address one element as row * width + col, same as
  * ds4's CPU-side tensor_2d_value(model, ape, col, row) (ds4.c:7882-7887).
- * The Q8_0 branch uses the same 32-value, 34-byte block layout (2-byte
- * little-endian F16 scale then 32 int8) used by the embedding kernels in
- * sycl/ds4_sycl_embedding.hpp. */
+ * The Q8_0 branch defers to the shared sycl_q8_0_row_bytes_checked and
+ * sycl_q8_0_dequant helpers in ds4_sycl_common.hpp, the same ones the
+ * embedding kernels in sycl/ds4_sycl_embedding.hpp use. */
 static inline float sycl_ape_value_dev(const unsigned char *base, uint32_t type,
                                        uint32_t width, uint32_t row, uint32_t col) {
     if (type == 1u) {
@@ -96,13 +96,12 @@ static inline float sycl_ape_value_dev(const unsigned char *base, uint32_t type,
         return (float)sycl::bit_cast<sycl::half>(p[(uint64_t)row * width + col]);
     }
     if (type == 8u) {
-        const uint64_t row_bytes = ((uint64_t)width + 31u) / 32u * 34u;
-        const unsigned char *blk =
-                base + (uint64_t)row * row_bytes + (uint64_t)(col >> 5) * 34u;
-        const uint16_t raw = (uint16_t)(blk[0] | ((uint16_t)blk[1] << 8));
-        const float scale = (float)sycl::bit_cast<sycl::half>(raw);
-        const signed char q = (signed char)blk[2u + (col & 31u)];
-        return scale * (float)q;
+        /* width is head_dim, already bounded by
+         * sycl_compressor_shape_supported above, so this cannot overflow;
+         * the same reasoning sycl_ape_2d_bytes relies on. */
+        uint64_t row_bytes = 0;
+        (void)sycl_q8_0_row_bytes_checked(width, &row_bytes);
+        return sycl_q8_0_dequant(base + (uint64_t)row * row_bytes, col);
     }
     const float *p = (const float *)base;
     return p[(uint64_t)row * width + col];

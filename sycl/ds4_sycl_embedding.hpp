@@ -72,8 +72,10 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(
     return 1;
 }
 
-/* Q8_0 row layout: blocks of 32 values, 34 bytes per block, being a 2-byte
- * F16 scale followed by 32 int8.  See rocm/ds4_rocm_common.cuh:19-63. */
+/* Q8_0 row layout and per-element decode are handled by the shared
+ * sycl_q8_0_row_bytes_checked and sycl_q8_0_dequant helpers in
+ * ds4_sycl_common.hpp.  See rocm/ds4_rocm_common.cuh:19-63 for the
+ * authoritative layout they encode. */
 static int ds4_sycl_embed_token_hc_q8_0(ds4_gpu_tensor *out_hc,
                                         const void *model_map,
                                         uint64_t model_size,
@@ -86,11 +88,10 @@ static int ds4_sycl_embed_token_hc_q8_0(ds4_gpu_tensor *out_hc,
         return 0;
     }
 
-    const uint64_t blocks    = ((uint64_t)n_embd + 31u) / 32u;
     uint64_t       row_bytes = 0;
     uint64_t       weight_bytes = 0;
     uint64_t       out_bytes = 0;
-    if (!sycl_u64_mul_checked(blocks, 34u, &row_bytes) ||
+    if (!sycl_q8_0_row_bytes_checked(n_embd, &row_bytes) ||
         !sycl_u64_mul_checked(row_bytes, n_vocab, &weight_bytes) ||
         !sycl_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !sycl_u64_mul3_checked(n_hc, n_embd, sizeof(float), &out_bytes) ||
@@ -117,14 +118,8 @@ static int ds4_sycl_embed_token_hc_q8_0(ds4_gpu_tensor *out_hc,
         float         *o = (float *)out_hc->ptr;
         const uint32_t e_stride = n_embd;
         q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
-            const size_t e   = gid % e_stride;
-            const size_t blk = e / 32;
-            const size_t idx = e % 32;
-            const unsigned char *bp = drow + blk * 34;
-            const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
-            const float scale = (float)sycl::bit_cast<sycl::half>(raw);
-            const signed char qv = (signed char)bp[2 + idx];
-            o[gid] = scale * (float)qv;
+            const size_t e = gid % e_stride;
+            o[gid] = sycl_q8_0_dequant(drow, (uint32_t)e);
         });
         q.wait_and_throw();
     } catch (const sycl::exception &e) {
@@ -237,11 +232,10 @@ static int ds4_sycl_embed_tokens_hc_q8_0(ds4_gpu_tensor *out_hc,
         return 0;
     }
 
-    const uint64_t blocks    = ((uint64_t)n_embd + 31u) / 32u;
     uint64_t       row_bytes = 0;
     uint64_t       weight_bytes = 0;
     uint64_t       n = 0;
-    if (!sycl_u64_mul_checked(blocks, 34u, &row_bytes) ||
+    if (!sycl_q8_0_row_bytes_checked(n_embd, &row_bytes) ||
         !sycl_u64_mul_checked(row_bytes, n_vocab, &weight_bytes) ||
         !sycl_model_range_fits(model_size, weight_offset, weight_bytes) ||
         !sycl_tensor_has_i32(tokens_t, n_tokens) ||
@@ -277,13 +271,7 @@ static int ds4_sycl_embed_tokens_hc_q8_0(ds4_gpu_tensor *out_hc,
             int32_t      raw_tok = tok[t];
             uint32_t     tk   = raw_tok < 0 ? 0u : (uint32_t)raw_tok;
             if (tk >= vocab) tk = 0u;
-            const size_t blk = d / 32;
-            const size_t idx = d % 32;
-            const unsigned char *bp = dtab + (size_t)tk * rb + blk * 34;
-            const uint16_t raw   = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
-            const float    scale = (float)sycl::bit_cast<sycl::half>(raw);
-            const signed char qv = (signed char)bp[2 + idx];
-            o[gid] = scale * (float)qv;
+            o[gid] = sycl_q8_0_dequant(dtab + (size_t)tk * rb, (uint32_t)d);
         });
         q.wait_and_throw();
     } catch (const sycl::exception &e) {
