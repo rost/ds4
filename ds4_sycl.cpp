@@ -497,3 +497,5 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
 #include "sycl/ds4_sycl_streaming.hpp"
 /* Same scoping reason as the includes above. */
 #include "sycl/ds4_sycl_matmul.hpp"
+/* Same scoping reason as the includes above. */
+#include "sycl/ds4_sycl_router.hpp"

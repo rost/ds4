@@ -38,6 +38,7 @@
 /tests/test_sycl_norm_rope
 /tests/test_sycl_compressor
 /tests/test_sycl_matmul
+/tests/test_sycl_router
 *.o
 *.dSYM/
 __pycache__/

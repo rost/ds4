@@ -209,7 +209,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_owned_slots_combine_rows_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_owned_slots_combine_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_set_selected_override)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_router_select_batch_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_router_select_tensor)
 /* ds4_gpu_set_current_device[_fenced]: 0 on success, nonzero on error or
  * out-of-range tier (see ds4_gpu_mgpu.h).  ds4.c's own CPU-only stub of
  * this entry returns -1; any nonzero value is a correct failure signal
