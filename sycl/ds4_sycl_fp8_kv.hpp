@@ -32,6 +32,14 @@
 
 namespace {
 
+/* The FP8 quantiser kernel's work-group size, matching the CUDA launch's
+ * fixed 64-thread block (see the comment above
+ * ds4_gpu_dsv4_fp8_kv_quantize_tensor below). The reduction's initial
+ * stride is derived from this rather than a separate literal, so the
+ * coupling between the group size and where the tree reduction starts is
+ * explicit in the code. */
+constexpr uint32_t kFp8KvGroup = 64u;
+
 static inline float sycl_e4m3fn_value(int code) {
     const int exp = (code >> 3) & 0x0f;
     const int mant = code & 0x07;
@@ -69,6 +77,17 @@ static inline float sycl_e4m3fn_dequant(float x) {
 
 } // namespace
 
+/* Both of these call sycl::exp2/sycl::fmin/sycl::fabs, where host and
+ * device code paths could in principle differ, especially under
+ * -ffast-math. This is covered empirically rather than assumed: in
+ * tests/test_sycl_fp8_kv.c, test_per_group_independent_scaling exercises
+ * the real device kernel path (not these host-callable test hooks) at a
+ * tight tolerance (1.0e-6 absolute against values of magnitude ~15000,
+ * i.e. roughly 7e-11 relative) that no meaningfully imprecise device-side
+ * exp2/fmin/fabs implementation could pass, so host/device numerical
+ * parity for these functions is exercised indirectly through that test
+ * even though these two particular hooks themselves only run on the
+ * host. */
 extern "C" float ds4_sycl_test_e4m3fn_value(int code) {
     return sycl_e4m3fn_value(code);
 }
@@ -107,7 +126,7 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x,
     if (n_nope == 0) return 1;
     if (g_devices.empty()) return 0;
 
-    const uint32_t groups = (n_nope + 63u) / 64u;
+    const uint32_t groups = (n_nope + kFp8KvGroup - 1u) / kFp8KvGroup;
 
     try {
         sycl::queue &q = ds4_sycl_queue(x->device_id);
@@ -115,17 +134,17 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x,
         const uint32_t width = head_dim;
 
         q.submit([&](sycl::handler &h) {
-            sycl::local_accessor<float, 1> scratch(sycl::range<1>(64), h);
+            sycl::local_accessor<float, 1> scratch(sycl::range<1>(kFp8KvGroup), h);
             h.parallel_for(
                 sycl::nd_range<2>(
-                        sycl::range<2>((size_t)n_tok * 64, groups),
-                        sycl::range<2>(64, 1)),
+                        sycl::range<2>((size_t)n_tok * kFp8KvGroup, groups),
+                        sycl::range<2>(kFp8KvGroup, 1)),
                 [=](sycl::nd_item<2> it) {
                     const size_t   row = it.get_group(0);
                     const uint32_t grp = (uint32_t)it.get_group(1);
                     const uint32_t tid = (uint32_t)it.get_local_id(0);
 
-                    const uint32_t off = grp * 64u;
+                    const uint32_t off = grp * kFp8KvGroup;
                     float *xr = px + row * width;
 
                     const bool  in_range = off + tid < n_nope;
@@ -150,7 +169,7 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x,
                     /* The barrier is OUTSIDE the `if`: every one of the 64
                      * lanes in the work-group must reach it on every
                      * iteration, matching rocm/ds4_rocm_fp8_kv.cuh:20-23. */
-                    for (uint32_t stride = 32; stride > 0; stride >>= 1) {
+                    for (uint32_t stride = kFp8KvGroup / 2; stride > 0; stride >>= 1) {
                         if (tid < stride) {
                             scratch[tid] = sycl::fmax(scratch[tid], scratch[tid + stride]);
                         }
@@ -291,17 +310,24 @@ extern "C" int ds4_sycl_test_sycl_half_encode_bits(float f, uint16_t *out_bits) 
  * (any raw_cache passes a `>= 0` bytes requirement) and would otherwise
  * reach a modulo-by-zero in the kernel.
  *
- * n_tokens == 0 has no dedicated early return in the source launcher:
- * validation passes trivially (kv needs zero bytes), the CUDA launch
- * becomes a legal zero-block no-op, and cuda_ok() on a clean launch
- * reports success purely as a side effect of the normal path. A
+ * n_tokens == 0 has no dedicated zero-work branch in the source launcher,
+ * unlike the sibling quantiser entry ds4_gpu_dsv4_fp8_kv_quantize_tensor
+ * above, which does have one. Whether the CUDA/HIP zero-grid-dimension
+ * launch this would otherwise produce is actually a legal no-op was not
+ * verified against real CUDA/HIP hardware in this environment (none was
+ * available), so no claim is made here about what the source actually
+ * does on this input. Instead, this SYCL port deliberately chooses to
+ * return success for n_tokens == 0 regardless of the source's actual
+ * behaviour, because that matches this backend's established zero-work
+ * convention (other entries, such as ds4_gpu_rms_norm_plain_rows_tensor,
+ * also return success for zero-length work) and matches what every real
+ * ds4.c call site expects: every call site passes a live batch count, so
+ * this path is not reachable in practice, but returning success rather
+ * than failure is the safer choice if it ever were. The actual kernel
+ * submission is skipped directly below when there is no work (a
  * sycl::range<1>(0) kernel submission is not a well-defined SYCL-safe
- * equivalent of a zero-block CUDA launch, so the actual kernel submission
- * is skipped directly below when there is no work, while still falling
- * through to the same `return 1`: this preserves the launcher's
- * observable success-on-empty-input behaviour through a different,
- * SYCL-safe mechanism, since there is no explicit zero-work branch in the
- * source to port that mechanism from. */
+ * equivalent of whatever the CUDA launch does), while still falling
+ * through to the same `return 1`. */
 extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache,
                                                  const ds4_gpu_tensor *kv,
                                                  uint32_t raw_cap, uint32_t pos0,

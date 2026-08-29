@@ -177,15 +177,10 @@ static int test_negative_zero_maps_positive(void) {
 }
 
 static int test_exact_tie_odd_best(void) {
-    /* Find adjacent codes (best, best+1) with best odd, take the exact
+    /* Adjacent codes (best, best+1) with best odd: take the exact
      * midpoint of their values as input, and confirm the ties-to-even
      * rule rounds up (since best+1 is then even). */
-    int best = -1;
-    for (int code = 1; code < 126; code += 2) {
-        best = code;
-        break;
-    }
-    CHECK(best > 0, "no odd code found below 126");
+    const int best = 1;
     const float lo_val = dsv4_e4m3fn_value_cpu(best);
     const float hi_val = dsv4_e4m3fn_value_cpu(best + 1);
     const float midpoint = lo_val + (hi_val - lo_val) * 0.5f;
@@ -201,12 +196,7 @@ static int test_exact_tie_odd_best(void) {
 static int test_exact_tie_even_best(void) {
     /* Same construction, but with best even: ties-to-even then keeps
      * best (the lower, even neighbour) instead of stepping up. */
-    int best = -1;
-    for (int code = 2; code < 126; code += 2) {
-        best = code;
-        break;
-    }
-    CHECK(best > 0, "no even code found below 126");
+    const int best = 2;
     const float lo_val = dsv4_e4m3fn_value_cpu(best);
     const float hi_val = dsv4_e4m3fn_value_cpu(best + 1);
     const float midpoint = lo_val + (hi_val - lo_val) * 0.5f;
@@ -214,6 +204,24 @@ static int test_exact_tie_even_best(void) {
     const float want = dsv4_e4m3fn_dequant_cpu(midpoint);
     CHECK_CLOSE(want, lo_val, 0.0, "oracle did not stay on even-best tie");
     CHECK_CLOSE(ds4_sycl_test_e4m3fn_dequant(midpoint), lo_val, 0.0, "tie with even best did not stay on even neighbour");
+    return 0;
+}
+
+static int test_exact_tie_subnormal_normal_boundary(void) {
+    /* Codes 7 and 8 straddle the subnormal/normal boundary of
+     * sycl_e4m3fn_value (exp field 0 vs the exp2f-style formula), unlike
+     * the two ties above, which both stay inside the subnormal branch.
+     * best (7) is odd, so this exercises the same round-up direction as
+     * test_exact_tie_odd_best while also covering both value branches in
+     * one comparison. */
+    const int best = 7;
+    const float lo_val = dsv4_e4m3fn_value_cpu(best);
+    const float hi_val = dsv4_e4m3fn_value_cpu(best + 1);
+    const float midpoint = lo_val + (hi_val - lo_val) * 0.5f;
+    CHECK(fabsf(midpoint - lo_val) == fabsf(midpoint - hi_val), "constructed midpoint is not an exact tie (subnormal/normal boundary)");
+    const float want = dsv4_e4m3fn_dequant_cpu(midpoint);
+    CHECK_CLOSE(want, hi_val, 0.0, "oracle did not round up on subnormal/normal boundary tie");
+    CHECK_CLOSE(ds4_sycl_test_e4m3fn_dequant(midpoint), hi_val, 0.0, "boundary tie did not round up to even neighbour");
     return 0;
 }
 
@@ -416,18 +424,25 @@ static int test_per_group_independent_scaling(void) {
  * so the value survives the clamp as a finite -448, dequantises to a
  * proper representable magnitude, and is finally multiplied by scale
  * (itself 0, not NaN, since exp2(ceil(log2(0))) = exp2(-inf) = 0) to give
- * exactly -0.0f: verified directly against the device with and without
- * the floor during development, both producing bit pattern 0x80000000.
- * A small-but-nonzero amax well under the floor was also tried as an
- * alternative probe and found equally unable to discriminate, for a
- * different, purely mathematical reason: E4M3 is itself a floating-point
- * format, so a power-of-two scale change shifts only the exponent and
+ * exactly -0.0f.  A small-but-nonzero amax well under the floor was
+ * also tried as an alternative probe and found equally unable to
+ * discriminate, for a different, purely mathematical reason: E4M3 is
+ * itself a floating-point format, so a power-of-two scale change shifts
+ * only the exponent and
  * leaves the mantissa's relative precision unaffected, meaning the
  * floored and unfloored reconstructions converge to nearly the same
  * value regardless (confirmed by direct device comparison during
- * development).  This test is kept because the all-zero-input scenario
- * (e.g. padding) is a real case worth locking down regardless of which
- * exact line is providing the guarantee. */
+ * development).  With the floor applied, amax is clamped to 1.0e-4f, so
+ * v/scale = 0.0f/scale = +0.0f exactly (no NaN ever appears), and
+ * sycl_e4m3fn_dequant(+0.0f) takes the sign=+1 branch (since 0.0f < 0.0f
+ * is false), giving +0.0f * scale = +0.0f.  Without the floor, the
+ * NaN-laundering path above gives -0.0f instead: verified directly
+ * against the device, both producing +0.0f or -0.0f (0x00000000 floored,
+ * 0x80000000 unfloored), which the test's CHECK_CLOSE tolerance check
+ * (computed via fabs in double) treats as equal, since +0.0 and -0.0
+ * differ by exactly 0.0.  This test is kept because the all-zero-input
+ * scenario (e.g. padding) is a real case worth locking down regardless of
+ * which exact line is providing the guarantee. */
 static int test_amax_floor(void) {
     enum { N_TOK = 1, N_ROT = 0, N_NOPE = 64, HEAD_DIM = N_NOPE + N_ROT };
     float x[HEAD_DIM];
@@ -1064,10 +1079,16 @@ int main(void) {
     failures += test_negative_zero_maps_positive();
     failures += test_exact_tie_odd_best();
     failures += test_exact_tie_even_best();
+    failures += test_exact_tie_subnormal_normal_boundary();
 
     failures += test_f16_decode_oracle_self_check();
     failures += test_f16_ported_encoder_matches_oracle();
 
+    /* ds4_gpu_init() clears g_devices and resets all its own state on
+     * failure (see ds4_sycl.cpp), so a failed init here already leaves
+     * nothing for ds4_gpu_cleanup() to do; skipping the cleanup call on
+     * this specific CHECK is a true no-op, not an inconsistency with the
+     * other CHECK-driven early returns below. */
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     failures += test_multi_row_multi_group();
     failures += test_rope_half_untouched();
