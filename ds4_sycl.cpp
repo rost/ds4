@@ -165,6 +165,12 @@ void ds4_sycl_build_devices(const std::vector<sycl::device> &wanted,
  * the caller happens to pass in. */
 static void sycl_stream_teardown_all(void);
 
+/* Defined in sycl/ds4_sycl_readback.hpp, included at the end of this
+ * file; forward-declared here so ds4_gpu_cleanup (below) can drop any
+ * stored selected-readback event before g_devices.clear() destroys the
+ * queue it was recorded against. */
+static void sycl_readback_teardown(void);
+
 /* Multi-GPU plumbing globals declared extern by ds4_gpu_mgpu.h and read
  * directly by ds4.c.  Before ds4_gpu_init runs (or if it never runs) this
  * exposes a single logical tier with no peers, matching the default
@@ -319,6 +325,7 @@ extern "C" void ds4_gpu_cleanup(void) {
      * (rocm/ds4_rocm_runtime.cuh:5873). Must run before g_devices.clear()
      * below destroys the queues. */
     if (!g_devices.empty()) sycl_stream_teardown_all();
+    sycl_readback_teardown();
     g_devices.clear();
     g_n_gpus       = 0;
     g_current_tier = 0;
@@ -737,3 +744,8 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
 /* Same scoping reason as the includes above: calls
  * ds4_gpu_matmul_q8_0_tensor, defined in ds4_sycl_matmul.hpp above. */
 #include "sycl/ds4_sycl_attention_output.hpp"
+
+/* Same scoping reason as the includes above: uses g_current_tier,
+ * ds4_sycl_queue and g_devices directly, and defines sycl_readback_
+ * teardown, forward-declared above for ds4_gpu_cleanup to call. */
+#include "sycl/ds4_sycl_readback.hpp"
