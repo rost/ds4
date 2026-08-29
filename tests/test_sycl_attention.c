@@ -490,6 +490,414 @@ static int test_decode_heads_masked(void) {
     return 0;
 }
 
+/* ---- Batched decode: ds4_gpu_attention_decode_raw_batch_heads_tensor and
+ * ds4_gpu_attention_decode_mixed_batch_heads_tensor -------------------------
+ *
+ * Oracle selection: these entries serve ds4.c's "ubatch" decode-batch path
+ * (ds4.c:28609, :29353), reached when a chunk of n_tokens is decoded
+ * together against an already-populated raw/compressed cache (not a
+ * from-scratch prefill). Tracing that path to its CPU counterpart:
+ * layer_attention_raw_swa_batch (ds4.c:13174) is the batched sibling of
+ * layer_attention_raw_swa_one, and its default (non prefix_batch_attn) loop
+ * pushes each token's own KV into the cache and then calls
+ * layer_attention_mixed_one (ds4.c:13403) for that token using whatever the
+ * cache holds at that point -- i.e. token t attends causally to every raw
+ * row up to and including its own position, plus its own visible compressed
+ * count. layer_attention_prefix_batch_worker (ds4.c:12840) is a DIFFERENT
+ * oracle for a different call shape: it backs prefix_batch_attn, which
+ * requires cache->n_raw == 0 && pos0 == 0 (a bare fresh-prompt prefill with
+ * no raw history at all), not the continued-generation shape these entries
+ * serve. So the oracle below unrolls layer_attention_raw_swa_batch's
+ * per-token layer_attention_mixed_one calls directly: for each token t, the
+ * same causal raw-window derivation the GPU kernels themselves use (mirrored
+ * from attention_decode_mixed_kernel/heads8_online, read from
+ * rocm/ds4_rocm_attention.cuh) picks out which raw/compressed rows are
+ * visible, then layer_attention_mixed_one's per-head softmax math is applied
+ * to just those rows.
+ *
+ * Differential cross-check: use_comp_mask forces the general kernel even at
+ * head_dim == 512 (the online path requires !use_comp_mask), so the same
+ * head_dim == 512, n_tokens > 1 shape is run twice -- once with
+ * use_comp_mask == 0 (online kernel) and once with use_comp_mask == 1 and an
+ * all-zero mask (general kernel, mathematically identical to no mask at
+ * all) -- and the two outputs are compared directly as well as against the
+ * oracle, since a differential between two real
+ * paths catches drift an oracle comparison alone can miss. */
+
+static void oracle_attention_decode_batch(
+        float *out_heads, const float *sinks, const float *q,
+        const float *raw_kv, uint32_t n_tokens, uint32_t pos0, uint32_t n_raw,
+        uint32_t raw_cap, uint32_t raw_start, const float *comp_kv, uint32_t n_comp,
+        uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    const bool single_all = (n_tokens == 1u && ratio == 0u);
+    const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    float *scores = (float *)malloc((size_t)(256u + n_comp + 1u) * sizeof(float));
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t qpos = pos0 + t;
+        uint32_t visible_comp = single_all ? n_comp : (n_comp ? (qpos + 1u) / ratio : 0u);
+        if (visible_comp > n_comp) visible_comp = n_comp;
+
+        uint32_t raw_count = 0u, raw_first_idx = 0u;
+        if (n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (single_all) {
+                raw_count = n_raw > 256u ? 256u : n_raw;
+            } else if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0u && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+            float max_score = sinks[h];
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const uint32_t row = (raw_start + raw_first_idx + r) % raw_cap;
+                const float *kv = raw_kv + (uint64_t)row * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                scores[r] = dot * scale;
+                if (scores[r] > max_score) max_score = scores[r];
+            }
+            for (uint32_t c = 0; c < visible_comp; c++) {
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                scores[raw_count + c] = dot * scale;
+                if (scores[raw_count + c] > max_score) max_score = scores[raw_count + c];
+            }
+
+            float *oh = out_heads + ((uint64_t)t * n_head + h) * head_dim;
+            memset(oh, 0, (size_t)head_dim * sizeof(float));
+            float denom = expf(sinks[h] - max_score);
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float w = expf(scores[r] - max_score);
+                denom += w;
+                const uint32_t row = (raw_start + raw_first_idx + r) % raw_cap;
+                const float *kv = raw_kv + (uint64_t)row * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t c = 0; c < visible_comp; c++) {
+                const float w = expf(scores[raw_count + c] - max_score);
+                denom += w;
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] /= denom;
+        }
+    }
+    free(scores);
+}
+
+#define SB_N_HEAD 4u
+#define SB_HEAD_DIM 16u
+#define SB_N_TOKENS 6u
+#define SB_POS0 40u
+#define SB_N_RAW 50u
+#define SB_RAW_CAP 64u
+#define SB_RAW_START 20u
+#define SB_WINDOW 12u
+#define SB_N_COMP 30u
+#define SB_RATIO 3u
+
+static int test_decode_raw_batch_small(void) {
+    float sinks[SB_N_HEAD];
+    for (uint32_t h = 0; h < SB_N_HEAD; h++) sinks[h] = test_prand(h, 11u, 1u) * 2.0f;
+    float *q = malloc((size_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    float *raw_kv = malloc((size_t)SB_RAW_CAP * SB_HEAD_DIM * sizeof(float));
+    for (uint32_t i = 0; i < SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM; i++) q[i] = test_prand(i, 51u, 2u);
+    for (uint32_t i = 0; i < SB_RAW_CAP * SB_HEAD_DIM; i++) raw_kv[i] = test_prand(i, 52u, 3u);
+
+    dh_model model = dh_model_build(sinks, SB_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)SB_RAW_CAP * SB_HEAD_DIM * sizeof(float));
+    CHECK(theads && tq && traw, "decode_raw_batch small: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, (uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float)) != 0,
+          "decode_raw_batch small: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, (uint64_t)SB_RAW_CAP * SB_HEAD_DIM * sizeof(float)) != 0,
+          "decode_raw_batch small: raw_kv write failed");
+
+    CHECK(ds4_gpu_attention_decode_raw_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw,
+              SB_N_TOKENS, SB_POS0, SB_N_RAW, SB_RAW_CAP, SB_RAW_START, SB_WINDOW,
+              SB_N_HEAD, SB_HEAD_DIM) != 0,
+          "decode_raw_batch small: launch failed");
+
+    float *got = malloc((size_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, (uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float)) != 0,
+          "decode_raw_batch small: read failed");
+    float *want = malloc((size_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    oracle_attention_decode_batch(want, sinks, q, raw_kv, SB_N_TOKENS, SB_POS0, SB_N_RAW,
+                                  SB_RAW_CAP, SB_RAW_START, NULL, 0u, SB_WINDOW, 1u,
+                                  SB_N_HEAD, SB_HEAD_DIM);
+    for (uint32_t i = 0; i < SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-3, "decode_raw_batch small: heads mismatch");
+    }
+
+    free(q); free(raw_kv); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    fprintf(stderr, "  test_decode_raw_batch_small OK\n");
+    return 0;
+}
+
+static int test_decode_mixed_batch_small(void) {
+    float sinks[SB_N_HEAD];
+    for (uint32_t h = 0; h < SB_N_HEAD; h++) sinks[h] = test_prand(h, 21u, 4u) * 2.0f;
+    float *q = malloc((size_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    float *raw_kv = malloc((size_t)SB_RAW_CAP * SB_HEAD_DIM * sizeof(float));
+    float *comp_kv = malloc((size_t)SB_N_COMP * SB_HEAD_DIM * sizeof(float));
+    for (uint32_t i = 0; i < SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM; i++) q[i] = test_prand(i, 61u, 5u);
+    for (uint32_t i = 0; i < SB_RAW_CAP * SB_HEAD_DIM; i++) raw_kv[i] = test_prand(i, 62u, 6u);
+    for (uint32_t i = 0; i < SB_N_COMP * SB_HEAD_DIM; i++) comp_kv[i] = test_prand(i, 63u, 7u);
+
+    dh_model model = dh_model_build(sinks, SB_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)SB_RAW_CAP * SB_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc((uint64_t)SB_N_COMP * SB_HEAD_DIM * sizeof(float));
+    CHECK(theads && tq && traw && tcomp, "decode_mixed_batch small: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, (uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float)) != 0,
+          "decode_mixed_batch small: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, (uint64_t)SB_RAW_CAP * SB_HEAD_DIM * sizeof(float)) != 0,
+          "decode_mixed_batch small: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, (uint64_t)SB_N_COMP * SB_HEAD_DIM * sizeof(float)) != 0,
+          "decode_mixed_batch small: comp_kv write failed");
+
+    CHECK(ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp,
+              /*comp_kv_f16=*/0u, /*comp_mask=*/NULL, /*use_comp_mask=*/0u,
+              SB_N_TOKENS, SB_POS0, SB_N_RAW, SB_RAW_CAP, SB_RAW_START, SB_N_COMP,
+              SB_WINDOW, SB_RATIO, SB_N_HEAD, SB_HEAD_DIM) != 0,
+          "decode_mixed_batch small: launch failed");
+
+    float *got = malloc((size_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, (uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float)) != 0,
+          "decode_mixed_batch small: read failed");
+    float *want = malloc((size_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    oracle_attention_decode_batch(want, sinks, q, raw_kv, SB_N_TOKENS, SB_POS0, SB_N_RAW,
+                                  SB_RAW_CAP, SB_RAW_START, comp_kv, SB_N_COMP, SB_WINDOW,
+                                  SB_RATIO, SB_N_HEAD, SB_HEAD_DIM);
+    for (uint32_t i = 0; i < SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-3, "decode_mixed_batch small: heads mismatch");
+    }
+
+    free(q); free(raw_kv); free(comp_kv); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp);
+    fprintf(stderr, "  test_decode_mixed_batch_small OK\n");
+    return 0;
+}
+
+#define OL_N_HEAD 3u
+#define OL_HEAD_DIM 512u
+#define OL_N_TOKENS 5u
+#define OL_POS0 90u
+#define OL_N_RAW 70u
+#define OL_RAW_CAP 96u
+#define OL_RAW_START 40u
+#define OL_WINDOW 20u
+#define OL_N_COMP 25u
+#define OL_RATIO 2u
+
+static int test_decode_mixed_batch_online_vs_general(void) {
+    float sinks[OL_N_HEAD];
+    for (uint32_t h = 0; h < OL_N_HEAD; h++) sinks[h] = test_prand(h, 71u, 8u) * 2.0f;
+    const uint64_t qn = (uint64_t)OL_N_TOKENS * OL_N_HEAD * OL_HEAD_DIM;
+    const uint64_t rawn = (uint64_t)OL_RAW_CAP * OL_HEAD_DIM;
+    const uint64_t compn = (uint64_t)OL_N_COMP * OL_HEAD_DIM;
+    float *q = malloc((size_t)qn * sizeof(float));
+    float *raw_kv = malloc((size_t)rawn * sizeof(float));
+    float *comp_kv = malloc((size_t)compn * sizeof(float));
+    for (uint64_t i = 0; i < qn; i++) q[i] = test_prand((uint32_t)i, 81u, 9u);
+    for (uint64_t i = 0; i < rawn; i++) raw_kv[i] = test_prand((uint32_t)i, 82u, 10u);
+    for (uint64_t i = 0; i < compn; i++) comp_kv[i] = test_prand((uint32_t)i, 83u, 11u);
+    float *zero_mask = calloc((size_t)OL_N_TOKENS * OL_N_COMP, sizeof(float));
+
+    dh_model model = dh_model_build(sinks, OL_N_HEAD);
+    ds4_gpu_tensor *theads_online = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *theads_general = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc(rawn * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc(compn * sizeof(float));
+    ds4_gpu_tensor *tmask = ds4_gpu_tensor_alloc((uint64_t)OL_N_TOKENS * OL_N_COMP * sizeof(float));
+    CHECK(theads_online && theads_general && tq && traw && tcomp && tmask,
+          "decode_mixed_batch online/general: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, qn * sizeof(float)) != 0, "online/general: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, rawn * sizeof(float)) != 0, "online/general: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, compn * sizeof(float)) != 0, "online/general: comp_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tmask, 0, zero_mask, (uint64_t)OL_N_TOKENS * OL_N_COMP * sizeof(float)) != 0,
+          "online/general: mask write failed");
+
+    /* use_comp_mask == 0: takes the head_dim == 512 online kernel. */
+    CHECK(ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+              theads_online, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp,
+              0u, NULL, /*use_comp_mask=*/0u,
+              OL_N_TOKENS, OL_POS0, OL_N_RAW, OL_RAW_CAP, OL_RAW_START, OL_N_COMP,
+              OL_WINDOW, OL_RATIO, OL_N_HEAD, OL_HEAD_DIM) != 0,
+          "online/general: online launch failed");
+    /* use_comp_mask == 1 with an all-zero mask: same math, forced onto the
+     * general scalar kernel since the online path requires !use_comp_mask. */
+    CHECK(ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+              theads_general, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp,
+              0u, tmask, /*use_comp_mask=*/1u,
+              OL_N_TOKENS, OL_POS0, OL_N_RAW, OL_RAW_CAP, OL_RAW_START, OL_N_COMP,
+              OL_WINDOW, OL_RATIO, OL_N_HEAD, OL_HEAD_DIM) != 0,
+          "online/general: general launch failed");
+
+    float *got_online = malloc((size_t)qn * sizeof(float));
+    float *got_general = malloc((size_t)qn * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads_online, 0, got_online, qn * sizeof(float)) != 0,
+          "online/general: online read failed");
+    CHECK(ds4_gpu_tensor_read(theads_general, 0, got_general, qn * sizeof(float)) != 0,
+          "online/general: general read failed");
+
+    float *want = malloc((size_t)qn * sizeof(float));
+    oracle_attention_decode_batch(want, sinks, q, raw_kv, OL_N_TOKENS, OL_POS0, OL_N_RAW,
+                                  OL_RAW_CAP, OL_RAW_START, comp_kv, OL_N_COMP, OL_WINDOW,
+                                  OL_RATIO, OL_N_HEAD, OL_HEAD_DIM);
+
+    for (uint64_t i = 0; i < qn; i++) {
+        CHECK_CLOSE(got_online[i], want[i], 1e-3, "online/general: online vs oracle mismatch");
+        CHECK_CLOSE(got_general[i], want[i], 1e-3, "online/general: general vs oracle mismatch");
+        CHECK_CLOSE(got_online[i], got_general[i], 1e-3, "online/general: online vs general differential mismatch");
+    }
+
+    free(q); free(raw_kv); free(comp_kv); free(zero_mask);
+    free(got_online); free(got_general); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads_online); ds4_gpu_tensor_free(theads_general);
+    ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw); ds4_gpu_tensor_free(tcomp);
+    ds4_gpu_tensor_free(tmask);
+    fprintf(stderr, "  test_decode_mixed_batch_online_vs_general OK\n");
+    return 0;
+}
+
+/* Targets the online kernel's running-max-across-tiles specifically: max
+ * subtraction is a numerical-stability device that is invisible in exact
+ * arithmetic (softmax is invariant to subtracting any constant, correct or
+ * not, from every scored position uniformly, per spec 6f), so a moderate
+ * score spread cannot discriminate a broken running max from a correct one
+ * -- both stay comfortably inside float range and normalise to the same
+ * ratios. This test instead makes one raw row's score enormous (a raw KV
+ * row set to a large constant magnitude against a consistently-signed Q,
+ * guaranteeing a large positive dot product) and places it in an EARLY
+ * 4-row tile while every other row stays near zero magnitude, so a kernel
+ * that fails to carry the running
+ * maximum across tiles ends its max-only pass holding only the LAST tile's
+ * (tiny) score. exp(huge_score - tiny_wrong_max) then overflows to
+ * infinity in the second pass; the correct running max keeps every
+ * exponent near zero and the result finite, close to the loud row itself
+ * (its softmax weight dominates all others by many orders of magnitude). */
+static int test_decode_mixed_batch_online_running_max(void) {
+    /* n_tokens must be > 1: the batch launcher only ever reaches the online
+     * kernel for head_dim == 512 when n_tokens > 1 (or when n_comp exceeds
+     * the general kernel's score-buffer cap, not exercised here); a
+     * single-token call at a small n_comp takes the general scalar kernel
+     * instead, per sycl_attention_decode_batch_launch's branch order. */
+    const uint32_t n_head = 1u, head_dim = 512u, n_tokens = 2u;
+    const uint32_t n_raw = 21u, raw_cap = 21u, raw_start = 0u;
+    const uint32_t loud_row = 2u; /* inside the first 4-row tile */
+    const uint32_t pos0 = n_raw - n_tokens;
+
+    float sinks[1] = {0.0f};
+    float *q = malloc((size_t)n_tokens * head_dim * sizeof(float));
+    float *raw_kv = malloc((size_t)raw_cap * head_dim * sizeof(float));
+    /* A small positive bias, not a zero-mean random value: the loud row
+     * below is a large CONSTANT rather than a multiple of Q, so its dot
+     * product with Q is only reliably large if Q's components are
+     * consistently signed. */
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        for (uint32_t d = 0; d < head_dim; d++) {
+            q[t * head_dim + d] = 0.05f + test_prand(t, d, 12u) * 0.02f;
+        }
+    }
+    for (uint32_t r = 0; r < raw_cap; r++) {
+        for (uint32_t d = 0; d < head_dim; d++) {
+            raw_kv[r * head_dim + d] = (r == loud_row) ? 4000.0f
+                                                        : test_prand(r, d, 93u) * 0.3f;
+        }
+    }
+
+    dh_model model = dh_model_build(sinks, n_head);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_head * head_dim * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)n_tokens * n_head * head_dim * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)raw_cap * head_dim * sizeof(float));
+    CHECK(theads && tq && traw, "online running max: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, (uint64_t)n_tokens * head_dim * sizeof(float)) != 0,
+          "online running max: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, (uint64_t)raw_cap * head_dim * sizeof(float)) != 0,
+          "online running max: raw_kv write failed");
+
+    CHECK(ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, NULL,
+              0u, NULL, /*use_comp_mask=*/0u, n_tokens, pos0, n_raw, raw_cap, raw_start,
+              /*n_comp=*/0u, /*window=*/0u, /*ratio=*/1u, n_head, head_dim) != 0,
+          "online running max: launch failed");
+
+    float *got = malloc((size_t)n_tokens * head_dim * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, (uint64_t)n_tokens * head_dim * sizeof(float)) != 0,
+          "online running max: read failed");
+    float *want = malloc((size_t)n_tokens * head_dim * sizeof(float));
+    oracle_attention_decode_batch(want, sinks, q, raw_kv, n_tokens, pos0, n_raw, raw_cap,
+                                  raw_start, NULL, 0u, 0u, 1u, n_head, head_dim);
+
+    for (uint32_t i = 0; i < n_tokens * head_dim; i++) {
+        const uint32_t d = i % head_dim;
+        CHECK(isfinite(got[i]), "online running max: got a non-finite value");
+        CHECK_CLOSE(got[i], want[i], 1e-2, "online running max: heads mismatch");
+        /* The loud row's weight should dominate to the point that the
+         * output is nearly identical to that row itself. */
+        CHECK_CLOSE(got[i], raw_kv[loud_row * head_dim + d], 5e-2,
+                    "online running max: output not dominated by the loud row");
+    }
+
+    free(q); free(raw_kv); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    fprintf(stderr, "  test_decode_mixed_batch_online_running_max OK\n");
+    return 0;
+}
+
+static int test_decode_batch_validation(void) {
+    float sinks[SB_N_HEAD] = {0};
+    dh_model model = dh_model_build(sinks, SB_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)SB_N_TOKENS * SB_N_HEAD * SB_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)SB_RAW_CAP * SB_HEAD_DIM * sizeof(float));
+    CHECK(theads && tq && traw, "decode_batch validation: alloc failed");
+
+    CHECK(ds4_gpu_attention_decode_raw_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw,
+              /*n_tokens=*/0u, SB_POS0, SB_N_RAW, SB_RAW_CAP, SB_RAW_START, SB_WINDOW,
+              SB_N_HEAD, SB_HEAD_DIM) == 0,
+          "decode_batch: n_tokens == 0 must be rejected");
+    CHECK(ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, NULL,
+              /*comp_kv_f16=*/1u, NULL, 0u, SB_N_TOKENS, SB_POS0, SB_N_RAW, SB_RAW_CAP,
+              SB_RAW_START, 0u, SB_WINDOW, 1u, SB_N_HEAD, SB_HEAD_DIM) == 0,
+          "decode_batch: comp_kv_f16 must be rejected");
+    CHECK(ds4_gpu_attention_decode_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, NULL,
+              0u, NULL, 0u, SB_N_TOKENS, SB_POS0, SB_N_RAW, SB_RAW_CAP, SB_RAW_START,
+              /*n_comp=*/5u, SB_WINDOW, /*ratio=*/0u, SB_N_HEAD, SB_HEAD_DIM) == 0,
+          "decode_batch: n_comp != 0 with ratio == 0 must be rejected");
+
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    free(model.bytes);
+    fprintf(stderr, "  test_decode_batch_validation OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_store_raw_kv() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -498,6 +906,11 @@ int main(void) {
     if (test_decode_heads_raw_only() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_decode_heads_masked() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_decode_heads_validation() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_decode_raw_batch_small() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_decode_mixed_batch_small() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_decode_mixed_batch_online_vs_general() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_decode_mixed_batch_online_running_max() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_decode_batch_validation() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_attention OK\n");
     return 0;
