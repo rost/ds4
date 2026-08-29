@@ -410,3 +410,190 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     }
     return 1;
 }
+
+/* Full two-stage batched projection, F32 output. Matches
+ * ds4.c:10517-10535 (layer_grouped_out_batch): the grouped A-stage above,
+ * generalised to n_tokens, then a plain Q8_0 matvec/matmul B-stage. Ported
+ * from ds4_gpu_attention_output_q8_batch_tensor,
+ * rocm/ds4_rocm_attention_launch.cuh:1072-1376. `group_tmp` and `low_tmp`
+ * are unused, matching ROCm's own `(void)group_tmp; (void)low_tmp;`: they
+ * exist for a scratch shape this port does not need (this port allocates
+ * its own A-stage scratch per sycl_attention_output_a_stage, same as every
+ * other landed subsystem, rather than relying on caller-provided scratch
+ * tensors ROCm itself does not use either).
+ *
+ * B-stage: delegates to ds4_gpu_matmul_q8_0_tensor (ds4_sycl_matmul.hpp),
+ * which already stages attn_output_b's weight range itself and
+ * already implements the exact ROCm-kernel-matching Q8_0 dense matmul the
+ * oracle's second line (matvec_q8_0 / matmul_q8_0_batch) needs,
+ * rather than porting cuda_matmul_q8_0_tensor_labeled's plain-kernel branch
+ * a second time.
+ *
+ * Return polarity: verified against the ROCm launcher (plain `return 0` on
+ * every rejection and staging failure; the final return is
+ * cuda_matmul_q8_0_tensor_labeled's own result, itself nonzero-success) and
+ * against ds4.c:25988 and :32534, both of which read the result as
+ * `ok = ... != 0` / `if (ok) ok = ...`. Nonzero-success, matching the
+ * low-rank entry above. */
+extern "C" int ds4_gpu_attention_output_q8_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    (void)group_tmp;
+    (void)low_tmp;
+    if (!out || !low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        n_groups == 0u || out_dim == 0u || n_tokens == 0u ||
+        group_dim > UINT32_MAX || rank > UINT32_MAX) {
+        return 0;
+    }
+
+    uint64_t low_dim = 0, out_a_bytes = 0;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    if (!sycl_u64_mul_checked(n_groups, rank, &low_dim) ||
+        !sycl_u64_mul3_checked((uint64_t)n_groups * rank, blocks_a, 34u, &out_a_bytes) ||
+        !sycl_model_range_fits(model_size, out_a_offset, out_a_bytes) ||
+        !sycl_tensor_has_elems2(heads, (uint64_t)n_tokens * n_groups, group_dim,
+                                sizeof(float)) ||
+        !sycl_tensor_has_elems2(low, n_tokens, low_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems2(out, n_tokens, out_dim, sizeof(float))) {
+        return 0;
+    }
+    const char *out_a_ptr = sycl_model_range_ptr(model_map, out_a_offset, out_a_bytes,
+                                                 model_size, "attn_out_a");
+    if (!out_a_ptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out->device_id);
+        sycl_device_scratch_guard w_guard = sycl_stage_host_bytes(q, out_a_ptr, out_a_bytes);
+        if (!w_guard.p) return 0;
+
+        if (!sycl_attention_output_a_stage(q, (float *)low->ptr,
+                                          (const unsigned char *)w_guard.p,
+                                          (const float *)heads->ptr, (uint32_t)group_dim,
+                                          rank, n_groups, blocks_a, low_dim, n_tokens)) {
+            return 0;
+        }
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_q8_batch A-stage failed: %s\n",
+                e.what());
+        return 0;
+    }
+
+    return ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size, out_b_offset,
+                                      low_dim, out_dim, low, n_tokens);
+}
+
+/* Same two-stage projection as above, F16 output (spec 6k). Ported from
+ * ds4_gpu_attention_output_q8_batch_f16_tensor,
+ * rocm/ds4_rocm_attention_launch.cuh:964-1071 -- but that ROCm function's
+ * entire body is a cuBLAS pipeline gated on `!g_cublas_ready` returning 0
+ * unconditionally when cuBLAS/rocBLAS is unavailable: it has NO kernel-only
+ * fallback path to port literally. This backend has no oneMKL/cuBLAS
+ * equivalent (design-spec section on the matmul tier), so a literal port
+ * would make this entry permanently fail on every call, which is not the
+ * intent here: this entry is meant to be implemented, not stubbed,
+ * with its own F16-tie ablations. Instead this entry computes the exact
+ * same two-stage projection as the F32 batch entry above (same A-stage
+ * kernel, same B-stage delegation to ds4_gpu_matmul_q8_0_tensor into an F32
+ * scratch buffer) and converts the F32 result to F16 as the last step,
+ * using the ported bit-manipulation encoder (sycl_f32_to_f16_bits_hip_round
+ * in ds4_sycl_common.hpp) rather than sycl::half, per spec 6k: sycl::half's
+ * device-side conversion rounds exact ties to even, ds4's own converter
+ * rounds every exact tie up, and they disagree only at exact ties.
+ *
+ * Unlike ROCm's cuBLAS pipeline (which ignores its own `low` parameter,
+ * `(void)low;`, keeping its own internal packed-F16 scratch instead), this
+ * entry writes the real A-stage result into the caller-provided `low`
+ * tensor, the same convention as the F32 batch entry: there is no reason
+ * to allocate a second scratch buffer for it when the ABI already has a
+ * home for it. This means, unlike ROCm's null-check list for this entry
+ * (`!out_h || !heads || !model_map`, `low` not required since ROCm never
+ * touches it), this port's null/size check DOES require `low`.
+ *
+ * Return polarity: verified against the ROCm launcher (plain `return 0` on
+ * every rejection, `st == CUBLAS_STATUS_SUCCESS` -- nonzero-success -- on
+ * the one live path) and ds4.c:29718 (`attn_out_f16 = ... != 0`).
+ * Nonzero-success, matching both entries above. */
+extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
+        ds4_gpu_tensor       *out_h,
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    if (!out_h || !low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        n_groups == 0u || out_dim == 0u || n_tokens == 0u ||
+        group_dim > UINT32_MAX || rank > UINT32_MAX) {
+        return 0;
+    }
+
+    uint64_t low_dim = 0, out_a_bytes = 0, out_elems = 0;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    if (!sycl_u64_mul_checked(n_groups, rank, &low_dim) ||
+        !sycl_u64_mul_checked(n_tokens, out_dim, &out_elems)) {
+        return 0;
+    }
+    if (!sycl_u64_mul3_checked((uint64_t)n_groups * rank, blocks_a, 34u, &out_a_bytes) ||
+        !sycl_model_range_fits(model_size, out_a_offset, out_a_bytes) ||
+        !sycl_tensor_has_elems2(heads, (uint64_t)n_tokens * n_groups, group_dim,
+                                sizeof(float)) ||
+        !sycl_tensor_has_elems2(low, n_tokens, low_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems(out_h, out_elems, sizeof(uint16_t))) {
+        return 0;
+    }
+    const char *out_a_ptr = sycl_model_range_ptr(model_map, out_a_offset, out_a_bytes,
+                                                 model_size, "attn_out_a");
+    if (!out_a_ptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out_h->device_id);
+        sycl_device_scratch_guard w_guard = sycl_stage_host_bytes(q, out_a_ptr, out_a_bytes);
+        if (!w_guard.p) return 0;
+
+        if (!sycl_attention_output_a_stage(q, (float *)low->ptr,
+                                          (const unsigned char *)w_guard.p,
+                                          (const float *)heads->ptr, (uint32_t)group_dim,
+                                          rank, n_groups, blocks_a, low_dim, n_tokens)) {
+            return 0;
+        }
+
+        float *out_f32 = sycl::malloc_device<float>((size_t)out_elems, q);
+        sycl_device_scratch_guard out_f32_guard(q, out_f32);
+        if (!out_f32) return 0;
+        ds4_gpu_tensor out_f32_view = {out_f32, out_elems * sizeof(float), 0, out_h->device_id};
+
+        if (!ds4_gpu_matmul_q8_0_tensor(&out_f32_view, model_map, model_size, out_b_offset,
+                                        low_dim, out_dim, low, n_tokens)) {
+            return 0;
+        }
+
+        uint16_t *out_bits = (uint16_t *)out_h->ptr;
+        q.parallel_for(sycl::range<1>((size_t)out_elems), [=](sycl::id<1> gid) {
+             out_bits[gid[0]] = sycl_f32_to_f16_bits_hip_round(out_f32[gid[0]]);
+         }).wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_q8_batch_f16 failed: %s\n",
+                e.what());
+        return 0;
+    }
+    return 1;
+}

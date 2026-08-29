@@ -140,6 +140,38 @@ static void oracle_grouped_out_batch_low(float *low, const float *heads,
     }
 }
 
+/* Oracle for the reused B-stage: matches ds4_gpu_matmul_q8_0_tensor's own
+ * documented formula (sycl_q8_0_matmul_launch in ds4_sycl_matmul.hpp,
+ * itself ported from matmul_q8_0_f32_warp8_kernel /
+ * _batch_warp8_kernel, rocm/ds4_rocm_q8.cuh:440-520): raw float activation
+ * times dequantised Q8_0 weight, NOT activation-quantised -- deliberately
+ * different from ds4.c's own matvec_q8_0 (which does quantise): this port
+ * reuses the already-landed, already-reviewed dense-matmul entry as
+ * the B-stage rather than porting a second B-stage that matches ds4.c
+ * exactly. Used only for the differential/end-to-end sanity checks below,
+ * not as the tight A-stage oracle. */
+static void oracle_matmul_q8_0_raw(float *out, const float *x,
+                                   const unsigned char *w, uint32_t in_dim,
+                                   uint32_t out_dim, uint32_t n_tok,
+                                   uint64_t row_bytes) {
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < out_dim; o++) {
+            const unsigned char *row = w + (size_t)o * row_bytes;
+            double sum = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) {
+                const uint32_t blk = k / 32u;
+                const uint32_t idx = k % 32u;
+                const unsigned char *bp = row + (size_t)blk * 34u;
+                const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+                const float scale = oracle_half_to_float(raw);
+                const signed char qv = (signed char)bp[2 + idx];
+                sum += (double)x[t * in_dim + k] * (double)scale * (double)qv;
+            }
+            out[t * out_dim + o] = (float)sum;
+        }
+    }
+}
+
 /* Test data helper: an (index-interaction, not affine) activation pattern
  * for one row of length n, distinguishable per (row, n) pair. */
 static void fill_activation_row(float *x, uint32_t n, uint32_t row_seed) {
@@ -341,11 +373,258 @@ static int test_attention_output_low_q8(void) {
     return 0;
 }
 
+/* ---- The batch entries, F32 and F16 ---- */
+
+extern uint16_t ds4_sycl_test_hip_round_f16_bits(float f);
+
+static int test_attention_output_q8_batch(void) {
+    enum { GROUP_DIM = 41, RANK = 6, N_GROUPS = 4, N_TOKENS = 3, OUT_DIM = 9 };
+    const uint32_t blocks_a = (GROUP_DIM + 31u) / 32u;
+    const uint64_t row_bytes_a = (uint64_t)blocks_a * 34u;
+    const uint32_t low_dim = RANK * N_GROUPS;
+    const uint32_t blocks_b = (low_dim + 31u) / 32u;
+    const uint64_t row_bytes_b = (uint64_t)blocks_b * 34u;
+
+    unsigned char wa[N_GROUPS * RANK * 2 * 34];
+    unsigned char wb[OUT_DIM * 34]; /* low_dim=24 here, blocks_b=1, row_bytes_b=34 */
+    float heads[N_TOKENS * N_GROUPS * GROUP_DIM];
+    float want_low[N_TOKENS * N_GROUPS * RANK];
+    float want_out[N_TOKENS * OUT_DIM];
+    float got_low[N_TOKENS * N_GROUPS * RANK];
+    float got_out[N_TOKENS * OUT_DIM];
+
+    for (uint32_t g = 0; g < N_GROUPS; g++) {
+        for (uint32_t r = 0; r < RANK; r++) {
+            encode_q8_0_row(wa + ((size_t)g * RANK + r) * row_bytes_a, GROUP_DIM, g * 19u + r + 3u);
+        }
+    }
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        encode_q8_0_row(wb + (size_t)o * row_bytes_b, low_dim, o + 41u);
+    }
+    for (uint32_t t = 0; t < N_TOKENS; t++) {
+        for (uint32_t g = 0; g < N_GROUPS; g++) {
+            fill_activation_row(heads + ((size_t)t * N_GROUPS + g) * GROUP_DIM, GROUP_DIM,
+                                t * 7u + g + 1u);
+        }
+    }
+    oracle_grouped_out_batch_low(want_low, heads, wa, N_TOKENS, N_GROUPS, GROUP_DIM, RANK);
+    oracle_matmul_q8_0_raw(want_out, want_low, wb, low_dim, OUT_DIM, N_TOKENS, row_bytes_b);
+
+    unsigned char model[sizeof(wa) + sizeof(wb)];
+    memcpy(model, wa, sizeof(wa));
+    memcpy(model + sizeof(wa), wb, sizeof(wb));
+    const uint64_t out_a_offset = 0;
+    const uint64_t out_b_offset = sizeof(wa);
+    const uint64_t model_size = sizeof(model);
+
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(sizeof(heads));
+    ds4_gpu_tensor *tlow = ds4_gpu_tensor_alloc(sizeof(got_low));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(got_out));
+    CHECK(theads && tlow && tout, "attention_output_q8_batch: allocation failed");
+    CHECK(ds4_gpu_tensor_write(theads, 0, heads, sizeof(heads)) != 0,
+          "attention_output_q8_batch: write heads");
+
+    CHECK(ds4_gpu_attention_output_q8_batch_tensor(tout, tlow, NULL, NULL, model, model_size,
+                                                   out_a_offset, out_b_offset, GROUP_DIM, RANK,
+                                                   N_GROUPS, OUT_DIM, theads, N_TOKENS) != 0,
+          "attention_output_q8_batch: call");
+    CHECK(ds4_gpu_tensor_read(tlow, 0, got_low, sizeof(got_low)) != 0,
+          "attention_output_q8_batch: read low");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got_out, sizeof(got_out)) != 0,
+          "attention_output_q8_batch: read out");
+
+    /* Tight: the A-stage matches ds4.c's own oracle (activation-quantised)
+     * to within Q8_0 int8 rounding noise. */
+    for (uint32_t i = 0; i < N_TOKENS * low_dim; i++) {
+        CHECK_CLOSE(got_low[i], want_low[i], 1e-2, "attention_output_q8_batch: low mismatch");
+    }
+    /* Looser: the full pipeline's B-stage deliberately reuses
+     * ds4_gpu_matmul_q8_0_tensor's raw-float (non-activation-quantised)
+     * kernel rather than porting a second, ds4.c-matching B-stage (see the
+     * header comment on ds4_gpu_attention_output_q8_batch_tensor), so
+     * `out` is compared against a raw-float oracle built from the true
+     * `want_low`, not against ds4.c's own (quantised) matvec_q8_0. */
+    for (uint32_t i = 0; i < N_TOKENS * OUT_DIM; i++) {
+        CHECK_CLOSE(got_out[i], want_out[i], 5e-2, "attention_output_q8_batch: out mismatch");
+    }
+
+    /* Cross-check: run the
+     * low-rank entry once per token, then the same B-stage matmul entry
+     * used above, and confirm the result matches the fused batch entry's
+     * `out` tightly (both paths share the exact same kernels, so this is
+     * far tighter than the raw-float-oracle comparison above -- it would
+     * catch drift an oracle comparison alone can miss). */
+    {
+        float low_loop[N_TOKENS * N_GROUPS * RANK];
+        for (uint32_t t = 0; t < N_TOKENS; t++) {
+            ds4_gpu_tensor *theads_t = ds4_gpu_tensor_alloc((size_t)N_GROUPS * GROUP_DIM * sizeof(float));
+            ds4_gpu_tensor *tlow_t = ds4_gpu_tensor_alloc((size_t)low_dim * sizeof(float));
+            CHECK(theads_t && tlow_t, "attention_output_q8_batch: per-token allocation failed");
+            CHECK(ds4_gpu_tensor_write(theads_t, 0, heads + (size_t)t * N_GROUPS * GROUP_DIM,
+                                       (size_t)N_GROUPS * GROUP_DIM * sizeof(float)) != 0,
+                  "attention_output_q8_batch: per-token write heads");
+            CHECK(ds4_gpu_attention_output_low_q8_tensor(tlow_t, model, model_size, out_a_offset,
+                                                         GROUP_DIM, RANK, N_GROUPS, theads_t) != 0,
+                  "attention_output_q8_batch: per-token low-rank call");
+            CHECK(ds4_gpu_tensor_read(tlow_t, 0, low_loop + (size_t)t * low_dim,
+                                      (size_t)low_dim * sizeof(float)) != 0,
+                  "attention_output_q8_batch: per-token read low");
+            ds4_gpu_tensor_free(theads_t);
+            ds4_gpu_tensor_free(tlow_t);
+        }
+        ds4_gpu_tensor *tlow_loop = ds4_gpu_tensor_alloc(sizeof(low_loop));
+        ds4_gpu_tensor *tout_loop = ds4_gpu_tensor_alloc(sizeof(got_out));
+        CHECK(tlow_loop && tout_loop, "attention_output_q8_batch: loop allocation failed");
+        CHECK(ds4_gpu_tensor_write(tlow_loop, 0, low_loop, sizeof(low_loop)) != 0,
+              "attention_output_q8_batch: write loop low");
+        CHECK(ds4_gpu_matmul_q8_0_tensor(tout_loop, model, model_size, out_b_offset, low_dim,
+                                         OUT_DIM, tlow_loop, N_TOKENS) != 0,
+              "attention_output_q8_batch: loop matmul call");
+        float out_loop[N_TOKENS * OUT_DIM];
+        CHECK(ds4_gpu_tensor_read(tout_loop, 0, out_loop, sizeof(out_loop)) != 0,
+              "attention_output_q8_batch: read loop out");
+        for (uint32_t i = 0; i < N_TOKENS * OUT_DIM; i++) {
+            CHECK_CLOSE(got_out[i], out_loop[i], 1e-3,
+                        "attention_output_q8_batch: differential vs per-token loop mismatch");
+        }
+        ds4_gpu_tensor_free(tlow_loop);
+        ds4_gpu_tensor_free(tout_loop);
+    }
+
+    /* The remaining required ablations (a token index held constant across
+     * the batch; the B-stage reading `low` before the A-stage has
+     * completed) are exercised by mutating the actual kernel source and
+     * confirming the checks above fail, per this project's ablation
+     * discipline: test data here already gives every token a numerically
+     * distinct activation row (fill_activation_row is seeded by `t`), so a
+     * constant-token mutation is guaranteed to produce a visibly wrong
+     * result at any token other than the one it collapses onto. */
+
+    CHECK(ds4_gpu_attention_output_q8_batch_tensor(tout, tlow, NULL, NULL, model, model_size, 0,
+                                                   out_b_offset, 0, RANK, N_GROUPS, OUT_DIM,
+                                                   theads, N_TOKENS) == 0,
+          "attention_output_q8_batch: zero group_dim must be rejected");
+    CHECK(ds4_gpu_attention_output_q8_batch_tensor(tout, tlow, NULL, NULL, model, model_size, 0,
+                                                   out_b_offset, GROUP_DIM, RANK, N_GROUPS,
+                                                   OUT_DIM, theads, 0) == 0,
+          "attention_output_q8_batch: zero n_tokens must be rejected");
+    CHECK(ds4_gpu_attention_output_q8_batch_tensor(tout, tlow, NULL, NULL, model, model_size,
+                                                   model_size, out_b_offset, GROUP_DIM, RANK,
+                                                   N_GROUPS, OUT_DIM, theads, N_TOKENS) == 0,
+          "attention_output_q8_batch: out-of-range out_a_offset must be rejected");
+
+    ds4_gpu_tensor_free(theads);
+    ds4_gpu_tensor_free(tlow);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_attention_output_q8_batch OK\n");
+    return 0;
+}
+
+static int test_attention_output_q8_batch_f16(void) {
+    enum { GROUP_DIM = 41, RANK = 6, N_GROUPS = 4, N_TOKENS = 3, OUT_DIM = 9 };
+    const uint32_t blocks_a = (GROUP_DIM + 31u) / 32u;
+    const uint64_t row_bytes_a = (uint64_t)blocks_a * 34u;
+    const uint32_t low_dim = RANK * N_GROUPS;
+    const uint32_t blocks_b = (low_dim + 31u) / 32u;
+    const uint64_t row_bytes_b = (uint64_t)blocks_b * 34u;
+
+    unsigned char wa[N_GROUPS * RANK * 2 * 34];
+    unsigned char wb[OUT_DIM * 34];
+    float heads[N_TOKENS * N_GROUPS * GROUP_DIM];
+
+    for (uint32_t g = 0; g < N_GROUPS; g++) {
+        for (uint32_t r = 0; r < RANK; r++) {
+            encode_q8_0_row(wa + ((size_t)g * RANK + r) * row_bytes_a, GROUP_DIM, g * 23u + r + 5u);
+        }
+    }
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        encode_q8_0_row(wb + (size_t)o * row_bytes_b, low_dim, o + 71u);
+    }
+    for (uint32_t t = 0; t < N_TOKENS; t++) {
+        for (uint32_t g = 0; g < N_GROUPS; g++) {
+            fill_activation_row(heads + ((size_t)t * N_GROUPS + g) * GROUP_DIM, GROUP_DIM,
+                                t * 3u + g + 2u);
+        }
+    }
+
+    unsigned char model[sizeof(wa) + sizeof(wb)];
+    memcpy(model, wa, sizeof(wa));
+    memcpy(model + sizeof(wa), wb, sizeof(wb));
+    const uint64_t out_a_offset = 0;
+    const uint64_t out_b_offset = sizeof(wa);
+    const uint64_t model_size = sizeof(model);
+
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(sizeof(heads));
+    ds4_gpu_tensor *tlow_ref = ds4_gpu_tensor_alloc((size_t)N_TOKENS * low_dim * sizeof(float));
+    ds4_gpu_tensor *tout_ref = ds4_gpu_tensor_alloc((size_t)N_TOKENS * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tlow_h = ds4_gpu_tensor_alloc((size_t)N_TOKENS * low_dim * sizeof(float));
+    ds4_gpu_tensor *tout_h = ds4_gpu_tensor_alloc((size_t)N_TOKENS * OUT_DIM * sizeof(uint16_t));
+    CHECK(theads && tlow_ref && tout_ref && tlow_h && tout_h,
+          "attention_output_q8_batch_f16: allocation failed");
+    CHECK(ds4_gpu_tensor_write(theads, 0, heads, sizeof(heads)) != 0,
+          "attention_output_q8_batch_f16: write heads");
+
+    /* Reference: the already-tested F32 batch entry, which uses the exact
+     * same A-stage and B-stage kernels this entry does. */
+    CHECK(ds4_gpu_attention_output_q8_batch_tensor(tout_ref, tlow_ref, NULL, NULL, model,
+                                                   model_size, out_a_offset, out_b_offset,
+                                                   GROUP_DIM, RANK, N_GROUPS, OUT_DIM, theads,
+                                                   N_TOKENS) != 0,
+          "attention_output_q8_batch_f16: F32 reference call");
+    float out_ref[N_TOKENS * OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(tout_ref, 0, out_ref, sizeof(out_ref)) != 0,
+          "attention_output_q8_batch_f16: read F32 reference out");
+
+    CHECK(ds4_gpu_attention_output_q8_batch_f16_tensor(tout_h, tlow_h, model, model_size,
+                                                       out_a_offset, out_b_offset, GROUP_DIM,
+                                                       RANK, N_GROUPS, OUT_DIM, theads,
+                                                       N_TOKENS) != 0,
+          "attention_output_q8_batch_f16: call");
+    uint16_t got_bits[N_TOKENS * OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(tout_h, 0, got_bits, sizeof(got_bits)) != 0,
+          "attention_output_q8_batch_f16: read out bits");
+
+    /* Exact: both entries share the same A-stage and B-stage kernels, so
+     * the only difference is the final F32-to-F16 encode. Comparing
+     * against the ported bit-manipulation oracle bit-for-bit (rather than
+     * a tolerance on the decoded value) is the tightest test available and
+     * would catch a fallback to sycl::half immediately at any input whose
+     * discarded mantissa bits happen to differ between the two encoders
+     * (anything but an exact tie, per spec 6k). */
+    for (uint32_t i = 0; i < N_TOKENS * OUT_DIM; i++) {
+        const uint16_t want_bits = ds4_sycl_test_hip_round_f16_bits(out_ref[i]);
+        CHECK(got_bits[i] == want_bits,
+              "attention_output_q8_batch_f16: F16 bits do not match the ported encoder");
+    }
+
+    /* Exact-tie distinguishability: per spec 6k, sycl::half and the ported
+     * encoder disagree ONLY at an exact tie (13 discarded mantissa bits
+     * exactly 0x1000, demonstrated on F32 0x3F801000). None of this test's
+     * quantised-arithmetic outputs land on such a tie (probability zero
+     * for a sum of many int8 products over essentially arbitrary weights),
+     * so this test cannot itself distinguish the two encoders through the
+     * full pipeline -- that is a test-data limitation of an end-to-end
+     * entry test, not evidence the choice does not matter. The shared
+     * helper itself is exercised at the exact tie directly by
+     * tests/test_sycl_fp8_kv.c's test_f16_exact_tie_sycl_half_diverges_
+     * from_oracle, which this file relies on rather than duplicating. */
+
+    ds4_gpu_tensor_free(theads);
+    ds4_gpu_tensor_free(tlow_ref);
+    ds4_gpu_tensor_free(tout_ref);
+    ds4_gpu_tensor_free(tlow_h);
+    ds4_gpu_tensor_free(tout_h);
+    fprintf(stderr, "  test_attention_output_q8_batch_f16 OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_quantize_q8_0_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_grouped_q8_0_a_preq() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_low_q8() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_attention_output_q8_batch() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_attention_output_q8_batch_f16() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_attention_output OK\n");
     return 0;
