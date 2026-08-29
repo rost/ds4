@@ -1021,10 +1021,45 @@ static int run_compressor_prefill_case(uint32_t head_dim, uint32_t ratio,
     CHECK(kv && sc && norm_w && state_kv && state_score && (n_comp == 0 || comp_want),
           "compressor_prefill: host allocation failed");
 
+    /* kv includes a (t * j) % 7 interaction term, unlike a plain affine
+     * ramp: a purely affine kv makes every candidate row differ from every
+     * other only by a per-row additive constant, which RMS-normalisation
+     * almost entirely divides back out regardless of which candidate the
+     * softmax or the previous-window gather picks.  test_compressor_prefill
+     * _ratio4_replay hit exactly this degeneracy first; see its comment for
+     * the numeric detail. Without the term, an off-by-one in the ratio-4
+     * previous-window gather (base = c * ratio instead of (c - 1) * ratio)
+     * moves the post-RMS-norm output by about 6e-10, far under this test's
+     * 1e-2 tolerance, so this data must not be affine either.
+     *
+     * sc needed a second, independent fix, verified numerically before
+     * writing it here: the original `t * 19` term grows without bound
+     * across windows, so for ratio == 4 the current window (larger t)
+     * always outscores the previous window by dozens of units, and after
+     * the softmax's exp() the previous window's weight is indistinguishable
+     * from zero.  With that bias in place the previous-window off-by-one is
+     * invisible no matter what kv contains, because the previous window
+     * never contributes to the pooled result either way.  Keying the
+     * affine term off (t % ratio) instead of raw t removes that unbounded
+     * growth, and weighting j more heavily than t (* 20 here, versus the
+     * * 19 on the bounded t term) instead makes the previous window's own
+     * best candidate reliably outscore the current window's, since it reads
+     * the smaller j half of the row: column d rather than head_dim + d.  So
+     * the previous window's candidate wins the softmax in both the correct
+     * and the ablated build, and what changes is only WHICH raw token that
+     * winning candidate's value comes from, which is exactly the property
+     * the previous-window base computation is responsible for getting
+     * right.  A numeric simulation of this exact configuration (head_dim
+     * = 4, ratio = 4, n_tokens = 11) confirmed the four pre-RMS-norm pooled
+     * values for comp index 1 move by roughly 25 to 37 under the ablation,
+     * comfortably above this test's 1e-2 tolerance. */
     for (uint32_t t = 0; t < n_tokens; t++) {
         for (uint32_t j = 0; j < width; j++) {
-            kv[(uint64_t)t * width + j] = (float)(t * 37u + j * 11u + 5u) * 0.25f;
-            sc[(uint64_t)t * width + j] = (float)((int)(t * 19u) - (int)(j * 3u) - 7);
+            kv[(uint64_t)t * width + j] = (float)(t * 37u + j * 11u + 5u) * 0.25f +
+                                          (float)((t * j) % 7u) * 2.0f;
+            sc[(uint64_t)t * width + j] =
+                    (float)((int)((t % ratio) * 19u) - (int)(j * 20u) - 7) +
+                    (float)((t * j) % 11u);
         }
     }
     for (uint32_t d = 0; d < head_dim; d++) norm_w[d] = (float)(d % 5u + 1u) * 0.2f;
