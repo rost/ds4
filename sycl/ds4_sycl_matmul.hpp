@@ -88,7 +88,11 @@ extern "C" int ds4_sycl_test_gemm_batch_smoke(void) {
                 return 0;
             }
         }
-    } catch (const sycl::exception &e) {
+    } catch (const std::exception &e) {
+        /* std::exception, not sycl::exception: oneapi::mkl::invalid_argument
+         * is on a different branch of the hierarchy and a sycl::exception
+         * handler does not catch it, so an uncaught one terminates the
+         * process rather than failing this call (spec 6v). */
         fprintf(stderr, DS4_GPU_LOG_PREFIX "gemm_batch smoke failed: %s\n", e.what());
         return 0;
     }

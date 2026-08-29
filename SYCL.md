@@ -323,9 +323,6 @@ plausible-looking wrong answer.
 * **No end-to-end run against real weights** has happened. Every subsystem is
   verified against a CPU oracle on synthetic data, which is real verification
   but is not the same as producing a token.
-* **One known unfixed hazard**: `sycl_stream_evict_at` frees a cache slab
-  without waiting when evicting under memory pressure. A use-after-free shape
-  that nothing on this hardware can test.
 * **Performance is untuned.** Weight staging is per call with no cross-call
   cache, oneMKL's `compute_mode` and the GEMM-versus-kernel dispatch
   thresholds (the mixed-prefill tiled path's 4 GiB cap among them) are all at
