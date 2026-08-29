@@ -320,13 +320,19 @@ static inline float sycl_attn_dot4(sycl::float4 a, sycl::float4 b) {
 /* warp_sum_f32 / attention_warp_sum_oldhip_w32 shape, generalised over the
  * sub-group width: a shuffle-down reduction tree. Ported as a genuine
  * sycl::sub_group reduction rather than a masked partition of a wider warp,
- * per the sub-group-width guidance (spec 6m): a
- * [[sycl::reqd_sub_group_size(N)]] kernel gets a real N-wide hardware
- * sub-group on this stack, so no mask is needed the way CUDA needs one to
- * fence a shuffle to a sub-range of its 32-wide warp. As with CUDA's
- * shfl_down-based reduction, only lane 0 holds the fully-reduced total when
- * this returns; callers that need every lane to see it broadcast lane 0's
- * value afterwards (sycl::group_broadcast), exactly mirroring the
+ * so no mask is needed the way CUDA needs one to fence a shuffle to a
+ * sub-range of its 32-wide warp. Note that [[sycl::reqd_sub_group_size(N)]]
+ * is advisory, not enforced by the driver on this stack (spec 6m): a
+ * device unable to honour N does not fail the kernel launch, it silently
+ * runs a different width, which would make this reduction's compiled-in
+ * tree depth wrong. What actually makes N genuine here is
+ * ds4_gpu_init's device-discovery check (ds4_sycl.cpp,
+ * kRequiredSubGroupWidths in ds4_sycl_common.hpp), which refuses to start
+ * on any device that cannot honour every required width; this annotation
+ * is not itself that guarantee. As with CUDA's shfl_down-based reduction,
+ * only lane 0 holds the fully-reduced total when this returns; callers
+ * that need every lane to see it broadcast lane 0's value afterwards
+ * (sycl::group_broadcast), exactly mirroring the
  * `__shfl_sync(mask, score, 0)` immediately following every warp_sum_f32
  * call at its CUDA call sites. */
 template <int N>
@@ -343,8 +349,8 @@ static inline float sycl_attn_subgroup_sum(sycl::sub_group sg, float v) {
  * this is a true batch (n_tokens > 1): a plain per-lane strided loop when
  * there is nothing to gain from parallelising a single row's dot product
  * (visible_comp == 0 or n_tokens == 1, matching the CUDA source exactly),
- * and an 8-lane-per-row grouping, genuinely 8-wide via reqd_sub_group_size,
- * otherwise. The block-wide max/sum reductions (CUDA's own plain shared-
+ * and an 8-lane-per-row grouping, 8-wide via reqd_sub_group_size, genuine
+ * only via ds4_gpu_init's device guard (spec 6m), otherwise. The block-wide max/sum reductions (CUDA's own plain shared-
  * memory `partial[]` tree, not the oldhip warp-shuffle scheme) are
  * substituted with sycl_block_row_reduce for the same reason as the oldhip
  * kernel above: identical whole-work-group reduction, reused rather than
