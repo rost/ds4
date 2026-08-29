@@ -350,7 +350,8 @@ static inline float sycl_attn_subgroup_sum(sycl::sub_group sg, float v) {
  * there is nothing to gain from parallelising a single row's dot product
  * (visible_comp == 0 or n_tokens == 1, matching the CUDA source exactly),
  * and an 8-lane-per-row grouping, 8-wide via reqd_sub_group_size, genuine
- * only via ds4_gpu_init's device guard (spec 6m), otherwise. The block-wide max/sum reductions (CUDA's own plain shared-
+ * only via ds4_gpu_init's device guard (spec 6m), otherwise. The
+ * block-wide max/sum reductions (CUDA's own plain shared-
  * memory `partial[]` tree, not the oldhip warp-shuffle scheme) are
  * substituted with sycl_block_row_reduce for the same reason as the oldhip
  * kernel above: identical whole-work-group reduction, reused rather than
