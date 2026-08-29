@@ -37,6 +37,32 @@ int main(void) {
     CHECK(ds4_gpu_tensor_device(v) == ds4_gpu_tensor_device(t),
           "view did not inherit the base tensor device");
 
+    /* ds4.c calls the tier-aware allocators unconditionally for tier 0 on
+     * every session, single-GPU included (ds4.c:17073), and the ABI
+     * contract (ds4_gpu_mgpu.h:111-118) makes tier 0 equivalent to the
+     * legacy allocator.  These returned NULL until they were implemented,
+     * which meant session creation could not succeed on this backend at
+     * all.  No kernel test caught it because every kernel test calls ABI
+     * entries directly instead of going through graph creation. */
+    ds4_gpu_tensor *tier0 = ds4_gpu_tensor_alloc_ptr_on(0, 4096);
+    CHECK(tier0 != NULL, "tensor_alloc_ptr_on(0) returned NULL");
+    CHECK(ds4_gpu_tensor_bytes(tier0) == 4096, "wrong ptr_on byte count");
+    CHECK(ds4_gpu_tensor_device(tier0) == 0, "ptr_on tensor not on tier 0");
+    ds4_gpu_tensor_free(tier0);
+
+    ds4_gpu_tensor *tier0m = ds4_gpu_tensor_alloc_managed_on(0, 4096);
+    CHECK(tier0m != NULL, "tensor_alloc_managed_on(0) returned NULL");
+    CHECK(ds4_gpu_tensor_bytes(tier0m) == 4096, "wrong managed_on byte count");
+    ds4_gpu_tensor_free(tier0m);
+
+    /* A tier this build has no device for must fail cleanly rather than
+     * silently landing on device 0: Level Zero has no unified virtual
+     * addressing to paper over a wrong-device pointer (spec 6a). */
+    CHECK(ds4_gpu_tensor_alloc_ptr_on(ds4_sycl_device_count(), 4096) == NULL,
+          "tensor_alloc_ptr_on accepted an out-of-range tier");
+    CHECK(ds4_gpu_tensor_alloc_ptr_on(-1, 4096) == NULL,
+          "tensor_alloc_ptr_on accepted a negative tier");
+
     /* A view whose offset and length individually fit but whose sum wraps
      * past UINT64_MAX must be rejected, not silently accepted. */
     ds4_gpu_tensor *bad = ds4_gpu_tensor_view(t, 0xFFFFFFFFFFFFFF00ULL, 0x200ULL);

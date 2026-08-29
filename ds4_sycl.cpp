@@ -314,6 +314,62 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     }
 }
 
+/* Tier-aware heap allocators.  ds4.c calls these unconditionally for tier 0
+ * on every session, single-GPU included (e.g. ds4.c:17073), and the ABI
+ * contract in ds4_gpu_mgpu.h:111-118 says tier 0 is equivalent to the
+ * legacy one-argument allocator.  The Apple fallback at ds4.c:179-192
+ * spells out the failure when that contract is not honoured: every
+ * multi-tier-aware allocation returns NULL, the validation chain fails,
+ * and session_create silently reports failure.  These were stubbed to
+ * nullptr until now, which meant the SYCL backend could not create a
+ * session at all; no test caught it because every test calls ABI entries
+ * directly rather than going through the engine's graph-creation path.
+ *
+ * Tiers above 0 are rejected rather than silently redirected: multi-device
+ * allocation is future work, and a wrong-device tensor is far worse
+ * than a clean failure under Level Zero, which has no unified virtual
+ * addressing to paper over it (spec 6a). */
+static int sycl_tier_is_valid(int tier, const char *what) {
+    if (tier >= 0 && (size_t)tier < g_devices.size()) return 1;
+    fprintf(stderr, DS4_GPU_LOG_PREFIX "%s: bad tier %d (%zu device(s))\n",
+            what, tier, g_devices.size());
+    return 0;
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(int tier, uint64_t bytes) {
+    if (g_devices.empty() || !sycl_tier_is_valid(tier, "tensor_alloc_ptr_on")) {
+        return nullptr;
+    }
+    if (tier == g_current_tier) return ds4_gpu_tensor_alloc(bytes);
+    if (bytes == 0) bytes = 1;
+    try {
+        sycl::queue &q = ds4_sycl_queue(tier);
+        void *ptr = sycl::malloc_device(bytes, q);
+        if (ptr == nullptr) return nullptr;
+        return new ds4_gpu_tensor{ptr, bytes, 1, tier};
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_alloc_ptr_on failed: %s\n", e.what());
+        return nullptr;
+    }
+}
+
+extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t bytes) {
+    if (g_devices.empty() || !sycl_tier_is_valid(tier, "tensor_alloc_managed_on")) {
+        return nullptr;
+    }
+    if (tier == g_current_tier) return ds4_gpu_tensor_alloc_managed(bytes);
+    if (bytes == 0) bytes = 1;
+    try {
+        sycl::queue &q = ds4_sycl_queue(tier);
+        void *ptr = sycl::malloc_shared(bytes, q);
+        if (ptr == nullptr) return nullptr;
+        return new ds4_gpu_tensor{ptr, bytes, 1, tier};
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_alloc_managed_on failed: %s\n", e.what());
+        return nullptr;
+    }
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
                                                uint64_t offset,
                                                uint64_t bytes) {

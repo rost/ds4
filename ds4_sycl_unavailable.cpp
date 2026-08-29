@@ -50,8 +50,6 @@ struct ds4_gpu_tensor;
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
 /* Return types other than int or void. */
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(...) { return nullptr; }
-extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(...) { return nullptr; }
 extern "C" uint64_t ds4_gpu_tier_free_vram(...) { return 0; }
 
 /* void returns. */
