@@ -57804,6 +57804,220 @@ int ds4_test_graph_encode_smoke(void) {
     g_ds4_shape = saved_shape;
     return ok ? 1 : 0;
 }
+
+#include "tests/test_sycl_layer_weights.h"
+
+/* Copies the five ds4_tensor fields metal_graph_encode_decode_layer_phase
+ * reads (abs_offset, bytes, elements, type, ndim, dim[0..2]) out of a
+ * ds4_tw_tensor built by tests/test_sycl_layer_weights.h. */
+static void ds4_test_tw_to_tensor(ds4_tensor *dst, const ds4_tw_tensor *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->abs_offset = src->abs_offset;
+    dst->bytes      = src->bytes;
+    dst->elements   = src->elements;
+    dst->type       = src->type;
+    dst->ndim       = src->ndim;
+    dst->dim[0]     = src->dim[0];
+    dst->dim[1]     = src->dim[1];
+    dst->dim[2]     = src->dim[2];
+}
+
+/* One level deeper still than ds4_test_graph_encode_smoke: that hook proves
+ * the engine can encode ONE kernel between begin_commands/end_commands/
+ * synchronize; this one drives metal_graph_encode_decode_layer (ds4.c:
+ * 25120), the thin wrapper around metal_graph_encode_decode_layer_phase
+ * with METAL_DECODE_LAYER_FULL that every real per-token decode step calls
+ * for every layer (metal_graph_encode_token_raw_swa's per-layer loop), on a
+ * full synthetic DeepSeek V4 Flash decoder layer built by
+ * tests/test_sycl_layer_weights.h: attention (LoRA Q, dense KV, grouped
+ * output), hyper-connection pre/post on both attention and FFN, the
+ * top-k router, routed MoE (IQ2_XXS gate/up, Q2_K down), and the Q8_0
+ * shared expert. Nothing on this backend has ever executed a full decoder
+ * layer through this path before this hook.
+ *
+ * Reads back metal_graph_after_ffn_hc(g) (ds4.c:15374): the buffer the
+ * real per-token decode loop treats as this layer's output hidden state
+ * before swapping it into cur_hc for the next layer, and exactly what
+ * ds4.c's own "hc_ffn_post" debug dump names at the same call site this
+ * hook drives.
+ *
+ * Returns 1 on success with *out_hc filled (hc_dim = DS4_N_HC * DS4_N_EMBD
+ * floats for this shape), 0 on any failure: a mismatched out_hc_floats,
+ * synthetic-weight allocation failure, graph allocation failure, the
+ * encode itself failing, or the final readback failing. A mismatched
+ * out_hc_floats returns 0 without writing out_hc, so a caller cannot
+ * mistake a size mismatch for a zeroed-but-successful read. */
+int ds4_test_graph_full_layer_encode(int token, float *out_hc, uint64_t out_hc_floats) {
+    const ds4_shape saved_shape = g_ds4_shape;
+
+    g_ds4_shape = (ds4_shape){
+        .name = "test-flash-layer",
+        .family = DS4_MODEL_FAMILY_DEEPSEEK4,
+        .variant = DS4_VARIANT_FLASH,
+        .n_layer = DS4_TW_N_LAYER,
+        .n_embd = DS4_TW_N_EMBD,
+        .n_vocab = DS4_TW_N_VOCAB,
+        .n_head = DS4_TW_N_HEAD,
+        .n_head_kv = DS4_TW_N_HEAD_KV,
+        .n_head_dim = DS4_TW_N_HEAD_DIM,
+        .n_value_dim = DS4_TW_N_VALUE_DIM,
+        .n_rot = DS4_TW_N_ROT,
+        .n_out_group = DS4_TW_N_OUT_GROUP,
+        .n_lora_q = DS4_TW_N_LORA_Q,
+        .n_lora_o = DS4_TW_N_LORA_O,
+        .n_expert = DS4_TW_N_EXPERT,
+        .n_expert_used = DS4_TW_N_EXPERT_USED,
+        .n_expert_shared = DS4_TW_N_EXPERT_SHARED,
+        .n_ff_exp = DS4_TW_N_FF_EXP,
+        .n_ff_dense = 32,
+        .n_hash_layer = 0,
+        .n_swa = DS4_TW_N_SWA,
+        .n_indexer_head = 2,
+        .n_indexer_head_dim = 8,
+        .n_indexer_top_k = 4,
+        .n_hc = DS4_TW_N_HC,
+        .n_hc_sinkhorn_iter = DS4_TW_N_HC_SINKHORN_ITER,
+        .rms_eps = DS4_DEFAULT_RMS_EPS,
+        .hc_eps = DS4_DEFAULT_HC_EPS,
+        .expert_weight_scale = 1.0f,
+        .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+        .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+        .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+        .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+        .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+        .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+        .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+    };
+    /* Compress ratio 0: the attention compressor and indexer are out of
+     * scope for this layer (see tests/test_sycl_layer_weights.h's header
+     * comment), matching the synthetic weights this hook builds below. */
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint64_t hc_dim = (uint64_t)DS4_TW_N_HC * DS4_TW_N_EMBD;
+    if (out_hc_floats != hc_dim) {
+        g_ds4_shape = saved_shape;
+        return 0;
+    }
+
+    ds4_tw_flash_weights tw;
+    if (!ds4_test_build_flash_layer_weights(&tw)) {
+        g_ds4_shape = saved_shape;
+        return 0;
+    }
+
+    ds4_model model;
+    memset(&model, 0, sizeof(model));
+    model.map  = tw.buf;
+    model.size = tw.buf_size;
+
+    ds4_tensor token_embd_t;
+    ds4_test_tw_to_tensor(&token_embd_t, &tw.token_embd);
+
+    ds4_tensor t_hc_attn_fn, t_hc_attn_scale, t_hc_attn_base, t_attn_norm,
+               t_attn_q_a, t_attn_q_a_norm, t_attn_q_b, t_attn_kv,
+               t_attn_kv_a_norm, t_attn_sinks, t_attn_output_a,
+               t_attn_output_b, t_hc_ffn_fn, t_hc_ffn_scale, t_hc_ffn_base,
+               t_ffn_norm, t_ffn_gate_inp, t_ffn_gate_exps, t_ffn_up_exps,
+               t_ffn_down_exps, t_ffn_gate_shexp, t_ffn_up_shexp,
+               t_ffn_down_shexp;
+    ds4_test_tw_to_tensor(&t_hc_attn_fn, &tw.layer.hc_attn_fn);
+    ds4_test_tw_to_tensor(&t_hc_attn_scale, &tw.layer.hc_attn_scale);
+    ds4_test_tw_to_tensor(&t_hc_attn_base, &tw.layer.hc_attn_base);
+    ds4_test_tw_to_tensor(&t_attn_norm, &tw.layer.attn_norm);
+    ds4_test_tw_to_tensor(&t_attn_q_a, &tw.layer.attn_q_a);
+    ds4_test_tw_to_tensor(&t_attn_q_a_norm, &tw.layer.attn_q_a_norm);
+    ds4_test_tw_to_tensor(&t_attn_q_b, &tw.layer.attn_q_b);
+    ds4_test_tw_to_tensor(&t_attn_kv, &tw.layer.attn_kv);
+    ds4_test_tw_to_tensor(&t_attn_kv_a_norm, &tw.layer.attn_kv_a_norm);
+    ds4_test_tw_to_tensor(&t_attn_sinks, &tw.layer.attn_sinks);
+    ds4_test_tw_to_tensor(&t_attn_output_a, &tw.layer.attn_output_a);
+    ds4_test_tw_to_tensor(&t_attn_output_b, &tw.layer.attn_output_b);
+    ds4_test_tw_to_tensor(&t_hc_ffn_fn, &tw.layer.hc_ffn_fn);
+    ds4_test_tw_to_tensor(&t_hc_ffn_scale, &tw.layer.hc_ffn_scale);
+    ds4_test_tw_to_tensor(&t_hc_ffn_base, &tw.layer.hc_ffn_base);
+    ds4_test_tw_to_tensor(&t_ffn_norm, &tw.layer.ffn_norm);
+    ds4_test_tw_to_tensor(&t_ffn_gate_inp, &tw.layer.ffn_gate_inp);
+    ds4_test_tw_to_tensor(&t_ffn_gate_exps, &tw.layer.ffn_gate_exps);
+    ds4_test_tw_to_tensor(&t_ffn_up_exps, &tw.layer.ffn_up_exps);
+    ds4_test_tw_to_tensor(&t_ffn_down_exps, &tw.layer.ffn_down_exps);
+    ds4_test_tw_to_tensor(&t_ffn_gate_shexp, &tw.layer.ffn_gate_shexp);
+    ds4_test_tw_to_tensor(&t_ffn_up_shexp, &tw.layer.ffn_up_shexp);
+    ds4_test_tw_to_tensor(&t_ffn_down_shexp, &tw.layer.ffn_down_shexp);
+
+    ds4_weights weights;
+    memset(&weights, 0, sizeof(weights));
+    weights.token_embd = &token_embd_t;
+
+    ds4_layer_weights *l = &weights.layer[0];
+    l->hc_attn_fn      = &t_hc_attn_fn;
+    l->hc_attn_scale   = &t_hc_attn_scale;
+    l->hc_attn_base    = &t_hc_attn_base;
+    l->attn_norm       = &t_attn_norm;
+    l->attn_q_a        = &t_attn_q_a;
+    l->attn_q_a_norm   = &t_attn_q_a_norm;
+    l->attn_q_b        = &t_attn_q_b;
+    l->attn_kv         = &t_attn_kv;
+    l->attn_kv_a_norm  = &t_attn_kv_a_norm;
+    l->attn_sinks      = &t_attn_sinks;
+    l->attn_output_a   = &t_attn_output_a;
+    l->attn_output_b   = &t_attn_output_b;
+    l->hc_ffn_fn       = &t_hc_ffn_fn;
+    l->hc_ffn_scale    = &t_hc_ffn_scale;
+    l->hc_ffn_base     = &t_hc_ffn_base;
+    l->ffn_norm        = &t_ffn_norm;
+    l->ffn_gate_inp    = &t_ffn_gate_inp;
+    l->ffn_gate_exps   = &t_ffn_gate_exps;
+    l->ffn_up_exps     = &t_ffn_up_exps;
+    l->ffn_down_exps   = &t_ffn_down_exps;
+    l->ffn_gate_shexp  = &t_ffn_gate_shexp;
+    l->ffn_up_shexp    = &t_ffn_up_shexp;
+    l->ffn_down_shexp  = &t_ffn_down_shexp;
+
+    ds4_gpu_graph g;
+    memset(&g, 0, sizeof(g));
+    bool ok = metal_graph_alloc_raw_cap(&g, &weights, l,
+                                        /*raw_cap=*/8, /*ctx_size=*/8,
+                                        /*prefill_cap=*/2,
+                                        /*enable_mtp=*/false,
+                                        /*placement=*/NULL,
+                                        /*cuda_tensor_parallel=*/false,
+                                        /*shared_prefill_workspace=*/NULL);
+
+    /* The exact begin/embed/encode-layer/end/synchronize shape
+     * metal_graph_encode_token_raw_swa uses for every real decode token
+     * (ds4.c:27552-27568), with a single METAL_DECODE_LAYER_FULL layer
+     * standing in for its per-layer loop. */
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = ds4_gpu_embed_token_hc_tensor(
+                     metal_graph_cur_hc(&g),
+                     model.map,
+                     model.size,
+                     token_embd_t.abs_offset,
+                     (uint32_t)token_embd_t.dim[1],
+                     (uint32_t)token,
+                     DS4_N_EMBD,
+                     DS4_N_HC) != 0;
+    }
+    if (ok) {
+        ok = metal_graph_encode_decode_layer(&g, &model, l,
+                                             /*il=*/0, /*pos=*/0,
+                                             g.layer_raw_cache[0], g.raw_cap,
+                                             /*raw_row=*/0, /*n_raw=*/1,
+                                             token);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+    if (ok) {
+        ok = ds4_gpu_tensor_read(metal_graph_after_ffn_hc(&g), 0, out_hc,
+                                 hc_dim * sizeof(float)) != 0;
+    }
+
+    metal_graph_free(&g);
+    ds4_test_free_flash_layer_weights(&tw);
+    g_ds4_shape = saved_shape;
+    return ok ? 1 : 0;
+}
 #endif /* DS4_TEST_HOOKS */
 
 static int engine_install_dspark_support_cache(ds4_engine *e);

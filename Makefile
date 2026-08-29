@@ -79,7 +79,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-gemm-batch-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl test-sycl-streaming test-sycl-matmul test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-kernels test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output test-sycl-readback test-sycl-subgroup-guard
+.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-gemm-batch-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl test-sycl-streaming test-sycl-matmul test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-kernels test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output test-sycl-readback test-sycl-subgroup-guard test-sycl-full-layer
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -476,7 +476,7 @@ tests/test_sycl_matmul: tests/test_sycl_matmul.o ds4_sycl.o ds4_sycl_unavailable
 test-sycl-matmul: tests/test_sycl_matmul
 	./tests/test_sycl_matmul
 
-test-sycl: test-sycl-smoke test-sycl-gemm-batch-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl-matmul test-sycl-streaming test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output test-sycl-engine-streaming-mgpu test-sycl-readback test-sycl-subgroup-guard
+test-sycl: test-sycl-smoke test-sycl-gemm-batch-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl-matmul test-sycl-streaming test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output test-sycl-engine-streaming-mgpu test-sycl-readback test-sycl-subgroup-guard test-sycl-full-layer
 tests/test_sycl_shared_expert.o: tests/test_sycl_shared_expert.c ds4_gpu.h ds4_gpu_mgpu.h tests/test_sycl_harness.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
 
@@ -545,7 +545,10 @@ test-sycl-mgpu: tests/test_sycl_mgpu
 # through ds4_test_graph_alloc_smoke for test_sycl_session_smoke, mirroring
 # ds4_cuda_test_hooks.o / ds4_cpu_test_hooks.o's existing pattern for the
 # other backends. No DS4_NO_GPU: the SYCL-backed GPU paths must compile.
-ds4_sycl_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
+# tests/test_sycl_layer_weights.h is a dependency here too: ds4.c includes
+# it directly under DS4_TEST_HOOKS to build ds4_test_graph_full_layer_encode's
+# synthetic weights.
+ds4_sycl_test_hooks.o: ds4.c ds4.h ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h tests/test_sycl_layer_weights.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -Wno-unused-function -DDS4_SYCL_BUILD -DDS4_TEST_HOOKS -I. -c -o $@ ds4.c
 
 tests/test_sycl_session_smoke.o: tests/test_sycl_session_smoke.c ds4_gpu.h ds4_gpu_mgpu.h
@@ -556,6 +559,15 @@ tests/test_sycl_session_smoke: tests/test_sycl_session_smoke.o ds4_sycl_test_hoo
 
 test-sycl-session-smoke: tests/test_sycl_session_smoke
 	./tests/test_sycl_session_smoke
+
+tests/test_sycl_full_layer.o: tests/test_sycl_full_layer.c ds4_gpu.h ds4_gpu_mgpu.h tests/test_sycl_layer_weights.h
+	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
+
+tests/test_sycl_full_layer: tests/test_sycl_full_layer.o ds4_sycl_test_hooks.o ds4_sycl.o ds4_sycl_unavailable.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o
+	$(ICPX) $(SYCL_CFLAGS) -o $@ $^ $(SYCL_LDLIBS) -lm
+
+test-sycl-full-layer: tests/test_sycl_full_layer
+	./tests/test_sycl_full_layer
 
 tests/test_sycl_engine_streaming_mgpu.o: tests/test_sycl_engine_streaming_mgpu.c ds4_gpu.h ds4_gpu_mgpu.h ds4_layer_pack.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
