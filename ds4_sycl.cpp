@@ -488,6 +488,32 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     return 1;
 }
 
+/* Reached unconditionally at engine open on the CUDA branch, which SYCL
+ * takes, unless DS4_CUDA_DIRECT_MODEL is set (ds4.c:2978, checked at the
+ * same line; failure aborts ds4_engine_open at :58746-58756). The caller's
+ * own error text calls this cache "optional" ("failed to prepare optional
+ * model cache", ds4.c:58749), which matches ROCm's own treatment: its
+ * implementation (rocm/ds4_rocm_runtime.cuh:6307) forms a device pointer
+ * for the range and then reports whether that range ended up cached.
+ *
+ * This backend keeps no device-resident model copy: every kernel stages
+ * the weight range it needs per call (spec 6l), so there is no cache to
+ * build or query here. Forming ROCm's pointer would mean allocating and
+ * copying the whole range for no reader, purely to answer a caching
+ * question truthfully as "no" -- which would then abort startup, exactly
+ * the "optional" trap the caller's own comment warns about. The honest
+ * implementation is therefore range validation only, reporting success for
+ * any in-bounds range, the same shape already used by
+ * ds4_gpu_set_model_map_range and ds4_gpu_cache_q8_f16_range above. */
+extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size,
+                                         uint64_t offset, uint64_t bytes,
+                                         const char *label) {
+    (void)label;
+    if (model_map == nullptr || bytes == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    return 1;
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
                                                uint64_t offset,
                                                uint64_t bytes) {

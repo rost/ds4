@@ -130,6 +130,28 @@ int main(void) {
                                      sizeof(fake_model), 1, 32, 32, "test") == 0,
           "cache_q8_f16_range accepted a range past the end");
 
+    /* ds4_gpu_cache_model_range (ds4.c:2978) is reached unconditionally at
+     * engine open on the CUDA branch, which SYCL takes, unless
+     * DS4_CUDA_DIRECT_MODEL is set. The caller's own error text calls this
+     * cache "optional" (ds4.c:58749, "failed to prepare optional model
+     * cache"), but a stub returning failure still aborts ds4_engine_open at
+     * :58746-58756. This backend keeps no device-resident model copy, so
+     * "not cached" is a legitimate answer and must be reported as success,
+     * the same shape as cache_q8_f16_range above. */
+    CHECK(ds4_gpu_cache_model_range(fake_model, sizeof(fake_model), 0,
+                                    sizeof(fake_model), "test") != 0,
+          "cache_model_range rejected a valid whole-file range");
+    CHECK(ds4_gpu_cache_model_range(NULL, sizeof(fake_model), 0, 0,
+                                    "test") != 0,
+          "cache_model_range rejected a null map with zero bytes");
+    CHECK(ds4_gpu_cache_model_range(fake_model, sizeof(fake_model),
+                                    sizeof(fake_model), 1, "test") == 0,
+          "cache_model_range accepted a range past the end");
+    CHECK(ds4_gpu_cache_model_range(fake_model, sizeof(fake_model),
+                                    0xFFFFFFFFFFFFFF00ULL, 0x200ULL,
+                                    "test") == 0,
+          "cache_model_range accepted an offset+size that overflows");
+
     ds4_gpu_cleanup();
     return 0;
 }

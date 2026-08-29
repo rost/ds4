@@ -82,7 +82,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_prefill_raw_heads_range_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_build_derived_artifacts)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_cache_model_range)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_commit_and_wait_selected_readback)
 /* Entry-specific convention, not the usual nonzero-means-success family
  * (see ds4_gpu.h). -1 matches both ROCm's own stub (ds4_rocm_compat.cu)
