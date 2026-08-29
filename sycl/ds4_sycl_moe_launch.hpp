@@ -23,8 +23,21 @@
 #include "ds4_sycl_moe.hpp"
 
 #include <cstdlib>
+#include <vector>
 
 namespace {
+
+/* Set at the end of every successful sycl_routed_moe_launch call to the
+ * number of experts, and the total gate+up+down bytes, actually copied
+ * host-to-device for that call -- whichever of the compacted or
+ * full-table path ran. Test-only instrumentation, read back through
+ * ds4_sycl_moe_test_last_staged_expert_count / _bytes below. The
+ * whole point of staging n_expert_used experts instead of n_total_expert
+ * is invisible in decode's numeric output -- the same weights end up at
+ * the same addresses either way -- so per spec 6w, only a counter, not
+ * an oracle comparison, can prove compaction actually happened. */
+static uint32_t g_sycl_moe_last_staged_expert_count = 0;
+static uint64_t g_sycl_moe_last_staged_bytes = 0;
 
 /* ---- routed_moe_build_plan, moe_launch.cuh:451-509 ------------------
  *
@@ -361,6 +374,150 @@ static bool sycl_moe_stage_weights(sycl::queue &q, const char *gate_w, const cha
     return true;
 }
 
+/* ---- Selected-expert compaction -----------------------------
+ *
+ * Every MoE kernel addresses a weight row as `base + expert *
+ * expert_bytes + row * row_bytes`, with `expert` read straight out of the
+ * `selected` array (verified against every gate/up/down kernel in
+ * ds4_sycl_moe.hpp: the decode kernels at ds4_sycl_moe_launch.hpp's own
+ * call sites and the tiled kernels via tile_experts, which
+ * sycl_moe_build_sorted_pairs derives from the same `selected` array).
+ * That arithmetic does not care whether `expert` is a global expert id or
+ * a position in a smaller packed table, so staging only the experts a
+ * call actually selected -- packed contiguously -- and rewriting
+ * `selected` to hold each pair's position in that packed table instead of
+ * its global id needs no kernel change. The `weights` array (combine-time
+ * per-slot scale) is indexed by (token, slot), never by expert id, so it
+ * is untouched either way.
+ *
+ * sycl_moe_build_expert_compaction below computes that packed table and
+ * the rewritten ids; sycl_moe_stage_selected_experts stages the packed
+ * table plus the rewritten ids to device memory. sycl_routed_moe_launch
+ * decides, per call, whether the packed table is small enough for this to
+ * be worth doing at all (see its fallback-threshold comment) and falls
+ * back to sycl_moe_stage_weights, addressed with the untouched global
+ * `selected`, otherwise. */
+
+/* Reads `selected` back to host and builds two things: the unique set of
+ * global expert ids this call actually needs, in first-appearance order
+ * (deterministic: `selected` is read in a fixed pair order regardless of
+ * how it was produced upstream), and, for every (token, slot) pair, that
+ * expert's position within the unique set -- the id every kernel will use
+ * once the caller stages only the unique set instead of the full table.
+ *
+ * Returns false if any id in `selected` is at or beyond n_total_expert.
+ * routed_moe_build_plan's own checks do not bound individual `selected`
+ * values (only its overall tensor shape), so this cannot assume the
+ * upstream router always produced one; per the "or when anything
+ * about the shape is unexpected, fall back to today's behaviour"
+ * guidance, an out-of-range id is treated as unexpected shape, and the
+ * caller falls back to the untouched full-table path rather than trusting
+ * a compacted table built from it.
+ *
+ * DS4_ROUTED_MOE_DEBUG_IDENTITY_REMAP, set to any non-empty value: for
+ * the compaction ablation only. Skips the slot remap and instead maps every
+ * pair to (global id) mod (unique count) -- compaction still happens, but
+ * ids are no longer the correct position in the packed table. This
+ * reproduces, deliberately, the exact defect the sorted-pairs trap warns
+ * against (a compacted buffer addressed with un-remapped ids) while
+ * staying inside the compacted buffer's bounds, so it corrupts output
+ * instead of reading past allocated device memory. */
+static bool sycl_moe_build_expert_compaction(sycl::queue &q, const int32_t *sel_dev,
+                                             uint32_t pair_count, uint32_t n_total_expert,
+                                             std::vector<int32_t> *unique_ids,
+                                             std::vector<int32_t> *remap) {
+    std::vector<int32_t> sel_host((size_t)pair_count);
+    q.memcpy(sel_host.data(), sel_dev, (size_t)pair_count * sizeof(int32_t)).wait_and_throw();
+
+    std::vector<int32_t> id_to_slot((size_t)n_total_expert, -1);
+    unique_ids->clear();
+    remap->assign((size_t)pair_count, 0);
+    for (uint32_t i = 0; i < pair_count; i++) {
+        int32_t e = sel_host[i];
+        if (e < 0) e = 0;
+        if ((uint32_t)e >= n_total_expert) return false;
+        if (id_to_slot[(size_t)e] < 0) {
+            id_to_slot[(size_t)e] = (int32_t)unique_ids->size();
+            unique_ids->push_back(e);
+        }
+        (*remap)[i] = id_to_slot[(size_t)e];
+    }
+
+    const char *identity_debug = getenv("DS4_ROUTED_MOE_DEBUG_IDENTITY_REMAP");
+    if (identity_debug && identity_debug[0]) {
+        const uint32_t unique_count = (uint32_t)unique_ids->size();
+        for (uint32_t i = 0; i < pair_count; i++) {
+            int32_t e = sel_host[i];
+            if (e < 0) e = 0;
+            (*remap)[i] = (int32_t)((uint32_t)e % unique_count);
+        }
+    }
+    return true;
+}
+
+/* Gathers the host mmap rows for exactly the experts named in
+ * `unique_ids` (packed contiguously, in that order) into three fresh
+ * device buffers, plus the pair-indexed `remap` array into a fourth.
+ *
+ * The per-expert rows are gathered into contiguous host staging buffers
+ * first (one std::memcpy per expert per matrix, at host RAM bandwidth,
+ * not PCIe), then each matrix crosses to the device in a single
+ * sycl_stage_host_bytes call. This keeps the number of enqueued SYCL
+ * copy commands fixed at four regardless of unique_count, rather than
+ * issuing 3*unique_count separate device-copy commands -- each with its
+ * own queue-submission overhead -- the way copying straight from the
+ * scattered mmap rows one-per-expert would. See sycl_routed_moe_launch's
+ * fallback-threshold comment for the arithmetic this trades against.
+ *
+ * Callers own the four returned pointers via their own
+ * sycl_device_scratch_guard, matching sycl_moe_stage_weights's
+ * ownership contract exactly: on failure, every allocation this call
+ * made is already freed (the local guards below own them until success
+ * is confirmed) and every out pointer is left null. */
+static bool sycl_moe_stage_selected_experts(
+        sycl::queue &q, const char *gate_w, const char *up_w, const char *down_w,
+        const int32_t *unique_ids, uint32_t unique_count, uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes, const int32_t *remap_host, uint32_t pair_count,
+        void **gate_dev, void **up_dev, void **down_dev, void **sel_dev) {
+    *gate_dev = *up_dev = *down_dev = *sel_dev = nullptr;
+    uint64_t gate_bytes = 0, down_bytes = 0, sel_bytes = 0;
+    if (!sycl_u64_mul_checked(unique_count, gate_expert_bytes, &gate_bytes) ||
+        !sycl_u64_mul_checked(unique_count, down_expert_bytes, &down_bytes) ||
+        !sycl_u64_mul_checked(pair_count, (uint32_t)sizeof(int32_t), &sel_bytes)) {
+        return false;
+    }
+
+    std::vector<char> gate_stage((size_t)gate_bytes);
+    std::vector<char> up_stage((size_t)gate_bytes);
+    std::vector<char> down_stage((size_t)down_bytes);
+    for (uint32_t i = 0; i < unique_count; i++) {
+        const uint64_t expert = (uint64_t)(uint32_t)unique_ids[i];
+        memcpy(gate_stage.data() + (uint64_t)i * gate_expert_bytes,
+               gate_w + expert * gate_expert_bytes, (size_t)gate_expert_bytes);
+        memcpy(up_stage.data() + (uint64_t)i * gate_expert_bytes,
+               up_w + expert * gate_expert_bytes, (size_t)gate_expert_bytes);
+        memcpy(down_stage.data() + (uint64_t)i * down_expert_bytes,
+               down_w + expert * down_expert_bytes, (size_t)down_expert_bytes);
+    }
+
+    sycl_device_scratch_guard gate_guard = sycl_stage_host_bytes(q, gate_stage.data(), gate_bytes);
+    sycl_device_scratch_guard up_guard = sycl_stage_host_bytes(q, up_stage.data(), gate_bytes);
+    sycl_device_scratch_guard down_guard = sycl_stage_host_bytes(q, down_stage.data(), down_bytes);
+    sycl_device_scratch_guard sel_guard = sycl_stage_host_bytes(q, remap_host, sel_bytes);
+    if (!gate_guard.p || !up_guard.p || !down_guard.p || !sel_guard.p) {
+        return false;
+    }
+    /* Ownership transfers to the caller's own guards from here: null the
+     * locals so their destructors, run when this function returns, do
+     * not free what the caller now owns. */
+    *gate_dev = gate_guard.p;
+    *up_dev = up_guard.p;
+    *down_dev = down_guard.p;
+    *sel_dev = sel_guard.p;
+    gate_guard.p = up_guard.p = down_guard.p = sel_guard.p = nullptr;
+    return true;
+}
+
 /* ---- MXFP4 format block -------------------------------------------
  *
  * Dispatch threshold mirrors moe_launch.cuh:750-777 restricted to the
@@ -584,36 +741,90 @@ static int sycl_routed_moe_launch(
          * streaming expert cache) is wired in here.  Applies to every format path
          * without exception: an unstaged range does not fault, it reads
          * zeros and reports success, so a path that skips this is wrong in
-         * a way no test on this hardware can see. */
-        void *gate_dev = nullptr, *up_dev = nullptr, *down_dev = nullptr;
-        if (!sycl_moe_stage_weights(q, gate_w, up_w, down_w, plan.gate_bytes, plan.down_bytes,
-                                    &gate_dev, &up_dev, &down_dev)) {
-            return 0;
+         * a way no test on this hardware can see.
+         *
+         * Which table gets staged is decided here: the full
+         * n_total_expert table, as above, or only the experts this call's
+         * `selected` names. Compaction's guaranteed reduction factor is
+         * n_total_expert / unique_count, so it is worth doing whenever
+         * unique_count is small; the question is where it stops being
+         * worth it. sycl_moe_stage_selected_experts gathers its packed
+         * table on the host before crossing to device (see its own
+         * comment), so, pessimistically, treat that host gather as
+         * costing as much again as the device copy itself -- even though
+         * host RAM bandwidth comfortably exceeds PCIe bandwidth, so this
+         * assumption is conservative in compaction's favour. Under that
+         * assumption compaction is a net win exactly while 2 * unique_count
+         * <= n_total_expert, i.e. unique_count <= n_total_expert / 2:
+         * below that point staging only the selected experts moves fewer
+         * effective bytes than staging the full table even with the
+         * gather taxed twice; at or above it, fall back to the plain
+         * full-table copy, whose cost does not depend on how the union
+         * came out. Decode's real union (n_expert_used, 6 of 256 for
+         * Flash) sits far below this threshold; a wide prefill batch's
+         * union approaches the full table and is
+         * exactly what this fallback is for. */
+        std::vector<int32_t> unique_ids, remap_ids;
+        const bool compaction_shape_ok = sycl_moe_build_expert_compaction(
+                q, (const int32_t *)selected->ptr, pair_count, n_total_expert,
+                &unique_ids, &remap_ids);
+        const uint32_t unique_count =
+                compaction_shape_ok ? (uint32_t)unique_ids.size() : n_total_expert;
+        const bool use_compaction =
+                compaction_shape_ok && unique_count > 0u && unique_count <= n_total_expert / 2u;
+
+        void *gate_dev = nullptr, *up_dev = nullptr, *down_dev = nullptr, *remap_dev = nullptr;
+        ds4_gpu_tensor remapped_selected{};
+        const ds4_gpu_tensor *effective_selected = selected;
+        uint32_t effective_n_total_expert = n_total_expert;
+
+        if (use_compaction) {
+            if (!sycl_moe_stage_selected_experts(
+                        q, gate_w, up_w, down_w, unique_ids.data(), unique_count,
+                        gate_expert_bytes, down_expert_bytes, remap_ids.data(), pair_count,
+                        &gate_dev, &up_dev, &down_dev, &remap_dev)) {
+                return 0;
+            }
+            remapped_selected = ds4_gpu_tensor{remap_dev, (uint64_t)pair_count * sizeof(int32_t),
+                                               /*owner=*/0, selected->device_id};
+            effective_selected = &remapped_selected;
+            effective_n_total_expert = unique_count;
+        } else {
+            if (!sycl_moe_stage_weights(q, gate_w, up_w, down_w, plan.gate_bytes, plan.down_bytes,
+                                        &gate_dev, &up_dev, &down_dev)) {
+                return 0;
+            }
         }
         sycl_device_scratch_guard gate_guard(q, gate_dev);
         sycl_device_scratch_guard up_guard(q, up_dev);
         sycl_device_scratch_guard down_guard(q, down_dev);
+        sycl_device_scratch_guard remap_guard(q, remap_dev);
+
+        g_sycl_moe_last_staged_expert_count = use_compaction ? unique_count : n_total_expert;
+        g_sycl_moe_last_staged_bytes =
+                2ull * (uint64_t)g_sycl_moe_last_staged_expert_count * gate_expert_bytes +
+                (uint64_t)g_sycl_moe_last_staged_expert_count * down_expert_bytes;
 
         if (plan.q4k_path) {
             return sycl_routed_moe_q4k_dispatch(
                     q, out, mid, down, xq, midq, (const char *)gate_dev,
                     (const char *)up_dev, (const char *)down_dev, weights,
-                    selected, gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+                    effective_selected, gate_expert_bytes, gate_row_bytes, down_expert_bytes,
                     down_row_bytes, xq_blocks, midq_blocks, expert_mid_dim, out_dim,
-                    n_total_expert, n_expert, n_tokens, pair_count, clamp);
+                    effective_n_total_expert, n_expert, n_tokens, pair_count, clamp);
         }
         if (plan.iq2_path || plan.iq2_iq2_path) {
             return sycl_routed_moe_iq2_dispatch(
                     q, out, mid, xq, midq, (const char *)gate_dev, (const char *)up_dev,
-                    (const char *)down_dev, weights, selected, gate_expert_bytes,
+                    (const char *)down_dev, weights, effective_selected, gate_expert_bytes,
                     gate_row_bytes, down_expert_bytes, down_row_bytes, xq_blocks,
-                    midq_blocks, expert_mid_dim, out_dim, n_total_expert, n_expert,
+                    midq_blocks, expert_mid_dim, out_dim, effective_n_total_expert, n_expert,
                     n_tokens, pair_count, clamp, plan.iq2_iq2_path);
         }
         if (plan.q2k_path) {
             return sycl_routed_moe_q2k_dispatch(
                     q, out, mid, xq, midq, (const char *)gate_dev, (const char *)up_dev,
-                    (const char *)down_dev, weights, selected, gate_expert_bytes,
+                    (const char *)down_dev, weights, effective_selected, gate_expert_bytes,
                     gate_row_bytes, down_expert_bytes, down_row_bytes, xq_blocks,
                     midq_blocks, expert_mid_dim, out_dim, n_expert, n_tokens, pair_count,
                     clamp);
@@ -621,10 +832,10 @@ static int sycl_routed_moe_launch(
         if (plan.mxfp4_path) {
             return sycl_routed_moe_mxfp4_dispatch(
                     q, out, mid, down, xq, midq, (const char *)gate_dev, (const char *)up_dev,
-                    (const char *)down_dev, weights, selected, gate_expert_bytes, gate_row_bytes,
-                    down_expert_bytes, down_row_bytes, xq_blocks, midq_blocks, expert_mid_dim,
-                    out_dim, n_total_expert, n_expert, n_tokens, pair_count, clamp,
-                    sycl_mxfp4_down_row_groups_from_env());
+                    (const char *)down_dev, weights, effective_selected, gate_expert_bytes,
+                    gate_row_bytes, down_expert_bytes, down_row_bytes, xq_blocks, midq_blocks,
+                    expert_mid_dim, out_dim, effective_n_total_expert, n_expert, n_tokens,
+                    pair_count, clamp, sycl_mxfp4_down_row_groups_from_env());
         }
         return 0; /* unreachable: build_plan already required exactly one path. */
     } catch (const sycl::exception &e) {
@@ -634,6 +845,20 @@ static int sycl_routed_moe_launch(
 }
 
 }  // namespace
+
+/* Test-only instrumentation: reports how many experts, and how
+ * many gate+up+down bytes, the most recently completed
+ * sycl_routed_moe_launch call actually staged host-to-device, whichever
+ * of the compacted or full-table path it took. See the comment on
+ * g_sycl_moe_last_staged_expert_count above for why a counter, not an
+ * oracle comparison, is what proves compaction happened. */
+extern "C" uint32_t ds4_sycl_moe_test_last_staged_expert_count(void) {
+    return g_sycl_moe_last_staged_expert_count;
+}
+
+extern "C" uint64_t ds4_sycl_moe_test_last_staged_bytes(void) {
+    return g_sycl_moe_last_staged_bytes;
+}
 
 /* ---- ABI entries ------------------------------------------------------
  *
