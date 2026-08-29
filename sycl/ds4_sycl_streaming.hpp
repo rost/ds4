@@ -714,11 +714,19 @@ static int sycl_stream_selected_load(
     for (uint32_t i = 0; i < n_selected; i++) {
         const uint64_t expert = (uint64_t)(uint32_t)selected_ids[i];
         uint64_t       gate_rel = 0, down_rel = 0;
+        /* The absolute offsets are formed through a checked add, not a bare
+         * sum, because the upload loops below recompute the same sums to
+         * build mmap pointers and rely on this loop having proved they do
+         * not wrap. */
+        uint64_t       gate_abs = 0, up_abs = 0, down_abs = 0;
         if (!sycl_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
             !sycl_u64_mul_checked(expert, down_expert_bytes, &down_rel) ||
-            !sycl_model_range_fits(model_size, gate_offset + gate_rel, gate_expert_bytes) ||
-            !sycl_model_range_fits(model_size, up_offset + gate_rel, gate_expert_bytes) ||
-            !sycl_model_range_fits(model_size, down_offset + down_rel, down_expert_bytes)) {
+            !sycl_u64_add_checked(gate_offset, gate_rel, &gate_abs) ||
+            !sycl_u64_add_checked(up_offset, gate_rel, &up_abs) ||
+            !sycl_u64_add_checked(down_offset, down_rel, &down_abs) ||
+            !sycl_model_range_fits(model_size, gate_abs, gate_expert_bytes) ||
+            !sycl_model_range_fits(model_size, up_abs, gate_expert_bytes) ||
+            !sycl_model_range_fits(model_size, down_abs, down_expert_bytes)) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "streaming selected expert offset outside model map\n");
             return 0;
@@ -883,11 +891,19 @@ static int sycl_stream_batch_selected_prepare(
     for (int32_t expert_i : unique_ids) {
         const uint64_t expert = (uint64_t)(uint32_t)expert_i;
         uint64_t       gate_rel = 0, down_rel = 0;
+        /* The absolute offsets are formed through a checked add, not a bare
+         * sum, because the upload loops below recompute the same sums to
+         * build mmap pointers and rely on this loop having proved they do
+         * not wrap. */
+        uint64_t       gate_abs = 0, up_abs = 0, down_abs = 0;
         if (!sycl_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
             !sycl_u64_mul_checked(expert, down_expert_bytes, &down_rel) ||
-            !sycl_model_range_fits(model_size, gate_offset + gate_rel, gate_expert_bytes) ||
-            !sycl_model_range_fits(model_size, up_offset + gate_rel, gate_expert_bytes) ||
-            !sycl_model_range_fits(model_size, down_offset + down_rel, down_expert_bytes)) {
+            !sycl_u64_add_checked(gate_offset, gate_rel, &gate_abs) ||
+            !sycl_u64_add_checked(up_offset, gate_rel, &up_abs) ||
+            !sycl_u64_add_checked(down_offset, down_rel, &down_abs) ||
+            !sycl_model_range_fits(model_size, gate_abs, gate_expert_bytes) ||
+            !sycl_model_range_fits(model_size, up_abs, gate_expert_bytes) ||
+            !sycl_model_range_fits(model_size, down_abs, down_expert_bytes)) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "streaming batch selected expert offset outside model map\n");
             return 0;
