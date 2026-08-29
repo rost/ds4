@@ -1004,10 +1004,20 @@ static inline float sycl_dev_dot_iq2_xxs_q8_k_block(const sycl_block_iq2_xxs *x,
  * above, batched across up to 8 activation blocks at once for the
  * expert-tile kernels.  Not a port of dead code, since nothing here is
  * reused verbatim from the unused CUDA kernel; only the arithmetic shape
- * is shared. */
+ * is shared.
+ *
+ * yb selects which Q8_K chunk of each token's activation to dot against,
+ * matching the weight block x, mirroring sycl_dev_dot_q4_k_q8_k_block8's
+ * yb parameter (fixed in 35852c0 for exactly this reason). Before this
+ * fix, every ys[p] read here ignored which chunk the caller's loop was
+ * on and always read chunk 0's block, so at any expert_in_dim wider than
+ * 256 (DS4 Flash's real model_dim=4096 gives 16 chunks) this kernel
+ * dotted every weight block after the first against the wrong activation
+ * data -- a live bug, caught by widening tests/test_sycl_moe.c's
+ * RM_EXPERT_IN_DIM past one Q8_K block (see the report). */
 static inline void sycl_dev_dot_iq2_xxs_q8_k_block8(
         const sycl_block_iq2_xxs *x, const sycl_block_q8_K *const ys[8],
-        uint32_t n, float acc[8]) {
+        uint32_t yb, uint32_t n, float acc[8]) {
     const float xd = sycl_moe_f16_to_f32(x->d);
     const uint16_t *q2 = x->qs;
     int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -1025,13 +1035,17 @@ static inline void sycl_dev_dot_iq2_xxs_q8_k_block8(
         const uint8_t s2i = (uint8_t)((aux1 >> 14) & 127u);
         const uint8_t s3i = (uint8_t)((aux1 >> 21) & 127u);
         for (uint32_t p = 0; p < n; p++) {
-            const int8_t *q8 = ys[p]->qs + ib32 * 32;
+            if (!ys[p]) continue;
+            const int8_t *q8 = (ys[p] + yb)->qs + ib32 * 32;
             int32_t sumi = sycl_iq2_pair_dot16(a0, s0i, a1, s1i, q8) +
                            sycl_iq2_pair_dot16(a2, s2i, a3, s3i, q8 + 16);
             bsum[p] += sumi * (int32_t)ls;
         }
     }
-    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
+    for (uint32_t p = 0; p < n; p++) {
+        if (!ys[p]) continue;
+        acc[p] += 0.125f * xd * (ys[p] + yb)->d * (float)bsum[p];
+    }
 }
 
 /* moe_gate_up_mid_qwarp32_kernel, moe.cuh:955-1006 (the untagged family;
@@ -1181,8 +1195,8 @@ static void sycl_moe_iq2_gate_up_mid_tile8(
                  float gate[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                  float up[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                  for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-                     sycl_dev_dot_iq2_xxs_q8_k_block8(gr + b, xqb, np, gate);
-                     sycl_dev_dot_iq2_xxs_q8_k_block8(ur + b, xqb, np, up);
+                     sycl_dev_dot_iq2_xxs_q8_k_block8(gr + b, xqb, b, np, gate);
+                     sycl_dev_dot_iq2_xxs_q8_k_block8(ur + b, xqb, b, np, up);
                  }
                  for (uint32_t p = 0; p < np; p++) {
                      gate[p] = sycl_moe_subgroup_sum<8>(sg, gate[p]);
@@ -1298,21 +1312,32 @@ static inline float sycl_dev_dot_q2_k_q8_k_block(const sycl_block_q2_K *x, const
 }
 
 /* dev_dot_q2_K_q8_K_block8, moe.cuh:688-730: the same dot product against
- * up to 8 activation blocks at once. */
+ * up to 8 activation blocks at once.  Unreachable by any format this
+ * plan implements or stubs (see the Q2_K "not ported, and why" note
+ * above sycl_block_q2_K's definition: every down path that could reach
+ * a block8-style tiled Q2_K kernel goes through sycl_moe_q2k_down_direct
+ * instead, which is untiled and indexes chunks with a plain `+ b`), so
+ * this has no live caller.  It carried the identical chunk-index defect
+ * sycl_dev_dot_iq2_xxs_q8_k_block8 had until this same change (see that
+ * function's comment): every ys[p] read here ignored which chunk the
+ * caller was on. Fixed with the same yb parameter for consistency and so
+ * it is not a landmine if a future tiled Q2_K kernel calls it. */
 static inline void sycl_dev_dot_q2_k_q8_k_block8(
         const sycl_block_q2_K *x, const sycl_block_q8_K *const ys[8],
-        uint32_t n, float acc[8]) {
+        uint32_t yb, uint32_t n, float acc[8]) {
     const uint8_t *sc = x->scales;
     const float xd = sycl_moe_f16_to_f32(x->d);
     const float xmin = sycl_moe_f16_to_f32(x->dmin);
     int32_t isum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     int32_t summs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     for (uint32_t p = 0; p < n; p++) {
-        for (int j = 0; j < 16; j++) summs[p] += (int32_t)ys[p]->bsums[j] * (int32_t)(sc[j] >> 4);
+        if (!ys[p]) continue;
+        for (int j = 0; j < 16; j++) summs[p] += (int32_t)(ys[p] + yb)->bsums[j] * (int32_t)(sc[j] >> 4);
     }
     for (uint32_t p = 0; p < n; p++) {
+        if (!ys[p]) continue;
         const uint8_t *q2 = x->qs;
-        const int8_t *q8 = ys[p]->qs;
+        const int8_t *q8 = (ys[p] + yb)->qs;
         int is = 0;
         for (int k = 0; k < (int)(kMoeQK / 128u); k++) {
             int shift = 0;
@@ -1328,7 +1353,8 @@ static inline void sycl_dev_dot_q2_k_q8_k_block8(
         }
     }
     for (uint32_t p = 0; p < n; p++) {
-        const float yd = ys[p]->d;
+        if (!ys[p]) continue;
+        const float yd = (ys[p] + yb)->d;
         acc[p] += yd * xd * (float)isum[p] - yd * xmin * (float)summs[p];
     }
 }
