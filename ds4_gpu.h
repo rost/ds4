@@ -193,6 +193,20 @@ void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes);
 uint64_t ds4_gpu_recommended_working_set_size(void);
 uint32_t ds4_gpu_stream_expert_cache_configured_count(void);
 uint32_t ds4_gpu_stream_expert_cache_current_count(void);
+/* Per-device forms of the five entries above, for engines that must size
+ * every device's streaming expert cache before running any of the
+ * hot-path entries below on any of them (multi-GPU streaming, spec
+ * section 5). The five forms above keep operating on whichever device
+ * ds4_gpu_set_current_device last selected, unchanged; these take an
+ * explicit tier instead, for setup code that runs before per-tier
+ * dispatch ever switches devices. A backend with no independent per-tier
+ * cache (Metal, plain CUDA, ROCm: all single-device for streaming) treats
+ * every tier past 0 as absent. */
+uint64_t ds4_gpu_recommended_working_set_size_on(int tier);
+void ds4_gpu_set_streaming_expert_cache_budget_on(int tier, uint32_t experts);
+void ds4_gpu_set_streaming_expert_cache_expert_bytes_on(int tier, uint64_t bytes);
+uint32_t ds4_gpu_stream_expert_cache_configured_count_on(int tier);
+uint32_t ds4_gpu_stream_expert_cache_current_count_on(int tier);
 typedef struct ds4_gpu_stream_expert_table {
     const void *model_map;
     uint64_t    model_size;

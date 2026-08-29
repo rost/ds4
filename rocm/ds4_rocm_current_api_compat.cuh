@@ -137,8 +137,20 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_stream_expert_cache_budget = experts;
 }
 
+/* Multi-GPU streaming (ds4_gpu.h's "_on(tier)" family) is SYCL-only:
+ * ROCm refuses any n_gpus != 1 (ds4_rocm_compat.cu), so tier 0 is the
+ * only tier that will ever be asked for and delegates to the real
+ * single-device entry above; anything else is out of range. */
+extern "C" void ds4_gpu_set_streaming_expert_cache_budget_on(int tier, uint32_t experts) {
+    if (tier == 0) ds4_gpu_set_streaming_expert_cache_budget(experts);
+}
+
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
     (void)bytes;
+}
+
+extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes_on(int tier, uint64_t bytes) {
+    if (tier == 0) ds4_gpu_set_streaming_expert_cache_expert_bytes(bytes);
 }
 
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
@@ -152,12 +164,24 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)total_b;
 }
 
+extern "C" uint64_t ds4_gpu_recommended_working_set_size_on(int tier) {
+    return tier == 0 ? ds4_gpu_recommended_working_set_size() : 0;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     return g_ssd_streaming_mode ? g_stream_expert_cache_budget : 0;
 }
 
+extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count_on(int tier) {
+    return tier == 0 ? ds4_gpu_stream_expert_cache_configured_count() : 0;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return (uint32_t)g_stream_resident_experts.size();
+}
+
+extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count_on(int tier) {
+    return tier == 0 ? ds4_gpu_stream_expert_cache_current_count() : 0;
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {

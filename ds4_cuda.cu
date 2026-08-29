@@ -30067,6 +30067,17 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)total_b * (uint64_t)n;
 }
 
+/* Multi-GPU streaming (ds4_gpu.h's "_on(tier)" family) is SYCL-only for
+ * now: this backend's own streaming expert cache below is already
+ * tier-oblivious (ds4_gpu_set_streaming_expert_cache_budget ignores its
+ * argument and ds4_gpu_stream_expert_cache_configured_count always
+ * returns 0), so the tier argument is accepted and ignored here too,
+ * matching those entries exactly rather than inventing new behaviour. */
+extern "C" uint64_t ds4_gpu_recommended_working_set_size_on(int tier) {
+    (void)tier;
+    return ds4_gpu_recommended_working_set_size();
+}
+
 extern "C" int ds4_gpu_routed_moe_set_selected_override(const int32_t *selected, uint32_t n_selected) {
     (void)selected;
     (void)n_selected;
@@ -30516,7 +30527,17 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     (void)experts;
 }
 
+extern "C" void ds4_gpu_set_streaming_expert_cache_budget_on(int tier, uint32_t experts) {
+    (void)tier;
+    (void)experts;
+}
+
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
+    (void)bytes;
+}
+
+extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes_on(int tier, uint64_t bytes) {
+    (void)tier;
     (void)bytes;
 }
 
@@ -30524,9 +30545,19 @@ extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
     return 0;
 }
 
+extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count_on(int tier) {
+    (void)tier;
+    return 0;
+}
+
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_selected_cache.valid ?
         g_stream_selected_cache.compact_count : 0;
+}
+
+extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count_on(int tier) {
+    (void)tier;
+    return ds4_gpu_stream_expert_cache_current_count();
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {

@@ -4242,6 +4242,23 @@ uint64_t ds4_gpu_recommended_working_set_size(void) {
     return (uint64_t)[g_device recommendedMaxWorkingSetSize];
 }
 
+/* Multi-GPU streaming (ds4_gpu.h's "_on(tier)" family) is SYCL-only:
+ * Metal has no multi-GPU placement at all (ds4_gpu_init_multi is absent
+ * for this backend), so tier 0 is the only tier that will ever be asked
+ * for and delegates to the real single-device entry; anything else is
+ * out of range. */
+uint64_t ds4_gpu_recommended_working_set_size_on(int tier) {
+    return tier == 0 ? ds4_gpu_recommended_working_set_size() : 0;
+}
+
+void ds4_gpu_set_streaming_expert_cache_budget_on(int tier, uint32_t experts) {
+    if (tier == 0) ds4_gpu_set_streaming_expert_cache_budget(experts);
+}
+
+void ds4_gpu_set_streaming_expert_cache_expert_bytes_on(int tier, uint64_t bytes) {
+    if (tier == 0) ds4_gpu_set_streaming_expert_cache_expert_bytes(bytes);
+}
+
 static int ds4_gpu_model_map_log_enabled(void) {
     if (!g_ssd_streaming_mode) return 1;
     const char *trace = getenv("DS4_METAL_STREAMING_MAP_TRACE");
@@ -11586,6 +11603,14 @@ uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
 
 uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
     return g_stream_expert_cache_entry_count;
+}
+
+uint32_t ds4_gpu_stream_expert_cache_configured_count_on(int tier) {
+    return tier == 0 ? ds4_gpu_stream_expert_cache_configured_count() : 0;
+}
+
+uint32_t ds4_gpu_stream_expert_cache_current_count_on(int tier) {
+    return tier == 0 ? ds4_gpu_stream_expert_cache_current_count() : 0;
 }
 
 uint32_t ds4_gpu_stream_expert_cache_budget_for_expert_size(

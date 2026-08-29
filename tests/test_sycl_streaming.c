@@ -974,6 +974,43 @@ static int test_teardown_frees_every_tier(void) {
     return 0;
 }
 
+/* ---- The five ds4_gpu.h "_on(tier)" entries: argument validation ------- */
+
+static int test_on_tier_argument_validation(void) {
+    ds4_gpu_cleanup();
+    CHECK(ds4_gpu_init() != 0, "init for _on(tier) validation");
+    /* Exactly one device is live here: tier 0 is valid, anything else is
+     * out of range. */
+    CHECK(ds4_gpu_recommended_working_set_size_on(0) != 0,
+          "recommended_working_set_size_on(0) must reflect the real device");
+    CHECK(ds4_gpu_recommended_working_set_size_on(-1) == 0,
+          "recommended_working_set_size_on(-1) must be 0 (negative tier)");
+    CHECK(ds4_gpu_recommended_working_set_size_on(1) == 0,
+          "recommended_working_set_size_on(1) must be 0 (only one device live)");
+
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_budget_on(0, 5);
+    CHECK(ds4_gpu_stream_expert_cache_configured_count_on(0) == 5,
+          "configured_count_on(0) must reflect the budget just set");
+    ds4_gpu_set_streaming_expert_cache_budget_on(1, 9);
+    CHECK(ds4_gpu_stream_expert_cache_configured_count_on(1) == 0,
+          "configured_count_on(1) must stay 0: the out-of-range set must not apply");
+    CHECK(ds4_gpu_stream_expert_cache_configured_count_on(-1) == 0,
+          "configured_count_on(-1) must be 0 (negative tier)");
+    CHECK(ds4_gpu_stream_expert_cache_current_count_on(0) == 0,
+          "current_count_on(0) must start at 0 before any seed");
+    CHECK(ds4_gpu_stream_expert_cache_current_count_on(1) == 0,
+          "current_count_on(1) must be 0: out of range");
+
+    /* No-op setter, but must not crash on an out-of-range tier either. */
+    ds4_gpu_set_streaming_expert_cache_expert_bytes_on(0, 123);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes_on(-1, 123);
+
+    ds4_gpu_cleanup();
+    fprintf(stderr, "  test_on_tier_argument_validation OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_seed_fewer_than_budget() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -997,6 +1034,7 @@ int main(void) {
     if (test_mode_off_prepare_selected_batch_fails() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_two_tiers_resident_cache_isolated() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_teardown_frees_every_tier() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_on_tier_argument_validation() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_streaming OK\n");
     return 0;

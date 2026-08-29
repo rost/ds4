@@ -41,7 +41,10 @@
  * ds4_gpu_stream_expert_cache_* / ds4_gpu_set_streaming_expert_cache_*
  * config entries) resolves its tier from g_current_tier at call time: no
  * ABI change, since the engine already calls
- * ds4_gpu_set_current_device(tier) before per-tier work runs. */
+ * ds4_gpu_set_current_device(tier) before per-tier work runs. The five
+ * ds4_gpu.h "_on(tier)" entries take an explicit tier instead, for engine
+ * setup code (ds4.c's per-tier auto-cache configure loop) that must size
+ * every device's cache before ever switching into one of them. */
 
 #include "ds4_sycl_common.hpp"
 
@@ -1014,18 +1017,38 @@ static int sycl_stream_batch_selected_prepare(
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    sycl_stream_state_for(g_current_tier).cache_budget = experts;
+    ds4_gpu_set_streaming_expert_cache_budget_on(g_current_tier, experts);
+}
+
+extern "C" void ds4_gpu_set_streaming_expert_cache_budget_on(int tier, uint32_t experts) {
+    if (tier < 0 || (size_t)tier >= g_devices.size()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "set_streaming_expert_cache_budget_on: tier %d out of range "
+                "(%zu device(s))\n", tier, g_devices.size());
+        return;
+    }
+    sycl_stream_state_for(tier).cache_budget = experts;
 }
 
 /* Matches rocm/ds4_rocm_current_api_compat.cuh:155 exactly: 0 while
  * streaming is disabled even if a budget was configured, the configured
  * budget once it is enabled. */
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return g_sycl_stream_mode ? sycl_stream_state_for(g_current_tier).cache_budget : 0;
+    return ds4_gpu_stream_expert_cache_configured_count_on(g_current_tier);
+}
+
+extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count_on(int tier) {
+    if (tier < 0 || (size_t)tier >= g_devices.size()) return 0;
+    return g_sycl_stream_mode ? sycl_stream_state_for(tier).cache_budget : 0;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return (uint32_t)sycl_stream_state_for(g_current_tier).resident.size();
+    return ds4_gpu_stream_expert_cache_current_count_on(g_current_tier);
+}
+
+extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count_on(int tier) {
+    if (tier < 0 || (size_t)tier >= g_devices.size()) return 0;
+    return (uint32_t)sycl_stream_state_for(tier).resident.size();
 }
 
 /* Ignores both byte arguments, exactly like ROCm
@@ -1120,10 +1143,23 @@ extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
+    ds4_gpu_set_streaming_expert_cache_expert_bytes_on(g_current_tier, bytes);
+}
+
+extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes_on(int tier, uint64_t bytes) {
     /* No-op, matching ROCm (rocm/ds4_rocm_current_api_compat.cuh:140):
      * the resident cache's slot size is derived from each seed call's
-     * gate/down byte arguments, not from a separately configured value. */
+     * gate/down byte arguments, not from a separately configured value.
+     * The tier argument exists only so the caller (ds4.c's per-tier
+     * auto-cache configure loop) has one entry to call uniformly across
+     * every "_on(tier)" setter; it is still validated so a genuinely
+     * out-of-range tier is visible rather than silently accepted. */
     (void)bytes;
+    if (tier < 0 || (size_t)tier >= g_devices.size()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "set_streaming_expert_cache_expert_bytes_on: tier %d out of "
+                "range (%zu device(s))\n", tier, g_devices.size());
+    }
 }
 
 extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
@@ -1139,8 +1175,12 @@ extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
  * "unavailable" value ds4_engine_configure_streaming_auto_cache checks
  * for (ds4.c:55374-55379) before refusing auto-cache configuration. */
 extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
-    if (g_devices.empty()) return 0;
-    return ds4_sycl_current_queue().get_device()
+    return ds4_gpu_recommended_working_set_size_on(g_current_tier);
+}
+
+extern "C" uint64_t ds4_gpu_recommended_working_set_size_on(int tier) {
+    if (tier < 0 || (size_t)tier >= g_devices.size()) return 0;
+    return ds4_sycl_queue(tier).get_device()
             .get_info<sycl::info::device::global_mem_size>();
 }
 
