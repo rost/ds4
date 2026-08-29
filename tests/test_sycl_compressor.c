@@ -1228,15 +1228,18 @@ static int test_compressor_prefill(void) {
                   false, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-5f) == 0,
               "compressor_prefill: non-zero norm_type must be rejected");
 
-        /* quantize_fp8 = true must propagate ds4_gpu_dsv4_fp8_kv_quantize_tensor's
-         * failure: that entry is still stubbed (implemented later), so this
-         * must fail rather than silently succeed. */
+        /* quantize_fp8 = true reaches ds4_gpu_dsv4_fp8_kv_quantize_tensor.
+         * That entry used to be a stub, so this assertion used to require
+         * failure; now that it is implemented the call must succeed.  The
+         * attention compressor's only production call sites pass true
+         * unconditionally (ds4.c:28705, :28797, :28824), so this is the path
+         * that actually runs. */
         CHECK(ds4_gpu_compressor_prefill_tensor(
                   tcomp, tskv, tssc, tkv, tsc, model, model_size,
                   ape_offset, 0u, norm_offset, 0u, HEAD_DIM, RATIO,
                   /*pos0=*/0u, N_TOKENS, /*n_rot=*/0u, 4096u,
-                  /*quantize_fp8=*/true, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-5f) == 0,
-              "compressor_prefill: quantize_fp8 must propagate the stubbed FP8 entry's failure");
+                  /*quantize_fp8=*/true, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f, 1.0f, 1e-5f) != 0,
+              "compressor_prefill: quantize_fp8 must succeed now the FP8 entry is real");
 
         ds4_gpu_tensor_free(tkv); ds4_gpu_tensor_free(tsc);
         ds4_gpu_tensor_free(tskv); ds4_gpu_tensor_free(tssc); ds4_gpu_tensor_free(tcomp);
