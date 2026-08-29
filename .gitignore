@@ -33,6 +33,7 @@
 /tests/test_sampling
 /tests/test_sycl_smoke
 /tests/test_sycl_kernels
+/tests/test_sycl_streaming
 *.o
 *.dSYM/
 __pycache__/
