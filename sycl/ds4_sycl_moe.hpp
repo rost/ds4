@@ -1444,8 +1444,29 @@ static void sycl_moe_iq2_down_direct(
  * layer_routed_moe_one_prealloc via matvec_experts_mid_prequant) always
  * dots against a Q8_K-prequantised x -- the raw-float kernels compute a
  * genuinely different (unquantised-activation) value that cannot agree at
- * tight tolerance regardless of how faithfully they are ported.  See the
- * plan report. */
+ * tight tolerance regardless of how faithfully they are ported.
+ *
+ * Three consequences a future reader needs before revisiting this, because
+ * they are easy to miss from the reasoning above:
+ *
+ * 1. This is pervasive, not a corner case.  ROCm reaches a raw-float down
+ *    kernel for essentially EVERY batched call on both iq2_path and
+ *    q2k_path: iq2_path via use_iq2_q2_float_down
+ *    (moe_launch.cuh:1627-1631), and q2k_path because its own Q8_K down
+ *    path is gated on "n_tokens == 1u && !g_quality_mode"
+ *    (moe_launch.cuh:2247-2576), so any n_tokens > 1 falls through to
+ *    moe_down_q2K_sum_rows_w32_kernel.  This backend's production-path
+ *    numerics therefore differ from ROCm's for all batched Q2_K and
+ *    IQ2_XXS MoE work, permanently.
+ * 2. "Matches the oracle" and "most accurate" point in DIFFERENT
+ *    directions here.  Raw-float activations carry no quantisation loss;
+ *    the Q8_K-prequantised route chosen here does.  Oracle fidelity was
+ *    chosen deliberately over accuracy, because an un-oracled numerical
+ *    path cannot be tested on this hardware at all.
+ * 3. Revisiting it means either changing the CPU oracle in ds4.c, which
+ *    is shared with every other backend, or accepting a kernel with no
+ *    test that can discriminate it.  Neither is cheap.  If output quality
+ *    ever looks wrong on batched prefill, start here. */
 static void sycl_moe_q2k_gate_up_mid_decode(
         sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
         const sycl_block_q8_K *xq, const int32_t *selected, const float *weights,
