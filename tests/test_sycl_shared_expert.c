@@ -1182,6 +1182,281 @@ static int test_shared_mid_swiglu(void) {
     return 0;
 }
 
+/* Batched rows path: ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor with
+ * n_tok > 1, backed by the internal
+ * shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel port
+ * (rocm/ds4_rocm_q8.cuh:524-671), tile 16 tokens by 16 Q8_0 blocks,
+ * rows_per_block == 32.  N_TOK == 20 is not a multiple of the 16-token
+ * tile (two tiles: 16 real + 4 real out of 16) and OUT_DIM == 50 is not a
+ * multiple of the 32-row block (two row-blocks: 32 real + 18 real out of
+ * 32), so both tile dimensions are partially filled in the same run.
+ * clamp == 0 throughout: the batch kernel has no clamp parameter at all,
+ * matching ROCm.
+ *
+ * gate/up/mid are allocated with PADDED_TOK == 32 capacity (2 full token
+ * tiles) rather than the exact N_TOK == 20 the entry is told about, and
+ * pre-filled with a canary the entry never sees in its own tensor byte
+ * checks (which only require capacity for N_TOK rows, satisfied
+ * trivially by the larger real allocation).  This is the sentinel that
+ * catches an unwritten or wrongly-guarded element: a row overflow past
+ * OUT_DIM for a token in the middle of the valid range aliases into the
+ * NEXT token's row 0..(overflow-1), which the per-token oracle comparison
+ * below already catches as a mismatch there; a row or token-tile overflow
+ * past the last valid token (19) lands in the canary region instead,
+ * which only the canary check catches. Both are covered by testing every
+ * token against a PER-TOKEN oracle, not only the first, plus the canary
+ * region past N_TOK. */
+static int test_shared_gate_up_swiglu_rows_batch_correctness(void) {
+    enum { IN_DIM = 64, OUT_DIM = 50, N_TOK = 20, PADDED_TOK = 32 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u; /* == 2 */
+    const uint64_t row_bytes = blocks * 34u;
+    const float clamp = 0.0f;
+    const float canary = -987654.0f;
+
+    unsigned char *wg = (unsigned char *)malloc((size_t)OUT_DIM * row_bytes);
+    unsigned char *wu = (unsigned char *)malloc((size_t)OUT_DIM * row_bytes);
+    float *x = (float *)malloc((size_t)N_TOK * IN_DIM * sizeof(float));
+    float *want_gate =
+            (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    float *want_up = (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    float *want_mid =
+            (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    float *got_gate =
+            (float *)malloc((size_t)PADDED_TOK * OUT_DIM * sizeof(float));
+    float *got_up =
+            (float *)malloc((size_t)PADDED_TOK * OUT_DIM * sizeof(float));
+    float *got_mid =
+            (float *)malloc((size_t)PADDED_TOK * OUT_DIM * sizeof(float));
+    float *padded_canary =
+            (float *)malloc((size_t)PADDED_TOK * OUT_DIM * sizeof(float));
+    unsigned char *combined =
+            (unsigned char *)malloc((size_t)2 * OUT_DIM * row_bytes);
+    CHECK(wg && wu && x && want_gate && want_up && want_mid && got_gate &&
+          got_up && got_mid && padded_canary && combined,
+          "shared_gate_up_swiglu_rows_batch: allocation failed");
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 4);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 40);
+    }
+    /* Small amplitude, matching test_shared_mid_swiglu's reasoning: with
+     * OUT_DIM == 50 and salt up to 40+49, the unscaled dot product across
+     * IN_DIM == 64 elements reaches magnitudes around 1e5-1e6, where the
+     * kernel's fp32 accumulation and the oracle's double accumulation
+     * agree only to a RELATIVE precision of about 1e-7 (fp32's own
+     * precision), which is a few tenths in absolute terms at that
+     * magnitude -- comfortably outside this test's absolute 1e-1
+     * tolerance despite both sides being correct. Scaling x down keeps
+     * every magnitude small enough that the absolute tolerance is
+     * meaningful.
+     *
+     * Every element is ALSO kept well clear of zero (no "- 8.0f"
+     * centering term): the barrier-drop ablation below turned out not to
+     * fail with a centred, near-zero x, because this hardware's masking
+     * of a torn local-memory read (spec section 6b: uninitialised local
+     * memory reads as zero here) is indistinguishable from a correct read
+     * when the correct value is itself close to zero. Values bounded away
+     * from zero make a torn read that returns 0 instead of the true
+     * staged value visible in the accumulated sum. */
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] =
+                    ((float)(((t + 2) * (k + 3)) % 17) + 5.0f +
+                     0.02f * (float)((t * k) % 11)) *
+                    0.02f;
+        }
+        oracle_shared_gate_up_swiglu(want_gate + t * OUT_DIM,
+                                     want_up + t * OUT_DIM,
+                                     want_mid + t * OUT_DIM, x + t * IN_DIM,
+                                     wg, wu, IN_DIM, OUT_DIM, row_bytes,
+                                     clamp);
+    }
+    for (int i = 0; i < PADDED_TOK * OUT_DIM; i++) padded_canary[i] = canary;
+
+    memcpy(combined, wg, (size_t)OUT_DIM * row_bytes);
+    memcpy(combined + (size_t)OUT_DIM * row_bytes, wu,
+           (size_t)OUT_DIM * row_bytes);
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = (uint64_t)OUT_DIM * row_bytes;
+    const uint64_t model_size = 2ull * OUT_DIM * row_bytes;
+
+    ds4_gpu_tensor *tx =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * IN_DIM * sizeof(float));
+    ds4_gpu_tensor *tgate = ds4_gpu_tensor_alloc(
+            (size_t)PADDED_TOK * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tup = ds4_gpu_tensor_alloc(
+            (size_t)PADDED_TOK * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tmid = ds4_gpu_tensor_alloc(
+            (size_t)PADDED_TOK * OUT_DIM * sizeof(float));
+    CHECK(tx && tgate && tup && tmid,
+          "shared_gate_up_swiglu_rows_batch: tensor allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x,
+                               (size_t)N_TOK * IN_DIM * sizeof(float)) != 0,
+          "shared_gate_up_swiglu_rows_batch: write x");
+    CHECK(ds4_gpu_tensor_write(tgate, 0, padded_canary,
+                               (size_t)PADDED_TOK * OUT_DIM *
+                                       sizeof(float)) != 0 &&
+          ds4_gpu_tensor_write(tup, 0, padded_canary,
+                               (size_t)PADDED_TOK * OUT_DIM *
+                                       sizeof(float)) != 0 &&
+          ds4_gpu_tensor_write(tmid, 0, padded_canary,
+                               (size_t)PADDED_TOK * OUT_DIM *
+                                       sizeof(float)) != 0,
+          "shared_gate_up_swiglu_rows_batch: write canary");
+
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, tx, N_TOK, clamp) != 0,
+          "shared_gate_up_swiglu_rows_batch: call");
+    CHECK(ds4_gpu_tensor_read(tgate, 0, got_gate,
+                              (size_t)PADDED_TOK * OUT_DIM *
+                                      sizeof(float)) != 0 &&
+          ds4_gpu_tensor_read(tup, 0, got_up,
+                              (size_t)PADDED_TOK * OUT_DIM *
+                                      sizeof(float)) != 0 &&
+          ds4_gpu_tensor_read(tmid, 0, got_mid,
+                              (size_t)PADDED_TOK * OUT_DIM *
+                                      sizeof(float)) != 0,
+          "shared_gate_up_swiglu_rows_batch: readback failed");
+
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got_gate[i], want_gate[i], 1e-1,
+                    "shared_gate_up_swiglu_rows_batch: gate mismatch");
+        CHECK_CLOSE(got_up[i], want_up[i], 1e-1,
+                    "shared_gate_up_swiglu_rows_batch: up mismatch");
+        CHECK_CLOSE(got_mid[i], want_mid[i], 1e-1,
+                    "shared_gate_up_swiglu_rows_batch: mid mismatch");
+    }
+    for (int i = N_TOK * OUT_DIM; i < PADDED_TOK * OUT_DIM; i++) {
+        CHECK(got_gate[i] == canary,
+              "shared_gate_up_swiglu_rows_batch: gate canary past n_tok "
+              "was overwritten");
+        CHECK(got_up[i] == canary,
+              "shared_gate_up_swiglu_rows_batch: up canary past n_tok was "
+              "overwritten");
+        CHECK(got_mid[i] == canary,
+              "shared_gate_up_swiglu_rows_batch: mid canary past n_tok "
+              "was overwritten");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgate);
+    ds4_gpu_tensor_free(tup);
+    ds4_gpu_tensor_free(tmid);
+    free(wg);
+    free(wu);
+    free(x);
+    free(want_gate);
+    free(want_up);
+    free(want_mid);
+    free(got_gate);
+    free(got_up);
+    free(got_mid);
+    free(padded_canary);
+    free(combined);
+    fprintf(stderr, "  test_shared_gate_up_swiglu_rows_batch_correctness OK\n");
+    return 0;
+}
+
+/* clamp > 1e-6f must REFUSE (return 0), not silently fall back to the
+ * general path, matching rocm/ds4_rocm_shared_expert.cuh:184. */
+static int test_shared_gate_up_swiglu_rows_batch_clamp_refusal(void) {
+    enum { IN_DIM = 32, OUT_DIM = 4, N_TOK = 3 };
+    const uint64_t row_bytes = 34;
+    unsigned char wg[OUT_DIM * 34];
+    unsigned char wu[OUT_DIM * 34];
+    float x[N_TOK * IN_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 5);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 55);
+    }
+    for (uint32_t k = 0; k < N_TOK * IN_DIM; k++) x[k] = (float)k * 0.1f;
+
+    unsigned char combined[sizeof(wg) + sizeof(wu)];
+    memcpy(combined, wg, sizeof(wg));
+    memcpy(combined + sizeof(wg), wu, sizeof(wu));
+    const uint64_t model_size = sizeof(combined);
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tgate =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tup =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tmid =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    CHECK(tx && tgate && tup && tmid,
+          "shared_gate_up_swiglu_rows_batch_clamp_refusal: allocation "
+          "failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "shared_gate_up_swiglu_rows_batch_clamp_refusal: write x");
+
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+                  tgate, tup, tmid, combined, model_size, 0, sizeof(wg),
+                  IN_DIM, OUT_DIM, tx, N_TOK, 1.0f) == 0,
+          "shared_gate_up_swiglu_rows_batch_clamp_refusal: nonzero clamp "
+          "with n_tok > 1 must be refused");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgate);
+    ds4_gpu_tensor_free(tup);
+    ds4_gpu_tensor_free(tmid);
+    fprintf(stderr,
+            "  test_shared_gate_up_swiglu_rows_batch_clamp_refusal OK\n");
+    return 0;
+}
+
+/* (in_dim & 31) != 0 must be rejected for the batched path, matching
+ * rocm/ds4_rocm_q8.cuh's batch kernel shape requirement
+ * (rocm/ds4_rocm_shared_expert.cuh:390-439 only ever launches it with
+ * in_dim a multiple of 32). */
+static int test_shared_gate_up_swiglu_rows_batch_in_dim_rejection(void) {
+    enum { IN_DIM = 33, OUT_DIM = 4, N_TOK = 3 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    unsigned char wg[OUT_DIM * 68];
+    unsigned char wu[OUT_DIM * 68];
+    float x[N_TOK * IN_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 6);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 66);
+    }
+    for (uint32_t k = 0; k < N_TOK * IN_DIM; k++) x[k] = (float)k * 0.1f;
+
+    unsigned char combined[sizeof(wg) + sizeof(wu)];
+    memcpy(combined, wg, sizeof(wg));
+    memcpy(combined + sizeof(wg), wu, sizeof(wu));
+    const uint64_t model_size = sizeof(combined);
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tgate =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tup =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tmid =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    CHECK(tx && tgate && tup && tmid,
+          "shared_gate_up_swiglu_rows_batch_in_dim_rejection: allocation "
+          "failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "shared_gate_up_swiglu_rows_batch_in_dim_rejection: write x");
+
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+                  tgate, tup, tmid, combined, model_size, 0, sizeof(wg),
+                  IN_DIM, OUT_DIM, tx, N_TOK, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_batch_in_dim_rejection: in_dim not a "
+          "multiple of 32 must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgate);
+    ds4_gpu_tensor_free(tup);
+    ds4_gpu_tensor_free(tmid);
+    fprintf(stderr,
+            "  test_shared_gate_up_swiglu_rows_batch_in_dim_rejection OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_shared_gate_up_swiglu_general() != 0) {
@@ -1225,6 +1500,18 @@ int main(void) {
         return 1;
     }
     if (test_shared_mid_swiglu() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_gate_up_swiglu_rows_batch_correctness() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_gate_up_swiglu_rows_batch_clamp_refusal() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_gate_up_swiglu_rows_batch_in_dim_rejection() != 0) {
         ds4_gpu_cleanup();
         return 1;
     }

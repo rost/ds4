@@ -393,13 +393,220 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
     }
 }
 
-/* n_tok == 1 delegates to the core entry; n_tok > 1 uses the batched rows
- * path, completed in the task that ports
+/* Batched rows path.  Internal helper, NOT an extern "C" entry point,
+ * matching the file header's treatment of ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor
+ * as a ROCm-internal helper reached only from the rows entry below. Ports
+ * rocm/ds4_rocm_shared_expert.cuh:390-439 (validation) and
  * shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel
- * (rocm/ds4_rocm_q8.cuh:524-671).  ROCm refuses (returns 0, not a
- * fallback to the general path) rather than route a nonzero clamp through
- * the batch kernel, which has no clamp parameter at all
- * (rocm/ds4_rocm_shared_expert.cuh:184); ported exactly. */
+ * (rocm/ds4_rocm_q8.cuh:524-671, instantiated there only with
+ * TOK_TILE == BLOCKS_TILE == 16, so those are plain constants here rather
+ * than a template).
+ *
+ * The staged activation tile in local memory is exactly the hazard spec
+ * section 6b describes: uninitialised local memory reads as zero on this
+ * A770, so a missing barrier would not show up as garbage here. Every
+ * element of shx is written unconditionally (a real value or 0.0f for a
+ * position past n_blocks/n_tok) before the barrier that follows it, with
+ * a second barrier after the row/token accumulation loop before the next
+ * tile's staging pass reuses the same local memory. CONFIRMED by ablation:
+ * dropping either barrier, or both together, produced no test failure
+ * across five repeated runs, including after the test data was
+ * specifically rebuilt so every staged value is bounded away from zero
+ * (ruling out the "torn read returns zero, indistinguishable from a
+ * small correct value" explanation spec 6b itself describes). With
+ * IN_DIM == 64 (n_blocks == 2, less than BLOCKS_TILE == 16) this kernel's
+ * outer loop runs exactly one iteration, so there is only one
+ * write-then-read hazard to observe, not the reuse-across-iterations
+ * hazard the second barrier guards; this hardware or driver evidently
+ * still does not expose it. This is a FOURTH ablation that fails to fail
+ * on this hardware, joining spec sections 6b, 6f and 6g: it is evidence
+ * about the test environment, never evidence that the barriers are
+ * unnecessary. Both barriers are correct by construction and by direct
+ * comparison with the ROCm source's __syncthreads placement, and must not
+ * be removed on the strength of a passing test suite. */
+static int sycl_shared_gate_up_swiglu_q8_0_batch(
+        ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset,
+        uint64_t up_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!gate || !up || !mid || !model_map || !x || n_tok == 0u ||
+        (in_dim & 31u) != 0u || in_dim == 0u || out_dim == 0u ||
+        in_dim > UINT32_MAX || out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    uint64_t x_bytes = 0, out_bytes = 0;
+    if (!sycl_u64_mul3_checked(n_tok, in_dim, sizeof(float), &x_bytes) ||
+        !sycl_u64_mul3_checked(n_tok, out_dim, sizeof(float), &out_bytes) ||
+        !sycl_tensor_has_bytes(x, x_bytes) ||
+        !sycl_tensor_has_bytes(gate, out_bytes) ||
+        !sycl_tensor_has_bytes(up, out_bytes) ||
+        !sycl_tensor_has_bytes(mid, out_bytes)) {
+        return 0;
+    }
+
+    uint64_t row_bytes = 0, weight_bytes = 0;
+    if (!sycl_q8_0_row_bytes_checked(in_dim, &row_bytes) ||
+        !sycl_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !sycl_model_range_fits(model_size, gate_offset, weight_bytes) ||
+        !sycl_model_range_fits(model_size, up_offset, weight_bytes)) {
+        return 0;
+    }
+    const char *wg = sycl_model_range_ptr(model_map, gate_offset,
+                                          weight_bytes, model_size,
+                                          "shared_gate_q8_batch");
+    const char *wu = sycl_model_range_ptr(model_map, up_offset, weight_bytes,
+                                          model_size, "shared_up_q8_batch");
+    if (!wg || !wu) return 0;
+    if (g_devices.empty()) return 0;
+
+    constexpr uint32_t kTokTile = 16u;
+    constexpr uint32_t kBlocksTile = 16u;
+    constexpr uint32_t kRowsPerBlock = 32u;
+    const uint32_t n_blocks = (uint32_t)(in_dim >> 5u);
+    const uint32_t out_dim32 = (uint32_t)out_dim;
+    const uint32_t n_tok32 = (uint32_t)n_tok;
+    const uint32_t grid_x =
+            (out_dim32 + kRowsPerBlock - 1u) / kRowsPerBlock;
+    const uint32_t grid_y = (n_tok32 + kTokTile - 1u) / kTokTile;
+    const size_t local_x = (size_t)kRowsPerBlock * 32u;
+    const size_t shmem_floats = (size_t)kTokTile * kBlocksTile * 32u;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(gate->device_id);
+
+        unsigned char *dwg =
+                sycl::malloc_device<unsigned char>((size_t)weight_bytes, q);
+        if (!dwg) return 0;
+        sycl_device_scratch_guard dwg_guard(q, dwg);
+        unsigned char *dwu =
+                sycl::malloc_device<unsigned char>((size_t)weight_bytes, q);
+        if (!dwu) return 0;
+        sycl_device_scratch_guard dwu_guard(q, dwu);
+
+        q.memcpy(dwg, wg, (size_t)weight_bytes).wait_and_throw();
+        q.memcpy(dwu, wu, (size_t)weight_bytes).wait_and_throw();
+
+        float *pgate = (float *)gate->ptr;
+        float *pup = (float *)up->ptr;
+        float *pmid = (float *)mid->ptr;
+        const float *px = (const float *)x->ptr;
+
+        q.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> shx(sycl::range<1>(shmem_floats),
+                                               h);
+            h.parallel_for(
+                    sycl::nd_range<2>(
+                            sycl::range<2>((size_t)grid_x * local_x, grid_y),
+                            sycl::range<2>(local_x, 1)),
+                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+                        const uint32_t tid = (uint32_t)it.get_local_id(0);
+                        const uint32_t lane = tid & 31u;
+                        const uint32_t wave = tid >> 5u;
+                        const uint32_t row =
+                                (uint32_t)it.get_group(0) * kRowsPerBlock +
+                                wave;
+                        const uint32_t t0 =
+                                (uint32_t)it.get_group(1) * kTokTile;
+                        const bool row_valid = row < out_dim32;
+                        const unsigned char *wgr =
+                                dwg + (uint64_t)(row_valid ? row : 0u) *
+                                              row_bytes;
+                        const unsigned char *wur =
+                                dwu + (uint64_t)(row_valid ? row : 0u) *
+                                              row_bytes;
+
+                        float accg[kTokTile];
+                        float accu[kTokTile];
+                        for (uint32_t u = 0; u < kTokTile; u++) {
+                            accg[u] = 0.0f;
+                            accu[u] = 0.0f;
+                        }
+
+                        for (uint32_t b0 = 0; b0 < n_blocks;
+                             b0 += kBlocksTile) {
+                            const uint32_t b_count =
+                                    ((b0 + kBlocksTile) <= n_blocks)
+                                            ? kBlocksTile
+                                            : (n_blocks - b0);
+                            /* Every position of shx is written here,
+                             * including out-of-range (t, bb) pairs, which
+                             * get an explicit 0.0f rather than being left
+                             * unwritten; see the section 6b note above. */
+                            for (uint32_t j = tid;
+                                 j < kTokTile * kBlocksTile * 32u;
+                                 j += (uint32_t)local_x) {
+                                const uint32_t u = j / (kBlocksTile * 32u);
+                                const uint32_t r = j - u * (kBlocksTile * 32u);
+                                const uint32_t bb = r >> 5u;
+                                const uint32_t k = r & 31u;
+                                const uint32_t t = t0 + u;
+                                shx[j] = (t < n_tok32 && bb < b_count)
+                                        ? px[(uint64_t)t * in_dim +
+                                             ((uint64_t)(b0 + bb) << 5u) + k]
+                                        : 0.0f;
+                            }
+                            it.barrier(sycl::access::fence_space::local_space);
+                            if (row_valid) {
+                                for (uint32_t bb = 0; bb < b_count; bb++) {
+                                    const unsigned char *bg =
+                                            wgr + (uint64_t)(b0 + bb) * 34u;
+                                    const unsigned char *bu =
+                                            wur + (uint64_t)(b0 + bb) * 34u;
+                                    const float wvg = sycl_q8_0_dequant(bg, lane);
+                                    const float wvu = sycl_q8_0_dequant(bu, lane);
+                                    for (uint32_t u = 0; u < kTokTile; u++) {
+                                        const float xv =
+                                                shx[(u * kBlocksTile + bb) *
+                                                            32u +
+                                                    lane];
+                                        accg[u] += wvg * xv;
+                                        accu[u] += wvu * xv;
+                                    }
+                                }
+                            }
+                            it.barrier(sycl::access::fence_space::local_space);
+                        }
+
+                        sycl::sub_group sg = it.get_sub_group();
+                        for (uint32_t u = 0; u < kTokTile; u++) {
+                            accg[u] = sycl::reduce_over_group(
+                                    sg, accg[u], sycl::plus<float>());
+                            accu[u] = sycl::reduce_over_group(
+                                    sg, accu[u], sycl::plus<float>());
+                        }
+                        if (sg.get_local_id()[0] == 0u && row_valid) {
+                            for (uint32_t u = 0; u < kTokTile; u++) {
+                                const uint32_t t = t0 + u;
+                                if (t < n_tok32) {
+                                    const uint64_t off =
+                                            (uint64_t)t * out_dim32 + row;
+                                    const float g = accg[u];
+                                    const float uv = accu[u];
+                                    pgate[off] = g;
+                                    pup[off] = uv;
+                                    pmid[off] =
+                                            (g / (1.0f + sycl::exp(-g))) * uv;
+                                }
+                            }
+                        }
+                    });
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "shared gate/up fused q8 batch launch failed: %s\n",
+                e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* n_tok == 1 delegates to the core entry; n_tok > 1 uses the batched rows
+ * path above (sycl_shared_gate_up_swiglu_q8_0_batch).  ROCm refuses
+ * (returns 0, not a fallback to the general path) rather than route a
+ * nonzero clamp through the batch kernel, which has no clamp parameter at
+ * all (rocm/ds4_rocm_shared_expert.cuh:184); ported exactly. */
 extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
         ds4_gpu_tensor       *gate,
         ds4_gpu_tensor       *up,
@@ -419,6 +626,8 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
                 in_dim, out_dim, x, clamp);
     }
     if (clamp > 1.0e-6f) return 0;
-    /* TODO: batched rows path, not yet implemented. */
-    return 0;
+    return sycl_shared_gate_up_swiglu_q8_0_batch(gate, up, mid, model_map,
+                                                 model_size, gate_offset,
+                                                 up_offset, in_dim, out_dim,
+                                                 x, n_tok);
 }
