@@ -1087,6 +1087,7 @@ static int test_shared_down_hc_expand_q8_0(void) {
     unsigned char weights[N_HC_EXPAND_EMBD * 34]; /* row_bytes == 34 here */
     float x[IN_DIM];
     float routed_out[N_HC_EXPAND_EMBD];
+    float raw_want[N_HC_EXPAND_EMBD];
     float block_want[N_HC_EXPAND_EMBD];
     float residual[N_HC * N_HC_EXPAND_EMBD];
     float split[MIX_HC];
@@ -1099,6 +1100,7 @@ static int test_shared_down_hc_expand_q8_0(void) {
     for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
         routed_out[o] = fill_val(o, o + 2u) * 1.3f;
         const float dot = hc_oracle_q8_0_dot(x, weights + (size_t)o * row_bytes, IN_DIM);
+        raw_want[o] = dot;
         block_want[o] = dot + routed_out[o];
     }
     for (int h = 0; h < N_HC; h++) {
@@ -1131,6 +1133,24 @@ static int test_shared_down_hc_expand_q8_0(void) {
     for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
         CHECK_CLOSE(hc_got[i], hc_want[i], 1e-2,
                     "shared_down_hc_expand: out_hc mismatch");
+    }
+
+    /* shared_out (block_out) must hold the RAW pre-add matmul result, not
+     * the value after routed_out is folded in: ds4_sycl_hc.hpp's own
+     * comment on sycl_matmul_q8_0_hc_expand_labeled states block_out is
+     * always written before the addend is applied, matching ROCm's
+     * `block_out[d] = acc;` running before `block_v` picks up the addend.
+     * Nothing above exercises this: hc_got only depends on the POST-add
+     * value, and the differential path below writes its own separate
+     * tensor, so a kernel that wrote the post-add value into shared_out
+     * would pass every other check in this test. Found by ablation. */
+    float shared_got[N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tshared, 0, shared_got, sizeof(shared_got)) != 0,
+          "shared_down_hc_expand: read shared_out");
+    for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(shared_got[i], raw_want[i], 1e-2,
+                    "shared_down_hc_expand: shared_out must be the raw "
+                    "pre-add matmul result");
     }
 
     /* Differential: matmul_q8_0 into a scratch buffer, then the unfused
