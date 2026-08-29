@@ -85,6 +85,12 @@ std::vector<sycl::device> ds4_sycl_dedup_devices(
 
 } /* namespace */
 
+/* Defined in sycl/ds4_sycl_streaming.hpp, included at the end of this
+ * file; forward-declared here so ds4_gpu_cleanup (below) can call it
+ * while the queue every streaming cache slab and buffer was allocated
+ * through is still alive, before g_devices.clear() destroys it. */
+static void sycl_stream_teardown_all(sycl::queue &q);
+
 /* Multi-GPU plumbing globals declared extern by ds4_gpu_mgpu.h and read
  * directly by ds4.c.  Before ds4_gpu_init runs (or if it never runs) this
  * exposes a single logical tier with no peers, matching the default
@@ -243,6 +249,11 @@ extern "C" void ds4_gpu_cleanup(void) {
                     "teardown: %s\n", e.what());
         }
     }
+    /* Frees every streaming cache slab and scratch buffer while their
+     * queue is still alive, matching ROCm's cuda_stream_selected_cache_release
+     * fan-out from ds4_gpu_cleanup (rocm/ds4_rocm_runtime.cuh:5873). Must
+     * run before g_devices.clear() below destroys the queue. */
+    if (!g_devices.empty()) sycl_stream_teardown_all(ds4_sycl_current_queue());
     g_devices.clear();
     g_n_gpus       = 0;
     g_current_tier = 0;

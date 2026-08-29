@@ -709,6 +709,151 @@ static int test_task2_malformed_inputs_fail(void) {
     return 0;
 }
 
+/* ---- Lifecycle, teardown, trivial entries ---- */
+
+/* set_ssd_streaming(false) must release the whole resident cache, and
+ * set_ssd_streaming(true) again on an already-empty cache must be a
+ * harmless no-op (ROCm's ds4_gpu_set_ssd_streaming releases
+ * unconditionally on every call, not only when disabling; see
+ * rocm/ds4_rocm_current_api_compat.cuh:119-126). */
+static int test_set_ssd_streaming_false_releases_resident(void) {
+    ds4_sycl_stream_test_reset();
+    enum { N_EXPERT = 4, GATE_BYTES = 16, DOWN_BYTES = 16, LAYER = 0, BUDGET = 4 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+
+    ds4_gpu_set_ssd_streaming(true);
+    int32_t ids[] = {0, 1};
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, ids, NULL, 2) != 0,
+          "ssd_streaming: seed failed");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 2,
+          "ssd_streaming: seed should have populated the cache");
+
+    ds4_gpu_set_ssd_streaming(false);
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 0,
+          "ssd_streaming: disabling streaming must release the resident cache");
+
+    /* Re-enabling on an already-empty cache is a harmless no-op: no crash,
+     * current_count stays 0, and a subsequent seed still works. */
+    ds4_gpu_set_ssd_streaming(true);
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 0,
+          "ssd_streaming: re-enabling an empty cache should not populate it");
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, ids, NULL, 2) != 0,
+          "ssd_streaming: seed after re-enable failed");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 2,
+          "ssd_streaming: full seed/teardown/re-seed cycle left the cache inconsistent");
+    fprintf(stderr, "  test_set_ssd_streaming_false_releases_resident OK\n");
+    return 0;
+}
+
+/* recommended_working_set_size must be a plausible nonzero value (this
+ * A770 has 16 GiB) while a device is initialised, and exactly 0 (the
+ * "unavailable" value ds4.c's auto-cache configuration checks for,
+ * ds4.c:55374-55379) once the device is torn down.  Re-initialises
+ * afterward so later tests in this binary are unaffected. */
+static int test_recommended_working_set_size(void) {
+    const uint64_t with_device = ds4_gpu_recommended_working_set_size();
+    CHECK(with_device > (1ull << 30),
+          "working_set_size: expected a plausible (>1 GiB) value with a device present");
+
+    ds4_gpu_cleanup();
+    CHECK(ds4_gpu_recommended_working_set_size() == 0,
+          "working_set_size: expected 0 (unavailable) with no device initialised");
+    CHECK(ds4_gpu_init() != 0, "working_set_size: re-init after teardown failed");
+    fprintf(stderr, "  test_recommended_working_set_size OK\n");
+    return 0;
+}
+
+/* The three trivial no-op entries must be callable and change nothing
+ * observable: none of them has an ABI-visible state to read back, so this
+ * only proves they do not crash and do not disturb unrelated cache state. */
+static int test_trivial_noop_entries_callable(void) {
+    ds4_sycl_stream_test_reset();
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_budget(3);
+
+    ds4_gpu_set_glm_streaming_prefill_full_layer(true);
+    ds4_gpu_set_glm_streaming_prefill_full_layer(false);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(12345);
+    ds4_gpu_stream_expert_cache_reset_route_hotness();
+
+    CHECK(ds4_gpu_stream_expert_cache_configured_count() == 3,
+          "trivial_noop: the three no-ops must not disturb the configured budget");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 0,
+          "trivial_noop: the three no-ops must not disturb the resident count");
+    fprintf(stderr, "  test_trivial_noop_entries_callable OK\n");
+    return 0;
+}
+
+/* Streaming mode off must be a no-op SUCCESS for seed_experts and
+ * begin_selected_load (rocm/ds4_rocm_runtime.cuh's
+ * cuda_stream_resident_seed_experts and cuda_stream_selected_load both
+ * check "if (!g_ssd_streaming_mode) return 1;" before any other
+ * validation), matching every other entry's zero-work-succeeds convention. */
+static int test_mode_off_seed_and_selected_are_noop_success(void) {
+    ds4_sycl_stream_test_reset();
+    enum { N_EXPERT = 4, GATE_BYTES = 8, DOWN_BYTES = 8, LAYER = 0, BUDGET = 4 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+
+    ds4_gpu_set_ssd_streaming(false);
+    int32_t ids[] = {0, 1};
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, ids, NULL, 2) != 0,
+          "mode_off: seed_experts must succeed as a no-op while streaming is disabled");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 0,
+          "mode_off: seed_experts must not admit anything while streaming is disabled");
+    CHECK(ds4_gpu_stream_expert_cache_begin_selected_load(&table, ids, 2) != 0,
+          "mode_off: begin_selected_load must succeed as a no-op while streaming is disabled");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 0,
+          "mode_off: begin_selected_load must not admit anything while streaming is disabled");
+    fprintf(stderr, "  test_mode_off_seed_and_selected_are_noop_success OK\n");
+    return 0;
+}
+
+/* prepare_selected_batch has the OPPOSITE polarity: ROCm folds
+ * "!g_ssd_streaming_mode" into the same condition as every malformed-input
+ * check in cuda_stream_batch_selected_prepare_from_host, all of which
+ * return 0.  Streaming disabled is therefore a FAILURE for this one
+ * entry, not a no-op success; this is a real, verified asymmetry, not an
+ * inconsistency to "fix" toward the other two entries. */
+static int test_mode_off_prepare_selected_batch_fails(void) {
+    ds4_sycl_stream_test_reset();
+    enum { N_EXPERT = 4, GATE_BYTES = 8, DOWN_BYTES = 8, LAYER = 0, BUDGET = 4 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+
+    ds4_gpu_set_ssd_streaming(false);
+    int32_t batch_ids[] = {0, 1, 2, 3};
+    CHECK(ds4_gpu_stream_expert_cache_prepare_selected_batch(&table, batch_ids, 2, 2) == 0,
+          "mode_off: prepare_selected_batch must fail (not no-op succeed) while disabled");
+    fprintf(stderr, "  test_mode_off_prepare_selected_batch_fails OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_seed_fewer_than_budget() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -725,6 +870,11 @@ int main(void) {
     if (test_prepare_selected_batch_dedup() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_batch_near_ceiling() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_task2_malformed_inputs_fail() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_set_ssd_streaming_false_releases_resident() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_recommended_working_set_size() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_trivial_noop_entries_callable() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_mode_off_seed_and_selected_are_noop_success() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_mode_off_prepare_selected_batch_fails() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_streaming OK\n");
     return 0;

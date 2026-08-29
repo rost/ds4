@@ -50,7 +50,6 @@ struct ds4_gpu_tensor;
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
 /* Return types other than int or void. */
-extern "C" uint64_t ds4_gpu_recommended_working_set_size(...) { return 0; }
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(...) { return nullptr; }
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_ptr_on(...) { return nullptr; }
 extern "C" uint64_t ds4_gpu_tier_free_vram(...) { return 0; }
@@ -62,12 +61,8 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_enable_q8_dequant_gemm)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_model_residency_skip)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_print_memory_report)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_set_glm_model)
-SYCL_UNAVAILABLE_VOID(ds4_gpu_set_glm_streaming_prefill_full_layer)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_set_q8_cache_suppressed)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_set_quality)
-SYCL_UNAVAILABLE_VOID(ds4_gpu_set_ssd_streaming)
-SYCL_UNAVAILABLE_VOID(ds4_gpu_set_streaming_expert_cache_expert_bytes)
-SYCL_UNAVAILABLE_VOID(ds4_gpu_stream_expert_cache_reset_route_hotness)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_keepalive_pause)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_set_attn_head_split)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_suspend_expert_sharding)

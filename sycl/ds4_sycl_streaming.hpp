@@ -111,6 +111,12 @@ static uint64_t      g_sycl_stream_slot_bytes = 0;
 static uint32_t      g_sycl_stream_slot_count = 0;
 static uint32_t      g_sycl_stream_cache_budget = 0;
 
+/* Mirrors ROCm's g_ssd_streaming_mode (rocm/ds4_rocm_current_api_compat.cuh:119-126).
+ * Only ds4_gpu_set_ssd_streaming ever sets this; see that entry's
+ * implementation below for why it releases the resident cache
+ * unconditionally, not only when disabling. */
+static bool g_sycl_stream_mode = false;
+
 static sycl_stream_resident_key sycl_stream_make_key(
         const void *model_map, uint32_t layer, int32_t expert,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
@@ -444,12 +450,18 @@ static int sycl_stream_resident_seed_experts(
         uint32_t n_experts, uint32_t n_total_expert, uint64_t gate_offset,
         uint64_t up_offset, uint64_t down_offset, uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes) {
+    /* Checked BEFORE the malformed-input block below, matching
+     * rocm/ds4_rocm_runtime.cuh's cuda_stream_resident_seed_experts
+     * ("if (!g_ssd_streaming_mode) return 1;" is its first line): a
+     * malformed call while streaming is disabled still reports success,
+     * not failure. */
+    if (!g_sycl_stream_mode) return 1;
     if (!model_map || !expert_ids || n_experts == 0 || n_total_expert == 0 ||
         n_total_expert > DS4_SYCL_STREAM_MAX_N_EXPERT || gate_expert_bytes == 0 ||
         down_expert_bytes == 0) {
         return 0;
     }
-    /* budget == 0 is the one true zero-work-succeeds case here, distinct
+    /* budget == 0 is the other zero-work-succeeds case here, distinct
      * from the malformed-input checks above which return 0 (see the
      * ds4_gpu_stream_expert_cache_seed_experts wrapper for the null-table
      * case, which fails before this function is ever called). */
@@ -610,6 +622,20 @@ static void sycl_stream_selected_release(sycl::queue &q) {
     g_sycl_stream_selected = sycl_stream_selected_cache{};
 }
 
+/* Master teardown, mirroring ROCm's cuda_stream_selected_cache_release
+ * fan-out (rocm/ds4_rocm_runtime.cuh:758-786) reduced to the two
+ * structures this port actually holds (the resident cache and the
+ * selected scratch cache; there is no batch-selected-cache-specific
+ * device state to free since prepare_selected_batch never allocates its
+ * own buffers here, see its comment above).  Called from
+ * ds4_gpu_set_ssd_streaming and from ds4_gpu_cleanup (forward-declared in
+ * ds4_sycl.cpp, defined here) while the queue used for every allocation
+ * is still alive. */
+static void sycl_stream_teardown_all(sycl::queue &q) {
+    sycl_stream_resident_release_all(q);
+    sycl_stream_selected_release(q);
+}
+
 static bool sycl_stream_selected_ensure_buffers(sycl::queue &q, uint64_t gate_bytes,
                                                 uint64_t down_bytes) {
     if (gate_bytes == 0 || down_bytes == 0) return false;
@@ -658,6 +684,12 @@ static int sycl_stream_selected_load(
         const int32_t *selected_ids, uint32_t n_total_expert, uint32_t n_selected,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
+    /* Checked BEFORE the malformed-input block below, matching
+     * rocm/ds4_rocm_runtime.cuh's cuda_stream_selected_load ("if
+     * (!g_ssd_streaming_mode) return 1;" is its first substantive line):
+     * a malformed call while streaming is disabled still reports
+     * success, not failure. */
+    if (!g_sycl_stream_mode) return 1;
     if (!model_map || !selected_ids || n_total_expert == 0 ||
         n_total_expert > DS4_SYCL_STREAM_MAX_N_EXPERT || n_selected == 0 ||
         n_selected > DS4_SYCL_STREAM_N_EXPERT_USED || gate_expert_bytes == 0 ||
@@ -826,10 +858,16 @@ static int sycl_stream_batch_selected_prepare(
         const int32_t *ids, uint32_t n_tokens, uint32_t n_total_expert,
         uint32_t n_selected, uint64_t gate_offset, uint64_t up_offset,
         uint64_t down_offset, uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
-    if (!model_map || !ids || n_tokens <= 1 || n_total_expert == 0 ||
-        n_total_expert > DS4_SYCL_STREAM_MAX_N_EXPERT || n_selected == 0 ||
-        n_selected > DS4_SYCL_STREAM_N_EXPERT_USED || gate_expert_bytes == 0 ||
-        down_expert_bytes == 0) {
+    /* Unlike seed_experts and selected_load, ROCm folds
+     * "!g_ssd_streaming_mode" into the SAME condition as every
+     * malformed-input check here (cuda_stream_batch_selected_prepare_from_host's
+     * opening "if" chain), all of which return 0.  Streaming disabled is
+     * therefore a FAILURE for this one entry, not a no-op success: a
+     * real, verified asymmetry, ported deliberately. */
+    if (!g_sycl_stream_mode || !model_map || !ids || n_tokens <= 1 ||
+        n_total_expert == 0 || n_total_expert > DS4_SYCL_STREAM_MAX_N_EXPERT ||
+        n_selected == 0 || n_selected > DS4_SYCL_STREAM_N_EXPERT_USED ||
+        gate_expert_bytes == 0 || down_expert_bytes == 0) {
         return 0;
     }
 
@@ -908,8 +946,11 @@ extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
     g_sycl_stream_cache_budget = experts;
 }
 
+/* Matches rocm/ds4_rocm_current_api_compat.cuh:155 exactly: 0 while
+ * streaming is disabled even if a budget was configured, the configured
+ * budget once it is enabled. */
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return g_sycl_stream_cache_budget;
+    return g_sycl_stream_mode ? g_sycl_stream_cache_budget : 0;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
@@ -982,6 +1023,51 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             n_tokens, table->n_total_expert, n_selected, table->gate_offset,
             table->up_offset, table->down_offset, table->gate_expert_bytes,
             table->down_expert_bytes);
+}
+
+/* Releases unconditionally on EVERY call, whether enabling or disabling,
+ * matching rocm/ds4_rocm_current_api_compat.cuh:119-126 exactly
+ * (ds4_gpu_set_ssd_streaming there calls cuda_model_range_release_all,
+ * which unconditionally calls cuda_stream_resident_cache_release, plus
+ * resets both scratch caches' loaded flags, regardless of the `enabled`
+ * argument).  This is not "release only when disabling": re-enabling an
+ * already-configured cache also wipes it, which callers must expect. */
+extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
+    g_sycl_stream_mode = enabled;
+    if (!g_devices.empty()) sycl_stream_teardown_all(ds4_sycl_current_queue());
+}
+
+extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
+    /* No-op, matching ROCm (rocm/ds4_rocm_current_api_compat.cuh:132):
+     * ROCm's full-layer graph-based prefill streaming is DS4_ROCM_BUILD-only
+     * and out of scope for this backend; the argument is discarded there
+     * too. */
+    (void)enabled;
+}
+
+extern "C" void ds4_gpu_set_streaming_expert_cache_expert_bytes(uint64_t bytes) {
+    /* No-op, matching ROCm (rocm/ds4_rocm_current_api_compat.cuh:140):
+     * the resident cache's slot size is derived from each seed call's
+     * gate/down byte arguments, not from a separately configured value. */
+    (void)bytes;
+}
+
+extern "C" void ds4_gpu_stream_expert_cache_reset_route_hotness(void) {
+    /* Empty body, matching ROCm (rocm/ds4_rocm_current_api_compat.cuh:163):
+     * this port has no separate route-hotness heuristic to reset. The
+     * resident cache itself is intentionally kept warm across calls, per
+     * ds4_gpu.h's declaration comment. */
+}
+
+/* total device memory, no reserve subtracted: matches ROCm exactly
+ * (rocm/ds4_rocm_current_api_compat.cuh:144 returns cudaMemGetInfo's
+ * total_b, not free_b).  0 with no device initialised is the
+ * "unavailable" value ds4_engine_configure_streaming_auto_cache checks
+ * for (ds4.c:55374-55379) before refusing auto-cache configuration. */
+extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
+    if (g_devices.empty()) return 0;
+    return ds4_sycl_current_queue().get_device()
+            .get_info<sycl::info::device::global_mem_size>();
 }
 
 /* Test-only side doors.  None of the entries above expose the resident
@@ -1063,12 +1149,13 @@ extern "C" int ds4_sycl_stream_test_batch_dedup(
 }
 
 extern "C" void ds4_sycl_stream_test_reset(void) {
-    if (!g_devices.empty()) {
-        sycl::queue &q = ds4_sycl_current_queue();
-        sycl_stream_resident_release_all(q);
-        sycl_stream_selected_release(q);
-    }
+    if (!g_devices.empty()) sycl_stream_teardown_all(ds4_sycl_current_queue());
     g_sycl_stream_cache_budget = 0;
     g_sycl_stream_hits = 0;
     g_sycl_stream_misses = 0;
+    /* Every test in this file exercises the cache itself, so default to
+     * streaming enabled here; tests specifically about
+     * ds4_gpu_set_ssd_streaming's own lifecycle call it directly to
+     * override this. */
+    g_sycl_stream_mode = true;
 }
