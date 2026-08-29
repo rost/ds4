@@ -366,6 +366,115 @@ static int test_router_probs_fully_written_both_counts(void) {
     return 0;
 }
 
+/* n_expert == 0 must resolve to the default (256), matching ROCm's launcher
+ * (active_n_expert = n_expert != 0 ? n_expert : DS4_ROCM_N_EXPERT). Tensors
+ * are sized for the actual resolved width (256), the call passes
+ * n_expert == 0, and every output is checked against the same oracle used
+ * elsewhere with n_expert == 256 explicitly: if the zero were mistakenly
+ * left unresolved, validation would reject it (0 is neither 256 nor 384)
+ * and the very first CHECK below would fail. */
+static int test_router_n_expert_zero_default(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 8 };
+    float logits[N_EXPERT];
+    for (uint32_t i = 0; i < N_EXPERT; i++) {
+        logits[i] = 0.01f * (float)i - 3.0f + 0.31f * (float)((i * 11) % 5);
+    }
+
+    ds4_gpu_tensor *tlogits = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *tselected = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *tweights = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *tprobs = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT * sizeof(float));
+    CHECK(tlogits && tselected && tweights && tprobs, "router: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tlogits, 0, logits, sizeof(logits)) != 0, "router: logits write failed");
+
+    unsigned char model[16];
+    memset(model, 0, sizeof(model));
+
+    CHECK(ds4_gpu_router_select_tensor(
+              tselected, tweights, tprobs, model, sizeof(model), 0, 0, 0, 0,
+              /*n_expert=*/0, N_EXPERT_USED, 1.5f, 0, 0, false, false, tlogits) != 0,
+          "router: n_expert == 0 must resolve to the default (256), not be rejected");
+
+    float got_probs[N_EXPERT];
+    int32_t got_selected[N_EXPERT_USED];
+    float got_weights[N_EXPERT_USED];
+    CHECK(ds4_gpu_tensor_read(tprobs, 0, got_probs, sizeof(got_probs)) != 0, "router: probs read failed");
+    CHECK(ds4_gpu_tensor_read(tselected, 0, got_selected, sizeof(got_selected)) != 0, "router: selected read failed");
+    CHECK(ds4_gpu_tensor_read(tweights, 0, got_weights, sizeof(got_weights)) != 0, "router: weights read failed");
+
+    float want_probs[N_EXPERT];
+    oracle_router_probs(want_probs, logits, N_EXPERT);
+    for (uint32_t i = 0; i < N_EXPERT; i++) {
+        CHECK_CLOSE(got_probs[i], want_probs[i], 1e-5, "router: n_expert==0 default probs mismatch");
+    }
+
+    int32_t want_selected[N_EXPERT_USED];
+    float want_weights[N_EXPERT_USED];
+    oracle_topk_select(want_selected, want_weights, want_probs, NULL, 0, N_EXPERT, N_EXPERT_USED, 1.5f);
+    for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+        CHECK(got_selected[j] == want_selected[j], "router: n_expert==0 default selected mismatch");
+        CHECK_CLOSE(got_weights[j], want_weights[j], 1e-5, "router: n_expert==0 default weight mismatch");
+    }
+
+    ds4_gpu_tensor_free(tlogits);
+    ds4_gpu_tensor_free(tselected);
+    ds4_gpu_tensor_free(tweights);
+    ds4_gpu_tensor_free(tprobs);
+    fprintf(stderr, "  test_router_n_expert_zero_default OK\n");
+    return 0;
+}
+
+/* n_expert_used == 0 must resolve to the default (8), matching ROCm's
+ * launcher. Tensors are sized for the actual resolved width (8), the call
+ * passes n_expert_used == 0, and every selected/weight output is checked
+ * against the oracle with n_expert_used == 8 explicitly: if the zero were
+ * mistakenly left unresolved, the topk loop would run zero iterations and
+ * every comparison below would fail against the real 8-expert oracle. */
+static int test_router_n_expert_used_zero_default(void) {
+    enum { N_EXPERT = 256, N_EXPERT_USED = 8 };
+    float logits[N_EXPERT];
+    for (uint32_t i = 0; i < N_EXPERT; i++) {
+        logits[i] = 0.01f * (float)i - 2.5f + 0.23f * (float)((i * 7) % 9);
+    }
+
+    ds4_gpu_tensor *tlogits = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *tselected = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT_USED * sizeof(int32_t));
+    ds4_gpu_tensor *tweights = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT_USED * sizeof(float));
+    ds4_gpu_tensor *tprobs = ds4_gpu_tensor_alloc((uint64_t)N_EXPERT * sizeof(float));
+    CHECK(tlogits && tselected && tweights && tprobs, "router: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tlogits, 0, logits, sizeof(logits)) != 0, "router: logits write failed");
+
+    unsigned char model[16];
+    memset(model, 0, sizeof(model));
+
+    CHECK(ds4_gpu_router_select_tensor(
+              tselected, tweights, tprobs, model, sizeof(model), 0, 0, 0, 0,
+              N_EXPERT, /*n_expert_used=*/0, 1.5f, 0, 0, false, false, tlogits) != 0,
+          "router: n_expert_used == 0 must resolve to the default (8), not be rejected");
+
+    int32_t got_selected[N_EXPERT_USED];
+    float got_weights[N_EXPERT_USED];
+    CHECK(ds4_gpu_tensor_read(tselected, 0, got_selected, sizeof(got_selected)) != 0, "router: selected read failed");
+    CHECK(ds4_gpu_tensor_read(tweights, 0, got_weights, sizeof(got_weights)) != 0, "router: weights read failed");
+
+    float want_probs[N_EXPERT];
+    oracle_router_probs(want_probs, logits, N_EXPERT);
+    int32_t want_selected[N_EXPERT_USED];
+    float want_weights[N_EXPERT_USED];
+    oracle_topk_select(want_selected, want_weights, want_probs, NULL, 0, N_EXPERT, N_EXPERT_USED, 1.5f);
+    for (uint32_t j = 0; j < N_EXPERT_USED; j++) {
+        CHECK(got_selected[j] == want_selected[j], "router: n_expert_used==0 default selected mismatch");
+        CHECK_CLOSE(got_weights[j], want_weights[j], 1e-5, "router: n_expert_used==0 default weight mismatch");
+    }
+
+    ds4_gpu_tensor_free(tlogits);
+    ds4_gpu_tensor_free(tselected);
+    ds4_gpu_tensor_free(tweights);
+    ds4_gpu_tensor_free(tprobs);
+    fprintf(stderr, "  test_router_n_expert_used_zero_default OK\n");
+    return 0;
+}
+
 /* Drives the selected probabilities small enough that their sum falls
  * below the 6.103515625e-5f floor, and asserts the floor is applied: very
  * negative logits push every prob toward 0. */
@@ -508,6 +617,8 @@ int main(void) {
     if (test_router_bias_changes_selection() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_router_ties() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_router_probs_fully_written_both_counts() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_n_expert_zero_default() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_router_n_expert_used_zero_default() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_router_sum_floor() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_router_rejections() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
