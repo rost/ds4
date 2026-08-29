@@ -133,6 +133,101 @@ static inline float sycl_q8_0_dequant(const unsigned char *row, uint32_t col) {
     return scale * (float)qv;
 }
 
+/* Q4_K row layout: cuda_block_q4_K, ds4_rocm.cu:72-77 (also the routed-MoE's
+ * own sycl_block_q4_K in ds4_sycl_moe.hpp before this move): 256-value
+ * superblock, F16 scale `d` and F16 min `dmin`, 12 bytes of packed 6-bit
+ * (scale, min) codes for 8 sub-blocks of 32, 128 bytes of packed 4-bit
+ * codes.  Moved here from ds4_sycl_moe.hpp (the routed-MoE Q4_K path)
+ * because the dense matmul and attention-output entries need the
+ * exact same block layout and scale/min decode; ds4_sycl_moe.hpp now
+ * references these definitions instead of keeping its own copy, per this
+ * project's standing rule against a second Q4_K dequantiser. */
+static inline int sycl_q4_k_row_bytes_checked(uint64_t in_dim, uint64_t *row_bytes) {
+    if (!row_bytes) return 0;
+    const uint64_t blocks = (in_dim + 255u) / 256u;
+    return sycl_u64_mul_checked(blocks, 144u, row_bytes);
+}
+
+struct sycl_block_q4_K {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[128];
+};
+
+/* dev_q4_K_get_scale_min, moe.cuh:250-262 (and ds4.c's own CPU oracle,
+ * q4_k_get_scale_min, ds4.c:3524-3532, which computes the identical two
+ * 6-bit codes from the same 12-byte layout): sub-block j in [0,8) packs its
+ * scale and min across the 12-byte `scales` array two different ways
+ * depending on whether j is in the first or second half. */
+static inline void sycl_dev_q4_k_get_scale_min(uint32_t j, const uint8_t *scales,
+                                               uint8_t *d_out, uint8_t *m_out) {
+    if (j < 4u) {
+        *d_out = scales[j] & 63u;
+        *m_out = scales[j + 4u] & 63u;
+    } else {
+        *d_out = (scales[j + 4u] & 0x0fu) | ((scales[j - 4u] >> 6u) << 4u);
+        *m_out = (scales[j + 4u] >> 4u) | ((scales[j] >> 6u) << 4u);
+    }
+}
+
+/* Dequantises one column of a Q4_K row: value = d*sc*nibble - dmin*m, the
+ * same per-element formula ds4.c's own ds4_vec_dot_q4_K_f32 (ds4.c:3709-
+ * 3736) accumulates over a whole row, and the same decomposition the
+ * routed-MoE's device dot product (sycl_dev_dot_q4_k_q8_k_block,
+ * ds4_sycl_moe.hpp) uses per sub-block.  Sub-block j = col/32 within the
+ * 256-wide superblock picks
+ * its (scale, min) pair via sycl_dev_q4_k_get_scale_min; sub-blocks pair up
+ * two-to-a-byte-range (j=2m holds the low nibble of qs[m*32 .. m*32+31],
+ * j=2m+1 the high nibble of the SAME bytes), matching moe.cuh's
+ * dev_dot_q4_32 byte_off = (j>>1)*32 / shift = (j&1)?4:0. */
+static inline float sycl_q4_k_dequant(const unsigned char *row, uint32_t col) {
+    const uint32_t blk = col / 256u;
+    const uint32_t idx = col % 256u;
+    const sycl_block_q4_K *bp =
+            (const sycl_block_q4_K *)(row + (size_t)blk * 144u);
+    const uint32_t j = idx / 32u;
+    const uint32_t pos = idx % 32u;
+    uint8_t sc = 0, m = 0;
+    sycl_dev_q4_k_get_scale_min(j, bp->scales, &sc, &m);
+    const uint32_t byte_off = (j >> 1u) * 32u + pos;
+    const uint8_t raw = bp->qs[byte_off];
+    const uint8_t nib = (j & 1u) ? (uint8_t)(raw >> 4u) : (uint8_t)(raw & 0x0fu);
+    const float d = (float)sycl::bit_cast<sycl::half>(bp->d);
+    const float dmin = (float)sycl::bit_cast<sycl::half>(bp->dmin);
+    return d * (float)sc * (float)nib - dmin * (float)m;
+}
+
+/* Q4_0 row layout: the standard GGUF q4_0 block (gguf_types[2] in ds4.c,
+ * block_elems=32, block_bytes=18).  Unlike Q4_K/Q8_0, nothing in ds4.c,
+ * ds4_cuda.cu or rocm/ has ever decoded this format before now: it is
+ * declared as a legal dense-quant type (tensor_type_is_dense_quant, ds4.c)
+ * but ds4_cuda.cu's own ds4_gpu_matmul_quant_tensor rejects every type but
+ * Q8_0/F16, and ds4_metal.m's implementation is a bespoke, non-portable
+ * Metal compute kernel with no scalar reference to transcribe.  This is
+ * therefore the standard llama.cpp/GGUF q4_0 layout, not a port: an F16
+ * scale `d` followed by 16 bytes of packed 4-bit codes for 32 values, byte
+ * i holding value i in its low nibble and value i+16 in its high nibble,
+ * decoded as a symmetric signed range via a zero-point of 8 (v = d *
+ * (nibble - 8)). */
+static inline int sycl_q4_0_row_bytes_checked(uint64_t in_dim, uint64_t *row_bytes) {
+    if (!row_bytes) return 0;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    return sycl_u64_mul_checked(blocks, 18u, row_bytes);
+}
+
+static inline float sycl_q4_0_dequant(const unsigned char *row, uint32_t col) {
+    const uint32_t blk = col / 32u;
+    const uint32_t idx = col % 32u;
+    const unsigned char *bp = row + (size_t)blk * 18u;
+    const uint16_t draw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+    const float d = (float)sycl::bit_cast<sycl::half>(draw);
+    const unsigned char *qs = bp + 2;
+    const uint8_t byte = (idx < 16u) ? qs[idx] : qs[idx - 16u];
+    const uint8_t nib = (idx < 16u) ? (uint8_t)(byte & 0x0fu) : (uint8_t)(byte >> 4u);
+    return d * ((float)nib - 8.0f);
+}
+
 namespace {
 
 /* Frees a sycl::malloc_device allocation when it goes out of scope, on

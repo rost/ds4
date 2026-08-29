@@ -816,6 +816,534 @@ static int test_matmul_q8_0_f16_out(void) {
     return 0;
 }
 
+/* ---- ds4_gpu_matmul_quant_tensor / _kslice_tensor: Q4_K and Q4_0 --------
+ *
+ * ds4_cuda.cu's own ds4_gpu_matmul_quant_tensor dispatches only Q8_0 and
+ * F16; ds4_metal.m genuinely supports Q4_K/Q4_0 here but through bespoke
+ * Metal compute shaders with no scalar source to transcribe. So these
+ * oracles are built directly from the standard block formats: Q4_K's from
+ * ds4.c's own q4_k_get_scale_min (ds4.c:3524-3532) and
+ * ds4_vec_dot_q4_K_f32 (ds4.c:3709-3736), the same formula the routed-MoE's
+ * device dot product (sycl_dev_dot_q4_k_q8_k_block, ds4_sycl_moe.hpp) already
+ * uses per sub-block; Q4_0's from the standard GGUF layout
+ * (gguf_types[2] in ds4.c: block_elems=32, block_bytes=18), which nothing
+ * in this codebase decoded before now. */
+
+/* Inverse of q4_k_get_scale_min (ds4.c:3524-3532): packs 8 (scale, min)
+ * pairs, each a 6-bit code (0-63), into the 12-byte array a real Q4_K block
+ * carries. Derived by solving q4_k_get_scale_min's two branches for their
+ * inputs; cross-checked against that decode by test_q4k_pack_roundtrip
+ * below before being trusted for anything else, mirroring the precedent in
+ * tests/test_sycl_moe.c's test_q4k_scale_pack_roundtrip. */
+static void test_q4k_pack_scales(uint8_t q[12], const uint8_t sc[8], const uint8_t m[8]) {
+    for (int i = 0; i < 4; i++) {
+        q[i]     = (uint8_t)((sc[i] & 0x3Fu) | ((uint32_t)(sc[i + 4] >> 4) << 6));
+        q[i + 4] = (uint8_t)((m[i]  & 0x3Fu) | ((uint32_t)(m[i + 4]  >> 4) << 6));
+        q[i + 8] = (uint8_t)((sc[i + 4] & 0x0Fu) | ((uint32_t)(m[i + 4] & 0x0Fu) << 4));
+    }
+}
+
+static void test_q4k_get_scale_min(int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m  = q[j + 4] & 63;
+    } else {
+        *sc = (uint8_t)((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+        *m  = (uint8_t)((q[j + 4] >> 4)  | ((q[j] >> 6) << 4));
+    }
+}
+
+static int test_q4k_pack_roundtrip(void) {
+    for (int seed = 0; seed < 5; seed++) {
+        uint8_t sc[8], m[8], q[12];
+        for (int j = 0; j < 8; j++) {
+            sc[j] = (uint8_t)((seed * 17 + j * 23) % 64);
+            m[j]  = (uint8_t)((seed * 29 + j * 11) % 64);
+        }
+        test_q4k_pack_scales(q, sc, m);
+        for (int j = 0; j < 8; j++) {
+            uint8_t got_sc, got_m;
+            test_q4k_get_scale_min(j, q, &got_sc, &got_m);
+            CHECK(got_sc == sc[j], "q4k_pack_roundtrip: sc mismatch");
+            CHECK(got_m == m[j], "q4k_pack_roundtrip: m mismatch");
+        }
+    }
+    fprintf(stderr, "  test_q4k_pack_roundtrip OK\n");
+    return 0;
+}
+
+/* Packs one 144-byte Q4_K block from an explicit (d, dmin, sc[8], m[8],
+ * nib[256]) description: two sub-blocks share each 32-byte qs region, low
+ * nibble for the even sub-block, high nibble for the odd one, matching
+ * sycl_q4_k_dequant's byte_off = (j>>1)*32 / shift = (j&1)?4:0 (and plan
+ * 9's identical moe.cuh-derived math). */
+static void test_q4k_pack_block(unsigned char out[144], float d, float dmin,
+                                const uint8_t sc[8], const uint8_t m[8],
+                                const uint8_t nib[256]) {
+    const uint16_t draw = test_float_to_half(d);
+    const uint16_t dminraw = test_float_to_half(dmin);
+    out[0] = (unsigned char)(draw & 0xFFu);
+    out[1] = (unsigned char)((draw >> 8) & 0xFFu);
+    out[2] = (unsigned char)(dminraw & 0xFFu);
+    out[3] = (unsigned char)((dminraw >> 8) & 0xFFu);
+    test_q4k_pack_scales(out + 4, sc, m);
+    unsigned char *qs = out + 16;
+    memset(qs, 0, 128);
+    for (int j = 0; j < 8; j++) {
+        const int byte_off = (j >> 1) * 32;
+        const int shift = (j & 1) ? 4 : 0;
+        for (int k = 0; k < 32; k++) {
+            const uint8_t v = nib[j * 32 + k] & 0x0Fu;
+            qs[byte_off + k] = (unsigned char)(qs[byte_off + k] | (v << shift));
+        }
+    }
+}
+
+/* Deterministic per-(row, block) Q4_K weight-row generator with an
+ * index-interaction nibble term (spec 6f/6i: affine test data hides
+ * scale-only bugs and makes adjacent blocks indistinguishable). Columns at
+ * or past in_dim within the last, possibly ragged, superblock are zeroed,
+ * matching test_encode_q8_0_row's own padding treatment. */
+static void test_encode_q4_k_row(unsigned char *row, uint32_t in_dim, uint32_t o) {
+    const uint32_t blocks = (in_dim + 255u) / 256u;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        uint8_t sc[8], m[8], nib[256];
+        for (uint32_t j = 0; j < 8u; j++) {
+            sc[j] = (uint8_t)(1u + ((o + j * 3u + blk * 11u) % 60u));
+            m[j]  = (uint8_t)(1u + ((o * 2u + j * 5u + blk * 7u) % 60u));
+        }
+        for (uint32_t idx = 0; idx < 256u; idx++) {
+            const uint32_t k = blk * 256u + idx;
+            nib[idx] = (k < in_dim)
+                    ? (uint8_t)(((o + 1u) * (k + 3u) + (o * k) % 7u) % 16u)
+                    : 0u;
+        }
+        const float d = 0.05f * (float)(o + blk + 1u);
+        const float dmin = 0.02f * (float)(o + 2u * blk + 1u);
+        test_q4k_pack_block(row + (size_t)blk * 144u, d, dmin, sc, m, nib);
+    }
+}
+
+/* Oracle: value = d*sc*nib - dmin*m per column, ds4.c:3709-3736
+ * (ds4_vec_dot_q4_K_f32), specialised to one column at a time so the
+ * matmul oracle below reads exactly like oracle_matmul_q8_0's shape. */
+static float oracle_q4_k_dequant(const unsigned char *row, uint32_t col) {
+    const uint32_t blk = col / 256u;
+    const uint32_t idx = col % 256u;
+    const unsigned char *bp = row + (size_t)blk * 144u;
+    const uint16_t draw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+    const uint16_t dminraw = (uint16_t)(bp[2] | ((uint16_t)bp[3] << 8));
+    const uint8_t *scales = bp + 4;
+    const uint8_t *qs = bp + 16;
+    const uint32_t j = idx / 32u;
+    const uint32_t pos = idx % 32u;
+    uint8_t sc, m;
+    test_q4k_get_scale_min((int)j, scales, &sc, &m);
+    const uint32_t byte_off = (j >> 1u) * 32u + pos;
+    const uint8_t raw = qs[byte_off];
+    const uint8_t nib = (j & 1u) ? (uint8_t)(raw >> 4u) : (uint8_t)(raw & 0x0Fu);
+    const float d = oracle_half_to_float(draw);
+    const float dmin = oracle_half_to_float(dminraw);
+    return d * (float)sc * (float)nib - dmin * (float)m;
+}
+
+static void oracle_matmul_q4_k(float *out, const float *x, const unsigned char *w,
+                               uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
+                               uint64_t row_bytes) {
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < out_dim; o++) {
+            const unsigned char *row = w + (size_t)o * row_bytes;
+            double sum = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) {
+                sum += (double)x[t * in_dim + k] * (double)oracle_q4_k_dequant(row, k);
+            }
+            out[t * out_dim + o] = (float)sum;
+        }
+    }
+}
+
+/* IN_DIM spans two superblocks, the second ragged, so both the full-block
+ * and remainder paths are exercised; weight_type=12u is Q4_K
+ * (DS4_TENSOR_Q4_K in ds4.c), passed numerically per this backend's
+ * existing convention (sycl/ds4_sycl_moe_launch.hpp's own comment: ds4_gpu.h
+ * declares no DS4_TENSOR_* constants for backend use). */
+static int test_matmul_q4_k(void) {
+    enum { IN_DIM = 293, OUT_DIM = 3, N_TOK = 2 };
+    const uint32_t weight_type = 12u; /* Q4_K */
+    const uint64_t blocks = (IN_DIM + 255u) / 256u;
+    const uint64_t row_bytes = blocks * 144u;
+
+    unsigned char weights[OUT_DIM * 2 * 144]; /* row_bytes <= 2*144 here */
+    float          x[N_TOK * IN_DIM];
+    float          want[N_TOK * OUT_DIM];
+    float          got[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q4_k_row(weights + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+    oracle_matmul_q4_k(want, x, weights, IN_DIM, OUT_DIM, N_TOK, row_bytes);
+
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * row_bytes;
+
+    ds4_gpu_tensor *tx  = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tx != NULL && tout != NULL, "matmul_q4_k: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0, "matmul_q4_k: write x");
+
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, 0, weight_type,
+                                      IN_DIM, OUT_DIM, tx, N_TOK) != 0,
+          "matmul_q4_k: call");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got, sizeof(got)) != 0,
+          "matmul_q4_k: read out");
+
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-2, "matmul_q4_k: out mismatch");
+    }
+
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, 0, weight_type,
+                                      0, OUT_DIM, tx, N_TOK) == 0,
+          "matmul_q4_k: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, 0, weight_type,
+                                      IN_DIM, 0, tx, N_TOK) == 0,
+          "matmul_q4_k: zero out_dim must be rejected");
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, 0, weight_type,
+                                      IN_DIM, OUT_DIM, tx, 0) == 0,
+          "matmul_q4_k: zero n_tok must be rejected");
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, weight_bytes,
+                                      weight_type, IN_DIM, OUT_DIM, tx, N_TOK) == 0,
+          "matmul_q4_k: out-of-range weight offset must be rejected");
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, 0, 99u,
+                                      IN_DIM, OUT_DIM, tx, N_TOK) == 0,
+          "matmul_q4_k: unsupported weight_type must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_matmul_q4_k OK\n");
+    return 0;
+}
+
+/* Q4_0 row encoder: the standard GGUF layout (gguf_types[2] in ds4.c,
+ * block_elems=32, block_bytes=18): an F16 scale followed by 16 bytes of
+ * packed 4-bit codes, byte i holding value i in its low nibble and value
+ * i+16 in its high nibble, decoded with a zero-point of 8. Nothing in this
+ * codebase decoded this format before now (established by grep: no
+ * block_q4_0 struct, no dequant function, anywhere in ds4.c or ds4_cuda.cu). */
+static void test_encode_q4_0_row(unsigned char *row, uint32_t in_dim, uint32_t o) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        unsigned char *bp = row + (size_t)blk * 18u;
+        const float d = 0.07f * (float)(o + blk + 1u);
+        const uint16_t draw = test_float_to_half(d);
+        bp[0] = (unsigned char)(draw & 0xFFu);
+        bp[1] = (unsigned char)((draw >> 8) & 0xFFu);
+        unsigned char *qs = bp + 2;
+        memset(qs, 0, 16);
+        for (uint32_t idx = 0; idx < 32u; idx++) {
+            const uint32_t k = blk * 32u + idx;
+            const uint8_t nib = (k < in_dim)
+                    ? (uint8_t)(((o + 1u) * (k + 5u) + (o * k) % 7u) % 16u)
+                    : 8u; /* zero-point: contributes exactly 0 when padding */
+            if (idx < 16u) qs[idx] = (unsigned char)(qs[idx] | nib);
+            else qs[idx - 16u] = (unsigned char)(qs[idx - 16u] | (nib << 4));
+        }
+    }
+}
+
+static float oracle_q4_0_dequant(const unsigned char *row, uint32_t col) {
+    const uint32_t blk = col / 32u;
+    const uint32_t idx = col % 32u;
+    const unsigned char *bp = row + (size_t)blk * 18u;
+    const uint16_t draw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+    const float d = oracle_half_to_float(draw);
+    const unsigned char *qs = bp + 2;
+    const uint8_t byte = (idx < 16u) ? qs[idx] : qs[idx - 16u];
+    const uint8_t nib = (idx < 16u) ? (uint8_t)(byte & 0x0Fu) : (uint8_t)(byte >> 4u);
+    return d * ((float)nib - 8.0f);
+}
+
+static void oracle_matmul_q4_0(float *out, const float *x, const unsigned char *w,
+                               uint32_t in_dim, uint32_t out_dim, uint32_t n_tok,
+                               uint64_t row_bytes) {
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < out_dim; o++) {
+            const unsigned char *row = w + (size_t)o * row_bytes;
+            double sum = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) {
+                sum += (double)x[t * in_dim + k] * (double)oracle_q4_0_dequant(row, k);
+            }
+            out[t * out_dim + o] = (float)sum;
+        }
+    }
+}
+
+/* IN_DIM spans two blocks, the second ragged (9 of 32 used), distinct from
+ * every Q4_K dimension above so a copy-paste between the two dequantisers
+ * would produce a visibly wrong shape, not just a wrong value. */
+static int test_matmul_q4_0(void) {
+    enum { IN_DIM = 41, OUT_DIM = 4, N_TOK = 3 };
+    const uint32_t weight_type = 2u; /* Q4_0 */
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 18u;
+
+    unsigned char weights[OUT_DIM * 2 * 18]; /* row_bytes <= 2*18 here */
+    float          x[N_TOK * IN_DIM];
+    float          want[N_TOK * OUT_DIM];
+    float          got[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q4_0_row(weights + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+    oracle_matmul_q4_0(want, x, weights, IN_DIM, OUT_DIM, N_TOK, row_bytes);
+
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * row_bytes;
+
+    ds4_gpu_tensor *tx  = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tx != NULL && tout != NULL, "matmul_q4_0: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0, "matmul_q4_0: write x");
+
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, 0, weight_type,
+                                      IN_DIM, OUT_DIM, tx, N_TOK) != 0,
+          "matmul_q4_0: call");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got, sizeof(got)) != 0,
+          "matmul_q4_0: read out");
+
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-2, "matmul_q4_0: out mismatch");
+    }
+
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, 0, weight_type,
+                                      0, OUT_DIM, tx, N_TOK) == 0,
+          "matmul_q4_0: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, 0, weight_type,
+                                      IN_DIM, 0, tx, N_TOK) == 0,
+          "matmul_q4_0: zero out_dim must be rejected");
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, 0, weight_type,
+                                      IN_DIM, OUT_DIM, tx, 0) == 0,
+          "matmul_q4_0: zero n_tok must be rejected");
+    CHECK(ds4_gpu_matmul_quant_tensor(tout, weights, weight_bytes, weight_bytes,
+                                      weight_type, IN_DIM, OUT_DIM, tx, N_TOK) == 0,
+          "matmul_q4_0: out-of-range weight offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_matmul_q4_0 OK\n");
+    return 0;
+}
+
+/* Differential test against the Q8_0 equivalent (plan guidance: two real
+ * implemented paths disagreeing is a stronger signal than either against an
+ * oracle alone). Both the Q4_K row and a Q8_0 row are built to encode
+ * approximately the SAME underlying float target: the Q4_K row's target is
+ * whatever its (d, sc, m, nib) fields evaluate to EXACTLY (the same formula
+ * sycl_q4_k_dequant computes), and that exact target is then Q8_0-quantised
+ * (per-32-block amax/127 scale, round to nearest, matching
+ * quantize_q8_0_activation-style encoding) into a same-shaped Q8_0 row.
+ * ds4_gpu_matmul_q8_0_tensor's result should then match
+ * ds4_gpu_matmul_quant_tensor's Q4_K result up to Q8_0's OWN quantisation
+ * error (a few tenths of a percent), not up to Q4_K's much coarser 4-bit
+ * step -- because the Q4_K side carries no approximation error here, only
+ * the Q8_0 side does. */
+static void test_encode_q8_0_row_matching_q4_k(unsigned char *q8_row,
+                                               const unsigned char *q4k_row,
+                                               uint32_t in_dim) {
+    const uint32_t q8_blocks = (in_dim + 31u) / 32u;
+    for (uint32_t b = 0; b < q8_blocks; b++) {
+        const uint32_t i0 = b * 32u;
+        const uint32_t bn = (in_dim - i0 < 32u) ? (in_dim - i0) : 32u;
+        float amax = 0.0f;
+        float target[32];
+        for (uint32_t i = 0; i < bn; i++) {
+            target[i] = oracle_q4_k_dequant(q4k_row, i0 + i);
+            const float ax = fabsf(target[i]);
+            if (ax > amax) amax = ax;
+        }
+        const float d = amax / 127.0f;
+        const float id = d != 0.0f ? 1.0f / d : 0.0f;
+        unsigned char *bp = q8_row + (size_t)b * 34u;
+        const uint16_t draw = test_float_to_half(d);
+        bp[0] = (unsigned char)(draw & 0xFFu);
+        bp[1] = (unsigned char)((draw >> 8) & 0xFFu);
+        for (uint32_t i = 0; i < 32u; i++) {
+            int v = 0;
+            if (i < bn) {
+                v = (int)lrintf(target[i] * id);
+                if (v > 127) v = 127;
+                if (v < -128) v = -128;
+            }
+            bp[2 + i] = (unsigned char)(signed char)v;
+        }
+    }
+}
+
+/* Worst-case propagated error bound for one output row of the Q8_0 side of
+ * the differential below: each quantised weight can be off by at most half
+ * its block's step (amax/127), so the dot product can be off by at most
+ * sum_k |x[k]| * step(k)/2. Sized per (token, out-row) rather than as a
+ * flat percentage of the answer, because the target data's mixed-sign
+ * d*sc*nibble - dmin*m terms can partially cancel, making a tolerance
+ * relative to the (possibly small) final sum too tight even when every
+ * individual term's quantisation error is unremarkable. */
+static double q8_0_row_error_bound(const float *x_row, const unsigned char *row,
+                                   uint32_t in_dim) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    double bound = 0.0;
+    for (uint32_t b = 0; b < blocks; b++) {
+        const unsigned char *bp = row + (size_t)b * 34u;
+        const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+        const double step = (double)oracle_half_to_float(raw);
+        const uint32_t i0 = b * 32u;
+        const uint32_t bn = (in_dim - i0 < 32u) ? (in_dim - i0) : 32u;
+        for (uint32_t i = 0; i < bn; i++) {
+            bound += fabs((double)x_row[i0 + i]) * step * 0.5;
+        }
+    }
+    return bound;
+}
+
+static int test_matmul_q4_k_vs_q8_0_differential(void) {
+    enum { IN_DIM = 256 + 40, OUT_DIM = 3, N_TOK = 2 };
+    const uint64_t q4k_blocks = (IN_DIM + 255u) / 256u;
+    const uint64_t q4k_row_bytes = q4k_blocks * 144u;
+    const uint64_t q8_blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t q8_row_bytes = q8_blocks * 34u;
+
+    unsigned char q4k_weights[OUT_DIM * 2 * 144];
+    unsigned char q8_weights[OUT_DIM * 10 * 34]; /* q8_blocks <= 10 here */
+    float          x[N_TOK * IN_DIM];
+    float          got_q4k[N_TOK * OUT_DIM];
+    float          got_q8[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q4_k_row(q4k_weights + (size_t)o * q4k_row_bytes, IN_DIM, o);
+        test_encode_q8_0_row_matching_q4_k(q8_weights + (size_t)o * q8_row_bytes,
+                                           q4k_weights + (size_t)o * q4k_row_bytes,
+                                           IN_DIM);
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tq4k = ds4_gpu_tensor_alloc(sizeof(got_q4k));
+    ds4_gpu_tensor *tq8 = ds4_gpu_tensor_alloc(sizeof(got_q8));
+    CHECK(tx && tq4k && tq8, "matmul_q4_k_vs_q8_0_differential: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "matmul_q4_k_vs_q8_0_differential: write x");
+
+    CHECK(ds4_gpu_matmul_quant_tensor(tq4k, q4k_weights, sizeof(q4k_weights), 0, 12u,
+                                      IN_DIM, OUT_DIM, tx, N_TOK) != 0,
+          "matmul_q4_k_vs_q8_0_differential: Q4_K call");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tq8, q8_weights, sizeof(q8_weights), 0,
+                                     IN_DIM, OUT_DIM, tx, N_TOK) != 0,
+          "matmul_q4_k_vs_q8_0_differential: Q8_0 call");
+    CHECK(ds4_gpu_tensor_read(tq4k, 0, got_q4k, sizeof(got_q4k)) != 0,
+          "matmul_q4_k_vs_q8_0_differential: read Q4_K out");
+    CHECK(ds4_gpu_tensor_read(tq8, 0, got_q8, sizeof(got_q8)) != 0,
+          "matmul_q4_k_vs_q8_0_differential: read Q8_0 out");
+
+    /* Tolerance is the worst-case Q8_0 quantisation error bound for this
+     * exact (token, out-row) pair (see q8_0_row_error_bound), with 50%
+     * headroom for accumulation-order differences between the GPU's float32
+     * sum and this bound's own double-precision arithmetic. */
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t o = 0; o < OUT_DIM; o++) {
+            const double bound = q8_0_row_error_bound(
+                    x + (size_t)t * IN_DIM, q8_weights + (size_t)o * q8_row_bytes, IN_DIM);
+            const double tol = 1.5 * bound + 1e-3;
+            CHECK_CLOSE(got_q8[t * OUT_DIM + o], got_q4k[t * OUT_DIM + o], tol,
+                        "matmul_q4_k_vs_q8_0_differential: Q8_0 vs Q4_K mismatch");
+        }
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tq4k);
+    ds4_gpu_tensor_free(tq8);
+    fprintf(stderr, "  test_matmul_q4_k_vs_q8_0_differential OK\n");
+    return 0;
+}
+
+/* ds4_gpu_matmul_quant_kslice_tensor: out[out_dim] = W[:, k_off:k_off+k_cnt]
+ * @ x[x_elem_off:+k_cnt], generalising ds4_gpu.h's doc comment on
+ * ds4_gpu_matmul_q8_0_kslice_tensor to every dense-quant type. Both call
+ * sites of this entry in ds4.c are gated by g->tp_world == 2 (tensor
+ * parallelism, out of scope for this port), so it is not reached by
+ * single-GPU Flash; tested directly here since it is listed as an
+ * interface to implement regardless. Exercises Q4_K specifically (Q8_0's
+ * own kslice entry, ds4_gpu_matmul_q8_0_kslice_tensor, is a separate,
+ * permanently-TP-only stub not touched here); k_off/k_cnt are
+ * chosen NOT aligned to a superblock boundary, unlike every real caller
+ * would use, specifically to prove the column-addressing math (k_off+k
+ * into the full un-sliced row) rather than a block-count shortcut that
+ * would only work for aligned slices. */
+static int test_matmul_quant_kslice_q4_k(void) {
+    enum { FULL_IN_DIM = 256 + 40, K_OFF = 50, K_CNT = 200, OUT_DIM = 3 };
+    const uint64_t row_bytes = ((FULL_IN_DIM + 255u) / 256u) * 144u;
+
+    unsigned char weights[OUT_DIM * 2 * 144];
+    float          x_full[FULL_IN_DIM];
+    float          want[OUT_DIM];
+    float          got[OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q4_k_row(weights + (size_t)o * row_bytes, FULL_IN_DIM, o);
+    }
+    for (uint32_t k = 0; k < FULL_IN_DIM; k++) {
+        x_full[k] = (float)((k + 2) % 9) - 4.0f;
+    }
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        const unsigned char *row = weights + (size_t)o * row_bytes;
+        double sum = 0.0;
+        for (uint32_t k = 0; k < K_CNT; k++) {
+            sum += (double)x_full[K_OFF + k] * (double)oracle_q4_k_dequant(row, K_OFF + k);
+        }
+        want[o] = (float)sum;
+    }
+
+    ds4_gpu_tensor *tx  = ds4_gpu_tensor_alloc(sizeof(x_full));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tx != NULL && tout != NULL, "matmul_quant_kslice_q4_k: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x_full, sizeof(x_full)) != 0,
+          "matmul_quant_kslice_q4_k: write x");
+
+    CHECK(ds4_gpu_matmul_quant_kslice_tensor(tout, weights, sizeof(weights), 0, 12u,
+                                             FULL_IN_DIM, K_OFF, K_CNT, OUT_DIM, tx,
+                                             K_OFF) != 0,
+          "matmul_quant_kslice_q4_k: call");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got, sizeof(got)) != 0,
+          "matmul_quant_kslice_q4_k: read out");
+
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-2, "matmul_quant_kslice_q4_k: out mismatch");
+    }
+
+    CHECK(ds4_gpu_matmul_quant_kslice_tensor(tout, weights, sizeof(weights), 0, 12u,
+                                             FULL_IN_DIM, FULL_IN_DIM + 1u, K_CNT,
+                                             OUT_DIM, tx, 0) == 0,
+          "matmul_quant_kslice_q4_k: k_off past full_in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_quant_kslice_tensor(tout, weights, sizeof(weights), 0, 12u,
+                                             FULL_IN_DIM, K_OFF, FULL_IN_DIM, OUT_DIM,
+                                             tx, K_OFF) == 0,
+          "matmul_quant_kslice_q4_k: k_cnt past full_in_dim must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_matmul_quant_kslice_q4_k OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_matmul_f16_pair() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -828,6 +1356,11 @@ int main(void) {
     if (test_matmul_f32() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_f16() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_f16_out() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_pack_roundtrip() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q4_k() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q4_0() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q4_k_vs_q8_0_differential() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_quant_kslice_q4_k() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_matmul OK\n");
     return 0;

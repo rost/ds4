@@ -148,9 +148,12 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_kslice_rows_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_top1_tensor)
+/* ds4_gpu_matmul_quant_decode_mpp_model_view_tensor stays stubbed: its only
+ * call site (ds4.c:41241, glm_graph_matmul_q8_0_decode_tensor) is in the
+ * glm_graph_* family, GLM-only, out of scope for this Flash-only backend
+ * (checked directly: every caller of glm_graph_matmul_q8_0_decode_tensor
+ * reads a ds4_glm_gpu_graph, not Flash's ds4_gpu_graph). */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_quant_decode_mpp_model_view_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_quant_kslice_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_quant_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_model_range_replaced)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_moe_handoff_pack_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_pack_slot_rows_f32_tensor)

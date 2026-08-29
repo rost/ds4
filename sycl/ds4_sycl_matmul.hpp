@@ -731,3 +731,295 @@ extern "C" int ds4_gpu_matmul_f32_tensor(
     }
     return 1;
 }
+
+/* ---- Dense Q4_K / Q4_0 matmul, plus the type-dispatching quant entries --
+ *
+ * ds4_gpu_matmul_quant_tensor and ds4_gpu_matmul_quant_kslice_tensor fire
+ * whenever attn_q_a, attn_kv, attn_output_a/b or ffn_gate/up/down_shexp is
+ * quantised Q4_K or Q4_0 rather than Q8_0: tensor_expect_dense_quant_layout
+ * (ds4.c) accepts all three for those tensors, so a legitimate Flash
+ * checkpoint can choose either, and weights_validate_layout does not pin
+ * Q8_0 (contrast mtp_weights_validate_layout, which does, for the unrelated
+ * MTP draft weights).
+ *
+ * CUDA is only a partial reference here: ds4_cuda.cu's own
+ * ds4_gpu_matmul_quant_tensor has real dispatch logic, but only for its
+ * Q8_0 and F16 cases -- its `default` branch rejects Q4_K/Q4_0 exactly like
+ * this file's own rejects an unsupported type, so CUDA itself has never
+ * run a Q4_K/Q4_0 dense-quant checkpoint through this entry. Only
+ * ds4_metal.m genuinely implements Q4_K/Q4_0 here, through bespoke,
+ * non-portable Metal compute shaders (kernel_mul_mv_q4_K_dense_f32 and
+ * friends) with no scalar formula to transcribe line-for-line. What is
+ * ported instead is the standard block-quantisation MATH those shaders (and
+ * ds4.c's own ds4_vec_dot_q4_K_f32, :3709-3736, used by the GLM CPU
+ * reference path) all compute: for Q4_K, value = d*sc*nibble - dmin*m per
+ * column, via ds4_sycl_common.hpp's sycl_q4_k_dequant, itself sharing its
+ * block struct and scale/min decode with the routed-MoE Q4_K path
+ * rather than a second copy; for Q4_0, the standard GGUF layout (never
+ * decoded anywhere in this codebase before now; see
+ * sycl_q4_0_dequant's own comment). ds4_gpu_matmul_quant_kslice_tensor's
+ * own ds4_cuda.cu definition is a plain unconditional stub even for Q8_0,
+ * so it has no CUDA reference behaviour at all; see its own comment below
+ * for why it is implemented anyway and what its real reachability turned
+ * out to be. */
+
+/* One work-item per (token, out_row) output element, generic over the
+ * per-column dequantiser: `Dequant` is a stateless functor
+ * `float(const unsigned char *row, uint32_t col)`, the same signature
+ * sycl_q8_0_dequant/sycl_q4_k_dequant/sycl_q4_0_dequant already share.
+ * Passed as a template parameter (a distinct functor type per call site,
+ * always a capture-less lambda below) rather than a runtime function
+ * pointer so the SYCL device compiler sees a direct, statically resolved
+ * call inside the kernel body rather than an indirect one. One level more
+ * general than sycl_q8_0_matmul_launch/sycl_matmul_f32_launch above, which
+ * this could replace but does not, to keep this change scoped to the new
+ * entries it actually needs. */
+template <typename Dequant>
+static void sycl_dense_quant_matmul_launch(sycl::queue &q, float *out,
+                                           const unsigned char *w, const float *x,
+                                           uint32_t in_dim, uint32_t out_dim,
+                                           uint32_t n_tok, uint64_t row_bytes,
+                                           Dequant dequant) {
+    const uint64_t n = (uint64_t)n_tok * out_dim;
+    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+        const uint32_t o  = (uint32_t)(gid % out_dim);
+        const uint32_t t  = (uint32_t)(gid / out_dim);
+        const float         *xr = x + (uint64_t)t * in_dim;
+        const unsigned char *wr = w + (uint64_t)o * row_bytes;
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < in_dim; k++) {
+            sum += xr[k] * dequant(wr, k);
+        }
+        out[gid] = sum;
+    });
+}
+
+/* Validation, staging and launch shared by the Q4_K and Q4_0 dense matmul
+ * paths: the same shape as sycl_q8_0_matmul_general above, generalised over
+ * the dequantiser and its row-bytes computation. */
+template <typename Dequant>
+static int sycl_dense_quant_matmul_general(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+        const ds4_gpu_tensor *x, uint64_t n_tok, const char *what,
+        int (*row_bytes_checked)(uint64_t, uint64_t *), Dequant dequant) {
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_tok == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    uint64_t row_bytes = 0, weight_bytes = 0;
+    if (!row_bytes_checked(in_dim, &row_bytes) ||
+        !sycl_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !sycl_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !sycl_tensor_has_elems2(x, n_tok, in_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems2(out, n_tok, out_dim, sizeof(float))) {
+        return 0;
+    }
+    const char *wptr = sycl_model_range_ptr(model_map, weight_offset,
+                                            weight_bytes, model_size, what);
+    if (!wptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out->device_id);
+
+        unsigned char *dw = sycl::malloc_device<unsigned char>(
+                (size_t)weight_bytes, q);
+        if (!dw) return 0;
+        sycl_device_scratch_guard dw_guard(q, dw);
+        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
+
+        sycl_dense_quant_matmul_launch(q, (float *)out->ptr, dw,
+                                       (const float *)x->ptr, (uint32_t)in_dim,
+                                       (uint32_t)out_dim, (uint32_t)n_tok,
+                                       row_bytes, dequant);
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "%s matmul failed: %s\n", what, e.what());
+        return 0;
+    }
+    return 1;
+}
+
+static int sycl_q4_k_matmul_general(ds4_gpu_tensor *out, const void *model_map,
+                                    uint64_t model_size, uint64_t weight_offset,
+                                    uint64_t in_dim, uint64_t out_dim,
+                                    const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return sycl_dense_quant_matmul_general(
+            out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok,
+            "q4_K", sycl_q4_k_row_bytes_checked,
+            [](const unsigned char *row, uint32_t col) { return sycl_q4_k_dequant(row, col); });
+}
+
+static int sycl_q4_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
+                                    uint64_t model_size, uint64_t weight_offset,
+                                    uint64_t in_dim, uint64_t out_dim,
+                                    const ds4_gpu_tensor *x, uint64_t n_tok) {
+    return sycl_dense_quant_matmul_general(
+            out, model_map, model_size, weight_offset, in_dim, out_dim, x, n_tok,
+            "q4_0", sycl_q4_0_row_bytes_checked,
+            [](const unsigned char *row, uint32_t col) { return sycl_q4_0_dequant(row, col); });
+}
+
+/* Type-dispatching dense matmul entry. Return polarity and dispatch shape
+ * both verified against ds4_cuda.cu's own ds4_gpu_matmul_quant_tensor
+ * (switch on weight_type, nonzero-success, `default` rejects with a
+ * diagnostic and returns 0) and against ds4.c's two call sites
+ * (metal_graph_matmul_plain_tensor:25768-25778 and
+ * metal_graph_matmul_dense_quant_abs:25802-25810, both `... != 0`).
+ * weight_type is ds4's DS4_TENSOR_* enum value, passed numerically per this
+ * backend's existing convention (no DS4_TENSOR_* constants are exposed to
+ * backend code; see ds4_sycl_moe_launch.hpp's own comment on gate_type/
+ * down_type). */
+extern "C" int ds4_gpu_matmul_quant_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    switch (weight_type) {
+    case 8u:   /* Q8_0 */
+        return sycl_q8_0_matmul_general(out, model_map, model_size, weight_offset,
+                                        in_dim, out_dim, x, n_tok);
+    case 1u:   /* F16 */
+        return ds4_gpu_matmul_f16_tensor(out, model_map, model_size, weight_offset,
+                                         in_dim, out_dim, x, n_tok);
+    case 12u:  /* Q4_K */
+        return sycl_q4_k_matmul_general(out, model_map, model_size, weight_offset,
+                                        in_dim, out_dim, x, n_tok);
+    case 2u:   /* Q4_0 */
+        return sycl_q4_0_matmul_general(out, model_map, model_size, weight_offset,
+                                        in_dim, out_dim, x, n_tok);
+    default:
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_quant: unsupported type %u\n",
+                weight_type);
+        return 0;
+    }
+}
+
+/* ds4_gpu_matmul_quant_kslice_tensor: out[out_dim] = W[:, k_off:k_off+k_cnt]
+ * @ x[x_elem_off:+k_cnt], single token, generalising ds4_gpu.h's doc
+ * comment on ds4_gpu_matmul_q8_0_kslice_tensor ("Tensor-parallel sliced
+ * projections (Metal decode path only)") to every dense-quant type.
+ *
+ * Reachability, checked directly rather than inferred from the design
+ * docs: both of ds4.c's call sites that reach this entry
+ * (metal_graph_matmul_dense_quant_kslice at :24323's tp_split_shared branch,
+ * :25009, and metal_graph_attention_output_dense_quant_tp, :25921, itself
+ * only called from the g->tp_world==2 branch at :23542-23558) require
+ * g->tp_world == 2, i.e. tensor parallelism -- permanently out of scope for
+ * this single-GPU port (SYCL.md; stub-reachability.md's TP section). Unlike
+ * the plain entry above, this one is NOT reached by single-GPU Flash decode
+ * or prefill, contradicting the design table, which lists it alongside
+ * the plain entry as firing under the same "any non-Q8_0/F16/F32
+ * dense-quant weight" condition. ds4_cuda.cu's own definition is also a
+ * plain unconditional `return 0` for every weight_type including Q8_0, so
+ * there is no CUDA reference behaviour to check this against either.
+ *
+ * Implemented anyway, since it is listed as an interface to build, and
+ * kept simple rather than staging only the addressed column range: the
+ * whole weight table is staged and the kernel indexes the absolute column
+ * k_off+k into it, rather than computing a per-row byte-range slice. That
+ * tight-slice staging is what a genuinely TP-reachable version would want
+ * for bandwidth, but this path is unreachable code today and not worth the
+ * complexity until TP is in scope. */
+template <typename Dequant>
+static int sycl_dense_quant_matmul_kslice_general(
+        ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+        uint64_t weight_offset, uint64_t full_in_dim, uint64_t k_off,
+        uint64_t k_cnt, uint64_t out_dim, const ds4_gpu_tensor *x,
+        uint64_t x_elem_off, const char *what,
+        int (*row_bytes_checked)(uint64_t, uint64_t *), Dequant dequant) {
+    if (!out || !x || !model_map || full_in_dim == 0u || k_cnt == 0u ||
+        out_dim == 0u || full_in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        k_off > full_in_dim || k_cnt > full_in_dim - k_off) {
+        return 0;
+    }
+
+    uint64_t row_bytes = 0, weight_bytes = 0, x_end = 0;
+    if (!row_bytes_checked(full_in_dim, &row_bytes) ||
+        !sycl_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !sycl_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !sycl_u64_add_checked(x_elem_off, k_cnt, &x_end) ||
+        !sycl_tensor_has_f32(x, x_end) ||
+        !sycl_tensor_has_f32(out, out_dim)) {
+        return 0;
+    }
+    const char *wptr = sycl_model_range_ptr(model_map, weight_offset,
+                                            weight_bytes, model_size, what);
+    if (!wptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out->device_id);
+
+        unsigned char *dw = sycl::malloc_device<unsigned char>(
+                (size_t)weight_bytes, q);
+        if (!dw) return 0;
+        sycl_device_scratch_guard dw_guard(q, dw);
+        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
+
+        float       *out_ptr = (float *)out->ptr;
+        const float *x_ptr   = (const float *)x->ptr + x_elem_off;
+        const uint32_t k_off32   = (uint32_t)k_off;
+        const uint32_t k_cnt32   = (uint32_t)k_cnt;
+        const uint32_t out_dim32 = (uint32_t)out_dim;
+        q.parallel_for(sycl::range<1>(out_dim32), [=](sycl::id<1> gid) {
+             const uint32_t o = (uint32_t)gid[0];
+             const unsigned char *wr = dw + (uint64_t)o * row_bytes;
+             float sum = 0.0f;
+             for (uint32_t k = 0; k < k_cnt32; k++) {
+                 sum += x_ptr[k] * dequant(wr, k_off32 + k);
+             }
+             out_ptr[o] = sum;
+         }).wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "%s matmul_kslice failed: %s\n", what, e.what());
+        return 0;
+    }
+    return 1;
+}
+
+extern "C" int ds4_gpu_matmul_quant_kslice_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                weight_type,
+        uint64_t                full_in_dim,
+        uint64_t                k_off,
+        uint64_t                k_cnt,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                x_elem_off) {
+    switch (weight_type) {
+    case 8u:   /* Q8_0 */
+        return sycl_dense_quant_matmul_kslice_general(
+                out, model_map, model_size, weight_offset, full_in_dim, k_off,
+                k_cnt, out_dim, x, x_elem_off, "q8_0_kslice",
+                sycl_q8_0_row_bytes_checked,
+                [](const unsigned char *row, uint32_t col) { return sycl_q8_0_dequant(row, col); });
+    case 12u:  /* Q4_K */
+        return sycl_dense_quant_matmul_kslice_general(
+                out, model_map, model_size, weight_offset, full_in_dim, k_off,
+                k_cnt, out_dim, x, x_elem_off, "q4_K_kslice",
+                sycl_q4_k_row_bytes_checked,
+                [](const unsigned char *row, uint32_t col) { return sycl_q4_k_dequant(row, col); });
+    case 2u:   /* Q4_0 */
+        return sycl_dense_quant_matmul_kslice_general(
+                out, model_map, model_size, weight_offset, full_in_dim, k_off,
+                k_cnt, out_dim, x, x_elem_off, "q4_0_kslice",
+                sycl_q4_0_row_bytes_checked,
+                [](const unsigned char *row, uint32_t col) { return sycl_q4_0_dequant(row, col); });
+    default:
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_quant_kslice: unsupported type %u\n",
+                weight_type);
+        return 0;
+    }
+}

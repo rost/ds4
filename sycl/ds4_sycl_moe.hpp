@@ -460,26 +460,12 @@ static void sycl_moe_test_subgroup_sum16(sycl::queue &q, const float *in,
  * always 8, never taking their "else" branch; two more whose only
  * possible caller condition -- a sorted-pairs allocation that succeeds
  * while its co-allocated tile arrays fail -- is unreachable because both
- * come from the same single allocation). */
-
-struct sycl_block_q4_K {
-    uint16_t d;
-    uint16_t dmin;
-    uint8_t  scales[12];
-    uint8_t  qs[128];
-};
-
-/* dev_q4_K_get_scale_min, moe.cuh:250-262. */
-static inline void sycl_dev_q4_k_get_scale_min(uint32_t j, const uint8_t *scales,
-                                               uint8_t *d_out, uint8_t *m_out) {
-    if (j < 4u) {
-        *d_out = scales[j] & 63u;
-        *m_out = scales[j + 4u] & 63u;
-    } else {
-        *d_out = (scales[j + 4u] & 0x0fu) | ((scales[j - 4u] >> 6u) << 4u);
-        *m_out = (scales[j + 4u] >> 4u) | ((scales[j] >> 6u) << 4u);
-    }
-}
+ * come from the same single allocation).
+ *
+ * The block struct and the scale/min decode (sycl_block_q4_K,
+ * sycl_dev_q4_k_get_scale_min) moved to ds4_sycl_common.hpp when the dense
+ * matmul and attention-output entries needed the same layout, so they are
+ * no longer defined here; this file uses the common ones. */
 
 /* dev_dot_q4_32, moe.cuh:264-271: dots 32 packed 4-bit codes (shifted by
  * `shift` out of their byte) against 32 signed Q8_K codes.  ROCm's form
