@@ -78,32 +78,15 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out,
                         sum += v * v;
                     }
 
-                    /* EVERY work-item writes its slot, including those
-                     * whose loop above ran zero times and whose sum is
-                     * therefore 0.  Matching
-                     * rocm/ds4_rocm_norm_rope.cuh:11-12.  Writing only the
-                     * slots that had work would tree-reduce uninitialised
-                     * local memory whenever width < 256.
-                     *
-                     * This repo's SYCL tests cannot catch removal of this
-                     * write on the current hardware and driver stack,
-                     * where uninitialised local memory has been observed
-                     * to read as zero (Arc A770, Level Zero, oneAPI
-                     * 2025.3). Do not treat a passing test suite as
-                     * licence to remove it. The SYCL specification
-                     * guarantees no zero-initialisation, so the behaviour
-                     * may differ on other hardware, including the
-                     * Battlemage devices this backend targets. */
-                    partial[lid] = sum;
-                    it.barrier(sycl::access::fence_space::local_space);
-
-                    for (size_t s = lsz / 2; s > 0; s >>= 1) {
-                        if (lid < s) partial[lid] += partial[lid + s];
-                        it.barrier(sycl::access::fence_space::local_space);
-                    }
+                    /* sycl_block_row_reduce (ds4_sycl_common.hpp) carries
+                     * the full explanation of why every lane must call it
+                     * unconditionally, including one whose loop above ran
+                     * zero times. Matching rocm/ds4_rocm_norm_rope.cuh:11-12. */
+                    const float total = sycl_block_row_reduce(
+                            it, partial, sum, sycl::plus<float>());
 
                     const float scale =
-                            sycl::rsqrt(partial[0] / (float)width + eps);
+                            sycl::rsqrt(total / (float)width + eps);
                     for (size_t i = lid; i < width; i += lsz) {
                         orow[i] = xr[i] * scale;
                     }
@@ -184,19 +167,11 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(
                         const float v = xr[i];
                         sum += v * v;
                     }
-                    /* Every work-item writes its slot unconditionally; see
-                     * the long comment on the equivalent line in
-                     * ds4_gpu_rms_norm_plain_rows_tensor above. */
-                    partial[lid] = sum;
-                    it.barrier(sycl::access::fence_space::local_space);
-
-                    for (size_t s = lsz / 2; s > 0; s >>= 1) {
-                        if (lid < s) partial[lid] += partial[lid + s];
-                        it.barrier(sycl::access::fence_space::local_space);
-                    }
+                    const float total = sycl_block_row_reduce(
+                            it, partial, sum, sycl::plus<float>());
 
                     const float scale =
-                            sycl::rsqrt(partial[0] / (float)width + eps);
+                            sycl::rsqrt(total / (float)width + eps);
                     for (size_t i = lid; i < width; i += lsz) {
                         orow[i] = xr[i] * scale * dw[i];
                     }
@@ -339,19 +314,11 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
                         const float v = xr[i];
                         sum += v * v;
                     }
-                    /* Every work-item writes its slot unconditionally; see
-                     * the long comment on the equivalent line in
-                     * ds4_gpu_rms_norm_plain_rows_tensor above. */
-                    partial[lid] = sum;
-                    it.barrier(sycl::access::fence_space::local_space);
-
-                    for (size_t s = lsz / 2; s > 0; s >>= 1) {
-                        if (lid < s) partial[lid] += partial[lid + s];
-                        it.barrier(sycl::access::fence_space::local_space);
-                    }
+                    const float total = sycl_block_row_reduce(
+                            it, partial, sum, sycl::plus<float>());
 
                     const float scale =
-                            sycl::rsqrt(partial[0] / (float)width + eps);
+                            sycl::rsqrt(total / (float)width + eps);
                     for (size_t i = lid; i < width; i += lsz) {
                         orow[i] = xr[i] * scale * w[i];
                     }
@@ -406,19 +373,11 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok,
                         const float v = xr[i];
                         sum += v * v;
                     }
-                    /* Every work-item writes its slot unconditionally; see
-                     * the long comment on the equivalent line in
-                     * ds4_gpu_rms_norm_plain_rows_tensor above. */
-                    partial[lid] = sum;
-                    it.barrier(sycl::access::fence_space::local_space);
-
-                    for (size_t s = lsz / 2; s > 0; s >>= 1) {
-                        if (lid < s) partial[lid] += partial[lid + s];
-                        it.barrier(sycl::access::fence_space::local_space);
-                    }
+                    const float total = sycl_block_row_reduce(
+                            it, partial, sum, sycl::plus<float>());
 
                     const float scale =
-                            sycl::rsqrt(partial[0] / (float)width + eps);
+                            sycl::rsqrt(total / (float)width + eps);
                     for (size_t i = lid; i < width; i += lsz) {
                         xr[i] *= scale;
                     }
@@ -484,17 +443,10 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(
                         const float v = xr[i];
                         sum += v * v;
                     }
-                    /* Every work-item writes its slot unconditionally; see
-                     * the long comment on the equivalent line in
-                     * ds4_gpu_rms_norm_plain_rows_tensor above. */
-                    partial[lid] = sum;
-                    it.barrier(sycl::access::fence_space::local_space);
-                    for (size_t s = lsz / 2; s > 0; s >>= 1) {
-                        if (lid < s) partial[lid] += partial[lid + s];
-                        it.barrier(sycl::access::fence_space::local_space);
-                    }
+                    const float total = sycl_block_row_reduce(
+                            it, partial, sum, sycl::plus<float>());
                     const float scale =
-                            sycl::rsqrt(partial[0] / (float)head_dim + eps);
+                            sycl::rsqrt(total / (float)head_dim + eps);
 
                     /* See the function comment above: this loop scales
                      * ONLY the leading n_nope channels.  The tail is

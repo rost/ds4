@@ -150,37 +150,21 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x,
                     const bool  in_range = off + tid < n_nope;
                     const float v = in_range ? xr[off + tid] : 0.0f;
 
-                    /* EVERY one of the 64 lanes writes its scratch slot,
-                     * including lanes past n_nope (which write an explicit
-                     * 0.0f), before the barrier below.  On this hardware
-                     * (Arc A770, Level Zero, oneAPI 2025.3), uninitialised
-                     * local memory has been observed to read as zero, so a
-                     * kernel that skipped this write for out-of-range
-                     * lanes would still pass here, but the SYCL
-                     * specification guarantees no zero-initialisation and
-                     * behaviour may differ on other hardware, including
-                     * the Battlemage devices this backend targets. See the
-                     * equivalent comment in
-                     * ds4_gpu_rms_norm_plain_rows_tensor in
-                     * sycl/ds4_sycl_norm_rope.hpp. */
-                    scratch[tid] = in_range ? sycl::fabs(v) : 0.0f;
-                    it.barrier(sycl::access::fence_space::local_space);
-
-                    /* The barrier is OUTSIDE the `if`: every one of the 64
-                     * lanes in the work-group must reach it on every
-                     * iteration, matching rocm/ds4_rocm_fp8_kv.cuh:20-23. */
-                    for (uint32_t stride = kFp8KvGroup / 2; stride > 0; stride >>= 1) {
-                        if (tid < stride) {
-                            scratch[tid] = sycl::fmax(scratch[tid], scratch[tid + stride]);
-                        }
-                        it.barrier(sycl::access::fence_space::local_space);
-                    }
+                    /* Every one of the 64 lanes calls sycl_block_row_reduce,
+                     * including lanes past n_nope, which pass an explicit
+                     * 0.0f: see that function's comment in
+                     * ds4_sycl_common.hpp for why, matching
+                     * rocm/ds4_rocm_fp8_kv.cuh:20-23. */
+                    const float lane_abs = in_range ? sycl::fabs(v) : 0.0f;
+                    const float row_max = sycl_block_row_reduce(
+                            it, scratch, lane_abs,
+                            [](float a, float b) { return sycl::fmax(a, b); });
 
                     /* Every lane computes the scale, not just lane 0:
                      * local memory is visible to the whole group after the
-                     * barrier above. */
+                     * reduction above. */
                     const float scale = sycl::exp2(sycl::ceil(
-                            sycl::log2(sycl::fmax(scratch[0], 1.0e-4f) / 448.0f)));
+                            sycl::log2(sycl::fmax(row_max, 1.0e-4f) / 448.0f)));
                     if (in_range) {
                         const float clamped =
                                 sycl::fmin(448.0f, sycl::fmax(-448.0f, v / scale));

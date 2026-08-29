@@ -191,4 +191,41 @@ static inline sycl_device_scratch_guard sycl_stage_host_bytes(
     return guard;
 }
 
+/* Work-group tree reduction over one row: every lane in the group passes
+ * its own already-accumulated `value`, and every lane gets back the same
+ * fully-reduced result.  `combine` must be associative and commutative
+ * (`[](float a, float b) { return a + b; }` for a sum, `sycl::fmax` for a
+ * max); `local` must be sized to at least the work-group's local range.
+ * `it` is accepted as a template parameter rather than a fixed nd_item<N>
+ * so this serves both a flat 1D row-per-group launch and a 2D launch that
+ * adds a second grid dimension (norm_rope's q/kv selector, fp8_kv's
+ * per-row group-of-groups split): both only ever address dimension 0 for
+ * the work-group's local id and range, which is all this needs.
+ *
+ * Every lane must call this, including a lane whose own per-lane loop
+ * accumulated zero terms, passing that lane's identity value (0.0f for a
+ * sum, 0.0f or -INFINITY for a max) rather than skipping the call: this
+ * is what the design spec's section 6b requires and it doubles as the
+ * enforcement, since there is no shorter path through this function that
+ * leaves a lane's slot unwritten.  On this hardware (Arc A770, Level
+ * Zero, oneAPI 2025.3), uninitialised local memory has been observed to
+ * read as zero, so no test on this machine can catch a lane skipping its
+ * write; the SYCL specification guarantees no such zero-initialisation,
+ * and behaviour may differ on other hardware, including the Battlemage
+ * devices this backend targets. Do not treat a passing test suite as
+ * licence to bypass this. */
+template <typename Item, typename Combine>
+static inline float sycl_block_row_reduce(Item it, const sycl::local_accessor<float, 1> &local,
+                                          float value, Combine combine) {
+    const size_t lid = it.get_local_id(0);
+    const size_t lsz = it.get_local_range(0);
+    local[lid] = value;
+    it.barrier(sycl::access::fence_space::local_space);
+    for (size_t s = lsz / 2; s > 0; s >>= 1) {
+        if (lid < s) local[lid] = combine(local[lid], local[lid + s]);
+        it.barrier(sycl::access::fence_space::local_space);
+    }
+    return local[0];
+}
+
 }  // namespace
