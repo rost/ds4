@@ -53,6 +53,7 @@
 /tests/test_sycl_readback
 /tests/test_sycl_subgroup_guard
 /tests/test_sycl_full_layer
+/tests/test_sycl_full_token
 *.o
 *.dSYM/
 __pycache__/
