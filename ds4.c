@@ -58235,6 +58235,255 @@ int ds4_test_graph_full_token_encode(int token, float *out_logits, uint64_t out_
     g_ds4_shape = saved_shape;
     return ok ? 1 : 0;
 }
+
+/* Prefill, a batch of tokens at once, through the engine's real
+ * batch path -- metal_graph_encode_layer_batch (ds4.c:30533), which chains
+ * metal_graph_encode_layer_attention_batch (:28106) and
+ * metal_graph_encode_layer_ffn_batch (:29908).  Every other engine-level
+ * test on this backend, including ds4_test_graph_full_layer_encode above,
+ * drives decode: one token, n_tokens == 1.  Nothing has ever driven prefill's
+ * batch kernels, dispatch thresholds or attention implementation through the
+ * engine before this.
+ *
+ * The multi-stage pipeline at ds4.c:34212 (metal_graph_prefill_pipeline_stage_major)
+ * requires n_stages >= 2 from metal_graph_build_prefill_stages, which groups
+ * consecutive layers by placement tier: a single-GPU placement puts every
+ * layer on the same tier, so n_stages is always 1 and that function always
+ * returns false. metal_graph_prefill_layer_major (:34437) then falls through
+ * to its own plain, non-pipelined branch (:34516-34544), which is exactly
+ * the begin/upload-embeddings/per-layer-encode-batch/end/synchronize shape
+ * ds4_test_graph_prefill_layer_batch_encode below reproduces with one layer
+ * standing in for the loop -- so this hook, like the decode one above,
+ * drives the real function through the real shape a single GPU always
+ * takes, not a hand-rolled substitute.
+ *
+ * Same synthetic one-layer DeepSeek V4 Flash shape as
+ * ds4_test_graph_full_layer_encode, built from the same
+ * tests/test_sycl_layer_weights.h.  ds4_test_prefill_fixture and its
+ * build/free pair below exist because these tests need the same fixture
+ * from two different call shapes (one batch encode, and a per-position
+ * decode loop for the prefill/decode consistency check); the per-tensor wiring
+ * itself reuses ds4_test_tw_layer_storage and ds4_test_tw_layer_to_weights
+ * above rather than repeating their one-ds4_test_tw_to_tensor-per-field
+ * assembly a second time. ds4_test_graph_full_layer_encode above is left
+ * untouched rather than rebased onto this, since it is already landed and
+ * green. */
+typedef struct {
+    ds4_tw_flash_weights tw;
+    ds4_model model;
+    ds4_tensor token_embd_t;
+    ds4_test_tw_layer_storage layer_storage;
+    ds4_weights weights;
+    ds4_layer_weights *layer;
+} ds4_test_prefill_fixture;
+
+static ds4_shape ds4_test_prefill_layer_shape(void) {
+    return (ds4_shape){
+        .name = "test-prefill-layer",
+        .family = DS4_MODEL_FAMILY_DEEPSEEK4,
+        .variant = DS4_VARIANT_FLASH,
+        .n_layer = DS4_TW_N_LAYER,
+        .n_embd = DS4_TW_N_EMBD,
+        .n_vocab = DS4_TW_N_VOCAB,
+        .n_head = DS4_TW_N_HEAD,
+        .n_head_kv = DS4_TW_N_HEAD_KV,
+        .n_head_dim = DS4_TW_N_HEAD_DIM,
+        .n_value_dim = DS4_TW_N_VALUE_DIM,
+        .n_rot = DS4_TW_N_ROT,
+        .n_out_group = DS4_TW_N_OUT_GROUP,
+        .n_lora_q = DS4_TW_N_LORA_Q,
+        .n_lora_o = DS4_TW_N_LORA_O,
+        .n_expert = DS4_TW_N_EXPERT,
+        .n_expert_used = DS4_TW_N_EXPERT_USED,
+        .n_expert_shared = DS4_TW_N_EXPERT_SHARED,
+        .n_ff_exp = DS4_TW_N_FF_EXP,
+        .n_ff_dense = 32,
+        .n_hash_layer = 0,
+        .n_swa = DS4_TW_N_SWA,
+        .n_indexer_head = 2,
+        .n_indexer_head_dim = 8,
+        .n_indexer_top_k = 4,
+        .n_hc = DS4_TW_N_HC,
+        .n_hc_sinkhorn_iter = DS4_TW_N_HC_SINKHORN_ITER,
+        .rms_eps = DS4_DEFAULT_RMS_EPS,
+        .hc_eps = DS4_DEFAULT_HC_EPS,
+        .expert_weight_scale = 1.0f,
+        .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+        .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+        .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+        .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+        .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+        .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+        .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+    };
+}
+
+static int ds4_test_prefill_fixture_build(ds4_test_prefill_fixture *f) {
+    memset(f, 0, sizeof(*f));
+    if (!ds4_test_build_flash_layer_weights(&f->tw)) return 0;
+
+    f->model.map = f->tw.buf;
+    f->model.size = f->tw.buf_size;
+
+    ds4_test_tw_to_tensor(&f->token_embd_t, &f->tw.token_embd);
+
+    memset(&f->weights, 0, sizeof(f->weights));
+    f->weights.token_embd = &f->token_embd_t;
+    f->layer = &f->weights.layer[0];
+    ds4_test_tw_layer_to_weights(f->layer, &f->layer_storage, &f->tw.layer[0],
+                                 /*has_tid2eid=*/false);
+    return 1;
+}
+
+static void ds4_test_prefill_fixture_free(ds4_test_prefill_fixture *f) {
+    ds4_test_free_flash_layer_weights(&f->tw);
+}
+
+/* Graph capacity shared by both hooks below: large enough to hold every
+ * batch size the test straddles dispatch thresholds with (up to 64
+ * tokens) without the raw KV ring wrapping in either the one-shot batch
+ * store or the per-position decode loop, and fixed across every batch size
+ * tried so DS4_TW_N_SWA (8) always clamps to the same raw_window (8): tying
+ * ctx_size to n_tokens instead would shrink the window for small batches
+ * and make the batch sizes not directly comparable. */
+enum { DS4_TEST_PREFILL_GRAPH_CAP = 64u };
+
+/* Drives metal_graph_encode_layer_batch (ds4.c:30533) for a single layer
+ * over `n_tokens` positions starting at pos0 == 0, reading back every
+ * token's post-FFN hidden-connection state (metal_graph_batch_cur_hc after
+ * the cur/next swap metal_graph_encode_layer_batch itself performs). */
+int ds4_test_graph_prefill_layer_batch_encode(const int *tokens, uint32_t n_tokens,
+                                              float *out_hc, uint64_t out_hc_floats) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = ds4_test_prefill_layer_shape();
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint64_t hc_dim = (uint64_t)DS4_TW_N_HC * DS4_TW_N_EMBD;
+    if (!tokens || n_tokens == 0 || n_tokens > DS4_TEST_PREFILL_GRAPH_CAP ||
+        out_hc_floats != (uint64_t)n_tokens * hc_dim) {
+        g_ds4_shape = saved_shape;
+        return 0;
+    }
+
+    ds4_test_prefill_fixture f;
+    if (!ds4_test_prefill_fixture_build(&f)) {
+        g_ds4_shape = saved_shape;
+        return 0;
+    }
+
+    token_vec prompt;
+    prompt.v = (int *)tokens;
+    prompt.len = (int)n_tokens;
+    prompt.cap = (int)n_tokens;
+
+    ds4_gpu_graph g;
+    memset(&g, 0, sizeof(g));
+    bool ok = metal_graph_alloc_raw_cap(&g, &f.weights, f.layer,
+                                        /*raw_cap=*/DS4_TEST_PREFILL_GRAPH_CAP,
+                                        /*ctx_size=*/DS4_TEST_PREFILL_GRAPH_CAP,
+                                        /*prefill_cap=*/DS4_TEST_PREFILL_GRAPH_CAP,
+                                        /*enable_mtp=*/false,
+                                        /*placement=*/NULL,
+                                        /*cuda_tensor_parallel=*/false,
+                                        /*shared_prefill_workspace=*/NULL);
+
+    /* The exact upload-embeddings/begin/encode-layer-batch/end/synchronize
+     * shape metal_graph_prefill_layer_major's plain branch (ds4.c:34516-
+     * 34544) uses for a single-tier prefill chunk, with one layer standing
+     * in for its per-layer loop. */
+    if (ok) {
+        ok = metal_graph_upload_prompt_embeddings_hc_cpu(metal_graph_batch_cur_hc(&g),
+                                                          &f.model, &f.weights, &prompt,
+                                                          /*pos0=*/0, n_tokens);
+    }
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = metal_graph_encode_layer_batch(&g, &f.model, f.layer, /*il=*/0,
+                                            /*pos0=*/0, n_tokens);
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+    if (ok) {
+        ok = ds4_gpu_tensor_read(metal_graph_batch_cur_hc(&g), 0, out_hc,
+                                 (uint64_t)n_tokens * hc_dim * sizeof(float)) != 0;
+    }
+
+    metal_graph_free(&g);
+    ds4_test_prefill_fixture_free(&f);
+    g_ds4_shape = saved_shape;
+    return ok ? 1 : 0;
+}
+
+/* The decode-side reference for the assertion above: decodes the same
+ * `n_tokens` tokens one at a time through metal_graph_encode_decode_layer
+ * (ds4.c:25120, the same wrapper ds4_test_graph_full_layer_encode drives),
+ * storing each position's own K/V into the raw ring at the row and with the
+ * n_raw a real streaming decode step would use
+ * (metal_graph_eval_token_raw_swa_streaming, ds4.c:30586, via
+ * metal_graph_raw_span_for_batch, ds4.c:19568), so a later position's
+ * attention sees exactly the raw keys a real decode step would see.
+ * Writes one hc_dim row of metal_graph_after_ffn_hc per position. */
+int ds4_test_graph_decode_layer_sequence_encode(const int *tokens, uint32_t n_tokens,
+                                                float *out_hc, uint64_t out_hc_floats) {
+    const ds4_shape saved_shape = g_ds4_shape;
+    g_ds4_shape = ds4_test_prefill_layer_shape();
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    const uint64_t hc_dim = (uint64_t)DS4_TW_N_HC * DS4_TW_N_EMBD;
+    if (!tokens || n_tokens == 0 || n_tokens > DS4_TEST_PREFILL_GRAPH_CAP ||
+        out_hc_floats != (uint64_t)n_tokens * hc_dim) {
+        g_ds4_shape = saved_shape;
+        return 0;
+    }
+
+    ds4_test_prefill_fixture f;
+    if (!ds4_test_prefill_fixture_build(&f)) {
+        g_ds4_shape = saved_shape;
+        return 0;
+    }
+
+    ds4_gpu_graph g;
+    memset(&g, 0, sizeof(g));
+    bool ok = metal_graph_alloc_raw_cap(&g, &f.weights, f.layer,
+                                        /*raw_cap=*/DS4_TEST_PREFILL_GRAPH_CAP,
+                                        /*ctx_size=*/DS4_TEST_PREFILL_GRAPH_CAP,
+                                        /*prefill_cap=*/DS4_TEST_PREFILL_GRAPH_CAP,
+                                        /*enable_mtp=*/false,
+                                        /*placement=*/NULL,
+                                        /*cuda_tensor_parallel=*/false,
+                                        /*shared_prefill_workspace=*/NULL);
+
+    for (uint32_t pos = 0; ok && pos < n_tokens; pos++) {
+        const uint32_t raw_row = pos % g.raw_cap;
+        const uint32_t n_raw = metal_graph_raw_span_for_batch(&g, pos, 1);
+        ok = ds4_gpu_begin_commands() != 0;
+        if (ok) {
+            ok = ds4_gpu_embed_token_hc_tensor(metal_graph_cur_hc(&g),
+                                               f.model.map, f.model.size,
+                                               f.token_embd_t.abs_offset,
+                                               (uint32_t)f.token_embd_t.dim[1],
+                                               (uint32_t)tokens[pos],
+                                               DS4_N_EMBD, DS4_N_HC) != 0;
+        }
+        if (ok) {
+            ok = metal_graph_encode_decode_layer(&g, &f.model, f.layer, /*il=*/0,
+                                                 pos, g.layer_raw_cache[0], g.raw_cap,
+                                                 raw_row, n_raw, tokens[pos]);
+        }
+        if (ok) ok = ds4_gpu_end_commands() != 0;
+        if (ok) ok = ds4_gpu_synchronize() != 0;
+        if (ok) {
+            ok = ds4_gpu_tensor_read(metal_graph_after_ffn_hc(&g), 0,
+                                     out_hc + (uint64_t)pos * hc_dim,
+                                     hc_dim * sizeof(float)) != 0;
+        }
+    }
+
+    metal_graph_free(&g);
+    ds4_test_prefill_fixture_free(&f);
+    g_ds4_shape = saved_shape;
+    return ok ? 1 : 0;
+}
 #endif /* DS4_TEST_HOOKS */
 
 static int engine_install_dspark_support_cache(ds4_engine *e);
