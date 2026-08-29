@@ -653,6 +653,10 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
  * of which must already be in scope. */
 #include "sycl/ds4_sycl_mgpu.hpp"
 
+/* Same scoping reason as ds4_sycl_mgpu.hpp above: the command-lifecycle
+ * entry points reference g_devices and ds4_sycl_current_queue. */
+#include "sycl/ds4_sycl_commands.hpp"
+
 /* Included at the end of this file, not with the includes at the top:
  * kernel entry points in ds4_sycl_output.hpp reference g_devices (declared
  * in the anonymous namespace opened above at the top of this file) and
