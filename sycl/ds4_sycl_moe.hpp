@@ -1203,7 +1203,48 @@ static void sycl_moe_iq2_gate_up_mid_tile8(
  * plan: the down-projection half of iq2_path's production path (the
  * untagged "down" family, moe.cuh:2603-3876, hardcodes this cast,
  * verified at moe.cuh:2705) and the standalone q2k_path
- * (gate_type==10 && down_type==10). */
+ * (gate_type==10 && down_type==10).
+ *
+ * Not ported, and why, consolidated here rather than scattered:
+ *
+ * - The untagged down family's other kernels (moe_down_kernel/_warp8/
+ *   _hwarp16, all DS4_ROCM_UNUSED; moe_down_qwarp32_kernel; moe_down_
+ *   sorted_qwarp32_kernel; moe_down_expert_tile4/8/16_row32/row2048/
+ *   rowspan; moe_down_sorted_p2_qwarp32_kernel) are dead by data-flow
+ *   trace, not by choice. moe_launch.cuh:746 already excludes q2k_path
+ *   from ever reaching them. For every path that does reach that shared
+ *   block (q4k_path, iq2_path, iq2_iq2_path, mxfp4_path):
+ *   iq2_path's decode always takes use_direct_down_sum6 (moe_launch.cuh
+ *   :775-777, n_tokens==1 with n_expert<=8 always true post build_plan);
+ *   iq2_path's batch always takes use_iq2_q2_float_down (moe_launch.cuh
+ *   :1627-1630, true whenever n_tokens>1 since sorted_pairs is always
+ *   built for this path -- see the iq2 dispatcher comment above); and
+ *   iq2_iq2_path always takes direct_iq2_down_done (moe_launch.cuh
+ *   :1637). None of the three ever falls through to the generic
+ *   sorted/tiled cascade at moe_launch.cuh:1691-1896 that would call
+ *   these kernels, and the earlier-established "two *_sorted_qwarp32_
+ *   kernels are unreachable by construction" finding (use_expert_tiles
+ *   == use_sorted_pairs always, moe_launch.cuh:759) applies here too.
+ * - The four WMMA kernels (moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel,
+ *   moe_gate_up_mid_q2K_hotlist_wmma_n2_kernel, moe_down_q2K_hotlist_
+ *   wmma_kernel, moe_down_q2K_hotlist_wmma_n2_kernel, moe.cuh:4762-5284)
+ *   are not ported at all: they are `#if HIP`-guarded and provably dead
+ *   on any non-HIP build, and joint_matrix translation is deferred to a
+ *   later tuning pass per the plan. The non-`_n2` moe_down_q2K_hotlist_
+ *   wmma_kernel is additionally dead even on HIP builds
+ *   (routed_moe_q2_float_down_launch's `const int no_n2 = 0;` at
+ *   moe_launch.cuh:303 makes its branch unreachable). What is NOT
+ *   skipped along with the WMMA bodies is the "hot expert" exclusion
+ *   logic that feeds them -- see sycl_moe_iq2_gate_up_mid_tile8's
+ *   comment above for the one site (moe_launch.cuh:1113-1139) where that
+ *   exclusion is not `#if HIP`-guarded and adopting it would silently
+ *   drop high-traffic experts.
+ * - q2k_path's own raw-float kernels (moe_gate_up_mid_q2K_rows_rpb1_w32/
+ *   rows_w32/expert_batch_sharedx, moe_down_q2K_sum_rows_w32/
+ *   expert_batch_sharedmid, and by extension routed_moe_q2_float_down_
+ *   launch's reuse of the sharedmid kernel for iq2_path's batch down) are
+ *   a deliberate divergence, not a trace finding: see the q2k dispatcher
+ *   comment below for why the Q8_K-quantised kernels are used instead. */
 
 struct sycl_block_q2_K {
     uint8_t scales[16];
