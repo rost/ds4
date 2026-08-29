@@ -250,62 +250,6 @@ static int sycl_routed_moe_iq2_dispatch(
         uint32_t expert_mid_dim, uint32_t out_dim, uint32_t n_total_expert,
         uint32_t n_expert, uint32_t n_tokens, uint32_t pair_count, float clamp,
         bool iq2_iq2_path) {
-/* ---- MXFP4 format block -------------------------------------------
- *
- * Dispatch threshold mirrors moe_launch.cuh:750-777 restricted to the
- * mxfp4_path-reachable branches: `use_mxfp4_tiny_batch = mxfp4_path &&
- * n_tokens <= 4u`, and `use_sorted_pairs = n_tokens > 1u &&
- * !use_mxfp4_tiny_batch && (!q4k_path || n_tokens >= 32u)`, which for
- * mxfp4_path (q4k_path false, so the q4k clause is unconditionally true)
- * collapses to `n_tokens > 4u`.  So MXFP4's tile threshold is n_tokens >=
- * 5, NOT Q4_K's n_tokens >= 32 -- confirmed directly against the launch
- * site rather than assumed from Q4_K's own threshold.  Two regimes:
- *   n_tokens <= 4:  decode gate/up (grid.y = pair_count, covers true
- *                   decode and the tiny-batch case identically), sum6
- *                   direct-to-out down (grid.y = n_tokens, no moe_sum
- *                   pass: moe_launch.cuh:1706-1707's comment, "the direct
- *                   decode kernel writes the final token row").
- *   n_tokens >= 5:  sorted-pairs tile8 gate/up and down into scratch,
- *                   then moe_sum combine, identical structure to q4k's
- *                   n_tokens >= 32 regime.
- *
- * Explicitly NOT ported: the four env-gated occupancy variants of the
- * gate/up tile8 kernel (TILE4, ROW64, LDSB, TILE32,
- * rocm/ds4_rocm_moe.cuh:2246-2229 and 2381-2637).  Each is documented in
- * ROCm as bit-exact against the canonical tile8 kernel (same dot helper,
- * same reduction, only tile/thread geometry differs), off by default, and
- * exists purely to trade staging footprint against resident-warp count on
- * AMDGCN hardware.  Porting them costs four more kernels' worth of A/B
- * tests and zero oracle-backed correctness surface (this trade is
- * explicitly optional); skipping them costs a tuning pass this
- * project defers until real occupancy data from the B60
- * target exists to tune against.  The row-group parameter below is
- * different in kind (a parameter on the one kernel actually shipped here,
- * not a fifth kernel body) and is ported for real. */
-/* DS4_ROCM_MXFP4_DOWN_RGROUP, rocm/ds4_rocm_moe_launch.cuh:801-807: a
- * row-group count parameter on the canonical down tile8 kernel, not a
- * distinct kernel body, so it is A/B-tested byte-exact against the
- * default (1) rather than needing its own oracle (see
- * the MXFP4 port's scope note).  Same env var name and
- * validation range as ROCm (1..8), defaulting to 1 when unset, empty, or
- * out of range. */
-static uint32_t sycl_mxfp4_down_row_groups_from_env() {
-    const char *v = getenv("DS4_ROCM_MXFP4_DOWN_RGROUP");
-    if (v && v[0]) {
-        const long rv = strtol(v, nullptr, 10);
-        if (rv >= 1 && rv <= 8) return (uint32_t)rv;
-    }
-    return 1u;
-}
-
-static int sycl_routed_moe_mxfp4_dispatch(
-        sycl::queue &q, ds4_gpu_tensor *out, ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
-        sycl_block_q8_K *xq, sycl_block_q8_K *midq, const char *gate_w, const char *up_w,
-        const char *down_w, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
-        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes,
-        uint64_t down_row_bytes, uint32_t xq_blocks, uint32_t midq_blocks,
-        uint32_t expert_mid_dim, uint32_t out_dim, uint32_t n_total_expert, uint32_t n_expert,
-        uint32_t n_tokens, uint32_t pair_count, float clamp, uint32_t down_row_groups) {
     const int32_t *sel = (const int32_t *)selected->ptr;
     const float *w = (const float *)weights->ptr;
     float *out_ptr = (float *)out->ptr;
@@ -317,14 +261,6 @@ static int sycl_routed_moe_mxfp4_dispatch(
     if (use_sorted_pairs) {
         if (!sycl_moe_build_sorted_pairs(q, sel, pair_count, n_total_expert, 8u,
                                          &tile_scratch, &sp)) {
-    float *down_ptr = (float *)down->ptr;
-    const bool tiny_batch = n_tokens <= 4u;
-
-    void *tile_scratch = nullptr;
-    sycl_moe_sorted_pairs sp;
-    if (!tiny_batch) {
-        if (!sycl_moe_build_sorted_pairs(q, sel, pair_count, n_total_expert, 8u, &tile_scratch,
-                                         &sp)) {
             return 0;
         }
     }
@@ -340,16 +276,6 @@ static int sycl_routed_moe_mxfp4_dispatch(
         sycl_moe_iq2_gate_up_mid_decode(q, mid_ptr, gate_w, up_w, xq, sel, w,
                                         gate_expert_bytes, gate_row_bytes, xq_blocks,
                                         expert_mid_dim, n_expert, pair_count, clamp);
-    if (tiny_batch) {
-        sycl_moe_mxfp4_gate_up_mid_decode(q, mid_ptr, gate_w, up_w, xq, sel, w, gate_expert_bytes,
-                                          gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
-                                          pair_count, clamp);
-    } else {
-        sycl_moe_mxfp4_gate_up_mid_tile8(q, mid_ptr, gate_w, up_w, xq, sp.sorted_pairs,
-                                         sp.offsets, sp.counts, sp.tile_total, sp.tile_experts,
-                                         sp.tile_starts, w, gate_expert_bytes, gate_row_bytes,
-                                         xq_blocks, expert_mid_dim, n_expert, sp.tile_capacity,
-                                         clamp);
     }
 
     sycl_moe_q8_k_quantize(q, midq, mid_ptr, expert_mid_dim, pair_count);
@@ -434,6 +360,93 @@ static bool sycl_moe_stage_weights(sycl::queue &q, const char *gate_w, const cha
     q.wait_and_throw();
     return true;
 }
+
+/* ---- MXFP4 format block -------------------------------------------
+ *
+ * Dispatch threshold mirrors moe_launch.cuh:750-777 restricted to the
+ * mxfp4_path-reachable branches: `use_mxfp4_tiny_batch = mxfp4_path &&
+ * n_tokens <= 4u`, and `use_sorted_pairs = n_tokens > 1u &&
+ * !use_mxfp4_tiny_batch && (!q4k_path || n_tokens >= 32u)`, which for
+ * mxfp4_path (q4k_path false, so the q4k clause is unconditionally true)
+ * collapses to `n_tokens > 4u`.  So MXFP4's tile threshold is n_tokens >=
+ * 5, NOT Q4_K's n_tokens >= 32 -- confirmed directly against the launch
+ * site rather than assumed from Q4_K's own threshold.  Two regimes:
+ *   n_tokens <= 4:  decode gate/up (grid.y = pair_count, covers true
+ *                   decode and the tiny-batch case identically), sum6
+ *                   direct-to-out down (grid.y = n_tokens, no moe_sum
+ *                   pass: moe_launch.cuh:1706-1707's comment, "the direct
+ *                   decode kernel writes the final token row").
+ *   n_tokens >= 5:  sorted-pairs tile8 gate/up and down into scratch,
+ *                   then moe_sum combine, identical structure to q4k's
+ *                   n_tokens >= 32 regime.
+ *
+ * Explicitly NOT ported: the four env-gated occupancy variants of the
+ * gate/up tile8 kernel (TILE4, ROW64, LDSB, TILE32,
+ * rocm/ds4_rocm_moe.cuh:2246-2229 and 2381-2637).  Each is documented in
+ * ROCm as bit-exact against the canonical tile8 kernel (same dot helper,
+ * same reduction, only tile/thread geometry differs), off by default, and
+ * exists purely to trade staging footprint against resident-warp count on
+ * AMDGCN hardware.  Porting them costs four more kernels' worth of A/B
+ * tests and zero oracle-backed correctness surface (this trade is
+ * explicitly optional); skipping them costs a tuning pass this
+ * project defers until real occupancy data from the B60
+ * target exists to tune against.  The row-group parameter below is
+ * different in kind (a parameter on the one kernel actually shipped here,
+ * not a fifth kernel body) and is ported for real. */
+/* DS4_ROCM_MXFP4_DOWN_RGROUP, rocm/ds4_rocm_moe_launch.cuh:801-807: a
+ * row-group count parameter on the canonical down tile8 kernel, not a
+ * distinct kernel body, so it is A/B-tested byte-exact against the
+ * default (1) rather than needing its own oracle (see
+ * the MXFP4 port's scope note).  Same env var name and
+ * validation range as ROCm (1..8), defaulting to 1 when unset, empty, or
+ * out of range. */
+static uint32_t sycl_mxfp4_down_row_groups_from_env() {
+    const char *v = getenv("DS4_ROCM_MXFP4_DOWN_RGROUP");
+    if (v && v[0]) {
+        const long rv = strtol(v, nullptr, 10);
+        if (rv >= 1 && rv <= 8) return (uint32_t)rv;
+    }
+    return 1u;
+}
+
+static int sycl_routed_moe_mxfp4_dispatch(
+        sycl::queue &q, ds4_gpu_tensor *out, ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        sycl_block_q8_K *xq, sycl_block_q8_K *midq, const char *gate_w, const char *up_w,
+        const char *down_w, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t xq_blocks, uint32_t midq_blocks,
+        uint32_t expert_mid_dim, uint32_t out_dim, uint32_t n_total_expert, uint32_t n_expert,
+        uint32_t n_tokens, uint32_t pair_count, float clamp, uint32_t down_row_groups) {
+    const int32_t *sel = (const int32_t *)selected->ptr;
+    const float *w = (const float *)weights->ptr;
+    float *out_ptr = (float *)out->ptr;
+    float *mid_ptr = (float *)mid->ptr;
+    float *down_ptr = (float *)down->ptr;
+    const bool tiny_batch = n_tokens <= 4u;
+
+    void *tile_scratch = nullptr;
+    sycl_moe_sorted_pairs sp;
+    if (!tiny_batch) {
+        if (!sycl_moe_build_sorted_pairs(q, sel, pair_count, n_total_expert, 8u, &tile_scratch,
+                                         &sp)) {
+            return 0;
+        }
+    }
+    sycl_device_scratch_guard tile_guard(q, tile_scratch);
+
+    if (tiny_batch) {
+        sycl_moe_mxfp4_gate_up_mid_decode(q, mid_ptr, gate_w, up_w, xq, sel, w, gate_expert_bytes,
+                                          gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                          pair_count, clamp);
+    } else {
+        sycl_moe_mxfp4_gate_up_mid_tile8(q, mid_ptr, gate_w, up_w, xq, sp.sorted_pairs,
+                                         sp.offsets, sp.counts, sp.tile_total, sp.tile_experts,
+                                         sp.tile_starts, w, gate_expert_bytes, gate_row_bytes,
+                                         xq_blocks, expert_mid_dim, n_expert, sp.tile_capacity,
+                                         clamp);
+    }
+
+    sycl_moe_q8_k_quantize(q, midq, mid_ptr, expert_mid_dim, pair_count);
 
     if (tiny_batch) {
         sycl_moe_mxfp4_down_sum6(q, out_ptr, down_w, midq, sel, down_expert_bytes, down_row_bytes,

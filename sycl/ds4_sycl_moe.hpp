@@ -1051,79 +1051,6 @@ static inline void sycl_dev_dot_iq2_xxs_q8_k_block8(
  * gate_out/up_out are never written here either, matching the Q4_K decode
  * kernel's precedent above. */
 static void sycl_moe_iq2_gate_up_mid_decode(
-/* ---- MXFP4 -------------------------------------------------------------
- *
- * cuda_block_mxfp4, ds4_rocm.cu (17 bytes: uint8_t e, uint8_t qs[16]),
- * 32 elements per block, low nibble is element j, high nibble is element
- * j+16 (rocm/ds4_rocm_moe.cuh:340-342's comment on
- * dev_dot_mxfp4_q8_K_block, cross-checked independently by
- * tests/test_sycl_moe.c's own oracle rather than trusted from that comment alone).
- *
- * The value-table and scale computations below are deliberately NOT the
- * float-table-plus-bit-cast shape tests/test_sycl_moe.c's oracle uses
- * (ds4-sycl-mxfp4-validation.md section 3a's symmetry-breaking argument):
- * sycl_dev_mxfp4_unpack1 is a bit-manipulation reconstruction of a doubled
- * signed magnitude, matching the SHAPE of dev_mxfp4_unpack4's portable
- * (non-AMDGCN) branch (rocm/ds4_rocm_moe.cuh:301-326), and
- * sycl_dev_e8m0_to_f32 bit-casts the exponent directly rather than calling
- * ldexpf.  A scalar per-element reformulation of ROCm's dp4a-packed
- * integer dot is used throughout (dp4a sums four exact int8-times-int8
- * products into one int32; summing the same 16 products in any order is
- * exact, so this is not an approximation of the packed form). */
-
-struct sycl_block_mxfp4 {
-    uint8_t e;
-    uint8_t qs[16];
-};
-
-static inline float sycl_dev_e8m0_to_f32(uint8_t e) {
-    const uint32_t bits = e == 0u ? 0x00400000u : (uint32_t)e << 23u;
-    return sycl::bit_cast<float>(bits);
-}
-
-/* dev_mxfp4_unpack4, rocm/ds4_rocm_moe.cuh:301-326, portable branch only
- * (the AMDGCN v_perm branch is Instinct-only and not applicable here):
- * reconstructs the doubled signed E2M1 magnitude {0,1,2,3,4,6,8,12} from
- * the 3 magnitude bits by bumping past the two missing 2^-1-mantissa
- * steps (codes 5 and 6) and adding 2 more at code 7 to reach 12, then
- * negates on the sign bit. */
-static inline int32_t sycl_dev_mxfp4_unpack1(uint8_t nibble) {
-    const uint32_t base = nibble & 7u;
-    int32_t value = (int32_t)(base + (base > 4u ? base - 4u : 0u) + (base == 7u ? 2u : 0u));
-    if (nibble & 8u) value = -value;
-    return value;
-}
-
-/* dev_dot_mxfp4_q8_K_half_block, rocm/ds4_rocm_moe.cuh:365-388: dots half
- * of one 32-value MXFP4 block (16 elements) against the matching half of
- * one Q8_K sub-block's 32 activation codes.  half==0 covers weight bytes
- * 0..7 (elements 0..7 low-nibble, 16..23 high-nibble); half==1 covers
- * weight bytes 8..15 (elements 8..15 low-nibble, 24..31 high-nibble). */
-static inline float sycl_dev_dot_mxfp4_q8_k_half_block(
-        const sycl_block_mxfp4 *x, const sycl_block_q8_K *y, uint32_t subblock,
-        uint32_t half) {
-    const uint32_t weight_offset = half * 8u;
-    const uint32_t activation_offset = subblock * 32u + weight_offset;
-    const int8_t *q8_lo = y->qs + activation_offset;
-    const int8_t *q8_hi = y->qs + activation_offset + 16u;
-    int32_t bsum = 0;
-    for (uint32_t k = 0; k < 8u; k++) {
-        const uint8_t byte = x->qs[weight_offset + k];
-        bsum += sycl_dev_mxfp4_unpack1(byte & 0x0fu) * (int32_t)q8_lo[k];
-        bsum += sycl_dev_mxfp4_unpack1(byte >> 4u) * (int32_t)q8_hi[k];
-    }
-    return 0.5f * y->d * sycl_dev_e8m0_to_f32(x->e) * (float)bsum;
-}
-
-/* moe_gate_up_mid_decode_mxfp4_qwarp32_kernel, rocm/ds4_rocm_moe.cuh:
- * 2767-2843.  Handles every MXFP4 call with n_tokens <= 4
- * (rocm/ds4_rocm_moe_launch.cuh:753-754's use_mxfp4_tiny_batch, decode
- * included), a genuinely different algorithm from the tile8 kernel rather
- * than a smaller tiling of it: one 32-wide sub-group computes one
- * (pair,row) output, splitting the 8 q8_K sub-blocks per chunk 16 ways
- * across lane pairs (block_lane) and each MXFP4 block's 32 values in half
- * between the two lanes of a pair (half). */
-static void sycl_moe_mxfp4_gate_up_mid_decode(
         sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
         const sycl_block_q8_K *xq, const int32_t *selected, const float *weights,
         uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint32_t xq_blocks,
@@ -1536,20 +1463,6 @@ static void sycl_moe_q2k_gate_up_mid_decode(
                  const uint32_t lane = (uint32_t)sg.get_local_id()[0];
                  const uint32_t row_lane = (uint32_t)(it.get_local_id(0) >> 4);
                  const uint32_t row_block = (uint32_t)it.get_group(0);
-    const uint32_t row_groups = (expert_mid_dim + 7u) / 8u;
-    if (row_groups == 0u || pair_count == 0u) return;
-    q.submit([&](sycl::handler &h) {
-         h.parallel_for(
-             sycl::nd_range<2>(sycl::range<2>((size_t)row_groups * 256u, pair_count),
-                               sycl::range<2>(256u, 1u)),
-             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
-                 sycl::sub_group sg = it.get_sub_group();
-                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
-                 const uint32_t wave = (uint32_t)(it.get_local_id(0) >> 5);
-                 const uint32_t block_lane = lane >> 1u;
-                 const uint32_t half = lane & 1u;
-                 const uint32_t row = (uint32_t)it.get_group(0) * 8u + wave;
-                 if (row >= expert_mid_dim) return;
                  const uint32_t pair = (uint32_t)it.get_group(1);
                  const uint32_t tok = pair / n_expert;
                  const uint32_t slot = pair - tok * n_expert;
@@ -1587,6 +1500,109 @@ static void sycl_moe_q2k_gate_up_mid_decode(
                          mid_out[off] = (gate / (1.0f + sycl::exp(-gate))) * up *
                                         weights[(uint64_t)tok * n_expert + slot];
                      }
+                 }
+             });
+     }).wait_and_throw();
+}
+
+/* ---- MXFP4 -------------------------------------------------------------
+ *
+ * cuda_block_mxfp4, ds4_rocm.cu (17 bytes: uint8_t e, uint8_t qs[16]),
+ * 32 elements per block, low nibble is element j, high nibble is element
+ * j+16 (rocm/ds4_rocm_moe.cuh:340-342's comment on
+ * dev_dot_mxfp4_q8_K_block, cross-checked independently by
+ * tests/test_sycl_moe.c's own oracle rather than trusted from that comment alone).
+ *
+ * The value-table and scale computations below are deliberately NOT the
+ * float-table-plus-bit-cast shape tests/test_sycl_moe.c's oracle uses
+ * (ds4-sycl-mxfp4-validation.md section 3a's symmetry-breaking argument):
+ * sycl_dev_mxfp4_unpack1 is a bit-manipulation reconstruction of a doubled
+ * signed magnitude, matching the SHAPE of dev_mxfp4_unpack4's portable
+ * (non-AMDGCN) branch (rocm/ds4_rocm_moe.cuh:301-326), and
+ * sycl_dev_e8m0_to_f32 bit-casts the exponent directly rather than calling
+ * ldexpf.  A scalar per-element reformulation of ROCm's dp4a-packed
+ * integer dot is used throughout (dp4a sums four exact int8-times-int8
+ * products into one int32; summing the same 16 products in any order is
+ * exact, so this is not an approximation of the packed form). */
+
+struct sycl_block_mxfp4 {
+    uint8_t e;
+    uint8_t qs[16];
+};
+
+static inline float sycl_dev_e8m0_to_f32(uint8_t e) {
+    const uint32_t bits = e == 0u ? 0x00400000u : (uint32_t)e << 23u;
+    return sycl::bit_cast<float>(bits);
+}
+
+/* dev_mxfp4_unpack4, rocm/ds4_rocm_moe.cuh:301-326, portable branch only
+ * (the AMDGCN v_perm branch is Instinct-only and not applicable here):
+ * reconstructs the doubled signed E2M1 magnitude {0,1,2,3,4,6,8,12} from
+ * the 3 magnitude bits by bumping past the two missing 2^-1-mantissa
+ * steps (codes 5 and 6) and adding 2 more at code 7 to reach 12, then
+ * negates on the sign bit. */
+static inline int32_t sycl_dev_mxfp4_unpack1(uint8_t nibble) {
+    const uint32_t base = nibble & 7u;
+    int32_t value = (int32_t)(base + (base > 4u ? base - 4u : 0u) + (base == 7u ? 2u : 0u));
+    if (nibble & 8u) value = -value;
+    return value;
+}
+
+/* dev_dot_mxfp4_q8_K_half_block, rocm/ds4_rocm_moe.cuh:365-388: dots half
+ * of one 32-value MXFP4 block (16 elements) against the matching half of
+ * one Q8_K sub-block's 32 activation codes.  half==0 covers weight bytes
+ * 0..7 (elements 0..7 low-nibble, 16..23 high-nibble); half==1 covers
+ * weight bytes 8..15 (elements 8..15 low-nibble, 24..31 high-nibble). */
+static inline float sycl_dev_dot_mxfp4_q8_k_half_block(
+        const sycl_block_mxfp4 *x, const sycl_block_q8_K *y, uint32_t subblock,
+        uint32_t half) {
+    const uint32_t weight_offset = half * 8u;
+    const uint32_t activation_offset = subblock * 32u + weight_offset;
+    const int8_t *q8_lo = y->qs + activation_offset;
+    const int8_t *q8_hi = y->qs + activation_offset + 16u;
+    int32_t bsum = 0;
+    for (uint32_t k = 0; k < 8u; k++) {
+        const uint8_t byte = x->qs[weight_offset + k];
+        bsum += sycl_dev_mxfp4_unpack1(byte & 0x0fu) * (int32_t)q8_lo[k];
+        bsum += sycl_dev_mxfp4_unpack1(byte >> 4u) * (int32_t)q8_hi[k];
+    }
+    return 0.5f * y->d * sycl_dev_e8m0_to_f32(x->e) * (float)bsum;
+}
+
+/* moe_gate_up_mid_decode_mxfp4_qwarp32_kernel, rocm/ds4_rocm_moe.cuh:
+ * 2767-2843.  Handles every MXFP4 call with n_tokens <= 4
+ * (rocm/ds4_rocm_moe_launch.cuh:753-754's use_mxfp4_tiny_batch, decode
+ * included), a genuinely different algorithm from the tile8 kernel rather
+ * than a smaller tiling of it: one 32-wide sub-group computes one
+ * (pair,row) output, splitting the 8 q8_K sub-blocks per chunk 16 ways
+ * across lane pairs (block_lane) and each MXFP4 block's 32 values in half
+ * between the two lanes of a pair (half). */
+static void sycl_moe_mxfp4_gate_up_mid_decode(
+        sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
+        const sycl_block_q8_K *xq, const int32_t *selected, const float *weights,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint32_t xq_blocks,
+        uint32_t expert_mid_dim, uint32_t n_expert, uint32_t pair_count, float clamp) {
+    const uint32_t row_groups = (expert_mid_dim + 7u) / 8u;
+    if (row_groups == 0u || pair_count == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_groups * 256u, pair_count),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(32)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t wave = (uint32_t)(it.get_local_id(0) >> 5);
+                 const uint32_t block_lane = lane >> 1u;
+                 const uint32_t half = lane & 1u;
+                 const uint32_t row = (uint32_t)it.get_group(0) * 8u + wave;
+                 if (row >= expert_mid_dim) return;
+                 const uint32_t pair = (uint32_t)it.get_group(1);
+                 const uint32_t tok = pair / n_expert;
+                 const uint32_t slot = pair - tok * n_expert;
+                 int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+                 if (expert_i < 0) expert_i = 0;
+                 const uint32_t expert = (uint32_t)expert_i;
+                 const sycl_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
                  const sycl_block_mxfp4 *gate_blocks = (const sycl_block_mxfp4 *)
                          (gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
                  const sycl_block_mxfp4 *up_blocks = (const sycl_block_mxfp4 *)
@@ -2056,12 +2072,48 @@ extern "C" int ds4_sycl_moe_test_q2k_down_direct(
         float *out) {
     if (g_devices.empty() || !down_bytes || !midq_bytes || !selected || !out ||
         out_dim == 0u || n_expert == 0u || n_tokens == 0u || midq_blocks == 0u ||
-/* Test-only side doors for the MXFP4 decode-regime kernels (n_tokens <= 4),
- * exercised directly rather than through the public dispatcher: these
- * kernels land before the mxfp4_path dispatcher
- * block is wired up, and their own tests are what must NOT flip
- * test_dispatcher_mxfp4_not_yet_implemented early, since that RM-shaped
- * call's n_tokens == 2 already falls in this tiny-batch regime.  Host
+        n_total_expert == 0u) {
+        return 0;
+    }
+    try {
+        sycl::queue &q = ds4_sycl_current_queue();
+        const uint64_t down_bytes_total = (uint64_t)n_total_expert * down_expert_bytes;
+        const uint64_t midq_count = (uint64_t)n_tokens * n_expert * midq_blocks;
+        const uint64_t midq_bytes_total = midq_count * sizeof(sycl_block_q8_K);
+        const uint64_t sel_bytes = (uint64_t)n_tokens * n_expert * sizeof(int32_t);
+        const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
+
+        void *d_down = sycl::malloc_device((size_t)down_bytes_total, q);
+        void *d_midq = sycl::malloc_device((size_t)midq_bytes_total, q);
+        int32_t *d_sel = (int32_t *)sycl::malloc_device((size_t)sel_bytes, q);
+        float *d_out = (float *)sycl::malloc_device((size_t)out_bytes, q);
+        if (!d_down || !d_midq || !d_sel || !d_out) {
+            if (d_down) sycl::free(d_down, q);
+            if (d_midq) sycl::free(d_midq, q);
+            if (d_sel) sycl::free(d_sel, q);
+            if (d_out) sycl::free(d_out, q);
+            return 0;
+        }
+        sycl_device_scratch_guard down_guard(q, d_down);
+        sycl_device_scratch_guard midq_guard(q, d_midq);
+        sycl_device_scratch_guard sel_guard(q, d_sel);
+        sycl_device_scratch_guard out_guard(q, d_out);
+        q.memcpy(d_down, down_bytes, (size_t)down_bytes_total);
+        q.memcpy(d_midq, midq_bytes, (size_t)midq_bytes_total);
+        q.memcpy(d_sel, selected, (size_t)sel_bytes);
+        q.wait_and_throw();
+
+        sycl_moe_q2k_down_direct(q, d_out, (const char *)d_down, (const sycl_block_q8_K *)d_midq,
+                                 d_sel, down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
+                                 n_expert, n_tokens);
+        q.memcpy(out, d_out, (size_t)out_bytes).wait_and_throw();
+        return 1;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_q2k_down_direct failed: %s\n", e.what());
+        return 0;
+    }
+}
+
 /* Test-only side doors for the MXFP4 decode-regime kernels (n_tokens <= 4):
  * exercise sycl_moe_mxfp4_gate_up_mid_decode / sycl_moe_mxfp4_down_sum6
  * directly rather than only through the public dispatcher, matching the
@@ -2151,39 +2203,6 @@ extern "C" int ds4_sycl_moe_test_mxfp4_down_sum6(
     }
     try {
         sycl::queue &q = ds4_sycl_current_queue();
-        const uint64_t down_bytes_total = (uint64_t)n_total_expert * down_expert_bytes;
-        const uint64_t midq_count = (uint64_t)n_tokens * n_expert * midq_blocks;
-        const uint64_t midq_bytes_total = midq_count * sizeof(sycl_block_q8_K);
-        const uint64_t sel_bytes = (uint64_t)n_tokens * n_expert * sizeof(int32_t);
-        const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
-
-        void *d_down = sycl::malloc_device((size_t)down_bytes_total, q);
-        void *d_midq = sycl::malloc_device((size_t)midq_bytes_total, q);
-        int32_t *d_sel = (int32_t *)sycl::malloc_device((size_t)sel_bytes, q);
-        float *d_out = (float *)sycl::malloc_device((size_t)out_bytes, q);
-        if (!d_down || !d_midq || !d_sel || !d_out) {
-            if (d_down) sycl::free(d_down, q);
-            if (d_midq) sycl::free(d_midq, q);
-            if (d_sel) sycl::free(d_sel, q);
-            if (d_out) sycl::free(d_out, q);
-            return 0;
-        }
-        sycl_device_scratch_guard down_guard(q, d_down);
-        sycl_device_scratch_guard midq_guard(q, d_midq);
-        sycl_device_scratch_guard sel_guard(q, d_sel);
-        sycl_device_scratch_guard out_guard(q, d_out);
-        q.memcpy(d_down, down_bytes, (size_t)down_bytes_total);
-        q.memcpy(d_midq, midq_bytes, (size_t)midq_bytes_total);
-        q.memcpy(d_sel, selected, (size_t)sel_bytes);
-        q.wait_and_throw();
-
-        sycl_moe_q2k_down_direct(q, d_out, (const char *)d_down, (const sycl_block_q8_K *)d_midq,
-                                 d_sel, down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
-                                 n_expert, n_tokens);
-        q.memcpy(out, d_out, (size_t)out_bytes).wait_and_throw();
-        return 1;
-    } catch (const sycl::exception &e) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_q2k_down_direct failed: %s\n", e.what());
         const uint32_t midq_blocks = mid_dim / kMoeQK;
         const uint64_t pair_count = (uint64_t)n_tokens * n_expert;
         const uint64_t table_bytes = (uint64_t)n_total_expert * down_expert_bytes;
