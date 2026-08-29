@@ -370,6 +370,59 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t by
     }
 }
 
+/* Model-map registration.  ds4_engine_open calls one of these two on every
+ * startup and ABORTS if it reports failure (ds4.c:58352 for the range form,
+ * :58254 and :58308 for the spans form, both checked at :58358).  While they
+ * were stubbed to their failure value, ds4_engine_open could not succeed for
+ * any real model on this backend, which no test could see because the whole
+ * suite calls ABI entries directly rather than opening an engine.
+ *
+ * This backend keeps no device-resident copy of the model: every kernel
+ * stages the weight range it needs per call (spec 6l), because a SYCL kernel
+ * cannot dereference the host mmap at all.  So there is nothing to register
+ * and the honest implementation is a range validation.  ROCm does more here
+ * (rocm/ds4_rocm_runtime.cuh:6133) only because its streaming mode maintains
+ * a device-side model cache with a size limit; when that lands for SYCL, this
+ * is where the limit check belongs. */
+extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size,
+                                           uint64_t map_offset, uint64_t map_size,
+                                           uint64_t max_tensor_bytes) {
+    (void)max_tensor_bytes;
+    if (model_map == nullptr || model_size == 0) return 0;
+    /* Overflow-safe: map_offset + map_size can wrap past UINT64_MAX. */
+    if (map_offset > model_size || map_size > model_size - map_offset) return 0;
+    return 1;
+}
+
+extern "C" int ds4_gpu_set_model_map_spans(const void *model_map, uint64_t model_size,
+                                           const uint64_t *offsets, const uint64_t *sizes,
+                                           uint32_t count, uint64_t max_tensor_bytes) {
+    (void)max_tensor_bytes;
+    if (model_map == nullptr || model_size == 0) return 0;
+    if (count != 0 && (offsets == nullptr || sizes == nullptr)) return 0;
+    for (uint32_t i = 0; i < count; i++) {
+        if (offsets[i] > model_size || sizes[i] > model_size - offsets[i]) return 0;
+    }
+    return 1;
+}
+
+/* An OPTIONAL F16 preload of a Q8_0 weight range.  ds4.c:3020 checks the
+ * result and aborts startup on failure (ds4.c:58405), so "not supported" must
+ * be reported as success, not failure.  ROCm agrees: its implementation
+ * (rocm/ds4_rocm_runtime.cuh:6314) returns 1 for a null map, zero bytes, a
+ * disabled preload or a label its policy declines, and returns 0 only for a
+ * genuinely out-of-range request.  This backend builds no such cache, so it
+ * validates and reports success. */
+extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size,
+                                          uint64_t offset, uint64_t bytes,
+                                          uint64_t in_dim, uint64_t out_dim,
+                                          const char *label) {
+    (void)in_dim; (void)out_dim; (void)label;
+    if (model_map == nullptr || bytes == 0) return 1;
+    if (offset > model_size || bytes > model_size - offset) return 0;
+    return 1;
+}
+
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
                                                uint64_t offset,
                                                uint64_t bytes) {
