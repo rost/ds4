@@ -57,6 +57,24 @@ static void oracle_matmul_f16(float *out, const float *x, const uint16_t *w,
     }
 }
 
+/* Oracle: out[t][o] = sum_k x[t][k] * w[o][k], cited to
+ * rocm/ds4_rocm_matmul.cuh:967-991 (matmul_f32_kernel, the non-cuBLAS
+ * fallback).  Weight storage is plain IEEE754 binary32, row-major, out_dim
+ * rows of in_dim float values each. */
+static void oracle_matmul_f32(float *out, const float *x, const float *w,
+                              uint32_t in_dim, uint32_t out_dim,
+                              uint32_t n_tok) {
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < out_dim; o++) {
+            double sum = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) {
+                sum += (double)x[t * in_dim + k] * (double)w[o * in_dim + k];
+            }
+            out[t * out_dim + o] = (float)sum;
+        }
+    }
+}
+
 /* in_dim deliberately not a multiple of 8/16/32/64 so a tile-remainder bug
  * would be exercised.  n_tok > 1 so the row-stride term over x is
  * exercised too, per rocm/ds4_rocm_matmul.cuh:873-931.  Weight and
@@ -591,6 +609,213 @@ static int test_matmul_q8_0_pair(void) {
     return 0;
 }
 
+/* in_dim deliberately not a multiple of 8/16/32/64, n_tok > 1: same
+ * discriminating shape as test_matmul_f16_pair above, applied to the
+ * plain (non-cuBLAS) F32 dense matmul, cited to
+ * rocm/ds4_rocm_matmul.cuh:967-991.  This backend has no cuBLAS/oneMKL
+ * batched-GEMM fast path wired for this entry:
+ * ROCm's non-BLAS kernel fallback is genuine and gated the same way the
+ * Q8_0 GEMM fast path is, so a hand-written kernel is the correct port
+ * here, not a GEMM), so there is exactly one code path to validate. */
+static int test_matmul_f32(void) {
+    enum { IN_DIM = 37, OUT_DIM = 5, N_TOK = 3 };
+
+    float weights[OUT_DIM * IN_DIM];
+    float x[N_TOK * IN_DIM];
+    float want[N_TOK * OUT_DIM];
+    float got[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            weights[o * IN_DIM + k] = (float)(((o + 1) * (k + 3)) % 13) - 6.0f;
+        }
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+    oracle_matmul_f32(want, x, weights, IN_DIM, OUT_DIM, N_TOK);
+
+    ds4_gpu_tensor *tx  = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tx != NULL && tout != NULL, "matmul_f32: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0, "matmul_f32: write x");
+
+    CHECK(ds4_gpu_matmul_f32_tensor(tout, weights, sizeof(weights), 0,
+                                    IN_DIM, OUT_DIM, tx, N_TOK) != 0,
+          "matmul_f32: call");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got, sizeof(got)) != 0,
+          "matmul_f32: read out");
+
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-3, "matmul_f32: out mismatch");
+    }
+
+    /* Validation ported from rocm/ds4_rocm_matmul.cuh:967-971. */
+    CHECK(ds4_gpu_matmul_f32_tensor(tout, weights, sizeof(weights), 0,
+                                    0, OUT_DIM, tx, N_TOK) == 0,
+          "matmul_f32: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_f32_tensor(tout, weights, sizeof(weights), 0,
+                                    IN_DIM, 0, tx, N_TOK) == 0,
+          "matmul_f32: zero out_dim must be rejected");
+    CHECK(ds4_gpu_matmul_f32_tensor(tout, weights, sizeof(weights), 0,
+                                    IN_DIM, OUT_DIM, tx, 0) == 0,
+          "matmul_f32: zero n_tok must be rejected");
+    CHECK(ds4_gpu_matmul_f32_tensor(tout, weights, sizeof(weights),
+                                    sizeof(weights), IN_DIM, OUT_DIM, tx,
+                                    N_TOK) == 0,
+          "matmul_f32: out-of-range weight offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_matmul_f32 OK\n");
+    return 0;
+}
+
+/* Same discriminating shape as test_matmul_f16_pair, applied to the single
+ * (non-paired) F16 dense matmul entry, cited to
+ * rocm/ds4_rocm_matmul.cuh:804-814/873-931.  This backend has no
+ * cuBLAS/oneMKL batched-GEMM fast path wired for this entry either (same
+ * reasoning as test_matmul_f32 above), reusing the general kernel already
+ * built for ds4_gpu_matmul_f16_pair_tensor
+ * (sycl_matmul_f16_launch, sycl/ds4_sycl_matmul.hpp). */
+static int test_matmul_f16(void) {
+    enum { IN_DIM = 37, OUT_DIM = 5, N_TOK = 3 };
+
+    uint16_t weights[OUT_DIM * IN_DIM];
+    float    x[N_TOK * IN_DIM];
+    float    want[N_TOK * OUT_DIM];
+    float    got[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            const float v = (float)(((o + 1) * (k + 3)) % 13) - 6.0f;
+            weights[o * IN_DIM + k] = test_float_to_half(v);
+        }
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+    oracle_matmul_f16(want, x, weights, IN_DIM, OUT_DIM, N_TOK);
+
+    ds4_gpu_tensor *tx  = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tx != NULL && tout != NULL, "matmul_f16: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0, "matmul_f16: write x");
+
+    CHECK(ds4_gpu_matmul_f16_tensor(tout, weights, sizeof(weights), 0,
+                                    IN_DIM, OUT_DIM, tx, N_TOK) != 0,
+          "matmul_f16: call");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got, sizeof(got)) != 0,
+          "matmul_f16: read out");
+
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-2, "matmul_f16: out mismatch");
+    }
+
+    /* Validation ported from rocm/ds4_rocm_matmul.cuh:804-808. */
+    CHECK(ds4_gpu_matmul_f16_tensor(tout, weights, sizeof(weights), 0,
+                                    0, OUT_DIM, tx, N_TOK) == 0,
+          "matmul_f16: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_f16_tensor(tout, weights, sizeof(weights), 0,
+                                    IN_DIM, 0, tx, N_TOK) == 0,
+          "matmul_f16: zero out_dim must be rejected");
+    CHECK(ds4_gpu_matmul_f16_tensor(tout, weights, sizeof(weights), 0,
+                                    IN_DIM, OUT_DIM, tx, 0) == 0,
+          "matmul_f16: zero n_tok must be rejected");
+    CHECK(ds4_gpu_matmul_f16_tensor(tout, weights, sizeof(weights),
+                                    sizeof(weights), IN_DIM, OUT_DIM, tx,
+                                    N_TOK) == 0,
+          "matmul_f16: out-of-range weight offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_matmul_f16 OK\n");
+    return 0;
+}
+
+/* ds4_gpu_matmul_q8_0_f16_out_tensor, rocm/ds4_rocm_matmul.cuh:216-291
+ * (cuda_matmul_q8_0_tensor_f16_gemm_out_half): the one matmul entry this
+ * plan found with NO non-GEMM fallback in ROCm at all (unconditional
+ * `if (!g_cublas_ready ...) return 0;`), so oneMKL is genuinely load-
+ * bearing here, not merely a performance choice the way it is for
+ * ds4_gpu_matmul_f32_tensor/ds4_gpu_matmul_f16_tensor above.  Reuses
+ * test_encode_q8_0_row/oracle_matmul_q8_0 (this file) for the weight side.
+ *
+ * The output tensor is genuinely F16 (the GEMM's own C operand, written by
+ * oneMKL/cuBLAS's internal cast, not by this backend's own bit-exact F16
+ * encoder), so the tolerance here is looser than the F32-output matmul
+ * tests above: both the Q8_0-dequantised weight and the F32 activation are
+ * themselves rounded to half before the multiply-accumulate, and the GPU
+ * accumulates in a different order than this double-precision oracle. 1e-2
+ * relative was measured to hold comfortably (observed deltas were an order
+ * of magnitude tighter across this test's whole output), while still being
+ * loose enough to absorb the half-precision rounding this path genuinely
+ * introduces. */
+static int test_matmul_q8_0_f16_out(void) {
+    enum { IN_DIM = 37, OUT_DIM = 5, N_TOK = 3 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+
+    unsigned char weights[OUT_DIM * 68]; /* row_bytes <= 2*34 = 68 here */
+    float          x[N_TOK * IN_DIM];
+    float          want[N_TOK * OUT_DIM];
+    uint16_t       got_h[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(weights + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+    oracle_matmul_q8_0(want, x, weights, IN_DIM, OUT_DIM, N_TOK, row_bytes);
+
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * row_bytes;
+
+    ds4_gpu_tensor *tx   = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *touth = ds4_gpu_tensor_alloc(sizeof(got_h));
+    CHECK(tx != NULL && touth != NULL, "matmul_q8_0_f16_out: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "matmul_q8_0_f16_out: write x");
+
+    CHECK(ds4_gpu_matmul_q8_0_f16_out_tensor(touth, weights, weight_bytes, 0,
+                                             IN_DIM, OUT_DIM, tx, N_TOK) != 0,
+          "matmul_q8_0_f16_out: call");
+    CHECK(ds4_gpu_tensor_read(touth, 0, got_h, sizeof(got_h)) != 0,
+          "matmul_q8_0_f16_out: read out");
+
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        const float got = oracle_half_to_float(got_h[i]);
+        const double tol = 1e-2 * (fabs((double)want[i]) > 1.0 ? fabs((double)want[i]) : 1.0);
+        CHECK_CLOSE(got, want[i], tol, "matmul_q8_0_f16_out: out mismatch");
+    }
+
+    /* Validation ported from rocm/ds4_rocm_matmul.cuh:250-261. */
+    CHECK(ds4_gpu_matmul_q8_0_f16_out_tensor(touth, weights, weight_bytes, 0,
+                                             0, OUT_DIM, tx, N_TOK) == 0,
+          "matmul_q8_0_f16_out: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_f16_out_tensor(touth, weights, weight_bytes, 0,
+                                             IN_DIM, 0, tx, N_TOK) == 0,
+          "matmul_q8_0_f16_out: zero out_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_f16_out_tensor(touth, weights, weight_bytes, 0,
+                                             IN_DIM, OUT_DIM, tx, 0) == 0,
+          "matmul_q8_0_f16_out: zero n_tok must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_f16_out_tensor(touth, weights, weight_bytes,
+                                             weight_bytes, IN_DIM, OUT_DIM,
+                                             tx, N_TOK) == 0,
+          "matmul_q8_0_f16_out: out-of-range weight offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(touth);
+    fprintf(stderr, "  test_matmul_q8_0_f16_out OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_matmul_f16_pair() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -600,6 +825,9 @@ int main(void) {
     if (test_matmul_q8_0_decode_mpp_model_view() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_rows_scalar() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_pair() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_f32() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_f16() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0_f16_out() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_matmul OK\n");
     return 0;

@@ -372,4 +372,31 @@ static inline sycl::event sycl_gemm_batch_f32(
                                          c, ldc, stride_c, batch_size, deps);
 }
 
+/* Single (non-batched) F16 GEMM via oneMKL's oneapi::mkl::blas::gemm, the
+ * analogue of cublasGemmEx(..., CUDA_R_16F, ..., CUBLAS_COMPUTE_32F, ...)
+ * used by ROCm's cuda_matmul_q8_0_tensor_f16_gemm_out_half
+ * (rocm/ds4_rocm_matmul.cuh:216-291), the one matmul entry with no non-GEMM
+ * fallback in ROCm at all. oneMKL's (sycl::half, sycl::half, sycl::half,
+ * sycl::half) instantiation is the closest available match: cuBLAS's alpha
+ * and beta are float pointers under CUBLAS_COMPUTE_32F, but both this
+ * caller's alpha (1.0) and beta (0.0) are exactly representable in half,
+ * so passing them as sycl::half loses no precision; the alpha/beta type
+ * has no bearing on the GEMM's own internal accumulation precision, which
+ * is implementation-defined on both platforms regardless of Ts. Same
+ * ordering contract as sycl_gemm_batch_f32 above: the returned event is
+ * the caller's only handle on ordering against whatever reads `c` next. */
+static inline sycl::event sycl_gemm_f16(
+        sycl::queue &q,
+        oneapi::mkl::transpose transa, oneapi::mkl::transpose transb,
+        int64_t m, int64_t n, int64_t k,
+        sycl::half alpha,
+        const sycl::half *a, int64_t lda,
+        const sycl::half *b, int64_t ldb,
+        sycl::half beta,
+        sycl::half *c, int64_t ldc,
+        const std::vector<sycl::event> &deps = {}) {
+    return oneapi::mkl::blas::gemm(q, transa, transb, m, n, k, alpha, a, lda,
+                                   b, ldb, beta, c, ldc, deps);
+}
+
 }  // namespace
