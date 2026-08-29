@@ -223,15 +223,12 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_set_model_map_spans)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_add_q8_0_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_q8_0_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor)
 /* Deliberately left stubbed: implemented ONLY in ds4_cuda.cu (CUDA-only;
  * rocm/ has no definition at all, so ROCm itself hits its own unavailable
  * stub here and ds4.c falls back).  It is also multi-GPU aware
  * (ds4_tensor_device_idx, g_gpu_peer_ok, cuda_tmp_alloc_on), so it belongs
  * with the multi-GPU streaming plan if this backend ever wants it. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_mid_swiglu_q8_0_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_should_use_managed_kv_cache)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_signal_selected_readback_ready)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_store_raw_kv_tensor)

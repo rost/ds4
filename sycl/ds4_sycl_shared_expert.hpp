@@ -314,3 +314,111 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_elems, clamp,
                                  1.0f);
 }
+
+/* Pure delegation to the core entry with identical arguments,
+ * rocm/ds4_rocm_shared_expert.cuh:133-156. */
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
+    return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(gate, up, mid, model_map,
+                                                     model_size, gate_offset,
+                                                     up_offset, in_dim,
+                                                     out_dim, x, clamp);
+}
+
+/* Allocates a 2 * out_dim scratch block, carves gate and up out of it, and
+ * delegates to the core entry, rocm/ds4_rocm_shared_expert.cuh:101-131.
+ * Validates out_dim but NOT in_dim before allocating, matching ROCm
+ * exactly; an in_dim == 0 (or otherwise invalid) call still fails, just
+ * one level down, inside the delegated core entry, after this wrapper's
+ * scratch allocation has already succeeded.
+ *
+ * ROCm's own carved tensors use a three-element brace initialiser against
+ * the four-field struct (ds4_gpu_mgpu.h:39: ptr, bytes, owner, device_id),
+ * leaving device_id at its default of 0.  0 means "device 0" here, not
+ * "untagged" (only -1 is legacy/untagged, per that struct's own comment),
+ * so this carries forward the exact same cross-device gap spec section 6a
+ * already documents for every multi-tensor entry point in this backend:
+ * harmless while every tensor lives on tier 0, which is true for all
+ * current work, and not a gap to close here ahead of the multi-GPU plan.
+ * owner 0 is also deliberate: this wrapper does not own the scratch
+ * allocation the way a real tensor would, since sycl_device_scratch_guard
+ * below already owns and frees it. */
+extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp) {
+    if (!mid || out_dim == 0u || out_dim > UINT32_MAX) return 0;
+
+    uint64_t tmp_elems = 0, tmp_bytes = 0;
+    if (!sycl_u64_mul_checked(2u, out_dim, &tmp_elems) ||
+        !sycl_u64_mul_checked(tmp_elems, sizeof(float), &tmp_bytes)) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(mid->device_id);
+
+        float *tmp = sycl::malloc_device<float>((size_t)tmp_elems, q);
+        if (!tmp) return 0;
+        sycl_device_scratch_guard tmp_guard(q, tmp);
+
+        ds4_gpu_tensor gate_tmp = { tmp, out_dim * sizeof(float), 0, 0 };
+        ds4_gpu_tensor up_tmp = { tmp + out_dim, out_dim * sizeof(float), 0,
+                                  0 };
+
+        return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+                &gate_tmp, &up_tmp, mid, model_map, model_size, gate_offset,
+                up_offset, in_dim, out_dim, x, clamp);
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "shared gate/up mid wrapper failed: %s\n", e.what());
+        return 0;
+    }
+}
+
+/* n_tok == 1 delegates to the core entry; n_tok > 1 uses the batched rows
+ * path, completed in the task that ports
+ * shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel
+ * (rocm/ds4_rocm_q8.cuh:524-671).  ROCm refuses (returns 0, not a
+ * fallback to the general path) rather than route a nonzero clamp through
+ * the batch kernel, which has no clamp parameter at all
+ * (rocm/ds4_rocm_shared_expert.cuh:184); ported exactly. */
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   clamp) {
+    if (n_tok == 1u) {
+        return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+                gate, up, mid, model_map, model_size, gate_offset, up_offset,
+                in_dim, out_dim, x, clamp);
+    }
+    if (clamp > 1.0e-6f) return 0;
+    /* TODO: batched rows path, not yet implemented. */
+    return 0;
+}
