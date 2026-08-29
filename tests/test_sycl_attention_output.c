@@ -682,6 +682,379 @@ static int test_attention_output_q8_batch_f16(void) {
     return 0;
 }
 
+/* ---- The Q4_K attention output projection ----------------------
+ *
+ * ds4_gpu_attention_output_low_q4_K_slice_tensor and
+ * ds4_gpu_attention_output_q4_K_batch_tensor parallel the Q8_0 entries
+ * above (same low-rank-then-expand structure), fired instead whenever
+ * attn_output_a is Q4_K rather than Q8_0. Unlike the Q8_0 A-stage, no
+ * activation quantisation is needed here: ds4_metal.m's own Q4_K matmul
+ * kernels (kernel_mul_mv_q4_K_dense_f32 and friends,
+ * ds4_gpu_matmul_quant_impl_tensor) read the raw F32 activation directly,
+ * matching sycl/ds4_sycl_matmul.hpp's dense Q4_K entries,
+ * which this file's B-stage reuses via ds4_gpu_matmul_quant_tensor. */
+
+/* Same construction as test_sycl_matmul.c's test_q4k_pack_scales/
+ * test_encode_q4_k_row (duplicated per this file's own precedent of
+ * reimplementing every oracle locally, matching encode_q8_0_row/
+ * test_encode_q8_0_row above): inverse of q4_k_get_scale_min
+ * (ds4.c:3524-3532), cross-checked in test_sycl_matmul.c's own
+ * test_q4k_pack_roundtrip before being trusted there. */
+static void encode_q4k_pack_scales(uint8_t q[12], const uint8_t sc[8], const uint8_t m[8]) {
+    for (int i = 0; i < 4; i++) {
+        q[i]     = (uint8_t)((sc[i] & 0x3Fu) | ((uint32_t)(sc[i + 4] >> 4) << 6));
+        q[i + 4] = (uint8_t)((m[i]  & 0x3Fu) | ((uint32_t)(m[i + 4]  >> 4) << 6));
+        q[i + 8] = (uint8_t)((sc[i + 4] & 0x0Fu) | ((uint32_t)(m[i + 4] & 0x0Fu) << 4));
+    }
+}
+
+static void encode_q4k_get_scale_min(int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m  = q[j + 4] & 63;
+    } else {
+        *sc = (uint8_t)((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+        *m  = (uint8_t)((q[j + 4] >> 4)  | ((q[j] >> 6) << 4));
+    }
+}
+
+/* Encodes one 144-byte-per-block Q4_K row of group_dim columns, an
+ * (o, k) interaction nibble term per spec 6f/6i, distinct constants from
+ * every other encoder in this file so a wrong-row read is visibly wrong. */
+static void encode_q4_k_row(unsigned char *row, uint32_t group_dim, uint32_t o) {
+    const uint32_t blocks = (group_dim + 255u) / 256u;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        unsigned char *bp = row + (size_t)blk * 144u;
+        uint8_t sc[8], m[8];
+        for (uint32_t j = 0; j < 8u; j++) {
+            sc[j] = (uint8_t)(1u + ((o + j * 3u + blk * 11u) % 60u));
+            m[j]  = (uint8_t)(1u + ((o * 2u + j * 5u + blk * 7u) % 60u));
+        }
+        const uint16_t draw = test_float_to_half(0.04f * (float)(o + blk + 1u));
+        const uint16_t dminraw = test_float_to_half(0.015f * (float)(o + 2u * blk + 1u));
+        bp[0] = (unsigned char)(draw & 0xFFu);
+        bp[1] = (unsigned char)((draw >> 8) & 0xFFu);
+        bp[2] = (unsigned char)(dminraw & 0xFFu);
+        bp[3] = (unsigned char)((dminraw >> 8) & 0xFFu);
+        encode_q4k_pack_scales(bp + 4, sc, m);
+        unsigned char *qs = bp + 16;
+        memset(qs, 0, 128);
+        for (uint32_t j = 0; j < 8u; j++) {
+            const uint32_t byte_off = (j >> 1u) * 32u;
+            const int shift = (j & 1u) ? 4 : 0;
+            for (uint32_t pos = 0; pos < 32u; pos++) {
+                const uint32_t k = blk * 256u + j * 32u + pos;
+                const uint32_t nib = (k < group_dim)
+                        ? (uint32_t)(((o + 1u) * (k + 7u) + (o * k) % 5u) % 16u)
+                        : 0u;
+                qs[byte_off + pos] = (unsigned char)(qs[byte_off + pos] | (nib << shift));
+            }
+        }
+    }
+}
+
+static float oracle_q4_k_dequant(const unsigned char *row, uint32_t col) {
+    const uint32_t blk = col / 256u;
+    const uint32_t idx = col % 256u;
+    const unsigned char *bp = row + (size_t)blk * 144u;
+    const uint16_t draw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+    const uint16_t dminraw = (uint16_t)(bp[2] | ((uint16_t)bp[3] << 8));
+    const uint8_t *scales = bp + 4;
+    const uint8_t *qs = bp + 16;
+    const uint32_t j = idx / 32u;
+    const uint32_t pos = idx % 32u;
+    uint8_t sc, m;
+    encode_q4k_get_scale_min((int)j, scales, &sc, &m);
+    const uint32_t byte_off = (j >> 1u) * 32u + pos;
+    const uint8_t raw = qs[byte_off];
+    const uint8_t nib = (j & 1u) ? (uint8_t)(raw >> 4u) : (uint8_t)(raw & 0x0Fu);
+    const float d = oracle_half_to_float(draw);
+    const float dmin = oracle_half_to_float(dminraw);
+    return d * (float)sc * (float)nib - dmin * (float)m;
+}
+
+/* Oracle for the Q4_K A-stage: sycl_grouped_q4_k_a_launch's own formula
+ * (sycl/ds4_sycl_attention_output.hpp), a plain float dot against the
+ * dequantised Q4_K row -- no activation quantisation, matching
+ * ds4_gpu_matmul_quant_impl_tensor's own Q4_K path in ds4_metal.m, which
+ * also reads raw F32 activations directly (unlike the Q8_0 A-stage above).
+ * `w` is n_groups*rank rows of row_bytes each, row layout
+ * [group][row_in_group], the same layout oracle_grouped_out_low uses. */
+static void oracle_grouped_out_low_q4_k(float *low, const float *heads,
+                                        const unsigned char *w, uint32_t n_groups,
+                                        uint32_t group_dim, uint32_t rank,
+                                        uint64_t row_bytes) {
+    for (uint32_t g = 0; g < n_groups; g++) {
+        for (uint32_t r = 0; r < rank; r++) {
+            const unsigned char *row = w + ((size_t)g * rank + r) * row_bytes;
+            double sum = 0.0;
+            for (uint32_t k = 0; k < group_dim; k++) {
+                sum += (double)heads[(size_t)g * group_dim + k] *
+                       (double)oracle_q4_k_dequant(row, k);
+            }
+            low[(size_t)g * rank + r] = (float)sum;
+        }
+    }
+}
+
+static void oracle_grouped_out_batch_low_q4_k(float *low, const float *heads,
+                                              const unsigned char *w, uint32_t n_tok,
+                                              uint32_t n_groups, uint32_t group_dim,
+                                              uint32_t rank, uint64_t row_bytes) {
+    for (uint32_t t = 0; t < n_tok; t++) {
+        oracle_grouped_out_low_q4_k(low + (size_t)t * n_groups * rank,
+                                    heads + (size_t)t * n_groups * group_dim, w,
+                                    n_groups, group_dim, rank, row_bytes);
+    }
+}
+
+/* GROUP_DIM spans two Q4_K superblocks (the second ragged), RANK and
+ * GROUP_CNT both > 1 so the row/group stride math is genuinely exercised.
+ * GROUP0 > 0 so the slice offset itself is exercised, not just group_cnt:
+ * the weight buffer here holds only the group0..group0+group_cnt-1 slice
+ * (mirroring how ds4.c's callers stage only that slice's bytes, per
+ * out_a->abs_offset + (group0+i)*group_weight_bytes in the generic
+ * per-group fallback, metal_graph_attention_output_dense_quant_low). */
+static int test_attention_output_low_q4_k_slice(void) {
+    enum { GROUP_DIM = 256 + 41, RANK = 5, GROUP0 = 2, GROUP_CNT = 3 };
+    const uint64_t blocks = (GROUP_DIM + 255u) / 256u;
+    const uint64_t row_bytes = blocks * 144u;
+    const uint32_t low_dim = RANK * GROUP_CNT;
+
+    unsigned char w[GROUP_CNT * RANK * 2 * 144]; /* row_bytes <= 2*144 here */
+    float heads[GROUP_CNT * GROUP_DIM];
+    float want_low[GROUP_CNT * RANK];
+    float got_low[GROUP_CNT * RANK];
+
+    for (uint32_t g = 0; g < GROUP_CNT; g++) {
+        for (uint32_t r = 0; r < RANK; r++) {
+            /* Encoded as if this were group (GROUP0+g), matching what a
+             * real staged slice starting at group0 would contain. */
+            encode_q4_k_row(w + ((size_t)g * RANK + r) * row_bytes, GROUP_DIM,
+                            (GROUP0 + g) * 13u + r + 2u);
+        }
+    }
+    for (uint32_t g = 0; g < GROUP_CNT; g++) {
+        fill_activation_row(heads + (size_t)g * GROUP_DIM, GROUP_DIM, g + 1u);
+    }
+    oracle_grouped_out_low_q4_k(want_low, heads, w, GROUP_CNT, GROUP_DIM, RANK, row_bytes);
+
+    /* out_a_offset is the FULL out_a tensor's own base offset, matching
+     * ds4.c's own calling convention (out_a->abs_offset unmodified, group0
+     * passed as a separate argument): `model` holds group0's worth of
+     * padding (never read; only the entry's OWN group0*group_weight_bytes
+     * arithmetic should reach past it) followed by the real GROUP_CNT-group
+     * slice, and out_a_offset itself stays 0. */
+    const uint64_t group_weight_bytes = (uint64_t)RANK * row_bytes;
+    const uint64_t slice_byte_offset = (uint64_t)GROUP0 * group_weight_bytes;
+    const uint64_t out_a_offset = 0;
+    unsigned char model[GROUP0 * RANK * 2 * 144 + sizeof(w)];
+    memset(model, 0xAA, (size_t)slice_byte_offset); /* padding before the slice */
+    memcpy(model + slice_byte_offset, w, sizeof(w));
+    const uint64_t model_size = sizeof(model);
+
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(sizeof(heads));
+    ds4_gpu_tensor *tlow = ds4_gpu_tensor_alloc(sizeof(got_low));
+    CHECK(theads && tlow, "attention_output_low_q4_k_slice: allocation failed");
+    CHECK(ds4_gpu_tensor_write(theads, 0, heads, sizeof(heads)) != 0,
+          "attention_output_low_q4_k_slice: write heads");
+
+    CHECK(ds4_gpu_attention_output_low_q4_K_slice_tensor(
+                  tlow, model, model_size, out_a_offset, GROUP_DIM, RANK, GROUP0,
+                  GROUP_CNT, theads) != 0,
+          "attention_output_low_q4_k_slice: call");
+    CHECK(ds4_gpu_tensor_read(tlow, 0, got_low, sizeof(got_low)) != 0,
+          "attention_output_low_q4_k_slice: read low");
+    /* Relative tolerance, not a flat 1e-2: this row's magnitude runs into
+     * the thousands (d*sc*nibble terms summed over ~300 columns), where a
+     * flat absolute tolerance is tighter than float32 accumulation-order
+     * noise between this double-precision oracle and the GPU's own summing
+     * order, matching the relative form used by other large-magnitude sums
+     * in this file (test_attention_output_a_stage_contention below). */
+    for (uint32_t i = 0; i < low_dim; i++) {
+        CHECK_CLOSE(got_low[i], want_low[i], 1e-2 + 1e-5 * fabs((double)want_low[i]),
+                    "attention_output_low_q4_k_slice: low mismatch");
+    }
+
+    /* Standard validation-failure checks, plus a slice-bounds check specific
+     * to this entry: group0+group_cnt past the model's actual slice size
+     * must be rejected (an out-of-range read past the mapped model, not
+     * merely past some caller-side n_groups_total this entry is never told). */
+    CHECK(ds4_gpu_attention_output_low_q4_K_slice_tensor(
+                  tlow, model, model_size, out_a_offset, 0, RANK, GROUP0, GROUP_CNT,
+                  theads) == 0,
+          "attention_output_low_q4_k_slice: zero group_dim must be rejected");
+    CHECK(ds4_gpu_attention_output_low_q4_K_slice_tensor(
+                  tlow, model, model_size, out_a_offset, GROUP_DIM, 0, GROUP0, GROUP_CNT,
+                  theads) == 0,
+          "attention_output_low_q4_k_slice: zero rank must be rejected");
+    CHECK(ds4_gpu_attention_output_low_q4_K_slice_tensor(
+                  tlow, model, model_size, out_a_offset, GROUP_DIM, RANK, GROUP0, 0,
+                  theads) == 0,
+          "attention_output_low_q4_k_slice: zero group_cnt must be rejected");
+    CHECK(ds4_gpu_attention_output_low_q4_K_slice_tensor(
+                  tlow, model, model_size, model_size, GROUP_DIM, RANK, GROUP0, GROUP_CNT,
+                  theads) == 0,
+          "attention_output_low_q4_k_slice: out-of-range out_a_offset must be rejected");
+    CHECK(ds4_gpu_attention_output_low_q4_K_slice_tensor(
+                  tlow, model, model_size, out_a_offset, GROUP_DIM, RANK, GROUP0,
+                  GROUP_CNT + 100u, theads) == 0,
+          "attention_output_low_q4_k_slice: group_cnt past the mapped model must be rejected");
+
+    ds4_gpu_tensor_free(theads);
+    ds4_gpu_tensor_free(tlow);
+    fprintf(stderr, "  test_attention_output_low_q4_k_slice OK\n");
+    return 0;
+}
+
+static int test_attention_output_q4_k_batch(void) {
+    enum { GROUP_DIM = 256 + 30, RANK = 4, N_GROUPS = 3, N_TOKENS = 2, OUT_DIM = 7 };
+    const uint64_t blocks_a = (GROUP_DIM + 255u) / 256u;
+    const uint64_t row_bytes_a = blocks_a * 144u;
+    const uint32_t low_dim = RANK * N_GROUPS;
+    const uint64_t blocks_b = (low_dim + 31u) / 32u;
+    const uint64_t row_bytes_b = blocks_b * 34u;
+    const uint32_t out_b_type = 8u; /* Q8_0, independent of out_a's Q4_K */
+
+    unsigned char wa[N_GROUPS * RANK * 2 * 144]; /* row_bytes_a <= 2*144 here */
+    unsigned char wb[OUT_DIM * 34];              /* low_dim=12 here, blocks_b=1 */
+    float heads[N_TOKENS * N_GROUPS * GROUP_DIM];
+    float want_low[N_TOKENS * N_GROUPS * RANK];
+    float want_out[N_TOKENS * OUT_DIM];
+    float got_low[N_TOKENS * N_GROUPS * RANK];
+    float got_out[N_TOKENS * OUT_DIM];
+
+    for (uint32_t g = 0; g < N_GROUPS; g++) {
+        for (uint32_t r = 0; r < RANK; r++) {
+            encode_q4_k_row(wa + ((size_t)g * RANK + r) * row_bytes_a, GROUP_DIM,
+                            g * 19u + r + 3u);
+        }
+    }
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        encode_q8_0_row(wb + (size_t)o * row_bytes_b, low_dim, o + 41u);
+    }
+    for (uint32_t t = 0; t < N_TOKENS; t++) {
+        for (uint32_t g = 0; g < N_GROUPS; g++) {
+            fill_activation_row(heads + ((size_t)t * N_GROUPS + g) * GROUP_DIM, GROUP_DIM,
+                                t * 7u + g + 1u);
+        }
+    }
+    oracle_grouped_out_batch_low_q4_k(want_low, heads, wa, N_TOKENS, N_GROUPS, GROUP_DIM,
+                                      RANK, row_bytes_a);
+    oracle_matmul_q8_0_raw(want_out, want_low, wb, low_dim, OUT_DIM, N_TOKENS, row_bytes_b);
+
+    unsigned char model[sizeof(wa) + sizeof(wb)];
+    memcpy(model, wa, sizeof(wa));
+    memcpy(model + sizeof(wa), wb, sizeof(wb));
+    const uint64_t out_a_offset = 0;
+    const uint64_t out_b_offset = sizeof(wa);
+    const uint64_t model_size = sizeof(model);
+
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(sizeof(heads));
+    ds4_gpu_tensor *tlow = ds4_gpu_tensor_alloc(sizeof(got_low));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(got_out));
+    CHECK(theads && tlow && tout, "attention_output_q4_k_batch: allocation failed");
+    CHECK(ds4_gpu_tensor_write(theads, 0, heads, sizeof(heads)) != 0,
+          "attention_output_q4_k_batch: write heads");
+
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+                  tout, tlow, NULL, NULL, model, model_size, out_a_offset, out_b_offset,
+                  out_b_type, GROUP_DIM, RANK, N_GROUPS, OUT_DIM, theads, N_TOKENS) != 0,
+          "attention_output_q4_k_batch: call");
+    CHECK(ds4_gpu_tensor_read(tlow, 0, got_low, sizeof(got_low)) != 0,
+          "attention_output_q4_k_batch: read low");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got_out, sizeof(got_out)) != 0,
+          "attention_output_q4_k_batch: read out");
+
+    /* Tight (relative, per the same reasoning as
+     * test_attention_output_low_q4_k_slice above: this row's magnitude
+     * runs into the tens of thousands, where a flat absolute tolerance is
+     * tighter than float32 accumulation-order noise): the A-stage matches
+     * the exact Q4_K dequant oracle, no activation-quantisation
+     * approximation to absorb here, unlike the Q8_0 batch entry's own test
+     * above. */
+    for (uint32_t i = 0; i < N_TOKENS * low_dim; i++) {
+        CHECK_CLOSE(got_low[i], want_low[i], 1e-2 + 1e-5 * fabs((double)want_low[i]),
+                    "attention_output_q4_k_batch: low mismatch");
+    }
+    for (uint32_t i = 0; i < N_TOKENS * OUT_DIM; i++) {
+        CHECK_CLOSE(got_out[i], want_out[i], 5e-2 + 1e-5 * fabs((double)want_out[i]),
+                    "attention_output_q4_k_batch: out mismatch");
+    }
+
+    /* Differential: run ds4_gpu_attention_output_low_q4_K_slice_tensor
+     * once per token (full group0=0, group_cnt=N_GROUPS slice) plus
+     * ds4_gpu_matmul_quant_tensor for the B-stage, and confirm the result
+     * matches the batch entry's own `out` tightly. This is also the
+     * audit-claim check: per
+     * ds4.c's own fallback (metal_graph_attention_output_dense_quant_batch,
+     * :26009-26066), when the batch entry's call fails or n_tokens < 32, the
+     * code falls back to EXACTLY this per-token loop -- calling the same
+     * low-rank scalar entry, not a different one -- so if the low-rank
+     * entry (the other Q4_K interface) and ds4_gpu_matmul_quant_tensor are
+     * both correct, that fallback already produces a correct result even
+     * with no batch-optimised kernel behind it. Confirmed by inspection of
+     * ds4.c and again here by construction: this loop uses only those two
+     * already-tested entries and matches the batch entry's own output. */
+    {
+        float low_loop[N_TOKENS * N_GROUPS * RANK];
+        for (uint32_t t = 0; t < N_TOKENS; t++) {
+            ds4_gpu_tensor *theads_t = ds4_gpu_tensor_alloc((size_t)N_GROUPS * GROUP_DIM * sizeof(float));
+            ds4_gpu_tensor *tlow_t = ds4_gpu_tensor_alloc((size_t)low_dim * sizeof(float));
+            CHECK(theads_t && tlow_t, "attention_output_q4_k_batch: per-token allocation failed");
+            CHECK(ds4_gpu_tensor_write(theads_t, 0, heads + (size_t)t * N_GROUPS * GROUP_DIM,
+                                       (size_t)N_GROUPS * GROUP_DIM * sizeof(float)) != 0,
+                  "attention_output_q4_k_batch: per-token write heads");
+            CHECK(ds4_gpu_attention_output_low_q4_K_slice_tensor(
+                          tlow_t, model, model_size, out_a_offset, GROUP_DIM, RANK, 0,
+                          N_GROUPS, theads_t) != 0,
+                  "attention_output_q4_k_batch: per-token low-rank call");
+            CHECK(ds4_gpu_tensor_read(tlow_t, 0, low_loop + (size_t)t * low_dim,
+                                      (size_t)low_dim * sizeof(float)) != 0,
+                  "attention_output_q4_k_batch: per-token read low");
+            ds4_gpu_tensor_free(theads_t);
+            ds4_gpu_tensor_free(tlow_t);
+        }
+        ds4_gpu_tensor *tlow_loop = ds4_gpu_tensor_alloc(sizeof(low_loop));
+        ds4_gpu_tensor *tout_loop = ds4_gpu_tensor_alloc(sizeof(got_out));
+        CHECK(tlow_loop && tout_loop, "attention_output_q4_k_batch: loop allocation failed");
+        CHECK(ds4_gpu_tensor_write(tlow_loop, 0, low_loop, sizeof(low_loop)) != 0,
+              "attention_output_q4_k_batch: write loop low");
+        CHECK(ds4_gpu_matmul_quant_tensor(tout_loop, model, model_size, out_b_offset,
+                                          out_b_type, low_dim, OUT_DIM, tlow_loop,
+                                          N_TOKENS) != 0,
+              "attention_output_q4_k_batch: loop matmul call");
+        float out_loop[N_TOKENS * OUT_DIM];
+        CHECK(ds4_gpu_tensor_read(tout_loop, 0, out_loop, sizeof(out_loop)) != 0,
+              "attention_output_q4_k_batch: read loop out");
+        for (uint32_t i = 0; i < N_TOKENS * OUT_DIM; i++) {
+            CHECK_CLOSE(got_out[i], out_loop[i], 1e-3,
+                        "attention_output_q4_k_batch: differential vs per-token loop mismatch");
+        }
+        ds4_gpu_tensor_free(tlow_loop);
+        ds4_gpu_tensor_free(tout_loop);
+    }
+
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+                  tout, tlow, NULL, NULL, model, model_size, 0, out_b_offset, out_b_type, 0,
+                  RANK, N_GROUPS, OUT_DIM, theads, N_TOKENS) == 0,
+          "attention_output_q4_k_batch: zero group_dim must be rejected");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+                  tout, tlow, NULL, NULL, model, model_size, 0, out_b_offset, out_b_type,
+                  GROUP_DIM, RANK, N_GROUPS, OUT_DIM, theads, 0) == 0,
+          "attention_output_q4_k_batch: zero n_tokens must be rejected");
+    CHECK(ds4_gpu_attention_output_q4_K_batch_tensor(
+                  tout, tlow, NULL, NULL, model, model_size, model_size, out_b_offset,
+                  out_b_type, GROUP_DIM, RANK, N_GROUPS, OUT_DIM, theads, N_TOKENS) == 0,
+          "attention_output_q4_k_batch: out-of-range out_a_offset must be rejected");
+
+    ds4_gpu_tensor_free(theads);
+    ds4_gpu_tensor_free(tlow);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_attention_output_q4_k_batch OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_quantize_q8_0_rows() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -690,6 +1063,8 @@ int main(void) {
     if (test_attention_output_a_stage_contention() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_q8_batch() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_q8_batch_f16() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_attention_output_low_q4_k_slice() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_attention_output_q4_k_batch() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_attention_output OK\n");
     return 0;

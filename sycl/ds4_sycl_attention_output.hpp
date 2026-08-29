@@ -606,3 +606,231 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
     }
     return 1;
 }
+
+/* ---- Q4_K attention output projection -----------------------------------
+ *
+ * ds4_gpu_attention_output_low_q4_K_slice_tensor and
+ * ds4_gpu_attention_output_q4_K_batch_tensor parallel the three Q8_0
+ * entries above: same low-rank-then-expand structure (a per-group,
+ * per-token A-stage projecting `heads` down to `low`, then a plain dense
+ * matmul B-stage expanding `low` up to the embedding width), fired instead
+ * of the Q8_0 entries whenever attn_output_a is Q4_K.
+ *
+ * Both ds4_cuda.cu's own definitions of these two entries are plain
+ * unconditional `return 0` stubs (every parameter cast to void), so unlike
+ * the plain dense matmul entries in ds4_sycl_matmul.hpp, there is no CUDA
+ * reference behaviour here at all, not even a partial one. Only
+ * ds4_metal.m implements them for real, through bespoke Metal compute
+ * shaders (ds4_gpu_attention_output_q4_K_batch_tensor,
+ * ds4_gpu_attention_output_low_q4_K_slice_tensor, both non-portable). The
+ * math ported is the same standard Q4_K block decode the dense matmul
+ * entries already use (sycl_q4_k_dequant, ds4_sycl_common.hpp): unlike the
+ * Q8_0 A-stage above, no activation quantisation step is needed, since
+ * ds4_metal.m's own Q4_K kernels (ds4_gpu_matmul_quant_impl_tensor) read
+ * the raw F32 activation directly, the same contract the Q4_K dense
+ * matmul already follows.
+ *
+ * Reachability, traced directly against ds4.c rather than assumed: the
+ * low-rank entry fires on every decode token and every prefill
+ * batch whenever attn_output_a is Q4_K (metal_graph_attention_output_
+ * dense_quant_low, ds4.c:25856-25919, dispatches here unconditionally for
+ * that type, with NO fallback if this entry fails -- unlike the generic
+ * per-group loop the same function falls through to for every OTHER
+ * dense-quant type). The batch entry only fires for n_tokens >= 32
+ * (metal_graph_attention_output_dense_quant_batch, ds4.c:26009), and ITS
+ * failure path (ds4.c:26029-26066) calls back into the very same low-rank
+ * entry, once per token with group0=0/group_cnt=n_groups, followed by
+ * ds4_gpu_matmul_quant_tensor for the B-stage -- confirming the audit's
+ * claim that the batch entry's apparent "fallback" is not a route around a
+ * missing implementation, only a slower path through the same low-rank
+ * scalar kernel this file also builds. */
+
+/* One work-item per (token, group-local row) output element: row = gid %
+ * low_dim decomposes into (group, row_in_group), tok = gid / low_dim.
+ * `w` holds only the addressed group_cnt*rank rows (already offset to the
+ * right slice by the caller's staging), so `group` here always starts at 0
+ * regardless of which slice of the checkpoint's real group range this
+ * call addresses -- the caller's own group0 only selects WHICH bytes get
+ * staged, never appears in this kernel's own indexing. Mirrors
+ * sycl_grouped_q8_0_a_preq_kernel's row/tok/group decomposition exactly,
+ * with a direct float dot against sycl_q4_k_dequant in place of that
+ * kernel's quantise-then-int8-dot A-stage. */
+static void sycl_grouped_q4_k_a_launch(sycl::queue &q, float *low,
+                                       const unsigned char *w, const float *heads,
+                                       uint32_t group_dim, uint64_t rank,
+                                       uint32_t n_groups, uint64_t row_bytes,
+                                       uint64_t low_dim, uint64_t n_tokens) {
+    if (low_dim == 0 || n_tokens == 0) return;
+    q.parallel_for(sycl::range<1>((size_t)(low_dim * n_tokens)), [=](sycl::id<1> gid) {
+        const uint64_t row = gid[0] % low_dim;
+        const uint64_t tok = gid[0] / low_dim;
+        const uint64_t group = row / rank;
+        const uint64_t row_in_group = row - group * rank;
+
+        const unsigned char *wr = w + (group * rank + row_in_group) * row_bytes;
+        const float *xr = heads + (tok * n_groups + group) * group_dim;
+
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < group_dim; k++) {
+            sum += xr[k] * sycl_q4_k_dequant(wr, k);
+        }
+        low[tok * low_dim + row] = sum;
+    });
+}
+
+/* The low-rank stage alone, sliced to groups [group0, group0+group_cnt),
+ * matching ds4.c's own per-group generic fallback's addressing
+ * (out_a->abs_offset + (group0+i)*group_weight_bytes,
+ * metal_graph_attention_output_dense_quant_low, ds4.c:25905-25918) rather
+ * than the Q8_0 low-rank entry's own unsliced n_groups parameter: unlike
+ * Q8_0, this entry is also the TP-sliced call target
+ * (metal_graph_attention_output_dense_quant_tp, ds4.c:25921-25974), so its
+ * ABI carries group0/group_cnt even though single-GPU Flash always calls it
+ * with group0=0, group_cnt=n_groups (ds4.c:23559-23577).
+ *
+ * Return polarity: verified against ds4_metal.m's real implementation
+ * (nonzero-success on every live path, plain `return 0` on every rejection)
+ * and against both ds4.c call sites (:23562, :26046, both `ok = ... != 0`
+ * or `ok = metal_graph_attention_output_dense_quant_low(...)` itself
+ * returning a bool built the same way). Zero-sized dimensions are a
+ * rejection, matching the Q8_0 sibling's own treatment of group_dim==0/
+ * rank==0/n_groups==0. */
+extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                group0,
+        uint32_t                group_cnt,
+        const ds4_gpu_tensor *heads) {
+    if (!low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        group_cnt == 0u || group_dim > UINT32_MAX || rank > UINT32_MAX) {
+        return 0;
+    }
+
+    /* out_a_offset is the FULL out_a tensor's own base offset (ds4.c passes
+     * out_a->abs_offset unmodified, group0 as a separate argument): this
+     * entry must fold group0 into the byte address itself, the same
+     * arithmetic ds4.c's own per-group generic fallback does inline
+     * (out_a->abs_offset + (group0+i)*group_weight_bytes,
+     * metal_graph_attention_output_dense_quant_low). Getting this wrong
+     * (e.g. treating out_a_offset as already-sliced) reads the wrong
+     * groups' weights while still landing inside the mapped model, so the
+     * bounds checks below would not catch it -- only a numeric mismatch
+     * against the oracle would. */
+    uint64_t low_dim = 0, row_bytes = 0, group_weight_bytes = 0, slice_bytes = 0;
+    uint64_t group0_bytes = 0, slice_offset = 0;
+    if (!sycl_u64_mul_checked(group_cnt, rank, &low_dim) ||
+        !sycl_q4_k_row_bytes_checked(group_dim, &row_bytes) ||
+        !sycl_u64_mul_checked(rank, row_bytes, &group_weight_bytes) ||
+        !sycl_u64_mul_checked(group_cnt, group_weight_bytes, &slice_bytes) ||
+        !sycl_u64_mul_checked((uint64_t)group0, group_weight_bytes, &group0_bytes) ||
+        !sycl_u64_add_checked(out_a_offset, group0_bytes, &slice_offset) ||
+        !sycl_tensor_has_elems2(heads, group_cnt, group_dim, sizeof(float)) ||
+        !sycl_tensor_has_f32(low, low_dim)) {
+        return 0;
+    }
+    if (!sycl_model_range_fits(model_size, slice_offset, slice_bytes)) return 0;
+    const char *out_a_ptr = sycl_model_range_ptr(model_map, slice_offset, slice_bytes,
+                                                 model_size, "attn_out_a_q4_K_slice");
+    if (!out_a_ptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(low->device_id);
+        sycl_device_scratch_guard w_guard = sycl_stage_host_bytes(q, out_a_ptr, slice_bytes);
+        if (!w_guard.p) return 0;
+
+        sycl_grouped_q4_k_a_launch(q, (float *)low->ptr, (const unsigned char *)w_guard.p,
+                                   (const float *)heads->ptr, (uint32_t)group_dim, rank,
+                                   group_cnt, row_bytes, low_dim, 1u);
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_low_q4_K_slice failed: %s\n",
+                e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* Full two-stage batched projection, the Q4_K analogue of
+ * ds4_gpu_attention_output_q8_batch_tensor above: the grouped Q4_K A-stage
+ * over the FULL [0, n_groups) range (unlike the slice entry above, this
+ * entry's own ds4.c call site never slices it, ds4.c:26010-26024), then a
+ * type-dispatching dense matmul B-stage.
+ *
+ * out_b_type exists because attn_output_a and attn_output_b are validated
+ * (and therefore choosable) independently in weights_validate_layout
+ * (ds4.c:5079-5080): a checkpoint can quantise attn_output_a as Q4_K while
+ * attn_output_b is Q8_0, Q4_K or Q4_0. The B-stage therefore delegates to
+ * the type-dispatching ds4_gpu_matmul_quant_tensor
+ * (sycl/ds4_sycl_matmul.hpp) rather than assuming Q8_0 the way the Q8_0
+ * batch entry above assumes its own B-stage weight is Q8_0 too.
+ * `group_tmp`/`low_tmp` are unused, matching the Q8_0 batch entry's own
+ * `(void)` treatment of ROCm's unused scratch-tensor parameters (ROCm does
+ * not implement this entry, so there is nothing to mirror there beyond the
+ * ABI signature itself).
+ *
+ * Return polarity: verified against ds4_metal.m's real implementation and
+ * against ds4.c's one call site (:26010, `if (... != 0) return true;`). */
+extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint32_t                out_b_type,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens) {
+    (void)group_tmp;
+    (void)low_tmp;
+    if (!out || !low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        n_groups == 0u || out_dim == 0u || n_tokens == 0u ||
+        group_dim > UINT32_MAX || rank > UINT32_MAX) {
+        return 0;
+    }
+
+    uint64_t low_dim = 0, row_bytes = 0, out_a_bytes = 0, n_rows = 0;
+    if (!sycl_u64_mul_checked(n_groups, rank, &low_dim) ||
+        !sycl_q4_k_row_bytes_checked(group_dim, &row_bytes) ||
+        !sycl_u64_mul_checked(n_groups, rank, &n_rows) ||
+        !sycl_u64_mul_checked(n_rows, row_bytes, &out_a_bytes) ||
+        !sycl_model_range_fits(model_size, out_a_offset, out_a_bytes) ||
+        !sycl_tensor_has_elems2(heads, (uint64_t)n_tokens * n_groups, group_dim,
+                                sizeof(float)) ||
+        !sycl_tensor_has_elems2(low, n_tokens, low_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems2(out, n_tokens, out_dim, sizeof(float))) {
+        return 0;
+    }
+    const char *out_a_ptr = sycl_model_range_ptr(model_map, out_a_offset, out_a_bytes,
+                                                 model_size, "attn_out_a_q4_K_batch");
+    if (!out_a_ptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out->device_id);
+        sycl_device_scratch_guard w_guard = sycl_stage_host_bytes(q, out_a_ptr, out_a_bytes);
+        if (!w_guard.p) return 0;
+
+        sycl_grouped_q4_k_a_launch(q, (float *)low->ptr, (const unsigned char *)w_guard.p,
+                                   (const float *)heads->ptr, (uint32_t)group_dim, rank,
+                                   n_groups, row_bytes, low_dim, n_tokens);
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_q4_K_batch A-stage failed: %s\n",
+                e.what());
+        return 0;
+    }
+
+    return ds4_gpu_matmul_quant_tensor(out, model_map, model_size, out_b_offset, out_b_type,
+                                       low_dim, out_dim, low, n_tokens);
+}
