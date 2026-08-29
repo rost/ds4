@@ -581,12 +581,12 @@ static int sycl_routed_moe_launch(
          * ds4_gpu_register_model_map_no_copy's job, still a stub in this
          * backend; this is a correctness-first placeholder that costs a
          * full-table copy on every call until that (or the resident
-         * streaming expert cache) is wired in here.  Skipped for mxfp4_path,
-         * which is not yet implemented and still a clean stub below; there
-         * is no point staging a table nothing will read. */
+         * streaming expert cache) is wired in here.  Applies to every format path
+         * without exception: an unstaged range does not fault, it reads
+         * zeros and reports success, so a path that skips this is wrong in
+         * a way no test on this hardware can see. */
         void *gate_dev = nullptr, *up_dev = nullptr, *down_dev = nullptr;
-        if (!plan.mxfp4_path &&
-            !sycl_moe_stage_weights(q, gate_w, up_w, down_w, plan.gate_bytes, plan.down_bytes,
+        if (!sycl_moe_stage_weights(q, gate_w, up_w, down_w, plan.gate_bytes, plan.down_bytes,
                                     &gate_dev, &up_dev, &down_dev)) {
             return 0;
         }
@@ -619,26 +619,6 @@ static int sycl_routed_moe_launch(
                     clamp);
         }
         if (plan.mxfp4_path) {
-            /* Same host-mmap staging rationale as q4k_path above (spec
-             * 6l): gate_w/up_w/down_w are copied to device memory before
-             * any MXFP4 kernel reads them. */
-            void *gate_dev = sycl::malloc_device((size_t)plan.gate_bytes, q);
-            void *up_dev = sycl::malloc_device((size_t)plan.gate_bytes, q);
-            void *down_dev = sycl::malloc_device((size_t)plan.down_bytes, q);
-            if (!gate_dev || !up_dev || !down_dev) {
-                if (gate_dev) sycl::free(gate_dev, q);
-                if (up_dev) sycl::free(up_dev, q);
-                if (down_dev) sycl::free(down_dev, q);
-                return 0;
-            }
-            sycl_device_scratch_guard gate_guard(q, gate_dev);
-            sycl_device_scratch_guard up_guard(q, up_dev);
-            sycl_device_scratch_guard down_guard(q, down_dev);
-            q.memcpy(gate_dev, gate_w, (size_t)plan.gate_bytes);
-            q.memcpy(up_dev, up_w, (size_t)plan.gate_bytes);
-            q.memcpy(down_dev, down_w, (size_t)plan.down_bytes);
-            q.wait_and_throw();
-
             return sycl_routed_moe_mxfp4_dispatch(
                     q, out, mid, down, xq, midq, (const char *)gate_dev, (const char *)up_dev,
                     (const char *)down_dev, weights, selected, gate_expert_bytes, gate_row_bytes,

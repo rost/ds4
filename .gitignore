@@ -43,8 +43,8 @@
 /tests/test_sycl_fp8_kv
 /tests/test_sycl_shared_expert
 /tests/test_sycl_moe
-/tests/test_sycl_hc /tests/test_sycl_mgpu
 /tests/test_sycl_hc
+/tests/test_sycl_mgpu
 /tests/test_sycl_indexer
 *.o
 *.dSYM/
