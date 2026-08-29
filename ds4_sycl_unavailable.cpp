@@ -108,7 +108,6 @@ SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_device_cache_tensors)
  * support-model path (DS4_SUPPORT_DSPARK, ds4.c:2532), not part of
  * baseline DeepSeek V4 Flash. Out of scope; stays stubbed. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dspark_markov_argmax_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_embed_token_quant_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_embed_tokens_quant_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_attention_flash_staged_tensor)

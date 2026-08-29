@@ -333,6 +333,213 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
     return 1;
 }
 
+/* Fuses the QKV RMS norm above with the KV rotary tail, in one launch keyed
+ * by (row, which).  Ported from CUDA's dsv4_qkv_rms_norm_rows_kv_rope_kernel
+ * (ds4_cuda.cu:6565) and its launcher (ds4_cuda.cu:16208): CUDA is the
+ * only reference for this entry, the first in this port where ROCm has no
+ * implementation at all to fall back on.  Only the kernel's SEMANTICS are
+ * ported, not its stream assumptions (spec 6t): the single `parallel_for`
+ * below is followed by one `wait_and_throw`, the same self-contained
+ * shape every other entry in this file already uses, so there is no
+ * cross-submit ordering to establish here.
+ *
+ * which == 0 (q): plain RMS-norm-with-weight over the full q_n row,
+ * identical to the q branch above.  No RoPE: Q's rotary tail is applied
+ * later, after the q_b projection, by
+ * ds4_gpu_head_rms_norm_rope_tail_tensor.
+ *
+ * which == 1 (kv): the RMS-norm SCALE is ONE reduction over the WHOLE
+ * kv_n row (every kv_n_head head concatenated), not per head -- this is
+ * NOT ds4_gpu_head_rms_norm_rope_tail_tensor's per-(token,head)
+ * reduction.  That single scale is then reused for every head: each
+ * head's leading n_nope = kv_head_dim - n_rot channels are scaled and
+ * weighted in place, and each head's trailing n_rot channels are scaled,
+ * weighted AND rotated together, the same "scale-then-rotate" order as
+ * ds4_gpu_head_rms_norm_rope_tail_tensor's tail loop but with kv_n_head
+ * heads folded into one grid row instead of one head per row. */
+extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+        ds4_gpu_tensor       *q_out,
+        const ds4_gpu_tensor *q,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              q_weight_offset,
+        uint32_t              q_n,
+        ds4_gpu_tensor       *kv_out,
+        const ds4_gpu_tensor *kv,
+        uint64_t              kv_weight_offset,
+        uint32_t              kv_n,
+        uint32_t              rows,
+        uint32_t              kv_n_head,
+        uint32_t              kv_head_dim,
+        uint32_t              n_rot,
+        uint32_t              pos0,
+        uint32_t              n_ctx_orig,
+        bool                  inverse,
+        float                 freq_base,
+        float                 freq_scale,
+        float                 ext_factor,
+        float                 attn_factor,
+        float                 beta_fast,
+        float                 beta_slow,
+        float                 eps) {
+    uint64_t q_weight_bytes = 0, kv_weight_bytes = 0, kv_n_check = 0;
+    if (kv_n_head == 0u || kv_head_dim == 0u ||
+        n_rot > kv_head_dim || (n_rot & 1u) ||
+        !sycl_u64_mul_checked(kv_n_head, kv_head_dim, &kv_n_check) ||
+        kv_n_check != (uint64_t)kv_n ||
+        !model_map ||
+        !sycl_u64_mul_checked(q_n, sizeof(float), &q_weight_bytes) ||
+        !sycl_u64_mul_checked(kv_n, sizeof(float), &kv_weight_bytes) ||
+        !sycl_model_range_fits(model_size, q_weight_offset, q_weight_bytes) ||
+        !sycl_model_range_fits(model_size, kv_weight_offset, kv_weight_bytes) ||
+        !sycl_tensor_has_elems2(q_out, q_n, rows, sizeof(float)) ||
+        !sycl_tensor_has_elems2(q, q_n, rows, sizeof(float)) ||
+        !sycl_tensor_has_elems2(kv_out, kv_n, rows, sizeof(float)) ||
+        !sycl_tensor_has_elems2(kv, kv_n, rows, sizeof(float))) {
+        return 0;
+    }
+    if (rows == 0u) return 1;
+
+    const char *q_wptr = sycl_model_range_ptr(model_map, q_weight_offset,
+                                              q_weight_bytes, model_size,
+                                              "q_rms_weight");
+    const char *kv_wptr = sycl_model_range_ptr(model_map, kv_weight_offset,
+                                               kv_weight_bytes, model_size,
+                                               "kv_rms_weight");
+    if (!q_wptr || !kv_wptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &sq = ds4_sycl_queue(q_out->device_id);
+
+        /* Zero-width staging can return a null pointer under the SYCL
+         * spec; only treat that as failure when the corresponding side
+         * actually has work to do, matching the unfused entry above. */
+        sycl_device_scratch_guard dqw_guard =
+                sycl_stage_host_bytes(sq, q_wptr, q_weight_bytes);
+        if (!dqw_guard.p && q_n != 0u) return 0;
+        sycl_device_scratch_guard dkvw_guard =
+                sycl_stage_host_bytes(sq, kv_wptr, kv_weight_bytes);
+        if (!dkvw_guard.p && kv_n != 0u) return 0;
+
+        const float *dqw  = (const float *)dqw_guard.p;
+        const float *dkvw = (const float *)dkvw_guard.p;
+
+        float       *qo   = (float *)q_out->ptr;
+        const float *qx   = (const float *)q->ptr;
+        float       *kvo  = (float *)kv_out->ptr;
+        const float *kvx  = (const float *)kv->ptr;
+        const uint32_t q_width     = q_n;
+        const uint32_t kv_width    = kv_n;
+        const uint32_t n_nope      = kv_head_dim - n_rot;
+        const uint32_t pairs_head  = n_rot / 2u;
+        const uint32_t total_pairs = kv_n_head * pairs_head;
+
+        sq.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> partial(
+                    sycl::range<1>(kRmsNormGroup), h);
+            h.parallel_for(
+                sycl::nd_range<2>(
+                        sycl::range<2>((size_t)rows * kRmsNormGroup, 2),
+                        sycl::range<2>(kRmsNormGroup, 1)),
+                [=](sycl::nd_item<2> it) {
+                    const size_t row   = it.get_group(0);
+                    const size_t which = it.get_group(1);
+                    const size_t lid   = it.get_local_id(0);
+                    const size_t lsz   = it.get_local_range(0);
+
+                    const uint32_t width = which == 0 ? q_width : kv_width;
+                    const float *xr   = (which == 0 ? qx : kvx) + row * width;
+                    float       *orow = (which == 0 ? qo : kvo) + row * width;
+                    const float *w    = which == 0 ? dqw : dkvw;
+
+                    float sum = 0.0f;
+                    for (size_t i = lid; i < width; i += lsz) {
+                        const float v = xr[i];
+                        sum += v * v;
+                    }
+                    const float total = sycl_block_row_reduce(
+                            it, partial, sum, sycl::plus<float>());
+                    const float scale =
+                            sycl::rsqrt(total / (float)width + eps);
+
+                    if (which == 0) {
+                        for (size_t i = lid; i < width; i += lsz) {
+                            orow[i] = xr[i] * scale * w[i];
+                        }
+                        return;
+                    }
+
+                    for (uint32_t hh = 0; hh < kv_n_head; hh++) {
+                        const uint32_t head_base = hh * kv_head_dim;
+                        for (size_t d = lid; d < n_nope; d += lsz) {
+                            const uint32_t i = head_base + (uint32_t)d;
+                            orow[i] = xr[i] * scale * w[i];
+                        }
+                    }
+
+                    /* Correction dims recomputed by every work-item,
+                     * matching the CUDA source and the fused per-head
+                     * kernel above. */
+                    float corr0 = 0.0f, corr1 = 0.0f;
+                    if (ext_factor != 0.0f) {
+                        const float denom = 2.0f * sycl::log(freq_base);
+                        corr0 = sycl::floor((float)n_rot *
+                                sycl::log((float)n_ctx_orig /
+                                          (beta_fast * 2.0f * (float)M_PI)) / denom);
+                        corr1 = sycl::ceil((float)n_rot *
+                                sycl::log((float)n_ctx_orig /
+                                          (beta_slow * 2.0f * (float)M_PI)) / denom);
+                        corr0 = sycl::fmax(0.0f, corr0);
+                        corr1 = sycl::fmin((float)(n_rot - 1), corr1);
+                    }
+                    const float theta_scale =
+                            sycl::pow(freq_base, -2.0f / (float)n_rot);
+
+                    for (size_t p = lid; p < total_pairs; p += lsz) {
+                        const uint32_t hh   = (uint32_t)p / pairs_head;
+                        const uint32_t pair = (uint32_t)p - hh * pairs_head;
+                        const uint32_t d    = n_nope + pair * 2u;
+                        const uint32_t i0   = hh * kv_head_dim + d;
+                        const uint32_t i    = pair * 2u;
+
+                        /* Direct power, not iterative accumulation; see
+                         * the matching comment on the per-head fused
+                         * kernel above. */
+                        const float theta_extrap =
+                                (float)(pos0 + row) *
+                                sycl::pow(theta_scale, (float)pair);
+                        const float theta_interp = freq_scale * theta_extrap;
+                        float theta  = theta_interp;
+                        float mscale = attn_factor;
+                        if (ext_factor != 0.0f) {
+                            const float ramp_mix =
+                                    sycl_rope_yarn_ramp(corr0, corr1, (int)i) *
+                                    ext_factor;
+                            theta = theta_interp * (1.0f - ramp_mix) +
+                                    theta_extrap * ramp_mix;
+                            mscale *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
+                        }
+                        float c = sycl::cos(theta) * mscale;
+                        float s = sycl::sin(theta) * mscale;
+                        if (inverse) s = -s;
+
+                        const float x0 = xr[i0]     * scale * w[i0];
+                        const float x1 = xr[i0 + 1u] * scale * w[i0 + 1u];
+                        orow[i0]      = x0 * c - x1 * s;
+                        orow[i0 + 1u] = x0 * s + x1 * c;
+                    }
+                });
+        });
+        sq.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "dsv4_qkv_rms_norm_rows_kv_rope failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
 /* Normalises each (token, head) slice of head_dim IN PLACE, once per
  * flattened row over n_tok * n_head, matching ROCm's head_rms_norm_kernel
  * (rocm/ds4_rocm_norm_rope.cuh:83-101) and its launcher

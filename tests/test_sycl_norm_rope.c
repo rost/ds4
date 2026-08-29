@@ -418,6 +418,241 @@ static int test_dsv4_qkv_rms_norm_rows(void) {
     return 0;
 }
 
+/* ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor: fuses the QKV RMS norm
+ * above with the KV rotary tail in one launch.  q_out gets plain
+ * norm-with-weight, exactly like the unfused entry's q branch.  kv_out's
+ * RMS-norm SCALE is ONE reduction over the WHOLE kv_n_head * kv_head_dim
+ * row (not per head), then every head's leading n_nope channels are
+ * scaled and weighted, and every head's trailing n_rot channels are
+ * scaled, weighted AND rotated in place -- matching CUDA's
+ * dsv4_qkv_rms_norm_rows_kv_rope_kernel (ds4_cuda.cu:6565), the only
+ * reference for this entry (no ROCm implementation exists at all).
+ *
+ * KV_N_HEAD = 2 deliberately: Flash always runs this with kv_n_head == 1
+ * (ds4.c's DS4_N_HEAD_KV), but a wider test here exercises the per-head
+ * loop and the head-relative-vs-absolute weight indexing this entry is
+ * new at, which a single-head test could not.  Per-head magnitudes
+ * (mag = (h+1)*(r+2), matching test_head_rms_norm's technique) plus a
+ * nonlinear (d + r*7 + h*3) % 13 interaction term keep heads and rows
+ * genuinely non-proportional to each other: per spec 6f, RMS norm divides
+ * a pure scale-only difference straight back out, and affine test data
+ * would hide exactly the reduction-scope bug this entry is new at (a
+ * per-head reduction masquerading as this kernel's required whole-row
+ * one, since equal per-head magnitudes would make both reductions agree). */
+static int test_dsv4_qkv_rms_norm_rows_kv_rope(void) {
+    enum { ROWS = 3, Q_N = 40, KV_N_HEAD = 2, KV_HEAD_DIM = 24,
+           KV_N = KV_N_HEAD * KV_HEAD_DIM, N_ROT = 16 };
+    const uint32_t POS0 = 5;
+    const uint32_t N_CTX_ORIG = 4096;
+    const float FREQ_BASE = 10000.0f;
+    const float BETA_FAST = 32.0f;
+    const float BETA_SLOW = 1.0f;
+    const float ATTN_FACTOR = 1.0f;
+    const float EPS = 1e-5f;
+    const double TOL = 1e-3;
+    const double DIFF_TOL = 1e-4;
+
+    struct { float freq_scale; float ext_factor; int inverse; } cases[] = {
+        {1.0f, 0.0f, 0},
+        {1.0f, 0.0f, 1},
+        {0.5f, 1.0f, 0},
+        {0.5f, 1.0f, 1},
+    };
+
+    float q_x[ROWS * Q_N], kv_x[ROWS * KV_N];
+    float q_w[Q_N], kv_w[KV_N];
+    for (int r = 0; r < ROWS; r++) {
+        for (int i = 0; i < Q_N; i++) {
+            q_x[r * Q_N + i] = ((float)((i + r * 13) % 19) - 9.0f) * 0.1f;
+        }
+        for (int h = 0; h < KV_N_HEAD; h++) {
+            const float mag = (float)(h + 1) * (float)(r + 2);
+            for (int d = 0; d < KV_HEAD_DIM; d++) {
+                const int idx = h * KV_HEAD_DIM + d;
+                kv_x[r * KV_N + idx] =
+                        ((float)((d + r * 7 + h * 3) % 13) - 6.0f) * 0.15f * mag;
+            }
+        }
+    }
+    for (int i = 0; i < Q_N; i++) q_w[i] = ((float)(i % 5) + 1.0f) * 0.3f;
+    for (int i = 0; i < KV_N; i++) kv_w[i] = ((float)(i % 7) + 1.0f) * 0.25f;
+
+    unsigned char model[sizeof(q_w) + sizeof(kv_w)];
+    memcpy(model, q_w, sizeof(q_w));
+    memcpy(model + sizeof(q_w), kv_w, sizeof(kv_w));
+    const uint64_t q_off = 0;
+    const uint64_t kv_off = sizeof(q_w);
+
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        float q_got[ROWS * Q_N], kv_got[ROWS * KV_N], kv_diff[ROWS * KV_N];
+        float q_want[Q_N], kv_want[KV_N];
+
+        ds4_gpu_tensor *tqx  = ds4_gpu_tensor_alloc(sizeof(q_x));
+        ds4_gpu_tensor *tqo  = ds4_gpu_tensor_alloc(sizeof(q_got));
+        ds4_gpu_tensor *tkvx = ds4_gpu_tensor_alloc(sizeof(kv_x));
+        ds4_gpu_tensor *tkvo = ds4_gpu_tensor_alloc(sizeof(kv_got));
+        ds4_gpu_tensor *tdiff = ds4_gpu_tensor_alloc(sizeof(kv_diff));
+        CHECK(tqx && tqo && tkvx && tkvo && tdiff,
+              "dsv4_qkv_kv_rope: allocation failed");
+        CHECK(ds4_gpu_tensor_write(tqx, 0, q_x, sizeof(q_x)) != 0,
+              "dsv4_qkv_kv_rope: write q");
+        CHECK(ds4_gpu_tensor_write(tkvx, 0, kv_x, sizeof(kv_x)) != 0,
+              "dsv4_qkv_kv_rope: write kv");
+        CHECK(ds4_gpu_tensor_write(tdiff, 0, kv_x, sizeof(kv_x)) != 0,
+              "dsv4_qkv_kv_rope: write kv (differential copy)");
+
+        CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+                  tqo, tqx, model, sizeof(model), q_off, Q_N,
+                  tkvo, tkvx, kv_off, KV_N, ROWS,
+                  KV_N_HEAD, KV_HEAD_DIM, N_ROT, POS0, N_CTX_ORIG,
+                  cases[ci].inverse, FREQ_BASE, cases[ci].freq_scale,
+                  cases[ci].ext_factor, ATTN_FACTOR, BETA_FAST, BETA_SLOW,
+                  EPS) != 0,
+              "dsv4_qkv_kv_rope: call");
+        CHECK(ds4_gpu_tensor_read(tqo, 0, q_got, sizeof(q_got)) != 0,
+              "dsv4_qkv_kv_rope: read q");
+        CHECK(ds4_gpu_tensor_read(tkvo, 0, kv_got, sizeof(kv_got)) != 0,
+              "dsv4_qkv_kv_rope: read kv");
+
+        /* Differential: the unfused norm entry followed by the standalone
+         * rope-tail entry, on an identical copy of the input, must agree
+         * with the fused kernel's kv_out. tdiff doubles as q's unfused
+         * output target below; only its kv-shaped buffer matters here. */
+        ds4_gpu_tensor *tqo_unfused = ds4_gpu_tensor_alloc(sizeof(q_got));
+        CHECK(tqo_unfused != NULL, "dsv4_qkv_kv_rope: unfused q alloc");
+        CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
+                  tqo_unfused, tqx, model, sizeof(model), q_off, Q_N,
+                  tdiff, tkvx, kv_off, KV_N, ROWS, EPS) != 0,
+              "dsv4_qkv_kv_rope: unfused norm call");
+        CHECK(ds4_gpu_rope_tail_tensor(tdiff, ROWS, KV_N_HEAD, KV_HEAD_DIM,
+                                       N_ROT, POS0, N_CTX_ORIG,
+                                       cases[ci].inverse, FREQ_BASE,
+                                       cases[ci].freq_scale,
+                                       cases[ci].ext_factor, ATTN_FACTOR,
+                                       BETA_FAST, BETA_SLOW) != 0,
+              "dsv4_qkv_kv_rope: unfused rope_tail call");
+        CHECK(ds4_gpu_tensor_read(tdiff, 0, kv_diff, sizeof(kv_diff)) != 0,
+              "dsv4_qkv_kv_rope: read unfused kv");
+        ds4_gpu_tensor_free(tqo_unfused);
+
+        for (int i = 0; i < ROWS * KV_N; i++) {
+            CHECK_CLOSE(kv_got[i], kv_diff[i], DIFF_TOL,
+                        "dsv4_qkv_kv_rope: fused vs unfused composition "
+                        "mismatch");
+        }
+
+        /* CPU oracle: whole-row norm-with-weight (spanning every head),
+         * then per-head rotation of the now-scaled-and-weighted tail. */
+        for (int r = 0; r < ROWS; r++) {
+            oracle_rms_norm_weight(q_want, &q_x[r * Q_N], q_w, Q_N, EPS);
+            for (int i = 0; i < Q_N; i++) {
+                CHECK_CLOSE(q_got[r * Q_N + i], q_want[i], TOL,
+                            "dsv4_qkv_kv_rope: q value mismatch");
+            }
+
+            oracle_rms_norm_weight(kv_want, &kv_x[r * KV_N], kv_w, KV_N, EPS);
+            for (int h = 0; h < KV_N_HEAD; h++) {
+                oracle_rope_tail_row(&kv_want[h * KV_HEAD_DIM], KV_HEAD_DIM,
+                                     N_ROT, POS0 + (uint32_t)r, N_CTX_ORIG,
+                                     FREQ_BASE, cases[ci].freq_scale,
+                                     cases[ci].ext_factor, ATTN_FACTOR,
+                                     BETA_FAST, BETA_SLOW, cases[ci].inverse);
+            }
+            for (int i = 0; i < KV_N; i++) {
+                CHECK_CLOSE(kv_got[r * KV_N + i], kv_want[i], TOL,
+                            "dsv4_qkv_kv_rope: kv value mismatch");
+            }
+        }
+
+        ds4_gpu_tensor_free(tqx);
+        ds4_gpu_tensor_free(tqo);
+        ds4_gpu_tensor_free(tkvx);
+        ds4_gpu_tensor_free(tkvo);
+        ds4_gpu_tensor_free(tdiff);
+    }
+
+    /* rows == 0 must succeed without doing any work. */
+    {
+        ds4_gpu_tensor *tqx  = ds4_gpu_tensor_alloc(sizeof(q_x));
+        ds4_gpu_tensor *tqo  = ds4_gpu_tensor_alloc(sizeof(q_x));
+        ds4_gpu_tensor *tkvx = ds4_gpu_tensor_alloc(sizeof(kv_x));
+        ds4_gpu_tensor *tkvo = ds4_gpu_tensor_alloc(sizeof(kv_x));
+        CHECK(tqx && tqo && tkvx && tkvo, "dsv4_qkv_kv_rope: rows=0 alloc");
+        CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+                  tqo, tqx, model, sizeof(model), q_off, Q_N,
+                  tkvo, tkvx, kv_off, KV_N, 0,
+                  KV_N_HEAD, KV_HEAD_DIM, N_ROT, POS0, N_CTX_ORIG, false,
+                  FREQ_BASE, 1.0f, 0.0f, ATTN_FACTOR, BETA_FAST, BETA_SLOW,
+                  EPS) != 0,
+              "dsv4_qkv_kv_rope: rows=0 must succeed");
+        ds4_gpu_tensor_free(tqx);
+        ds4_gpu_tensor_free(tqo);
+        ds4_gpu_tensor_free(tkvx);
+        ds4_gpu_tensor_free(tkvo);
+    }
+
+    /* Validation: odd n_rot, n_rot > kv_head_dim, a kv_n that does not
+     * factor as kv_n_head * kv_head_dim, an out-of-range weight offset,
+     * and an undersized output tensor must all be rejected. */
+    {
+        ds4_gpu_tensor *tqx  = ds4_gpu_tensor_alloc(sizeof(q_x));
+        ds4_gpu_tensor *tqo  = ds4_gpu_tensor_alloc(sizeof(q_x));
+        ds4_gpu_tensor *tkvx = ds4_gpu_tensor_alloc(sizeof(kv_x));
+        ds4_gpu_tensor *tkvo = ds4_gpu_tensor_alloc(sizeof(kv_x));
+        CHECK(tqx && tqo && tkvx && tkvo, "dsv4_qkv_kv_rope: validation alloc");
+
+        CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+                  tqo, tqx, model, sizeof(model), q_off, Q_N,
+                  tkvo, tkvx, kv_off, KV_N, ROWS,
+                  KV_N_HEAD, KV_HEAD_DIM, N_ROT - 1, POS0, N_CTX_ORIG, false,
+                  FREQ_BASE, 1.0f, 0.0f, ATTN_FACTOR, BETA_FAST, BETA_SLOW,
+                  EPS) == 0,
+              "dsv4_qkv_kv_rope: odd n_rot must be rejected");
+        CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+                  tqo, tqx, model, sizeof(model), q_off, Q_N,
+                  tkvo, tkvx, kv_off, KV_N, ROWS,
+                  KV_N_HEAD, KV_HEAD_DIM, KV_HEAD_DIM + 2, POS0, N_CTX_ORIG,
+                  false, FREQ_BASE, 1.0f, 0.0f, ATTN_FACTOR, BETA_FAST,
+                  BETA_SLOW, EPS) == 0,
+              "dsv4_qkv_kv_rope: n_rot > kv_head_dim must be rejected");
+        CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+                  tqo, tqx, model, sizeof(model), q_off, Q_N,
+                  tkvo, tkvx, kv_off, KV_N, ROWS,
+                  KV_N_HEAD, KV_HEAD_DIM + 1, N_ROT, POS0, N_CTX_ORIG, false,
+                  FREQ_BASE, 1.0f, 0.0f, ATTN_FACTOR, BETA_FAST, BETA_SLOW,
+                  EPS) == 0,
+              "dsv4_qkv_kv_rope: kv_n != kv_n_head*kv_head_dim must be "
+              "rejected");
+        CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+                  tqo, tqx, model, sizeof(model), sizeof(model), Q_N,
+                  tkvo, tkvx, kv_off, KV_N, ROWS,
+                  KV_N_HEAD, KV_HEAD_DIM, N_ROT, POS0, N_CTX_ORIG, false,
+                  FREQ_BASE, 1.0f, 0.0f, ATTN_FACTOR, BETA_FAST, BETA_SLOW,
+                  EPS) == 0,
+              "dsv4_qkv_kv_rope: out-of-range q weight_offset must be "
+              "rejected");
+
+        ds4_gpu_tensor *small = ds4_gpu_tensor_alloc(sizeof(float) * 4);
+        CHECK(small != NULL, "dsv4_qkv_kv_rope: small allocation failed");
+        CHECK(ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
+                  tqo, tqx, model, sizeof(model), q_off, Q_N,
+                  small, tkvx, kv_off, KV_N, ROWS,
+                  KV_N_HEAD, KV_HEAD_DIM, N_ROT, POS0, N_CTX_ORIG, false,
+                  FREQ_BASE, 1.0f, 0.0f, ATTN_FACTOR, BETA_FAST, BETA_SLOW,
+                  EPS) == 0,
+              "dsv4_qkv_kv_rope: undersized kv_out must be rejected");
+        ds4_gpu_tensor_free(small);
+
+        ds4_gpu_tensor_free(tqx);
+        ds4_gpu_tensor_free(tqo);
+        ds4_gpu_tensor_free(tkvx);
+        ds4_gpu_tensor_free(tkvo);
+    }
+
+    fprintf(stderr, "  test_dsv4_qkv_rms_norm_rows_kv_rope OK\n");
+    return 0;
+}
+
 /* ds4_gpu_rope_tail_tensor: the flat, pair-parallel, no-reduction RoPE
  * kernel.  N_HEAD > 1 and N_TOK > 1 both hold so the kernel's own
  * decomposition of the flat id into (pair, head, token) is genuinely
@@ -671,6 +906,7 @@ int main(void) {
     if (test_add_rms_norm_weight() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_head_rms_norm() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dsv4_qkv_rms_norm_rows() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dsv4_qkv_rms_norm_rows_kv_rope() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_head_rms_norm_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
