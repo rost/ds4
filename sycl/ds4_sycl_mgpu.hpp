@@ -22,6 +22,202 @@
  * g_gpu_peer_ok all come from ds4_gpu_mgpu.h, included by ds4_sycl.cpp
  * before this header. */
 
+/* The peer-access validation protocol, ported whole from
+ * ds4_cuda.cu:2630-2760, not just its capability-query steps: the comment
+ * there (:2629-2645) records that on RTX 6000 Ada, cudaDeviceCanAccessPeer
+ * and cudaDeviceEnablePeerAccess both reported success while
+ * cudaMemcpyPeer silently delivered wrong data, non-deterministically, at
+ * realistic sizes. The failure being guarded against is a driver/hardware
+ * property, not a CUDA-specific one, and Intel's own documentation
+ * describes cross-card SYCL access as "slow... through host memory" even
+ * where the extension reports support (spec finding 7's B60 Dual: two
+ * dies behind a PCIe switch is exactly the suspect topology), so the same
+ * byte-exact round trip is required here, not a translation of the
+ * capability query alone. */
+
+static const size_t SYCL_PEER_BYTECHECK_SIZES[] = {
+    4u * 1024u,
+    256u * 1024u,
+    1u * 1024u * 1024u,
+    16u * 1024u * 1024u,
+};
+static const int    SYCL_PEER_BYTECHECK_N_SIZES = 4;
+static const int    SYCL_PEER_BYTECHECK_ITERS    = 4;
+static const size_t SYCL_PEER_BYTECHECK_MAX_BYTES = 16u * 1024u * 1024u;
+
+/* The byte-exact round trip itself: write a distinguishable per-iteration
+ * pattern to a host buffer, copy host to source device, source device to
+ * destination device (the actual peer-copy attempt, submitted on the
+ * source's queue against a pointer that lives on the destination's
+ * device), destination device back to host, and compare. Every one of
+ * `SYCL_PEER_BYTECHECK_N_SIZES * SYCL_PEER_BYTECHECK_ITERS` rounds must be
+ * byte-perfect.
+ *
+ * `corrupt`, `inject_compare_bug` and `vary_pattern` are test-only knobs
+ * (see ds4_sycl_test_peer_bytecheck below); the one production call site
+ * (sycl_validate_peer_pair) always passes (false, false, true).
+ *
+ * With `corrupt` set, one byte of the destination-side readback is
+ * clobbered on the very first round before the comparison runs, so the
+ * comparison MUST report a mismatch; if it does not, the comparison is not
+ * wired to the data it claims to check.
+ *
+ * With `inject_compare_bug` set, a round is compared against the PREVIOUS
+ * iteration's expected pattern instead of its own once one exists,
+ * simulating a stale-comparison-window defect: real pattern variation
+ * (vary_pattern=true) makes that defect visible as a mismatch, while a
+ * constant pattern across iterations (vary_pattern=false) makes the
+ * previous iteration's expected value equal the current one, hiding it.
+ * This is the mechanism spec 6i and the "same pattern for every
+ * iteration" ablation are both about: a comparison bug that only a varying
+ * pattern can expose. */
+static bool sycl_peer_bytecheck(sycl::queue &qi, void *dev_src, sycl::queue &qj,
+                                 void *dev_dst, size_t *out_fail_bytes,
+                                 int *out_fail_iter, bool corrupt,
+                                 bool inject_compare_bug, bool vary_pattern) {
+    std::vector<unsigned char> host_src(SYCL_PEER_BYTECHECK_MAX_BYTES);
+    std::vector<unsigned char> host_dst(SYCL_PEER_BYTECHECK_MAX_BYTES);
+    std::vector<unsigned char> prev_expected(SYCL_PEER_BYTECHECK_MAX_BYTES);
+    try {
+        for (int s_idx = 0; s_idx < SYCL_PEER_BYTECHECK_N_SIZES; s_idx++) {
+            const size_t n = SYCL_PEER_BYTECHECK_SIZES[s_idx];
+            /* Scoped to one size: comparing against a previous round's
+             * buffer only makes sense within a fixed byte count. Reset at
+             * every new size so a smaller earlier round's leftover bytes
+             * never leak into a larger round's comparison. */
+            bool have_prev = false;
+            for (int it = 0; it < SYCL_PEER_BYTECHECK_ITERS; it++) {
+                const size_t it_term = vary_pattern ? (size_t)it * 17u : 0u;
+                const size_t s_term  = vary_pattern ? (size_t)s_idx * 53u : 0u;
+                for (size_t k = 0; k < n; k++) {
+                    host_src[k] =
+                        (unsigned char)((k * 31u + it_term + s_term + 11u) & 0xffu);
+                }
+                qi.memcpy(dev_src, host_src.data(), n).wait_and_throw();
+                qi.memcpy(dev_dst, dev_src, n).wait_and_throw();
+                qj.memcpy(host_dst.data(), dev_dst, n).wait_and_throw();
+                if (corrupt && s_idx == 0 && it == 0) host_dst[0] ^= 0xFFu;
+
+                const unsigned char *expected = host_src.data();
+                if (inject_compare_bug && have_prev) expected = prev_expected.data();
+                if (memcmp(expected, host_dst.data(), n) != 0) {
+                    if (out_fail_bytes) *out_fail_bytes = n;
+                    if (out_fail_iter) *out_fail_iter = it;
+                    return false;
+                }
+                memcpy(prev_expected.data(), host_src.data(), n);
+                have_prev = true;
+            }
+        }
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "peer bytecheck threw: %s\n", e.what());
+        return false;
+    }
+    return true;
+}
+
+/* Test-only: exercises the shared bytecheck loop directly against a single
+ * real device used as both legs of the "pair", since this box has no
+ * second device to validate real cross-die behaviour against. This proves
+ * the probe's own mechanics (pattern generation, the multi-size/iteration
+ * loop, and the comparison) are sound; it cannot and does not claim
+ * anything about real PCIe peer correctness, which is what
+ * sycl_validate_peer_pair below exists to determine and which requires a
+ * second physical device to ever run for real. Not part of the ABI (not
+ * declared in ds4_gpu.h or ds4_gpu_mgpu.h). */
+extern "C" int ds4_sycl_test_peer_bytecheck(int tier, int corrupt,
+                                             int inject_compare_bug, int vary_pattern) {
+    if (tier < 0 || (size_t)tier >= g_devices.size()) return 0;
+    sycl::queue &q = g_devices[(size_t)tier].queue;
+    void *dev_src = sycl::malloc_device(SYCL_PEER_BYTECHECK_MAX_BYTES, q);
+    void *dev_dst = sycl::malloc_device(SYCL_PEER_BYTECHECK_MAX_BYTES, q);
+    if (!dev_src || !dev_dst) {
+        if (dev_src) sycl::free(dev_src, q);
+        if (dev_dst) sycl::free(dev_dst, q);
+        return 0;
+    }
+    size_t fail_bytes = 0;
+    int fail_iter = -1;
+    bool ok = sycl_peer_bytecheck(q, dev_src, q, dev_dst, &fail_bytes, &fail_iter,
+                                   corrupt != 0, inject_compare_bug != 0,
+                                   vary_pattern != 0);
+    sycl::free(dev_src, q);
+    sycl::free(dev_dst, q);
+    return ok ? 1 : 0;
+}
+
+/* Runs the full protocol for one ordered device pair: capability query,
+ * enable, then (regardless of what either reported) the byte-exact round
+ * trip. Only an all-perfect round trip marks the pair usable; any
+ * exception or any single mismatch anywhere disables it and every
+ * cross-device copy for that pair keeps using the host bounce
+ * automatically (ds4_gpu_tensor_copy_xdev above already checks
+ * g_gpu_peer_ok). `ext_oneapi_enable_peer_access` returns void per the
+ * extension's declared signature, so unlike CUDA's checked return value an
+ * exception is the only failure signal here; it is wrapped accordingly. */
+static bool sycl_validate_peer_pair(int i, int j) {
+    sycl::device &dev_i = g_devices[(size_t)i].dev;
+    sycl::device &dev_j = g_devices[(size_t)j].dev;
+
+    bool can = false;
+    try {
+        can = dev_i.ext_oneapi_can_access_peer(
+            dev_j, sycl::ext::oneapi::peer_access::access_supported);
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "peer access %d->%d: can_access_peer threw: %s\n", i, j, e.what());
+        return false;
+    }
+    if (!can) return false;
+
+    try {
+        dev_i.ext_oneapi_enable_peer_access(dev_j);
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "peer access %d->%d: enable_peer_access threw: %s\n", i, j, e.what());
+        return false;
+    }
+
+    sycl::queue &qi = g_devices[(size_t)i].queue;
+    sycl::queue &qj = g_devices[(size_t)j].queue;
+    void *dev_src = nullptr;
+    void *dev_dst = nullptr;
+    bool   validated  = false;
+    size_t fail_bytes = 0;
+    int    fail_iter  = -1;
+    try {
+        dev_src = sycl::malloc_device(SYCL_PEER_BYTECHECK_MAX_BYTES, qi);
+        dev_dst = sycl::malloc_device(SYCL_PEER_BYTECHECK_MAX_BYTES, qj);
+        if (!dev_src || !dev_dst) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "peer access %d->%d: probe buffer allocation failed\n", i, j);
+        } else {
+            validated = sycl_peer_bytecheck(qi, dev_src, qj, dev_dst, &fail_bytes,
+                                             &fail_iter, false, false, true);
+        }
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "peer access %d->%d probe threw: %s\n",
+                i, j, e.what());
+        validated = false;
+    }
+    if (dev_src) { try { sycl::free(dev_src, qi); } catch (const sycl::exception &) {} }
+    if (dev_dst) { try { sycl::free(dev_dst, qj); } catch (const sycl::exception &) {} }
+
+    if (validated) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "peer access %d->%d validated across %d sizes x %d iterations "
+                "(max %zu MiB)\n",
+                i, j, SYCL_PEER_BYTECHECK_N_SIZES, SYCL_PEER_BYTECHECK_ITERS,
+                SYCL_PEER_BYTECHECK_MAX_BYTES / (1024u * 1024u));
+    } else {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "peer access %d->%d FAILED validation at size=%zu iter=%d; "
+                "falling back to pinned-host bounce\n",
+                i, j, fail_bytes, fail_iter);
+    }
+    return validated;
+}
+
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     if (g_initialised) ds4_gpu_cleanup();
@@ -53,13 +249,16 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
             g_gpu[i].used_bytes   = 0;
         }
 
-        /* NxN peer-access matrix. Seeds only the trivial diagonal
-         * (a device always reaches its own memory); the real i != j
-         * byte-validation protocol is sycl_validate_peer_pair below. Every
-         * pair defaults to 0 (bounce-only) until validated. */
+        /* NxN peer-access matrix: the diagonal is trivially true (a device
+         * always reaches its own memory), every other ordered pair runs
+         * the full validation protocol (sycl_validate_peer_pair, defined
+         * above this function) and defaults to 0 (bounce-only) on any
+         * failure. On this single-device box only the diagonal ever
+         * executes; the i != j branch requires a second physical device to
+         * run for real (see the report on testability). */
         for (int i = 0; i < g_n_gpus; i++) {
             for (int j = 0; j < g_n_gpus; j++) {
-                g_gpu_peer_ok[i][j] = (i == j) ? 1 : 0;
+                g_gpu_peer_ok[i][j] = (i == j) ? 1 : (sycl_validate_peer_pair(i, j) ? 1 : 0);
             }
         }
 
@@ -218,6 +417,16 @@ static int sycl_xdev_host_bounce(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
  * (not declared in ds4_gpu.h or ds4_gpu_mgpu.h). */
 extern "C" int ds4_sycl_test_xdev_bounce_calls(void) { return g_sycl_xdev_bounce_calls; }
 
+/* A validated pair shares one sycl::context (ds4_sycl_build_devices groups
+ * queues by platform, and ext_oneapi_can_access_peer only ever reports
+ * true within one backend per the peer-access extension, so a validated
+ * pair is always same-platform), so a plain queue::memcpy between their
+ * USM pointers is exactly the SYCL analogue of CUDA's cudaMemcpyPeerAsync:
+ * legal because both pointers share a context, submitted on the
+ * destination's queue for destination-side ordering. Honors
+ * DS4_FORCE_HOST_BOUNCE=1 per ds4_gpu_mgpu.h:131. Any exception here falls
+ * back to the host bounce rather than propagating: a pair that validated
+ * at init can still be worth a fallback rather than a hard failure. */
 extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
                                         uint64_t bytes) {
     if (!dst || !src) return 0;
@@ -226,6 +435,20 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tenso
     const int sd = src->device_id >= 0 ? src->device_id : g_current_tier;
     const int dd = dst->device_id >= 0 ? dst->device_id : g_current_tier;
     if (sd == dd) return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
+
+    const bool peer_ok = sd >= 0 && dd >= 0 && sd < DS4_MAX_GPUS && dd < DS4_MAX_GPUS &&
+                         g_gpu_peer_ok[sd][dd] != 0;
+    if (peer_ok && getenv("DS4_FORCE_HOST_BOUNCE") == nullptr) {
+        try {
+            ds4_sycl_queue(dd).memcpy(dst->ptr, src->ptr, bytes).wait_and_throw();
+            return 1;
+        } catch (const sycl::exception &e) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "tensor_copy_xdev: validated peer copy %d->%d failed, falling "
+                    "back to host bounce: %s\n",
+                    sd, dd, e.what());
+        }
+    }
     return sycl_xdev_host_bounce(dst, src, bytes, sd, dd);
 }
 

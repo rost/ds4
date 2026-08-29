@@ -33,6 +33,14 @@ extern int ds4_sycl_current_tier(void);
  * this single-device box rather than merely assert it. */
 extern int ds4_sycl_test_xdev_bounce_calls(void);
 
+/* Test-only: exercises the peer-access byte-validation protocol's shared
+ * inner loop against a single real device used as both legs, since this
+ * box has no second device to validate real cross-die PCIe behaviour
+ * against. See sycl/ds4_sycl_mgpu.hpp for exactly what this can and
+ * cannot prove. */
+extern int ds4_sycl_test_peer_bytecheck(int tier, int corrupt,
+                                         int inject_compare_bug, int vary_pattern);
+
 #define CHECK(cond, msg)                                                    \
     do {                                                                    \
         if (!(cond)) {                                                      \
@@ -375,6 +383,76 @@ static int test_wait_xdev(void) {
     return 0;
 }
 
+/* ---- peer-access byte-validation protocol ------------------------------
+ *
+ * sycl_validate_peer_pair itself (the capability query, enable, and
+ * dispatch into the shared bytecheck loop between two DISTINCT devices)
+ * cannot run for real on this box: g_gpu_peer_ok's off-diagonal entries
+ * are only ever populated by ds4_gpu_init_multi's i != j loop, which never
+ * executes with one device. What follows exercises the shared bytecheck
+ * loop's own mechanics directly through ds4_sycl_test_peer_bytecheck. */
+
+static int test_peer_bytecheck_baseline(void) {
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 1;
+    cfg.device_indices[0] = 0;
+    CHECK(ds4_gpu_init_multi(&cfg) != 0, "init_multi for peer bytecheck");
+
+    /* Clean baseline (spec 6n): establish that the unablated probe passes
+     * before any ablation is attempted below. */
+    CHECK(ds4_sycl_test_peer_bytecheck(0, /*corrupt=*/0, /*inject_compare_bug=*/0,
+                                        /*vary_pattern=*/1) == 1,
+          "peer bytecheck clean baseline");
+
+    ds4_gpu_cleanup();
+    return 0;
+}
+
+static int test_peer_bytecheck_corrupt_is_caught(void) {
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 1;
+    cfg.device_indices[0] = 0;
+    CHECK(ds4_gpu_init_multi(&cfg) != 0, "init_multi for corrupt bytecheck");
+
+    /* A genuinely corrupted round MUST be reported as a failure: proves
+     * the comparison is wired to the data it claims to check. */
+    CHECK(ds4_sycl_test_peer_bytecheck(0, /*corrupt=*/1, /*inject_compare_bug=*/0,
+                                        /*vary_pattern=*/1) == 0,
+          "corrupted round must be caught");
+
+    ds4_gpu_cleanup();
+    return 0;
+}
+
+static int test_peer_bytecheck_pattern_variation_matters(void) {
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 1;
+    cfg.device_indices[0] = 0;
+    CHECK(ds4_gpu_init_multi(&cfg) != 0, "init_multi for pattern-variation bytecheck");
+
+    /* A stale-comparison-window defect (compare against the previous
+     * iteration's expected pattern) must be exposed when the pattern
+     * varies per iteration... */
+    CHECK(ds4_sycl_test_peer_bytecheck(0, /*corrupt=*/0, /*inject_compare_bug=*/1,
+                                        /*vary_pattern=*/1) == 0,
+          "varying pattern must expose the stale-comparison defect");
+    /* ...and hidden when it does not: this is the "same pattern for every
+     * iteration" ablation from the plan, run directly against the shared
+     * loop since sycl_validate_peer_pair itself cannot execute on one
+     * device. A constant pattern across iterations makes the previous
+     * iteration's expected value equal the current one, so the injected
+     * defect produces no observable mismatch. */
+    CHECK(ds4_sycl_test_peer_bytecheck(0, /*corrupt=*/0, /*inject_compare_bug=*/1,
+                                        /*vary_pattern=*/0) == 1,
+          "constant pattern hides the same stale-comparison defect");
+
+    ds4_gpu_cleanup();
+    return 0;
+}
+
 int main(void) {
     if (test_init_multi_n1()) return 1;
     if (test_init_multi_rejects_bad_cfg()) return 1;
@@ -386,6 +464,9 @@ int main(void) {
     if (test_copy_xdev_default_and_ordered_same_device()) return 1;
     if (test_copy_xdev3_same_device()) return 1;
     if (test_wait_xdev()) return 1;
+    if (test_peer_bytecheck_baseline()) return 1;
+    if (test_peer_bytecheck_corrupt_is_caught()) return 1;
+    if (test_peer_bytecheck_pattern_variation_matters()) return 1;
     fprintf(stderr, "test_sycl_mgpu: all tests passed\n");
     return 0;
 }
