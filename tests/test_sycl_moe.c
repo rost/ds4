@@ -73,6 +73,9 @@ extern int ds4_sycl_moe_test_q2k_down_direct(
 /* MXFP4 decode/tiny-batch regime side doors, driving
  * sycl_moe_mxfp4_gate_up_mid_decode / sycl_moe_mxfp4_down_sum6 directly
  * before the mxfp4_path dispatcher block is wired up. */
+/* MXFP4 decode/tiny-batch regime side doors, driving
+ * sycl_moe_mxfp4_gate_up_mid_decode / sycl_moe_mxfp4_down_sum6 directly,
+ * independent of the public dispatcher's format gate. */
 extern int ds4_sycl_moe_test_mxfp4_gate_up_mid_decode(
         const void *gate_model, const void *up_model, uint64_t gate_expert_bytes,
         uint64_t gate_row_bytes, uint32_t n_total_expert, const float *x, uint32_t in_dim,
@@ -146,10 +149,10 @@ static float f16_bits_to_f32(uint16_t bits) {
  *     (rocm/ds4_rocm_moe.cuh:301-326), independently re-derived here
  *     rather than copied, used only as the cross-check.
  *
- * No kernel exists yet at this point in the plan; this is deliberately
- * the one place in the project where a test legitimately passes before
- * any device code exists, because what it is testing is the oracle
- * itself. */
+ * These format-level checks were written and passing before any MXFP4
+ * kernel existed; that is deliberate, since what they test is the oracle
+ * itself, the one place in this project where a test legitimately passes
+ * before the device code it will later validate exists. */
 
 enum { MXFP4_QK = 32 };
 
@@ -896,14 +899,22 @@ static int test_dispatcher_q2k_succeeds(void) {
     return 0;
 }
 
-static int test_dispatcher_mxfp4_not_yet_implemented(void) {
+/* Both MXFP4 regimes are implemented here: RM_N_TOKENS == 2 falls
+ * in the tiny-batch decode regime (n_tokens <= 4), so the dispatcher now
+ * takes this call structurally rather than failing before reaching its
+ * mxfp4_path block.  rm_build_model's byte layout is Q4_K-shaped (144-byte
+ * rows), not MXFP4-shaped (17-byte blocks), so this checks only that the
+ * call completes and returns success; test_mxfp4_tiny_batch and
+ * test_mxfp4_prefill (below) are what check the actual numeric output
+ * against the format oracle, using a real MXFP4-shaped model. */
+static int test_dispatcher_mxfp4_now_implemented(void) {
     rm_model m = rm_build_model();
     rm_tensors t = rm_build_tensors();
-    CHECK(rm_call_batch(&m, &t, 39u, 39u, RM_N_TOKENS, NULL) == 0,
-          "dispatcher: mxfp4_path must fail until it is implemented");
+    CHECK(rm_call_batch(&m, &t, 39u, 39u, RM_N_TOKENS, NULL) != 0,
+          "dispatcher: mxfp4_path must now succeed on a well-formed tiny-batch call");
     rm_free_tensors(&t);
     free(m.model);
-    fprintf(stderr, "  test_dispatcher_mxfp4_not_yet_implemented OK\n");
+    fprintf(stderr, "  test_dispatcher_mxfp4_now_implemented OK\n");
     return 0;
 }
 
@@ -934,8 +945,9 @@ static int test_dispatcher_mid_is_f16_written_false(void) {
     rm_model m = rm_build_model();
     rm_tensors t = rm_build_tensors();
     bool mid_is_f16 = true;
-    /* The call itself fails (mxfp4 not implemented yet), but mid_is_f16
-     * must still be written, unconditionally, before that failure. */
+    /* mid_is_f16 must be written unconditionally at entry, independent of
+     * whatever this call goes on to return (it now succeeds, but this
+     * test's own property does not depend on that outcome). */
     rm_call_batch(&m, &t, 39u, 39u, RM_N_TOKENS, &mid_is_f16);
     CHECK(mid_is_f16 == false,
           "dispatcher: mid_is_f16 must be written false regardless of outcome");
@@ -1597,14 +1609,12 @@ static int32_t oracle_iq2_grid_dot8(uint8_t grid_idx, uint8_t sign_idx, const in
 /* ---- MXFP4: decode/tiny-batch regime (n_tokens <= 4) against the format
  * oracle above --------------------------------------------------------
  *
- * Driven through the side-door hooks
+ * Driven through the component-level side-door hooks
  * (ds4_sycl_moe_test_mxfp4_gate_up_mid_decode / _down_sum6) rather than the
- * public ds4_gpu_routed_moe_{one,batch}_tensor entries: the mxfp4_path
- * dispatcher block is wired up separately, once the prefill (n_tokens >= 5)
- * kernels exist too, and test_dispatcher_mxfp4_not_yet_implemented's
- * RM_N_TOKENS == 2 already falls inside this tiny-batch regime, so wiring
- * the dispatcher block before that commit would flip this
- * test early. */
+ * public ds4_gpu_routed_moe_{one,batch}_tensor entries, so a gate/up-mid
+ * failure and a down failure are never conflated into one combined
+ * mismatch.  test_mxfp4_prefill below exercises the same oracle through
+ * the real public entries instead, covering both regimes end to end. */
 
 enum {
     MX_IN_DIM         = 512, /* 2 Q8_K chunks per row */
@@ -1656,8 +1666,8 @@ static void mxfp4_fill_row(oracle_mxfp4_block *blocks, uint32_t n_blocks, uint32
 }
 
 /* dot_mxfp4_q8_K, tests/test_mxfp4_rocm.c:121-140, re-expressed over this
- * file's own (independently derived, ablation-tested) oracle_mxfp4_e8m0_scale
- * / oracle_mxfp4_code_value_ocp rather than that file's mxfp4_values table. */
+ * file's own independently derived and ablated oracle_mxfp4_e8m0_scale /
+ * oracle_mxfp4_code_value_ocp rather than that file's mxfp4_values table. */
 static float oracle_mxfp4_dot_q8k(const oracle_mxfp4_block *row, const oracle_q8k_block *x,
                                   uint32_t input_dim) {
     float sum = 0.0f;
@@ -1874,51 +1884,61 @@ static void oracle_moe_one_token(const rm_model *m, uint32_t mid_dim, uint32_t o
                                     (uint64_t)row * m->gate_row_bytes;
             float gate = gate_dot(gate_blk, &xq);
             float up = gate_dot(up_blk, &xq);
+/* One combined host buffer plus offsets, matching rm_model's shape: lets
+ * the same weight table back both the component-level side-door hooks
+ * (which take separate gate/up/down pointers, so t.model+t.gate_offset
+ * etc. are passed directly) and the public
+ * ds4_gpu_routed_moe_{one,batch}_tensor entries (which need one
+ * model_map plus offsets). */
 typedef struct {
-    unsigned char *gate, *up, *down;
+    unsigned char *model;
+    uint64_t model_size;
+    uint64_t gate_offset, up_offset, down_offset;
     uint64_t gate_expert_bytes, gate_row_bytes;
     uint64_t down_expert_bytes, down_row_bytes;
-} mx_tables;
+} mx_model;
 
-static mx_tables mx_build_tables(void) {
-    mx_tables t;
+static mx_model mx_build_model(void) {
+    mx_model m;
     /* Row byte size is the number of MXFP4 BLOCKS per row (in_dim/32), not
      * the number of Q8_K CHUNKS per row (in_dim/256, MX_XQ_BLOCKS/
-     * MX_MIDQ_BLOCKS): those are 8x smaller and using them here understated
-     * every row's stride by 8x, aliasing every 8th row's data across the
-     * rows in between.  Caught by test_mxfp4_tiny_batch's oracle check
-     * (a hand-recompute of expert 31 row 505 turned up a corrupted block
-     * with e=76, far outside the generator's intended [120,125) band). */
-    t.gate_row_bytes = (uint64_t)MX_GATE_MXFP4_BLOCKS * sizeof(oracle_mxfp4_block);
-    t.gate_expert_bytes = (uint64_t)MX_MID_DIM * t.gate_row_bytes;
-    t.down_row_bytes = (uint64_t)MX_DOWN_MXFP4_BLOCKS * sizeof(oracle_mxfp4_block);
-    t.down_expert_bytes = (uint64_t)MX_OUT_DIM * t.down_row_bytes;
-    t.gate = malloc((size_t)(t.gate_expert_bytes * MX_N_TOTAL_EXPERT));
-    t.up = malloc((size_t)(t.gate_expert_bytes * MX_N_TOTAL_EXPERT));
-    t.down = malloc((size_t)(t.down_expert_bytes * MX_N_TOTAL_EXPERT));
+     * MX_MIDQ_BLOCKS): those are 8x smaller, and an earlier version of
+     * this function used them here, understating every row's stride by 8x
+     * and aliasing every 8th row's data across the rows in between.
+     * Caught by test_mxfp4_tiny_batch's oracle check (a hand-recompute of
+     * expert 31 row 505 turned up a corrupted block with e=76, far
+     * outside the generator's intended [120,125) band). */
+    m.gate_row_bytes = (uint64_t)MX_GATE_MXFP4_BLOCKS * sizeof(oracle_mxfp4_block);
+    m.gate_expert_bytes = (uint64_t)MX_MID_DIM * m.gate_row_bytes;
+    m.down_row_bytes = (uint64_t)MX_DOWN_MXFP4_BLOCKS * sizeof(oracle_mxfp4_block);
+    m.down_expert_bytes = (uint64_t)MX_OUT_DIM * m.down_row_bytes;
+    m.gate_offset = 0;
+    m.up_offset = m.gate_expert_bytes * MX_N_TOTAL_EXPERT;
+    m.down_offset = m.up_offset + m.gate_expert_bytes * MX_N_TOTAL_EXPERT;
+    m.model_size = m.down_offset + m.down_expert_bytes * MX_N_TOTAL_EXPERT;
+    m.model = malloc((size_t)m.model_size);
     for (uint32_t e = 0; e < MX_N_TOTAL_EXPERT; e++) {
         for (uint32_t row = 0; row < MX_MID_DIM; row++) {
-            mxfp4_fill_row((oracle_mxfp4_block *)(t.gate + (uint64_t)e * t.gate_expert_bytes +
-                                                  (uint64_t)row * t.gate_row_bytes),
+            mxfp4_fill_row((oracle_mxfp4_block *)(m.model + m.gate_offset +
+                                                  (uint64_t)e * m.gate_expert_bytes +
+                                                  (uint64_t)row * m.gate_row_bytes),
                            MX_GATE_MXFP4_BLOCKS, MXFP4_PHASE_GATE, e, row);
-            mxfp4_fill_row((oracle_mxfp4_block *)(t.up + (uint64_t)e * t.gate_expert_bytes +
-                                                  (uint64_t)row * t.gate_row_bytes),
+            mxfp4_fill_row((oracle_mxfp4_block *)(m.model + m.up_offset +
+                                                  (uint64_t)e * m.gate_expert_bytes +
+                                                  (uint64_t)row * m.gate_row_bytes),
                            MX_GATE_MXFP4_BLOCKS, MXFP4_PHASE_UP, e, row);
         }
         for (uint32_t row = 0; row < MX_OUT_DIM; row++) {
-            mxfp4_fill_row((oracle_mxfp4_block *)(t.down + (uint64_t)e * t.down_expert_bytes +
-                                                  (uint64_t)row * t.down_row_bytes),
+            mxfp4_fill_row((oracle_mxfp4_block *)(m.model + m.down_offset +
+                                                  (uint64_t)e * m.down_expert_bytes +
+                                                  (uint64_t)row * m.down_row_bytes),
                            MX_DOWN_MXFP4_BLOCKS, MXFP4_PHASE_DOWN, e, row);
         }
     }
-    return t;
+    return m;
 }
 
-static void mx_free_tables(mx_tables *t) {
-    free(t->gate);
-    free(t->up);
-    free(t->down);
-}
+static void mx_free_model(mx_model *m) { free(m->model); }
 
 /* Four routing patterns, cycled by token index, matching
  * tests/test_mxfp4_rocm.c's init_patterns shape: expert ids at both ends
@@ -1944,7 +1964,7 @@ static void mx_build_pattern(uint32_t p, int32_t sel[MX_N_EXPERT], float w[MX_N_
  * Q8_K-quantised x, SwiGLU with the router weight folded in at the mid
  * stage (confirmed against rocm/ds4_rocm_moe.cuh:2108-2229's epilogue,
  * not assumed). */
-static void oracle_mxfp4_gate_up_mid(const mx_tables *t, const int32_t *sel, const float *w,
+static void oracle_mxfp4_gate_up_mid(const mx_model *m, const int32_t *sel, const float *w,
                                      const float *x, float clamp, float *mid_out) {
     oracle_q8k_block xq[MX_XQ_BLOCKS];
     for (uint32_t b = 0; b < MX_XQ_BLOCKS; b++) {
@@ -1954,11 +1974,11 @@ static void oracle_mxfp4_gate_up_mid(const mx_tables *t, const int32_t *sel, con
         const uint32_t expert = (uint32_t)sel[s];
         for (uint32_t row = 0; row < MX_MID_DIM; row++) {
             const oracle_mxfp4_block *gate_row = (const oracle_mxfp4_block *)
-                    (t->gate + (uint64_t)expert * t->gate_expert_bytes +
-                     (uint64_t)row * t->gate_row_bytes);
+                    (m->model + m->gate_offset + (uint64_t)expert * m->gate_expert_bytes +
+                     (uint64_t)row * m->gate_row_bytes);
             const oracle_mxfp4_block *up_row = (const oracle_mxfp4_block *)
-                    (t->up + (uint64_t)expert * t->gate_expert_bytes +
-                     (uint64_t)row * t->gate_row_bytes);
+                    (m->model + m->up_offset + (uint64_t)expert * m->gate_expert_bytes +
+                     (uint64_t)row * m->gate_row_bytes);
             float gate = oracle_mxfp4_dot_q8k(gate_row, xq, MX_IN_DIM);
             float up = oracle_mxfp4_dot_q8k(up_row, xq, MX_IN_DIM);
             if (clamp > 1.0e-6f) {
@@ -2499,7 +2519,7 @@ static int test_q2k_down_slot_order(void) {
  * called from a test) rather than re-deriving it from the oracle, so a
  * down-kernel bug is distinguishable from a gate/up bug. Ascending
  * slot order, matching sycl_moe_sum / moe_sum_kernel. */
-static void oracle_mxfp4_down_from_mid(const mx_tables *t, const int32_t *sel, const float *mid,
+static void oracle_mxfp4_down_from_mid(const mx_model *m, const int32_t *sel, const float *mid,
                                        float *out) {
     oracle_q8k_block midq[MX_N_EXPERT][MX_MIDQ_BLOCKS];
     for (uint32_t s = 0; s < MX_N_EXPERT; s++) {
@@ -2513,19 +2533,20 @@ static void oracle_mxfp4_down_from_mid(const mx_tables *t, const int32_t *sel, c
         for (uint32_t s = 0; s < MX_N_EXPERT; s++) {
             const uint32_t expert = (uint32_t)sel[s];
             const oracle_mxfp4_block *down_row = (const oracle_mxfp4_block *)
-                    (t->down + (uint64_t)expert * t->down_expert_bytes +
-                     (uint64_t)row * t->down_row_bytes);
+                    (m->model + m->down_offset + (uint64_t)expert * m->down_expert_bytes +
+                     (uint64_t)row * m->down_row_bytes);
             acc += oracle_mxfp4_dot_q8k(down_row, midq[s], MX_MID_DIM);
         }
         out[row] = acc;
     }
 }
 
-/* Covers n_tokens in {1,2,3,4}: every call this task's kernels handle.
- * Checks gate/up-mid against the full oracle, then feeds the SYCL
- * kernel's own mid into the down oracle half and checks out against
- * that (the stage-isolated check requires). */
-static int test_mxfp4_tiny_batch(const mx_tables *t, uint32_t n_tokens) {
+/* Covers n_tokens in {1,2,3,4}, the decode/tiny-batch regime.  Checks
+ * gate/up-mid against the full oracle, then feeds the SYCL kernel's own
+ * mid into the down oracle half and checks out against that: a
+ * stage-isolated check, so a down bug is distinguishable from a gate/up
+ * bug rather than compounding into one end-to-end mismatch. */
+static int test_mxfp4_tiny_batch(const mx_model *t, uint32_t n_tokens) {
     int32_t sel_pat[MX_N_PATTERN][MX_N_EXPERT];
     float w_pat[MX_N_PATTERN][MX_N_EXPERT];
     float x_pat[MX_N_PATTERN][MX_IN_DIM];
@@ -2550,9 +2571,9 @@ static int test_mxfp4_tiny_batch(const mx_tables *t, uint32_t n_tokens) {
     }
 
     if (ds4_sycl_moe_test_mxfp4_gate_up_mid_decode(
-            t->gate, t->up, t->gate_expert_bytes, t->gate_row_bytes, MX_N_TOTAL_EXPERT, x_all,
-            MX_IN_DIM, n_tokens, sel_all, w_all, MX_N_EXPERT, MX_MID_DIM, MX_CLAMP,
-            mid_gpu) == 0) {
+            t->model + t->gate_offset, t->model + t->up_offset, t->gate_expert_bytes,
+            t->gate_row_bytes, MX_N_TOTAL_EXPERT, x_all, MX_IN_DIM, n_tokens, sel_all, w_all,
+            MX_N_EXPERT, MX_MID_DIM, MX_CLAMP, mid_gpu) == 0) {
         fprintf(stderr, "FAIL: mxfp4_tiny_batch(%u): gate_up_mid_decode call failed\n", n_tokens);
         rc = 1;
         goto out;
@@ -2587,9 +2608,10 @@ static int test_mxfp4_tiny_batch(const mx_tables *t, uint32_t n_tokens) {
         oracle_mxfp4_down_from_mid(t, sel_pat[p], mid_gpu + (size_t)tok * MX_N_EXPERT * MX_MID_DIM,
                                    out_oracle + (size_t)tok * MX_OUT_DIM);
     }
-    if (ds4_sycl_moe_test_mxfp4_down_sum6(t->down, t->down_expert_bytes, t->down_row_bytes,
-                                          MX_N_TOTAL_EXPERT, mid_gpu, MX_MID_DIM, n_tokens,
-                                          sel_all, MX_N_EXPERT, MX_OUT_DIM, out_gpu) == 0) {
+    if (ds4_sycl_moe_test_mxfp4_down_sum6(t->model + t->down_offset, t->down_expert_bytes,
+                                          t->down_row_bytes, MX_N_TOTAL_EXPERT, mid_gpu,
+                                          MX_MID_DIM, n_tokens, sel_all, MX_N_EXPERT, MX_OUT_DIM,
+                                          out_gpu) == 0) {
         fprintf(stderr, "FAIL: mxfp4_tiny_batch(%u): down_sum6 call failed\n", n_tokens);
         rc = 1;
         goto out;
@@ -2618,10 +2640,145 @@ out:
     return rc;
 }
 
+/* Covers every n_tokens through the real public entries
+ * (ds4_gpu_routed_moe_batch_tensor), straddling the launcher's own
+ * mxfp4_path threshold (n_tokens >= 5 takes the sorted-pairs tile8 path;
+ * n_tokens <= 4 takes the same decode/tiny-batch kernels
+ * test_mxfp4_tiny_batch already checked through the component-level side
+ * doors, this time end to end through the dispatcher).  Four routing
+ * patterns cycle by token index (tests/test_mxfp4_rocm.c's own shape),
+ * so the oracle cost stays flat regardless of n_tokens: mid is checked
+ * against the full oracle per pattern, and out is checked against the
+ * down oracle fed the GPU's own mid for that pattern, re-derived only
+ * when a pattern's GPU mid output changes (it should not, since the
+ * computation is deterministic; a memcmp confirms rather than assumes
+ * this). */
+static int test_mxfp4_batch(const mx_model *m, uint32_t n_tokens) {
+    int32_t sel_pat[MX_N_PATTERN][MX_N_EXPERT];
+    float w_pat[MX_N_PATTERN][MX_N_EXPERT];
+    float x_pat[MX_N_PATTERN][MX_IN_DIM];
+    float mid_oracle_pat[MX_N_PATTERN][MX_N_EXPERT * MX_MID_DIM];
+    for (uint32_t p = 0; p < MX_N_PATTERN; p++) {
+        mx_build_pattern(p, sel_pat[p], w_pat[p], x_pat[p]);
+        oracle_mxfp4_gate_up_mid(m, sel_pat[p], w_pat[p], x_pat[p], MX_CLAMP, mid_oracle_pat[p]);
+    }
+
+    const uint64_t route_count = (uint64_t)n_tokens * MX_N_EXPERT;
+    int32_t *sel_all = malloc((size_t)(route_count * sizeof(int32_t)));
+    float *w_all = malloc((size_t)(route_count * sizeof(float)));
+    float *x_all = malloc((size_t)((uint64_t)n_tokens * MX_IN_DIM * sizeof(float)));
+    float *mid_gpu = malloc((size_t)(route_count * MX_MID_DIM * sizeof(float)));
+    float *out_gpu = malloc((size_t)((uint64_t)n_tokens * MX_OUT_DIM * sizeof(float)));
+    for (uint32_t tok = 0; tok < n_tokens; tok++) {
+        const uint32_t p = tok % MX_N_PATTERN;
+        memcpy(sel_all + (size_t)tok * MX_N_EXPERT, sel_pat[p], sizeof(sel_pat[p]));
+        memcpy(w_all + (size_t)tok * MX_N_EXPERT, w_pat[p], sizeof(w_pat[p]));
+        memcpy(x_all + (size_t)tok * MX_IN_DIM, x_pat[p], sizeof(x_pat[p]));
+    }
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * MX_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(route_count * MX_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(route_count * MX_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(route_count * MX_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(route_count * MX_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(route_count * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(route_count * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tokens * MX_IN_DIM * sizeof(float));
+    int ok = sel_all && w_all && x_all && mid_gpu && out_gpu && out && gate && up && mid &&
+             down && selected && weights && x;
+    int rc = 1;
+
+    ok = ok && ds4_gpu_tensor_write(selected, 0, sel_all, route_count * sizeof(int32_t));
+    ok = ok && ds4_gpu_tensor_write(weights, 0, w_all, route_count * sizeof(float));
+    ok = ok && ds4_gpu_tensor_write(x, 0, x_all, (uint64_t)n_tokens * MX_IN_DIM * sizeof(float));
+
+    bool mid_is_f16 = true;
+    ok = ok && ds4_gpu_routed_moe_batch_tensor(
+                       out, gate, up, mid, down, m->model, m->model_size, m->gate_offset,
+                       m->up_offset, m->down_offset, 39u, 39u, m->gate_expert_bytes,
+                       m->gate_row_bytes, m->down_expert_bytes, m->down_row_bytes, MX_IN_DIM,
+                       MX_MID_DIM, MX_OUT_DIM, selected, weights, MX_N_TOTAL_EXPERT, MX_N_EXPERT,
+                       MX_CLAMP, x, 0u, n_tokens, &mid_is_f16, false) != 0;
+    if (!ok) {
+        fprintf(stderr, "FAIL: mxfp4_batch(%u): routed_moe_batch_tensor call failed\n", n_tokens);
+        goto out;
+    }
+    if (mid_is_f16) {
+        fprintf(stderr, "FAIL: mxfp4_batch(%u): mid_is_f16 unexpectedly true\n", n_tokens);
+        goto out;
+    }
+    ok = ds4_gpu_tensor_read(mid, 0, mid_gpu, route_count * MX_MID_DIM * sizeof(float)) != 0 &&
+         ds4_gpu_tensor_read(out, 0, out_gpu, (uint64_t)n_tokens * MX_OUT_DIM * sizeof(float)) != 0;
+    if (!ok) {
+        fprintf(stderr, "FAIL: mxfp4_batch(%u): tensor readback failed\n", n_tokens);
+        goto out;
+    }
+
+    for (uint32_t tok = 0; tok < n_tokens; tok++) {
+        const uint32_t p = tok % MX_N_PATTERN;
+        const float *got = mid_gpu + (uint64_t)tok * MX_N_EXPERT * MX_MID_DIM;
+        const float *want = mid_oracle_pat[p];
+        for (uint32_t i = 0; i < MX_N_EXPERT * MX_MID_DIM; i++) {
+            const float tol = fabsf(want[i]) * 1.0e-4f + 1.0e-4f;
+            if (fabsf(got[i] - want[i]) > tol) {
+                fprintf(stderr,
+                        "FAIL: mxfp4_batch(%u): mid mismatch at tok=%u i=%u got %.9g want %.9g\n",
+                        n_tokens, tok, i, (double)got[i], (double)want[i]);
+                goto out;
+            }
+        }
+    }
+
+    {
+        float down_oracle_cache[MX_N_PATTERN][MX_OUT_DIM];
+        int32_t cached_tok[MX_N_PATTERN] = {-1, -1, -1, -1};
+        for (uint32_t tok = 0; tok < n_tokens; tok++) {
+            const uint32_t p = tok % MX_N_PATTERN;
+            const float *mid_tok = mid_gpu + (uint64_t)tok * MX_N_EXPERT * MX_MID_DIM;
+            const uint64_t mid_bytes = (uint64_t)MX_N_EXPERT * MX_MID_DIM * sizeof(float);
+            if (cached_tok[p] < 0 ||
+                memcmp(mid_gpu + (uint64_t)cached_tok[p] * MX_N_EXPERT * MX_MID_DIM, mid_tok,
+                       (size_t)mid_bytes) != 0) {
+                oracle_mxfp4_down_from_mid(m, sel_pat[p], mid_tok, down_oracle_cache[p]);
+                cached_tok[p] = (int32_t)tok;
+            }
+            const float *got = out_gpu + (uint64_t)tok * MX_OUT_DIM;
+            const float *want = down_oracle_cache[p];
+            for (uint32_t i = 0; i < MX_OUT_DIM; i++) {
+                const float tol = fabsf(want[i]) * 2.0e-4f + 2.0e-4f;
+                if (fabsf(got[i] - want[i]) > tol) {
+                    fprintf(stderr,
+                            "FAIL: mxfp4_batch(%u): out mismatch at tok=%u i=%u got %.9g "
+                            "want %.9g (from GPU's own mid)\n",
+                            n_tokens, tok, i, (double)got[i], (double)want[i]);
+                    goto out;
+                }
+            }
+        }
+    }
+
+    fprintf(stderr, "  test_mxfp4_batch(n_tokens=%u) OK\n", n_tokens);
+    rc = 0;
+out:
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(x);
+    free(sel_all);
+    free(w_all);
+    free(x_all);
+    free(mid_gpu);
+    free(out_gpu);
+    return rc;
+}
+
 int main(void) {
-    /* MXFP4 format-oracle tests need no GPU; run
-     * them before ds4_gpu_init so a failure here is never confused with a
-     * device-side problem. */
+    /* MXFP4 format-oracle tests need no GPU; run them before ds4_gpu_init
+     * so a failure here is never confused with a device-side problem. */
     if (test_mxfp4_block_layout() != 0) return 1;
     if (test_mxfp4_e8m0_boundary() != 0) return 1;
     if (test_mxfp4_e255_pinned() != 0) return 1;
@@ -2643,6 +2800,9 @@ int main(void) {
     if (test_dispatcher_iq2_succeeds() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_q2k_succeeds() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_mxfp4_not_yet_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_iq2_not_yet_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_q2k_not_yet_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_mxfp4_now_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_add_in_rejected() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_mid_is_f16_written_false() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_build_plan_validation() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -2668,13 +2828,26 @@ int main(void) {
     if (test_q2k_down_slot_order() != 0) { ds4_gpu_cleanup(); return 1; }
 
     {
-        mx_tables mxt = mx_build_tables();
+        mx_model mxm = mx_build_model();
         int mx_ok = 1;
-        mx_ok = mx_ok && test_mxfp4_tiny_batch(&mxt, 1u) == 0;
-        mx_ok = mx_ok && test_mxfp4_tiny_batch(&mxt, 2u) == 0;
-        mx_ok = mx_ok && test_mxfp4_tiny_batch(&mxt, 3u) == 0;
-        mx_ok = mx_ok && test_mxfp4_tiny_batch(&mxt, 4u) == 0;
-        mx_free_tables(&mxt);
+        mx_ok = mx_ok && test_mxfp4_tiny_batch(&mxm, 1u) == 0;
+        mx_ok = mx_ok && test_mxfp4_tiny_batch(&mxm, 2u) == 0;
+        mx_ok = mx_ok && test_mxfp4_tiny_batch(&mxm, 3u) == 0;
+        mx_ok = mx_ok && test_mxfp4_tiny_batch(&mxm, 4u) == 0;
+        mx_ok = mx_ok && test_mxfp4_batch(&mxm, 1u) == 0;
+        mx_ok = mx_ok && test_mxfp4_batch(&mxm, 5u) == 0;
+        mx_ok = mx_ok && test_mxfp4_batch(&mxm, 32u) == 0;
+        mx_ok = mx_ok && test_mxfp4_batch(&mxm, 128u) == 0;
+        mx_ok = mx_ok && test_mxfp4_batch(&mxm, 512u) == 0;
+        /* Permanent stress regression (spec 6j): a dropped tile8
+         * staging-barrier ablation did not fail through n_tokens=4096
+         * (thousands of tiles across 32 experts), only at 16384, matching
+         * the earlier finding that an equivalent race needed a launch
+         * two orders of magnitude bigger than the functional test suite
+         * before real work-group contention exposed it.  Runs in under
+         * two seconds end to end, cheap enough to keep permanently. */
+        mx_ok = mx_ok && test_mxfp4_batch(&mxm, 16384u) == 0;
+        mx_free_model(&mxm);
         if (!mx_ok) { ds4_gpu_cleanup(); return 1; }
     }
 

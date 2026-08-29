@@ -1667,6 +1667,194 @@ static void sycl_moe_mxfp4_down_sum6(
      }).wait_and_throw();
 }
 
+/* dev_dot_mxfp4_q8_K_block8, rocm/ds4_rocm_moe.cuh:524-546: the same
+ * per-Q8_K-chunk dot as sycl_dev_dot_mxfp4_q8_k_half_block's two halves
+ * combined, against up to 8 activation chunks (one per token/slot pair in
+ * a tile) at once.  bsum is reset per (sub-block, pair): ROCm's dp4a-packed
+ * form resets one int32 accumulator per sub-block and folds four terms at
+ * a time; this scalar reformulation sums the same 16 terms per sub-block
+ * in a different grouping, which is exact for integers, so the two are
+ * bit-identical despite the different shape. */
+static inline void sycl_dev_dot_mxfp4_q8_k_block8(
+        const sycl_block_mxfp4 *x8, const sycl_block_q8_K *const ys[8], uint32_t n,
+        float acc[8]) {
+    float chunk[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (uint32_t sb = 0; sb < 8u; sb++) {
+        const sycl_block_mxfp4 *x = x8 + sb;
+        const float d = sycl_dev_e8m0_to_f32(x->e);
+        for (uint32_t p = 0; p < n; p++) {
+            const int8_t *q8 = ys[p]->qs + sb * 32u;
+            int32_t bsum = 0;
+            for (uint32_t k = 0; k < 16u; k++) {
+                const uint8_t byte = x->qs[k];
+                bsum += sycl_dev_mxfp4_unpack1(byte & 0x0fu) * (int32_t)q8[k];
+                bsum += sycl_dev_mxfp4_unpack1(byte >> 4u) * (int32_t)q8[k + 16u];
+            }
+            chunk[p] += d * (float)bsum;
+        }
+    }
+    for (uint32_t p = 0; p < n; p++) acc[p] += 0.5f * ys[p]->d * chunk[p];
+}
+
+/* moe_gate_up_mid_mxfp4_expert_tile8_row32_kernel, rocm/ds4_rocm_moe.cuh:
+ * 2108-2229 (unstaged dot path only: the b128-aligned LDS staging
+ * optimisation active when xq_blocks <= 28 is a performance path this
+ * port does not need for correctness, following the precedent Q4_K's own
+ * tile8 kernel already set in this file).  Canonical prefill gate/up+mid,
+ * n_tokens >= 5 for MXFP4 (rocm/ds4_rocm_moe_launch.cuh:750-757:
+ * mxfp4_path's use_mxfp4_tiny_batch is n_tokens <= 4, which collapses
+ * use_sorted_pairs to n_tokens > 4 for this format, unlike Q4_K's
+ * n_tokens >= 32 threshold -- confirmed by reading the launch site, not
+ * assumed from Q4_K's own threshold). */
+static void sycl_moe_mxfp4_gate_up_mid_tile8(
+        sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
+        const sycl_block_q8_K *xq, const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total, const uint32_t *tile_experts,
+        const uint32_t *tile_starts, const float *weights, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t n_expert, uint32_t tile_capacity, float clamp) {
+    const uint32_t row_blocks = (expert_mid_dim + 31u) / 32u;
+    if (row_blocks == 0u || tile_capacity == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         sycl::local_accessor<sycl_block_q8_K, 2> sxq(sycl::range<2>(8, 16), h);
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, tile_capacity),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 const uint32_t tile = (uint32_t)it.get_group(1);
+                 if (tile >= *tile_total) return;
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u + (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t expert = tile_experts[tile];
+                 const uint32_t count = counts[expert];
+                 const uint32_t local_start = tile_starts[tile];
+
+                 uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 const sycl_block_q8_K *xqb[8] = {xq, xq, xq, xq, xq, xq, xq, xq};
+                 uint32_t np = 0;
+                 for (; np < 8u; np++) {
+                     const uint32_t local_pair = local_start + np;
+                     if (local_pair >= count) break;
+                     pair[np] = sorted_pairs[offsets[expert] + local_pair];
+                     const uint32_t tok = pair[np] / n_expert;
+                     xqb[np] = xq + (uint64_t)tok * xq_blocks;
+                 }
+                 if (xq_blocks <= 16u) {
+                     const uint32_t lid = (uint32_t)it.get_local_id(0);
+                     for (uint32_t i = lid; i < np * xq_blocks; i += 256u) {
+                         const uint32_t p = i / xq_blocks;
+                         const uint32_t b = i - p * xq_blocks;
+                         sxq[p][b] = xqb[p][b];
+                     }
+                     it.barrier(sycl::access::fence_space::local_space);
+                     for (uint32_t p = 0; p < np; p++) xqb[p] = &sxq[p][0];
+                 }
+                 if (row >= expert_mid_dim) return;
+                 const char *gate_row = gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+                 const char *up_row = up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes;
+                 const uint64_t gate_chunk_bytes = gate_row_bytes / xq_blocks;
+                 float gate[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 float up[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+                     const sycl_block_mxfp4 *gb = (const sycl_block_mxfp4 *)(gate_row + (uint64_t)b * gate_chunk_bytes);
+                     const sycl_block_mxfp4 *ub = (const sycl_block_mxfp4 *)(up_row + (uint64_t)b * gate_chunk_bytes);
+                     const sycl_block_q8_K *ys[8];
+                     for (uint32_t p = 0; p < 8u; p++) ys[p] = xqb[p] + b;
+                     sycl_dev_dot_mxfp4_q8_k_block8(gb, ys, np, gate);
+                     sycl_dev_dot_mxfp4_q8_k_block8(ub, ys, np, up);
+                 }
+                 for (uint32_t p = 0; p < np; p++) {
+                     gate[p] = sycl_moe_subgroup_sum<8>(sg, gate[p]);
+                     up[p] = sycl_moe_subgroup_sum<8>(sg, up[p]);
+                     if (lane == 0u) {
+                         float g = gate[p], u = up[p];
+                         if (clamp > 1.0e-6f) {
+                             if (g > clamp) g = clamp;
+                             if (u > clamp) u = clamp;
+                             if (u < -clamp) u = -clamp;
+                         }
+                         mid_out[(uint64_t)pair[p] * expert_mid_dim + row] =
+                                 (g / (1.0f + sycl::exp(-g))) * u * weights[pair[p]];
+                     }
+                 }
+             });
+     }).wait_and_throw();
+}
+
+/* moe_down_mxfp4_expert_tile8_row32_kernel, rocm/ds4_rocm_moe.cuh:
+ * 3339-3436 (unstaged dot path only, same rationale as the gate/up tile8
+ * kernel above).  Canonical prefill down, n_tokens >= 5 for MXFP4.
+ * row_groups is DS4_ROCM_MXFP4_DOWN_RGROUP (rocm/ds4_rocm_moe_launch.cuh:
+ * 801-807): parameterises how many 32-row groups one work-group covers
+ * against one staged copy of the tile's activations, wired to the
+ * dispatcher's environment-variable read below.  The arithmetic per (token,row) is
+ * untouched by row_groups (same helper, same lane-strided block loop,
+ * same reduction), so results are bit-identical for any valid value. */
+static void sycl_moe_mxfp4_down_tile8(
+        sycl::queue &q, float *down_out, const char *down_base, const sycl_block_q8_K *midq,
+        const uint32_t *sorted_pairs, const uint32_t *offsets, const uint32_t *counts,
+        const uint32_t *tile_total, const uint32_t *tile_experts, const uint32_t *tile_starts,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t midq_blocks,
+        uint32_t out_dim, uint32_t tile_capacity, uint32_t row_groups) {
+    if (row_groups == 0u) row_groups = 1u;
+    const uint32_t row_blocks = (out_dim + 31u) / 32u;
+    const uint32_t grid_x = (row_blocks + row_groups - 1u) / row_groups;
+    if (grid_x == 0u || tile_capacity == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         sycl::local_accessor<sycl_block_q8_K, 2> sxq(sycl::range<2>(8, 8), h);
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)grid_x * 256u, tile_capacity),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 const uint32_t tile = (uint32_t)it.get_group(1);
+                 if (tile >= *tile_total) return;
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t expert = tile_experts[tile];
+                 const uint32_t count = counts[expert];
+                 const uint32_t local_start = tile_starts[tile];
+
+                 uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 const sycl_block_q8_K *xqb[8] = {midq, midq, midq, midq, midq, midq, midq, midq};
+                 uint32_t np = 0;
+                 for (; np < 8u; np++) {
+                     const uint32_t local_pair = local_start + np;
+                     if (local_pair >= count) break;
+                     pair[np] = sorted_pairs[offsets[expert] + local_pair];
+                     xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
+                 }
+                 if (midq_blocks <= 8u) {
+                     const uint32_t lid = (uint32_t)it.get_local_id(0);
+                     for (uint32_t i = lid; i < np * midq_blocks; i += 256u) {
+                         const uint32_t p = i / midq_blocks;
+                         const uint32_t b = i - p * midq_blocks;
+                         sxq[p][b] = xqb[p][b];
+                     }
+                     it.barrier(sycl::access::fence_space::local_space);
+                     for (uint32_t p = 0; p < np; p++) xqb[p] = &sxq[p][0];
+                 }
+                 const uint64_t down_chunk_bytes = down_row_bytes / midq_blocks;
+                 for (uint32_t rg = 0; rg < row_groups; rg++) {
+                     const uint32_t row = (it.get_group(0) * row_groups + rg) * 32u + (uint32_t)(it.get_local_id(0) >> 3);
+                     if (row >= out_dim) continue;
+                     const char *down_row = down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes;
+                     float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                     for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+                         const sycl_block_mxfp4 *wb = (const sycl_block_mxfp4 *)(down_row + (uint64_t)b * down_chunk_bytes);
+                         const sycl_block_q8_K *ys[8];
+                         for (uint32_t p = 0; p < 8u; p++) ys[p] = xqb[p] + b;
+                         sycl_dev_dot_mxfp4_q8_k_block8(wb, ys, np, acc);
+                     }
+                     for (uint32_t p = 0; p < np; p++) {
+                         acc[p] = sycl_moe_subgroup_sum<8>(sg, acc[p]);
+                         if (lane == 0u) down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
+                     }
+                 }
+             });
+     }).wait_and_throw();
+}
+
 }  // namespace
 
 /* ---- Test-only side doors ------------------------------------------
@@ -1874,6 +2062,10 @@ extern "C" int ds4_sycl_moe_test_q2k_down_direct(
  * block is wired up, and their own tests are what must NOT flip
  * test_dispatcher_mxfp4_not_yet_implemented early, since that RM-shaped
  * call's n_tokens == 2 already falls in this tiny-batch regime.  Host
+/* Test-only side doors for the MXFP4 decode-regime kernels (n_tokens <= 4):
+ * exercise sycl_moe_mxfp4_gate_up_mid_decode / sycl_moe_mxfp4_down_sum6
+ * directly rather than only through the public dispatcher, matching the
+ * precedent set by this file's sort/quantise/sum test hooks above.  Host
  * buffers are laid out exactly like the real ABI's model_map: gate_model
  * and up_model are n_total_expert rows of gate_expert_bytes, each an
  * expert_mid_dim x gate_row_bytes table of packed MXFP4 blocks. */
@@ -1943,8 +2135,8 @@ extern "C" int ds4_sycl_moe_test_mxfp4_gate_up_mid_decode(
     }
 }
 
-/* Stage-isolated MXFP4 down check (a requirement mirroring
- * tests/test_mxfp4_rocm.c's check_out_from_gpu_mid): the caller feeds
+/* Stage-isolated MXFP4 down check, mirroring
+ * tests/test_mxfp4_rocm.c's check_out_from_gpu_mid: the caller feeds
  * this hook the SYCL gate/up kernel's own mid output rather than a CPU
  * oracle's mid, so a down-kernel bug is distinguishable from a gate/up
  * bug rather than compounding into one end-to-end mismatch. */

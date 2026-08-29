@@ -248,6 +248,32 @@ static int sycl_routed_moe_iq2_dispatch(
         uint32_t expert_mid_dim, uint32_t out_dim, uint32_t n_total_expert,
         uint32_t n_expert, uint32_t n_tokens, uint32_t pair_count, float clamp,
         bool iq2_iq2_path) {
+/* ---- MXFP4 format block -------------------------------------------
+ *
+ * Dispatch threshold mirrors moe_launch.cuh:750-777 restricted to the
+ * mxfp4_path-reachable branches: `use_mxfp4_tiny_batch = mxfp4_path &&
+ * n_tokens <= 4u`, and `use_sorted_pairs = n_tokens > 1u &&
+ * !use_mxfp4_tiny_batch && (!q4k_path || n_tokens >= 32u)`, which for
+ * mxfp4_path (q4k_path false, so the q4k clause is unconditionally true)
+ * collapses to `n_tokens > 4u`.  So MXFP4's tile threshold is n_tokens >=
+ * 5, NOT Q4_K's n_tokens >= 32 -- confirmed directly against the launch
+ * site rather than assumed from Q4_K's own threshold.  Two regimes:
+ *   n_tokens <= 4:  decode gate/up (grid.y = pair_count, covers true
+ *                   decode and the tiny-batch case identically), sum6
+ *                   direct-to-out down (grid.y = n_tokens, no moe_sum
+ *                   pass: moe_launch.cuh:1706-1707's comment, "the direct
+ *                   decode kernel writes the final token row").
+ *   n_tokens >= 5:  sorted-pairs tile8 gate/up and down into scratch,
+ *                   then moe_sum combine, identical structure to q4k's
+ *                   n_tokens >= 32 regime. */
+static int sycl_routed_moe_mxfp4_dispatch(
+        sycl::queue &q, ds4_gpu_tensor *out, ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
+        sycl_block_q8_K *xq, sycl_block_q8_K *midq, const char *gate_w, const char *up_w,
+        const char *down_w, const ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t xq_blocks, uint32_t midq_blocks,
+        uint32_t expert_mid_dim, uint32_t out_dim, uint32_t n_total_expert, uint32_t n_expert,
+        uint32_t n_tokens, uint32_t pair_count, float clamp, uint32_t down_row_groups) {
     const int32_t *sel = (const int32_t *)selected->ptr;
     const float *w = (const float *)weights->ptr;
     float *out_ptr = (float *)out->ptr;
@@ -259,6 +285,14 @@ static int sycl_routed_moe_iq2_dispatch(
     if (use_sorted_pairs) {
         if (!sycl_moe_build_sorted_pairs(q, sel, pair_count, n_total_expert, 8u,
                                          &tile_scratch, &sp)) {
+    float *down_ptr = (float *)down->ptr;
+    const bool tiny_batch = n_tokens <= 4u;
+
+    void *tile_scratch = nullptr;
+    sycl_moe_sorted_pairs sp;
+    if (!tiny_batch) {
+        if (!sycl_moe_build_sorted_pairs(q, sel, pair_count, n_total_expert, 8u, &tile_scratch,
+                                         &sp)) {
             return 0;
         }
     }
@@ -274,6 +308,16 @@ static int sycl_routed_moe_iq2_dispatch(
         sycl_moe_iq2_gate_up_mid_decode(q, mid_ptr, gate_w, up_w, xq, sel, w,
                                         gate_expert_bytes, gate_row_bytes, xq_blocks,
                                         expert_mid_dim, n_expert, pair_count, clamp);
+    if (tiny_batch) {
+        sycl_moe_mxfp4_gate_up_mid_decode(q, mid_ptr, gate_w, up_w, xq, sel, w, gate_expert_bytes,
+                                          gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                          pair_count, clamp);
+    } else {
+        sycl_moe_mxfp4_gate_up_mid_tile8(q, mid_ptr, gate_w, up_w, xq, sp.sorted_pairs,
+                                         sp.offsets, sp.counts, sp.tile_total, sp.tile_experts,
+                                         sp.tile_starts, w, gate_expert_bytes, gate_row_bytes,
+                                         xq_blocks, expert_mid_dim, n_expert, sp.tile_capacity,
+                                         clamp);
     }
 
     sycl_moe_q8_k_quantize(q, midq, mid_ptr, expert_mid_dim, pair_count);
@@ -357,6 +401,20 @@ static bool sycl_moe_stage_weights(sycl::queue &q, const char *gate_w, const cha
     q.memcpy(*down_dev, down_w, (size_t)down_bytes);
     q.wait_and_throw();
     return true;
+}
+
+    if (tiny_batch) {
+        sycl_moe_mxfp4_down_sum6(q, out_ptr, down_w, midq, sel, down_expert_bytes, down_row_bytes,
+                                 midq_blocks, out_dim, n_expert, n_tokens);
+        return 1;
+    }
+
+    sycl_moe_mxfp4_down_tile8(q, down_ptr, down_w, midq, sp.sorted_pairs, sp.offsets, sp.counts,
+                              sp.tile_total, sp.tile_experts, sp.tile_starts, down_expert_bytes,
+                              down_row_bytes, midq_blocks, out_dim, sp.tile_capacity,
+                              down_row_groups);
+    sycl_moe_sum(q, out_ptr, down_ptr, out_dim, n_expert, n_tokens);
+    return 1;
 }
 
 /* ---- The shared launcher ---------------------------------------------
@@ -516,8 +574,32 @@ static int sycl_routed_moe_launch(
                     clamp);
         }
         if (plan.mxfp4_path) {
-            /* Not yet implemented; no CPU oracle exists for this format at all. */
-            return 0;
+            /* Same host-mmap staging rationale as q4k_path above (spec
+             * 6l): gate_w/up_w/down_w are copied to device memory before
+             * any MXFP4 kernel reads them. */
+            void *gate_dev = sycl::malloc_device((size_t)plan.gate_bytes, q);
+            void *up_dev = sycl::malloc_device((size_t)plan.gate_bytes, q);
+            void *down_dev = sycl::malloc_device((size_t)plan.down_bytes, q);
+            if (!gate_dev || !up_dev || !down_dev) {
+                if (gate_dev) sycl::free(gate_dev, q);
+                if (up_dev) sycl::free(up_dev, q);
+                if (down_dev) sycl::free(down_dev, q);
+                return 0;
+            }
+            sycl_device_scratch_guard gate_guard(q, gate_dev);
+            sycl_device_scratch_guard up_guard(q, up_dev);
+            sycl_device_scratch_guard down_guard(q, down_dev);
+            q.memcpy(gate_dev, gate_w, (size_t)plan.gate_bytes);
+            q.memcpy(up_dev, up_w, (size_t)plan.gate_bytes);
+            q.memcpy(down_dev, down_w, (size_t)plan.down_bytes);
+            q.wait_and_throw();
+
+            return sycl_routed_moe_mxfp4_dispatch(
+                    q, out, mid, down, xq, midq, (const char *)gate_dev, (const char *)up_dev,
+                    (const char *)down_dev, weights, selected, gate_expert_bytes, gate_row_bytes,
+                    down_expert_bytes, down_row_bytes, xq_blocks, midq_blocks, expert_mid_dim,
+                    out_dim, n_total_expert, n_expert, n_tokens, pair_count, clamp,
+                    /*down_row_groups=*/1u);
         }
         return 0; /* unreachable: build_plan already required exactly one path. */
     } catch (const sycl::exception &e) {
