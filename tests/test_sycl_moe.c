@@ -83,6 +83,7 @@ extern int ds4_sycl_moe_test_mxfp4_down_sum6(
         const void *down_model, uint64_t down_expert_bytes, uint64_t down_row_bytes,
         uint32_t n_total_expert, const float *mid, uint32_t mid_dim, uint32_t n_tokens,
         const int32_t *selected, uint32_t n_expert, uint32_t out_dim, float *out);
+
 /* Mirror of ds4_sycl_moe_test_q2k_down_direct above, for iq2_iq2_path's
  * down projection (sycl_moe_iq2_down_direct, down_type == 16). */
 extern int ds4_sycl_moe_test_iq2_down_direct(

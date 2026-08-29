@@ -2245,21 +2245,6 @@ extern "C" int ds4_sycl_moe_test_mxfp4_down_sum6(
         const int32_t *selected, uint32_t n_expert, uint32_t out_dim, float *out) {
     if (g_devices.empty() || !down_model || !mid || !selected || !out || mid_dim == 0u ||
         mid_dim % kMoeQK != 0u || out_dim == 0u || n_tokens == 0u || n_expert == 0u ||
-/* Mirror of ds4_sycl_moe_test_q2k_down_direct above, for iq2_iq2_path's
- * down projection (down_type == 16, sycl_moe_iq2_down_direct): the same
- * "n_expert >= 2 in every ABI test cannot discriminate slot order"
- * argument applies identically here, since sycl_moe_iq2_down_direct has
- * the same `for slot in 0..n_expert: total += acc` accumulation shape.
- * down_bytes holds n_total_expert rows of down_expert_bytes of
- * sycl_block_iq2_xxs data (not Q2_K); everything else matches the Q2_K
- * hook's addressing exactly. */
-extern "C" int ds4_sycl_moe_test_iq2_down_direct(
-        const uint8_t *down_bytes, const uint8_t *midq_bytes, const int32_t *selected,
-        uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t midq_blocks,
-        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t n_total_expert,
-        float *out) {
-    if (g_devices.empty() || !down_bytes || !midq_bytes || !selected || !out ||
-        out_dim == 0u || n_expert == 0u || n_tokens == 0u || midq_blocks == 0u ||
         n_total_expert == 0u) {
         return 0;
     }
@@ -2305,6 +2290,30 @@ extern "C" int ds4_sycl_moe_test_iq2_down_direct(
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_mxfp4_down_sum6 failed: %s\n", e.what());
+        return 0;
+    }
+}
+
+/* Mirror of ds4_sycl_moe_test_q2k_down_direct above, for iq2_iq2_path's
+ * down projection (down_type == 16, sycl_moe_iq2_down_direct): the same
+ * "n_expert >= 2 in every ABI test cannot discriminate slot order"
+ * argument applies identically here, since sycl_moe_iq2_down_direct has
+ * the same `for slot in 0..n_expert: total += acc` accumulation shape.
+ * down_bytes holds n_total_expert rows of down_expert_bytes of
+ * sycl_block_iq2_xxs data (not Q2_K); everything else matches the Q2_K
+ * hook's addressing exactly. */
+extern "C" int ds4_sycl_moe_test_iq2_down_direct(
+        const uint8_t *down_bytes, const uint8_t *midq_bytes, const int32_t *selected,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t midq_blocks,
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t n_total_expert,
+        float *out) {
+    if (g_devices.empty() || !down_bytes || !midq_bytes || !selected || !out ||
+        out_dim == 0u || n_expert == 0u || n_tokens == 0u || midq_blocks == 0u ||
+        n_total_expert == 0u) {
+        return 0;
+    }
+    try {
+        sycl::queue &q = ds4_sycl_current_queue();
         const uint64_t down_bytes_total = (uint64_t)n_total_expert * down_expert_bytes;
         const uint64_t midq_count = (uint64_t)n_tokens * n_expert * midq_blocks;
         const uint64_t midq_bytes_total = midq_count * sizeof(sycl_block_q8_K);
