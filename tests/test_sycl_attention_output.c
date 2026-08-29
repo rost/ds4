@@ -373,6 +373,70 @@ static int test_attention_output_low_q8(void) {
     return 0;
 }
 
+/* Contention-scale regression test for the A-stage's own internal ordering:
+ * sycl_attention_output_a_stage (ds4_sycl_attention_output.hpp) submits the
+ * quantise kernel and the grouped preq dot-product kernel back to back on
+ * the same out-of-order queue, over raw USM with no automatic dependency
+ * tracking (design-spec queue-ordering note). The preq kernel reads
+ * xq/xscale, which the quantise kernel writes; a wait between the two
+ * submissions is what makes that safe. This test's shapes are picked large
+ * enough (GROUP_DIM=4096, N_GROUPS=64, RANK=16) to give both kernels many
+ * work-groups in flight, per design-spec section 6j: a launch too small to
+ * create contention will not expose a missing-ordering race even when one
+ * exists. Repeated REPS times per process run, since a race need not
+ * reproduce on every call. */
+static int test_attention_output_a_stage_contention(void) {
+    enum { GROUP_DIM = 4096, RANK = 16, N_GROUPS = 64, REPS = 20 };
+    const uint32_t blocks = (GROUP_DIM + 31u) / 32u;
+    const uint64_t row_bytes = (uint64_t)blocks * 34u;
+    const uint32_t low_dim = RANK * N_GROUPS;
+
+    unsigned char *w = malloc((size_t)N_GROUPS * RANK * row_bytes);
+    float *heads = malloc((size_t)N_GROUPS * GROUP_DIM * sizeof(float));
+    float *want_low = malloc((size_t)N_GROUPS * RANK * sizeof(float));
+    float *got_low = malloc((size_t)N_GROUPS * RANK * sizeof(float));
+    CHECK(w && heads && want_low && got_low,
+          "attention_output_a_stage_contention: host allocation failed");
+
+    for (uint32_t g = 0; g < N_GROUPS; g++) {
+        for (uint32_t r = 0; r < RANK; r++) {
+            encode_q8_0_row(w + ((size_t)g * RANK + r) * row_bytes, GROUP_DIM, g * 13u + r + 2u);
+        }
+    }
+    for (uint32_t g = 0; g < N_GROUPS; g++) {
+        fill_activation_row(heads + (size_t)g * GROUP_DIM, GROUP_DIM, g + 1u);
+    }
+    oracle_grouped_out_low(want_low, heads, w, N_GROUPS, GROUP_DIM, RANK);
+
+    const uint64_t out_a_bytes = (uint64_t)N_GROUPS * RANK * row_bytes;
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((size_t)N_GROUPS * GROUP_DIM * sizeof(float));
+    ds4_gpu_tensor *tlow = ds4_gpu_tensor_alloc((size_t)low_dim * sizeof(float));
+    CHECK(theads && tlow, "attention_output_a_stage_contention: device allocation failed");
+    CHECK(ds4_gpu_tensor_write(theads, 0, heads, (size_t)N_GROUPS * GROUP_DIM * sizeof(float)) != 0,
+          "attention_output_a_stage_contention: write heads");
+
+    for (int rep = 0; rep < REPS; rep++) {
+        CHECK(ds4_gpu_attention_output_low_q8_tensor(tlow, w, out_a_bytes, 0, GROUP_DIM, RANK,
+                                                     N_GROUPS, theads) != 0,
+              "attention_output_a_stage_contention: call");
+        CHECK(ds4_gpu_tensor_read(tlow, 0, got_low, (size_t)low_dim * sizeof(float)) != 0,
+              "attention_output_a_stage_contention: read low");
+        for (uint32_t i = 0; i < low_dim; i++) {
+            CHECK_CLOSE(got_low[i], want_low[i], 1e-2 + 1e-2 * fabsf(want_low[i]),
+                        "attention_output_a_stage_contention: low mismatch");
+        }
+    }
+
+    ds4_gpu_tensor_free(theads);
+    ds4_gpu_tensor_free(tlow);
+    free(w);
+    free(heads);
+    free(want_low);
+    free(got_low);
+    fprintf(stderr, "  test_attention_output_a_stage_contention OK\n");
+    return 0;
+}
+
 /* ---- The batch entries, F32 and F16 ---- */
 
 extern uint16_t ds4_sycl_test_hip_round_f16_bits(float f);
@@ -623,6 +687,7 @@ int main(void) {
     if (test_quantize_q8_0_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_grouped_q8_0_a_preq() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_low_q8() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_attention_output_a_stage_contention() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_q8_batch() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_q8_batch_f16() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();

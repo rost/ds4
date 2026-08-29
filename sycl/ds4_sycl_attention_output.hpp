@@ -278,6 +278,15 @@ static int sycl_attention_output_a_stage(sycl::queue &q, float *low_ptr,
 
     sycl_quantize_q8_0_rows_launch(q, xq, xscale, heads_ptr, group_dim,
                                    (uint32_t)blocks_a, x_rows);
+    /* The preq kernel below reads xq/xscale, which the quantize kernel just
+     * wrote. Both are separate q.submit() calls to the same out-of-order
+     * queue over raw USM (no buffer/accessor dependency tracking), so
+     * nothing guarantees the preq kernel does not start, or even run
+     * concurrently, before the quantize kernel's writes land. This wait
+     * establishes that ordering explicitly; the wait_and_throw() below,
+     * after the preq launch, only orders this function's return against the
+     * caller, not the two kernels against each other. */
+    q.wait_and_throw();
     sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim,
                                     rank, n_groups, blocks_a, low_dim, n_tokens);
     q.wait_and_throw();
