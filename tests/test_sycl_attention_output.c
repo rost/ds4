@@ -268,10 +268,84 @@ static int test_grouped_q8_0_a_preq(void) {
     return 0;
 }
 
+/* ---- The low-rank entry ---- */
+
+static int test_attention_output_low_q8(void) {
+    enum { GROUP_DIM = 37, RANK = 5, N_GROUPS = 3 };
+    const uint32_t blocks = (GROUP_DIM + 31u) / 32u;
+    const uint64_t row_bytes = (uint64_t)blocks * 34u;
+    const uint32_t low_dim = RANK * N_GROUPS;
+
+    unsigned char w[N_GROUPS * RANK * 2 * 34];
+    float heads[N_GROUPS * GROUP_DIM];
+    float want_low[N_GROUPS * RANK];
+    float got_low[N_GROUPS * RANK];
+
+    for (uint32_t g = 0; g < N_GROUPS; g++) {
+        for (uint32_t r = 0; r < RANK; r++) {
+            encode_q8_0_row(w + ((size_t)g * RANK + r) * row_bytes, GROUP_DIM, g * 13u + r + 2u);
+        }
+    }
+    for (uint32_t g = 0; g < N_GROUPS; g++) {
+        fill_activation_row(heads + (size_t)g * GROUP_DIM, GROUP_DIM, g + 1u);
+    }
+    oracle_grouped_out_low(want_low, heads, w, N_GROUPS, GROUP_DIM, RANK);
+
+    const uint64_t out_a_bytes = sizeof(w);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(sizeof(heads));
+    ds4_gpu_tensor *tlow = ds4_gpu_tensor_alloc(sizeof(got_low));
+    CHECK(theads && tlow, "attention_output_low_q8: allocation failed");
+    CHECK(ds4_gpu_tensor_write(theads, 0, heads, sizeof(heads)) != 0,
+          "attention_output_low_q8: write heads");
+
+    CHECK(ds4_gpu_attention_output_low_q8_tensor(tlow, w, out_a_bytes, 0, GROUP_DIM, RANK,
+                                                 N_GROUPS, theads) != 0,
+          "attention_output_low_q8: call");
+    CHECK(ds4_gpu_tensor_read(tlow, 0, got_low, sizeof(got_low)) != 0,
+          "attention_output_low_q8: read low");
+    for (uint32_t i = 0; i < low_dim; i++) {
+        CHECK_CLOSE(got_low[i], want_low[i], 1e-2, "attention_output_low_q8: low mismatch");
+    }
+
+    /* Swap the A matrix's two dimensions: pass group_dim/rank transposed.
+     * The weight buffer is far too small for the transposed shape's byte
+     * requirement, so this must be rejected outright. The remaining
+     * ablations called for (dropping the Q8_0 scale, using the
+     * wrong group for a head) are exercised by mutating the actual kernel
+     * source and confirming the oracle comparison above fails, per this
+     * project's ablation discipline (design-spec sections 6b/6j/6n): the
+     * test data above already gives every group and row a numerically
+     * distinct oracle value, so either mutation is guaranteed to produce a
+     * visibly wrong result rather than a coincidentally matching one. */
+    CHECK(ds4_gpu_attention_output_low_q8_tensor(tlow, w, out_a_bytes, 0, RANK, GROUP_DIM,
+                                                 N_GROUPS, theads) == 0,
+          "attention_output_low_q8: swapped A dimensions must be rejected");
+
+    /* Standard validation-failure checks. */
+    CHECK(ds4_gpu_attention_output_low_q8_tensor(tlow, w, out_a_bytes, 0, 0, RANK, N_GROUPS,
+                                                 theads) == 0,
+          "attention_output_low_q8: zero group_dim must be rejected");
+    CHECK(ds4_gpu_attention_output_low_q8_tensor(tlow, w, out_a_bytes, 0, GROUP_DIM, 0, N_GROUPS,
+                                                 theads) == 0,
+          "attention_output_low_q8: zero rank must be rejected");
+    CHECK(ds4_gpu_attention_output_low_q8_tensor(tlow, w, out_a_bytes, 0, GROUP_DIM, RANK, 0,
+                                                 theads) == 0,
+          "attention_output_low_q8: zero n_groups must be rejected");
+    CHECK(ds4_gpu_attention_output_low_q8_tensor(tlow, w, out_a_bytes, out_a_bytes, GROUP_DIM,
+                                                 RANK, N_GROUPS, theads) == 0,
+          "attention_output_low_q8: out-of-range out_a_offset must be rejected");
+
+    ds4_gpu_tensor_free(theads);
+    ds4_gpu_tensor_free(tlow);
+    fprintf(stderr, "  test_attention_output_low_q8 OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_quantize_q8_0_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_grouped_q8_0_a_preq() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_attention_output_low_q8() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_attention_output OK\n");
     return 0;

@@ -252,6 +252,38 @@ static void sycl_grouped_q8_0_a_preq_launch(sycl::queue &q, float *low,
     });
 }
 
+/* Shared A-stage: quantises `heads` (n_tokens * n_groups independent
+ * group_dim-wide rows) to Q8_0 into fresh device scratch, then runs the
+ * grouped preq dot product into `low_ptr` (already device memory, either
+ * caller-provided or scratch -- see the two ABI entries' own comments for
+ * which). `w_ptr` must already be staged device memory for the out_a
+ * weight range (spec 6l); staging happens once at each entry's own call
+ * site so the entry's own error path can report the right context on
+ * failure. Returns 0 (nothing launched) on scratch allocation failure,
+ * matching this file's other internal helpers' own return convention
+ * rather than throwing, so callers can check-and-return 0 like every other
+ * allocation in this file instead of adding a new exception path. */
+static int sycl_attention_output_a_stage(sycl::queue &q, float *low_ptr,
+                                         const unsigned char *w_ptr,
+                                         const float *heads_ptr,
+                                         uint32_t group_dim, uint64_t rank,
+                                         uint32_t n_groups, uint64_t blocks_a,
+                                         uint64_t low_dim, uint64_t n_tokens) {
+    const uint64_t x_rows = n_tokens * (uint64_t)n_groups;
+    int8_t *xq = sycl::malloc_device<int8_t>((size_t)(x_rows * blocks_a * 32u), q);
+    sycl_device_scratch_guard xq_guard(q, xq);
+    float *xscale = sycl::malloc_device<float>((size_t)(x_rows * blocks_a), q);
+    sycl_device_scratch_guard xscale_guard(q, xscale);
+    if (!xq || !xscale) return 0;
+
+    sycl_quantize_q8_0_rows_launch(q, xq, xscale, heads_ptr, group_dim,
+                                   (uint32_t)blocks_a, x_rows);
+    sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim,
+                                    rank, n_groups, blocks_a, low_dim, n_tokens);
+    q.wait_and_throw();
+    return 1;
+}
+
 }  // namespace
 
 /* Test-only hooks, exercising the kernel family directly through the
@@ -314,6 +346,66 @@ extern "C" int ds4_sycl_test_grouped_q8_0_a_preq(ds4_gpu_tensor *low,
         q.wait_and_throw();
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "test_grouped_q8_0_a_preq failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* The low-rank stage alone, matching ds4.c:10482-10498's first line
+ * (matvec_q8_0_grouped_rows) exactly: no n_tokens parameter, one head
+ * vector per group. Ported from
+ * ds4_gpu_attention_output_low_q8_tensor, rocm/ds4_rocm_attention_launch.cuh
+ * :1377-1499.
+ *
+ * Return polarity: verified against both the ROCm launcher (plain `return 0`
+ * on every rejection, `cuda_ok(...)` -- nonzero on success -- on every
+ * live path) and the two ds4.c call sites (ds4.c:23463 and :25866 both
+ * read the result through `ok = ... != 0` / `return ...`), confirming
+ * NONZERO-success, the majority convention (spec 3a). Zero-sized
+ * dimensions are a rejection here (return 0), not a zero-work success:
+ * ROCm's own guard is `group_dim == 0 || rank == 0 || n_groups == 0`,
+ * unconditional, no early "size zero, nothing to do" success branch. */
+extern "C" int ds4_gpu_attention_output_low_q8_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        const ds4_gpu_tensor *heads) {
+    if (!low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        n_groups == 0u || group_dim > UINT32_MAX || rank > UINT32_MAX) {
+        return 0;
+    }
+
+    uint64_t low_dim = 0, out_a_bytes = 0;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    if (!sycl_u64_mul_checked(n_groups, rank, &low_dim) ||
+        !sycl_u64_mul3_checked((uint64_t)n_groups * rank, blocks_a, 34u, &out_a_bytes) ||
+        !sycl_model_range_fits(model_size, out_a_offset, out_a_bytes) ||
+        !sycl_tensor_has_elems2(heads, n_groups, group_dim, sizeof(float)) ||
+        !sycl_tensor_has_f32(low, low_dim)) {
+        return 0;
+    }
+    const char *out_a_ptr = sycl_model_range_ptr(model_map, out_a_offset, out_a_bytes,
+                                                 model_size, "attn_out_a");
+    if (!out_a_ptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(low->device_id);
+        sycl_device_scratch_guard w_guard = sycl_stage_host_bytes(q, out_a_ptr, out_a_bytes);
+        if (!w_guard.p) return 0;
+
+        if (!sycl_attention_output_a_stage(q, (float *)low->ptr,
+                                          (const unsigned char *)w_guard.p,
+                                          (const float *)heads->ptr, (uint32_t)group_dim,
+                                          rank, n_groups, blocks_a, low_dim, 1u)) {
+            return 0;
+        }
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_low_q8 failed: %s\n", e.what());
         return 0;
     }
     return 1;
