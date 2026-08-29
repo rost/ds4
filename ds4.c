@@ -58018,6 +58018,223 @@ int ds4_test_graph_full_layer_encode(int token, float *out_hc, uint64_t out_hc_f
     g_ds4_shape = saved_shape;
     return ok ? 1 : 0;
 }
+
+/* Per-layer ds4_tensor storage for ds4_test_graph_full_token_encode: one
+ * real ds4_tensor per ds4_tw_tensor field of one ds4_tw_layer, so
+ * ds4_layer_weights can point at real tensors rather than at the
+ * ds4_tw_tensor descriptors themselves (ds4_layer_weights.* are
+ * ds4_tensor*, not ds4_tw_tensor*). */
+typedef struct {
+    ds4_tensor hc_attn_fn, hc_attn_scale, hc_attn_base, attn_norm, attn_q_a,
+               attn_q_a_norm, attn_q_b, attn_kv, attn_kv_a_norm, attn_sinks,
+               attn_output_a, attn_output_b, hc_ffn_fn, hc_ffn_scale,
+               hc_ffn_base, ffn_norm, ffn_gate_inp, ffn_gate_exps,
+               ffn_up_exps, ffn_down_exps, ffn_gate_shexp, ffn_up_shexp,
+               ffn_down_shexp, ffn_gate_tid2eid;
+} ds4_test_tw_layer_storage;
+
+/* Fills every ds4_layer_weights field but ffn_gate_tid2eid from twl into
+ * st's matching ds4_tensor and points l at it.  ffn_gate_tid2eid is only
+ * copied and bound when has_tid2eid is set; otherwise l->ffn_gate_tid2eid
+ * is left NULL, exactly the choice weights_bind_layer (ds4.c:5948) makes
+ * for a real model's top-k layers. */
+static void ds4_test_tw_layer_to_weights(
+        ds4_layer_weights        *l,
+        ds4_test_tw_layer_storage *st,
+        const ds4_tw_layer       *twl,
+        bool                       has_tid2eid) {
+    ds4_test_tw_to_tensor(&st->hc_attn_fn, &twl->hc_attn_fn);
+    ds4_test_tw_to_tensor(&st->hc_attn_scale, &twl->hc_attn_scale);
+    ds4_test_tw_to_tensor(&st->hc_attn_base, &twl->hc_attn_base);
+    ds4_test_tw_to_tensor(&st->attn_norm, &twl->attn_norm);
+    ds4_test_tw_to_tensor(&st->attn_q_a, &twl->attn_q_a);
+    ds4_test_tw_to_tensor(&st->attn_q_a_norm, &twl->attn_q_a_norm);
+    ds4_test_tw_to_tensor(&st->attn_q_b, &twl->attn_q_b);
+    ds4_test_tw_to_tensor(&st->attn_kv, &twl->attn_kv);
+    ds4_test_tw_to_tensor(&st->attn_kv_a_norm, &twl->attn_kv_a_norm);
+    ds4_test_tw_to_tensor(&st->attn_sinks, &twl->attn_sinks);
+    ds4_test_tw_to_tensor(&st->attn_output_a, &twl->attn_output_a);
+    ds4_test_tw_to_tensor(&st->attn_output_b, &twl->attn_output_b);
+    ds4_test_tw_to_tensor(&st->hc_ffn_fn, &twl->hc_ffn_fn);
+    ds4_test_tw_to_tensor(&st->hc_ffn_scale, &twl->hc_ffn_scale);
+    ds4_test_tw_to_tensor(&st->hc_ffn_base, &twl->hc_ffn_base);
+    ds4_test_tw_to_tensor(&st->ffn_norm, &twl->ffn_norm);
+    ds4_test_tw_to_tensor(&st->ffn_gate_inp, &twl->ffn_gate_inp);
+    ds4_test_tw_to_tensor(&st->ffn_gate_exps, &twl->ffn_gate_exps);
+    ds4_test_tw_to_tensor(&st->ffn_up_exps, &twl->ffn_up_exps);
+    ds4_test_tw_to_tensor(&st->ffn_down_exps, &twl->ffn_down_exps);
+    ds4_test_tw_to_tensor(&st->ffn_gate_shexp, &twl->ffn_gate_shexp);
+    ds4_test_tw_to_tensor(&st->ffn_up_shexp, &twl->ffn_up_shexp);
+    ds4_test_tw_to_tensor(&st->ffn_down_shexp, &twl->ffn_down_shexp);
+
+    l->hc_attn_fn     = &st->hc_attn_fn;
+    l->hc_attn_scale  = &st->hc_attn_scale;
+    l->hc_attn_base   = &st->hc_attn_base;
+    l->attn_norm      = &st->attn_norm;
+    l->attn_q_a       = &st->attn_q_a;
+    l->attn_q_a_norm  = &st->attn_q_a_norm;
+    l->attn_q_b       = &st->attn_q_b;
+    l->attn_kv        = &st->attn_kv;
+    l->attn_kv_a_norm = &st->attn_kv_a_norm;
+    l->attn_sinks     = &st->attn_sinks;
+    l->attn_output_a  = &st->attn_output_a;
+    l->attn_output_b  = &st->attn_output_b;
+    l->hc_ffn_fn      = &st->hc_ffn_fn;
+    l->hc_ffn_scale   = &st->hc_ffn_scale;
+    l->hc_ffn_base    = &st->hc_ffn_base;
+    l->ffn_norm       = &st->ffn_norm;
+    l->ffn_gate_inp   = &st->ffn_gate_inp;
+    l->ffn_gate_exps  = &st->ffn_gate_exps;
+    l->ffn_up_exps    = &st->ffn_up_exps;
+    l->ffn_down_exps  = &st->ffn_down_exps;
+    l->ffn_gate_shexp = &st->ffn_gate_shexp;
+    l->ffn_up_shexp   = &st->ffn_up_shexp;
+    l->ffn_down_shexp = &st->ffn_down_shexp;
+
+    if (has_tid2eid) {
+        ds4_test_tw_to_tensor(&st->ffn_gate_tid2eid, &twl->ffn_gate_tid2eid);
+        l->ffn_gate_tid2eid = &st->ffn_gate_tid2eid;
+    } else {
+        l->ffn_gate_tid2eid = NULL;
+    }
+}
+
+/* One level deeper still than ds4_test_graph_full_layer_encode: that hook
+ * drives one layer directly with metal_graph_encode_decode_layer; this one
+ * drives metal_graph_eval_token_raw_swa (ds4.c:30748), the exact function
+ * every real decode token calls, over DS4_TW_N_LAYER layers plus the
+ * output head (metal_graph_encode_output_head, ds4.c:25147), then reads
+ * DS4_N_VOCAB logits back -- on a synthetic multi-layer DeepSeek V4 Flash
+ * shape built by tests/test_sycl_layer_weights.h, with no model file.
+ *
+ * A single layer, as ds4_test_graph_full_layer_encode drives, can exercise
+ * neither the layer-to-layer hyper-connection carry (real state threaded
+ * between iterations of the per-token layer loop) nor the hash-routing
+ * path (ds4.c:4910, ds4.c:5948: layers below n_hash_layer route by a
+ * ffn_gate_tid2eid lookup table instead of top-k).  This hook sets
+ * n_hash_layer = DS4_TW_N_HASH_LAYER = 3, matching Flash's own
+ * n_hash_layer (ds4.c:566), so layers 0-2 route by hash and layer 3 routes
+ * by top-k, and nothing on this backend has exercised either of those two
+ * gaps before this hook.
+ *
+ * Returns 1 on success with *out_logits filled (DS4_N_VOCAB floats for
+ * this shape), 0 on any failure: a mismatched out_logits_floats,
+ * synthetic-weight allocation failure, graph allocation failure, the
+ * encode itself failing, or the final readback failing.  A mismatched
+ * out_logits_floats returns 0 without writing out_logits, so a caller
+ * cannot mistake a size mismatch for a zeroed-but-successful read. */
+int ds4_test_graph_full_token_encode(int token, float *out_logits, uint64_t out_logits_floats) {
+    const ds4_shape saved_shape = g_ds4_shape;
+
+    g_ds4_shape = (ds4_shape){
+        .name = "test-flash-token",
+        .family = DS4_MODEL_FAMILY_DEEPSEEK4,
+        .variant = DS4_VARIANT_FLASH,
+        .n_layer = DS4_TW_N_LAYER,
+        .n_embd = DS4_TW_N_EMBD,
+        .n_vocab = DS4_TW_N_VOCAB,
+        .n_head = DS4_TW_N_HEAD,
+        .n_head_kv = DS4_TW_N_HEAD_KV,
+        .n_head_dim = DS4_TW_N_HEAD_DIM,
+        .n_value_dim = DS4_TW_N_VALUE_DIM,
+        .n_rot = DS4_TW_N_ROT,
+        .n_out_group = DS4_TW_N_OUT_GROUP,
+        .n_lora_q = DS4_TW_N_LORA_Q,
+        .n_lora_o = DS4_TW_N_LORA_O,
+        .n_expert = DS4_TW_N_EXPERT,
+        .n_expert_used = DS4_TW_N_EXPERT_USED,
+        .n_expert_shared = DS4_TW_N_EXPERT_SHARED,
+        .n_ff_exp = DS4_TW_N_FF_EXP,
+        .n_ff_dense = 32,
+        .n_hash_layer = DS4_TW_N_HASH_LAYER,
+        .n_swa = DS4_TW_N_SWA,
+        .n_indexer_head = 2,
+        .n_indexer_head_dim = 8,
+        .n_indexer_top_k = 4,
+        .n_hc = DS4_TW_N_HC,
+        .n_hc_sinkhorn_iter = DS4_TW_N_HC_SINKHORN_ITER,
+        .rms_eps = DS4_DEFAULT_RMS_EPS,
+        .hc_eps = DS4_DEFAULT_HC_EPS,
+        .expert_weight_scale = 1.0f,
+        .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+        .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+        .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+        .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+        .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+        .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+        .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+    };
+    /* Compress ratio 0 for every layer: the attention compressor and
+     * indexer are out of scope (see tests/test_sycl_layer_weights.h's
+     * header comment), matching the synthetic weights this hook builds
+     * below. */
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    if (out_logits_floats != DS4_TW_N_VOCAB) {
+        g_ds4_shape = saved_shape;
+        return 0;
+    }
+
+    ds4_tw_flash_weights tw;
+    if (!ds4_test_build_flash_layer_weights(&tw)) {
+        g_ds4_shape = saved_shape;
+        return 0;
+    }
+
+    ds4_model model;
+    memset(&model, 0, sizeof(model));
+    model.map  = tw.buf;
+    model.size = tw.buf_size;
+
+    ds4_tensor token_embd_t, output_hc_base_t, output_hc_fn_t,
+               output_hc_scale_t, output_norm_t, output_t;
+    ds4_test_tw_to_tensor(&token_embd_t, &tw.token_embd);
+    ds4_test_tw_to_tensor(&output_hc_base_t, &tw.output_hc_base);
+    ds4_test_tw_to_tensor(&output_hc_fn_t, &tw.output_hc_fn);
+    ds4_test_tw_to_tensor(&output_hc_scale_t, &tw.output_hc_scale);
+    ds4_test_tw_to_tensor(&output_norm_t, &tw.output_norm);
+    ds4_test_tw_to_tensor(&output_t, &tw.output);
+
+    ds4_weights weights;
+    memset(&weights, 0, sizeof(weights));
+    weights.token_embd      = &token_embd_t;
+    weights.output_hc_base  = &output_hc_base_t;
+    weights.output_hc_fn    = &output_hc_fn_t;
+    weights.output_hc_scale = &output_hc_scale_t;
+    weights.output_norm     = &output_norm_t;
+    weights.output          = &output_t;
+
+    ds4_test_tw_layer_storage layer_storage[DS4_TW_N_LAYER];
+    for (uint32_t il = 0; il < DS4_TW_N_LAYER; il++) {
+        ds4_test_tw_layer_to_weights(&weights.layer[il], &layer_storage[il],
+                                     &tw.layer[il], il < DS4_TW_N_HASH_LAYER);
+    }
+
+    ds4_gpu_graph g;
+    memset(&g, 0, sizeof(g));
+    bool ok = metal_graph_alloc_raw_cap(&g, &weights, &weights.layer[0],
+                                        /*raw_cap=*/8, /*ctx_size=*/8,
+                                        /*prefill_cap=*/2,
+                                        /*enable_mtp=*/false,
+                                        /*placement=*/NULL,
+                                        /*cuda_tensor_parallel=*/false,
+                                        /*shared_prefill_workspace=*/NULL);
+
+    /* The exact function every real decode token calls
+     * (metal_graph_eval_token_raw_swa, ds4.c:30748): begin_commands, embed
+     * the token, encode every layer with the hyper-connection carry
+     * threaded between them (ds4.c:27552-27568's per-layer loop), encode
+     * the output head, end_commands, then read DS4_N_VOCAB logits back. */
+    if (ok) {
+        ok = metal_graph_eval_token_raw_swa(&g, &model, &weights,
+                                            token, /*pos=*/0, out_logits);
+    }
+
+    metal_graph_free(&g);
+    ds4_test_free_flash_layer_weights(&tw);
+    g_ds4_shape = saved_shape;
+    return ok ? 1 : 0;
+}
 #endif /* DS4_TEST_HOOKS */
 
 static int engine_install_dspark_support_cache(ds4_engine *e);
