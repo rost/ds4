@@ -139,6 +139,17 @@ struct sycl_device_scratch_guard {
     sycl::queue &q;
     void        *p;
     sycl_device_scratch_guard(sycl::queue &queue, void *ptr) : q(queue), p(ptr) {}
+    /* Transfers ownership rather than copying it, nulling the source so
+     * only one side ever frees.  Needed so sycl_stage_host_bytes below can
+     * return a guard by value: the guard must already own the allocation
+     * before the staging memcpy runs, so the factory cannot build it from
+     * a prvalue at the return statement, and returning a named local
+     * requires an accessible move constructor even where the compiler
+     * elides the move at runtime. */
+    sycl_device_scratch_guard(sycl_device_scratch_guard &&other) noexcept
+            : q(other.q), p(other.p) {
+        other.p = nullptr;
+    }
     ~sycl_device_scratch_guard() {
         /* Destructors are implicitly noexcept: if sycl::free throws while
          * we are already unwinding from another exception (e.g. the
@@ -157,5 +168,27 @@ struct sycl_device_scratch_guard {
     sycl_device_scratch_guard(const sycl_device_scratch_guard &) = delete;
     sycl_device_scratch_guard &operator=(const sycl_device_scratch_guard &) = delete;
 };
+
+/* Stages `bytes` bytes of host memory at `host_ptr` (typically a range
+ * inside the read-only model mmap) into fresh device scratch on `q`,
+ * waiting for the copy to finish before returning a guard that owns the
+ * allocation.  On allocation failure the returned guard wraps a null
+ * pointer; callers must check `.p` before using it.  Callers must keep
+ * the returned guard alive for as long as its pointer is used by kernels
+ * dispatched on `q`.
+ *
+ * This is the single-buffer host-to-device staging shape used wherever a
+ * kernel needs bytes that live in the host mmap.  Per design-spec section
+ * 6l, a SYCL kernel cannot dereference that mmap pointer directly: it
+ * silently reads zeros and reports success rather than faulting, so this
+ * staging is load-bearing correctness code, not an optimisation. */
+static inline sycl_device_scratch_guard sycl_stage_host_bytes(
+        sycl::queue &q, const void *host_ptr, uint64_t bytes) {
+    unsigned char *dptr = sycl::malloc_device<unsigned char>((size_t)bytes, q);
+    if (!dptr) return sycl_device_scratch_guard(q, nullptr);
+    sycl_device_scratch_guard guard(q, dptr);
+    q.memcpy(dptr, host_ptr, (size_t)bytes).wait_and_throw();
+    return guard;
+}
 
 }  // namespace

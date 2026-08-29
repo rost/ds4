@@ -49,11 +49,10 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(
         /* The weight table lives in the host mmap.  Copy only the one row
          * this token needs to the device rather than the whole table. */
         const uint64_t row_bytes = (uint64_t)n_embd * sizeof(uint16_t);
-        uint16_t *drow = sycl::malloc_device<uint16_t>(n_embd, q);
-        if (!drow) return 0;
-        sycl_device_scratch_guard drow_guard(q, drow);
-        q.memcpy(drow, wptr + (uint64_t)token * row_bytes,
-                 (size_t)row_bytes).wait_and_throw();
+        sycl_device_scratch_guard drow_guard = sycl_stage_host_bytes(
+                q, wptr + (uint64_t)token * row_bytes, row_bytes);
+        if (!drow_guard.p) return 0;
+        uint16_t *drow = (uint16_t *)drow_guard.p;
 
         float         *o = (float *)out_hc->ptr;
         const uint32_t e_stride = n_embd;
@@ -108,12 +107,10 @@ static int ds4_sycl_embed_token_hc_q8_0(ds4_gpu_tensor *out_hc,
 
     try {
         sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
-        unsigned char *drow = sycl::malloc_device<unsigned char>(
-                (size_t)row_bytes, q);
-        if (!drow) return 0;
-        sycl_device_scratch_guard drow_guard(q, drow);
-        q.memcpy(drow, wptr + (uint64_t)token * row_bytes,
-                 (size_t)row_bytes).wait_and_throw();
+        sycl_device_scratch_guard drow_guard = sycl_stage_host_bytes(
+                q, wptr + (uint64_t)token * row_bytes, row_bytes);
+        if (!drow_guard.p) return 0;
+        unsigned char *drow = (unsigned char *)drow_guard.p;
 
         float         *o = (float *)out_hc->ptr;
         const uint32_t e_stride = n_embd;
@@ -189,11 +186,10 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
     try {
         sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
 
-        uint16_t *dtab = sycl::malloc_device<uint16_t>(
-                (size_t)(weight_bytes / sizeof(uint16_t)), q);
-        if (!dtab) return 0;
-        sycl_device_scratch_guard dtab_guard(q, dtab);
-        q.memcpy(dtab, wptr, (size_t)weight_bytes).wait_and_throw();
+        sycl_device_scratch_guard dtab_guard =
+                sycl_stage_host_bytes(q, wptr, weight_bytes);
+        if (!dtab_guard.p) return 0;
+        uint16_t *dtab = (uint16_t *)dtab_guard.p;
 
         const int32_t  *tok      = (const int32_t *)tokens_t->ptr;
         float          *o        = (float *)out_hc->ptr;
@@ -253,11 +249,10 @@ static int ds4_sycl_embed_tokens_hc_q8_0(ds4_gpu_tensor *out_hc,
     try {
         sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
 
-        unsigned char *dtab = sycl::malloc_device<unsigned char>(
-                (size_t)weight_bytes, q);
-        if (!dtab) return 0;
-        sycl_device_scratch_guard dtab_guard(q, dtab);
-        q.memcpy(dtab, wptr, (size_t)weight_bytes).wait_and_throw();
+        sycl_device_scratch_guard dtab_guard =
+                sycl_stage_host_bytes(q, wptr, weight_bytes);
+        if (!dtab_guard.p) return 0;
+        unsigned char *dtab = (unsigned char *)dtab_guard.p;
 
         const int32_t  *tok      = (const int32_t *)tokens_t->ptr;
         float          *o        = (float *)out_hc->ptr;

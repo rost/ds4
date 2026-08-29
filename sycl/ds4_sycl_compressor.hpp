@@ -171,10 +171,9 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
          * scratch under a guard, as ds4_gpu_rms_norm_weight_rows_tensor
          * (ds4_sycl_norm_rope.hpp) does; never a bare malloc_device/free
          * pair. */
-        unsigned char *dape = sycl::malloc_device<unsigned char>((size_t)ape_bytes, q);
-        if (!dape) return 0;
-        sycl_device_scratch_guard dape_guard(q, dape);
-        q.memcpy(dape, ape, (size_t)ape_bytes).wait_and_throw();
+        sycl_device_scratch_guard dape_guard = sycl_stage_host_bytes(q, ape, ape_bytes);
+        if (!dape_guard.p) return 0;
+        unsigned char *dape = (unsigned char *)dape_guard.p;
 
         const float *pkv = (const float *)kv->ptr;
         const float *psc = (const float *)sc->ptr;
@@ -506,10 +505,9 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
          * under a guard, as every other entry in this file does.  Its
          * lifetime spans both the tail seeding below and the pool gather
          * further down, both of which read it. */
-        unsigned char *dape = sycl::malloc_device<unsigned char>((size_t)ape_bytes, q);
-        if (!dape) return 0;
-        sycl_device_scratch_guard dape_guard(q, dape);
-        q.memcpy(dape, ape, (size_t)ape_bytes).wait_and_throw();
+        sycl_device_scratch_guard dape_guard = sycl_stage_host_bytes(q, ape, ape_bytes);
+        if (!dape_guard.p) return 0;
+        unsigned char *dape = (unsigned char *)dape_guard.p;
 
         float       *skv  = (float *)state_kv->ptr;
         float       *ssc  = (float *)state_score->ptr;
@@ -759,10 +757,9 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
     try {
         sycl::queue &q = ds4_sycl_queue(state_kv->device_id);
 
-        unsigned char *dape = sycl::malloc_device<unsigned char>((size_t)ape_bytes, q);
-        if (!dape) return 0;
-        sycl_device_scratch_guard dape_guard(q, dape);
-        q.memcpy(dape, ape, (size_t)ape_bytes).wait_and_throw();
+        sycl_device_scratch_guard dape_guard = sycl_stage_host_bytes(q, ape, ape_bytes);
+        if (!dape_guard.p) return 0;
+        unsigned char *dape = (unsigned char *)dape_guard.p;
 
         const float *skv  = (const float *)state_kv->ptr;
         const float *ssc  = (const float *)state_score->ptr;
@@ -862,10 +859,9 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
     try {
         sycl::queue &q = ds4_sycl_queue(state_kv->device_id);
 
-        unsigned char *dape = sycl::malloc_device<unsigned char>((size_t)ape_bytes, q);
-        if (!dape) return 0;
-        sycl_device_scratch_guard dape_guard(q, dape);
-        q.memcpy(dape, ape, (size_t)ape_bytes).wait_and_throw();
+        sycl_device_scratch_guard dape_guard = sycl_stage_host_bytes(q, ape, ape_bytes);
+        if (!dape_guard.p) return 0;
+        unsigned char *dape = (unsigned char *)dape_guard.p;
 
         float       *skv = (float *)state_kv->ptr;
         float       *ssc = (float *)state_score->ptr;
@@ -951,10 +947,9 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
     try {
         sycl::queue &q = ds4_sycl_queue(state_kv->device_id);
 
-        unsigned char *dape = sycl::malloc_device<unsigned char>((size_t)ape_bytes, q);
-        if (!dape) return 0;
-        sycl_device_scratch_guard dape_guard(q, dape);
-        q.memcpy(dape, ape, (size_t)ape_bytes).wait_and_throw();
+        sycl_device_scratch_guard dape_guard = sycl_stage_host_bytes(q, ape, ape_bytes);
+        if (!dape_guard.p) return 0;
+        unsigned char *dape = (unsigned char *)dape_guard.p;
 
         float       *skv = (float *)state_kv->ptr;
         float       *ssc = (float *)state_score->ptr;
