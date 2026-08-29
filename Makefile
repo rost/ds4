@@ -67,7 +67,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-output test-sycl-embedding test-sycl-norm_rope test-sycl-compressor test-sycl test-sycl-streaming
+.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-output test-sycl-embedding test-sycl-norm_rope test-sycl-compressor test-sycl test-sycl-streaming test-sycl-matmul
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -446,7 +446,16 @@ tests/test_sycl_compressor: tests/test_sycl_compressor.o ds4_sycl.o ds4_sycl_una
 test-sycl-compressor: tests/test_sycl_compressor
 	./tests/test_sycl_compressor
 
-test-sycl: test-sycl-output test-sycl-embedding test-sycl-norm_rope test-sycl-compressor
+tests/test_sycl_matmul.o: tests/test_sycl_matmul.c ds4_gpu.h ds4_gpu_mgpu.h tests/test_sycl_harness.h
+	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
+
+tests/test_sycl_matmul: tests/test_sycl_matmul.o ds4_sycl.o ds4_sycl_unavailable.o
+	$(ICPX) $(SYCL_CFLAGS) -o $@ $^ $(SYCL_LDLIBS) -lm
+
+test-sycl-matmul: tests/test_sycl_matmul
+	./tests/test_sycl_matmul
+
+test-sycl: test-sycl-output test-sycl-embedding test-sycl-norm_rope test-sycl-compressor test-sycl-matmul
 
 tests/test_sycl_streaming.o: tests/test_sycl_streaming.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
@@ -606,4 +615,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_sycl_smoke tests/test_sycl_output tests/test_sycl_embedding tests/test_sycl_norm_rope tests/test_sycl_compressor tests/test_sycl_streaming tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_sycl_smoke tests/test_sycl_output tests/test_sycl_embedding tests/test_sycl_norm_rope tests/test_sycl_compressor tests/test_sycl_streaming tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_sycl_matmul

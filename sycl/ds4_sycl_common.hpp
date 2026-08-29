@@ -83,6 +83,30 @@ static inline const char *sycl_model_range_ptr(const void *model_map,
     return (const char *)model_map + offset;
 }
 
+/* Q8_0 row layout: blocks of 32 values, 34 bytes per block, a little-endian
+ * F16 scale in bytes 0-1 followed by 32 signed int8 values.  See
+ * rocm/ds4_rocm_common.cuh:19-63.  Not yet used by any entry in this file;
+ * added ahead of the Q8_0 matmul entries that need it so those entries do
+ * not have to touch this file. */
+static inline int sycl_q8_0_row_bytes_checked(uint64_t in_dim, uint64_t *row_bytes) {
+    if (!row_bytes) return 0;
+    const uint64_t blocks = (in_dim + 31u) / 32u;
+    return sycl_u64_mul_checked(blocks, 34u, row_bytes);
+}
+
+/* Dequantises one column of a Q8_0 row.  Device-callable: mirrors the
+ * inline decode already used in sycl/ds4_sycl_embedding.hpp, factored out
+ * so later Q8_0 matmul kernels can call it instead of repeating it. */
+static inline float sycl_q8_0_dequant(const unsigned char *row, uint32_t col) {
+    const uint32_t blk = col / 32u;
+    const uint32_t idx = col % 32u;
+    const unsigned char *bp = row + (size_t)blk * 34u;
+    const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+    const float scale = (float)sycl::bit_cast<sycl::half>(raw);
+    const signed char qv = (signed char)bp[2 + idx];
+    return scale * (float)qv;
+}
+
 namespace {
 
 /* Frees a sycl::malloc_device allocation when it goes out of scope, on
