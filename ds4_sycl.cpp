@@ -83,6 +83,78 @@ std::vector<sycl::device> ds4_sycl_dedup_devices(
     return unique;
 }
 
+/* Every physical GPU on the box, backend-preferred (Level Zero over
+ * OpenCL) and deduplicated.  Shared by ds4_gpu_init (which uses every
+ * enumerated device) and ds4_gpu_init_multi/ds4_gpu_args_probe_auto_cuda
+ * (sycl/ds4_sycl_mgpu.hpp; both index into this same list by physical
+ * position), so the physical index space one entry point validates
+ * against is exactly the index space another one enumerates. */
+std::vector<sycl::device> ds4_sycl_enumerate_gpus() {
+    std::vector<sycl::device> gpus;
+    for (const sycl::platform &p : sycl::platform::get_platforms()) {
+        for (const sycl::device &d : p.get_devices()) {
+            if (d.is_gpu()) gpus.push_back(d);
+        }
+    }
+
+    std::vector<sycl::device> preferred;
+    for (const sycl::device &d : gpus) {
+        if (d.get_backend() == sycl::backend::ext_oneapi_level_zero) {
+            preferred.push_back(d);
+        }
+    }
+    const std::vector<sycl::device> &chosen = preferred.empty() ? gpus : preferred;
+    return ds4_sycl_dedup_devices(chosen);
+}
+
+/* Builds one sycl::queue per device in `wanted`, and appends them (paired
+ * with their device) to *out, in `wanted`'s order.  USM allocations are
+ * bound to a context, not a device (SYCL 2020), and any queue that
+ * dereferences one must be built from that same context; a context in
+ * turn can only span devices of one SYCL platform.  The original
+ * per-device `sycl::queue(d, handler)` construction relied on whatever
+ * default context the implementation happened to attach, which SYCL does
+ * not guarantee is shared across devices -- not something multi-device
+ * USM sharing can be built on.  This builds one explicit sycl::context per
+ * distinct platform present in `wanted` (normally just one: Intel's own
+ * multi-card guidance builds a single context spanning every root device
+ * on the box, which is exactly what happens here when every device shares
+ * a platform), and every device joins the context for its own platform, so
+ * devices that DO share a platform also share USM visibility, while a
+ * device on a different platform still gets a valid queue of its own
+ * rather than being dropped.  Tier order always follows `wanted`'s order,
+ * independent of how devices group into contexts. */
+void ds4_sycl_build_devices(const std::vector<sycl::device> &wanted,
+                             std::vector<ds4_sycl_device> *out) {
+    std::vector<sycl::platform> platforms;
+    std::vector<sycl::context>  contexts;
+    for (const sycl::device &d : wanted) {
+        const sycl::platform p = d.get_platform();
+        bool have_ctx = false;
+        for (const sycl::platform &seen : platforms) {
+            if (seen == p) { have_ctx = true; break; }
+        }
+        if (have_ctx) continue;
+        std::vector<sycl::device> group;
+        for (const sycl::device &d2 : wanted) {
+            if (d2.get_platform() == p) group.push_back(d2);
+        }
+        platforms.push_back(p);
+        contexts.push_back(sycl::context(group));
+    }
+
+    for (const sycl::device &d : wanted) {
+        const sycl::platform p = d.get_platform();
+        for (size_t k = 0; k < platforms.size(); k++) {
+            if (platforms[k] == p) {
+                out->push_back(ds4_sycl_device{
+                    d, sycl::queue(contexts[k], d, ds4_sycl_async_handler)});
+                break;
+            }
+        }
+    }
+}
+
 } /* namespace */
 
 /* Defined in sycl/ds4_sycl_streaming.hpp, included at the end of this
@@ -143,34 +215,14 @@ extern "C" int ds4_gpu_init(void) {
     if (g_initialised) return 1;
 
     try {
-        std::vector<sycl::device> gpus;
-        for (const sycl::platform &p : sycl::platform::get_platforms()) {
-            for (const sycl::device &d : p.get_devices()) {
-                if (d.is_gpu()) gpus.push_back(d);
-            }
-        }
+        std::vector<sycl::device> chosen = ds4_sycl_enumerate_gpus();
 
-        if (gpus.empty()) {
+        if (chosen.empty()) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "no SYCL GPU device found\n");
             return 0;
         }
 
-        /* Prefer the Level Zero backend when a device is exposed by more
-         * than one platform, which is the normal case on Intel: the same
-         * physical GPU appears under both OpenCL and Level Zero. */
-        std::vector<sycl::device> preferred;
-        for (const sycl::device &d : gpus) {
-            if (d.get_backend() == sycl::backend::ext_oneapi_level_zero) {
-                preferred.push_back(d);
-            }
-        }
-        const std::vector<sycl::device> &chosen = preferred.empty() ? gpus
-                                                                    : preferred;
-
-        for (const sycl::device &d : ds4_sycl_dedup_devices(chosen)) {
-            g_devices.push_back(
-                ds4_sycl_device{d, sycl::queue(d, ds4_sycl_async_handler)});
-        }
+        ds4_sycl_build_devices(chosen, &g_devices);
 
         /* Keep g_n_gpus and g_gpu[].device_id in step with what was just
          * enumerated: ds4.c reads these directly (see ds4.c's engine setup
@@ -581,6 +633,12 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
         return 0;
     }
 }
+
+/* Same scoping reason as every include below: entry points here reference
+ * g_devices, g_initialised, g_current_tier, ds4_sycl_queue,
+ * ds4_gpu_cleanup and the enumeration/context helpers defined above, all
+ * of which must already be in scope. */
+#include "sycl/ds4_sycl_mgpu.hpp"
 
 /* Included at the end of this file, not with the includes at the top:
  * kernel entry points in ds4_sycl_output.hpp reference g_devices (declared

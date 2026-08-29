@@ -164,7 +164,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_scores_decode_batch_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_scores_prefill_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_top1_value_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_topk_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_init_multi)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_kv_fp8_store_raw_decode_rows_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_kv_fp8_store_raw_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_f16_rms_fold_tensor)
@@ -196,13 +195,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_owned_packed_combine_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_owned_slots_combine_rows_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_owned_slots_combine_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_set_selected_override)
-/* ds4_gpu_set_current_device[_fenced]: 0 on success, nonzero on error or
- * out-of-range tier (see ds4_gpu_mgpu.h).  ds4.c's own CPU-only stub of
- * this entry returns -1; any nonzero value is a correct failure signal
- * here since callers only ever check for exactly 0, but 1 keeps this stub
- * consistent with every other ZERO_OK entry in this file. */
-SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_set_current_device)
-SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_set_current_device_fenced)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_set_decode_fast_attention)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_set_decode_score_vec4)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_set_model_fd)
