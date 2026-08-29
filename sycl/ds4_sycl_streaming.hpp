@@ -166,6 +166,13 @@ struct sycl_stream_tier_state {
      * that does copy).  Test-only instrumentation; not part of the ABI. */
     uint64_t                            hits = 0;
     uint64_t                            misses = 0;
+    /* Counts calls to sycl_stream_reclaim_wait, i.e. how many times this
+     * tier's queue was drained before a resident- or selected-cache buffer
+     * was freed or handed back for reuse.  Test-only instrumentation for
+     * the eviction-ordering invariant that spec 6g says no test on this
+     * hardware can observe by its effect (corruption); not part of the
+     * ABI. */
+    uint64_t                            reclaim_waits = 0;
 };
 
 /* Parallel to g_devices (ds4_sycl.cpp): one entry per logical tier,
@@ -242,11 +249,57 @@ static bool sycl_stream_is_protected(const sycl_stream_resident_expert &e, uint3
     return false;
 }
 
+/* Spec 6t: this backend's queues are out-of-order and every resident- or
+ * selected-cache buffer is raw USM, so nothing orders a kernel's read of
+ * e.gate/e.up/e.down (or st.selected.gate/up/down) against a later free of
+ * that same allocation or a later reuse of the same pooled slab by a
+ * different expert. Freeing or reusing such a buffer while a kernel might
+ * still be reading it is undefined behaviour by the SYCL USM
+ * specification, independent of whether this driver happens to make it
+ * survive in practice (see spec 6g on why an ablation of this exact shape
+ * produced no observable failure elsewhere in this project).
+ *
+ * No kernel currently reads any of these buffers: ds4_sycl_moe_launch.hpp's
+ * sycl_stream_layer_expert_cache_apply_lookup / sycl_stream_selected_apply_
+ * split_lookup / sycl_stream_selected_apply_lookup are permanently stubbed
+ * to false (see that file's block comment), so routed MoE always stages
+ * gate/up/down fresh from the host mmap via sycl_moe_stage_weights instead
+ * of reading this cache, and ds4_sycl_shared_expert.hpp never references
+ * this cache at all. The only current readers are the upload memcpys a few
+ * lines below each admission and the ds4_sycl_stream_test_read_* test
+ * hooks, and every one of those already issues its own q.wait_and_throw()
+ * immediately after its memcpy. So this wait observes an already-idle
+ * queue today; it is not dead weight, it is the invariant that keeps this
+ * cache correct the moment future work wires a real consumer into one of
+ * those three stubs, which is exactly what the resident cache exists for.
+ *
+ * Mirrors ROCm's cuda_stream_resident_reclaim_wait
+ * (rocm/ds4_rocm_runtime.cuh:643-647), which every resident evict, resident
+ * alloc and cache release calls before touching a slab for the same
+ * reason. ROCm's version waits on two narrow CUDA events recorded right
+ * after the kernels that read the selected/batch-selected caches
+ * (cuda_stream_selected_reuse_wait, cuda_stream_batch_selected_reuse_wait);
+ * this port has no such kernel to record an event after yet, so it waits
+ * for the whole queue instead. Once a real consumer exists and this
+ * queue-wide wait is shown to cost something on a hot eviction path, an
+ * event scoped to that consumer (the same upgrade ROCm already made) is
+ * the next step, not converting the queue to in_order. */
+static void sycl_stream_reclaim_wait(sycl::queue &q, sycl_stream_tier_state &st,
+                                     const char *what) {
+    st.reclaim_waits++;
+    try {
+        q.wait_and_throw();
+    } catch (const sycl::exception &ex) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "%s wait failed: %s\n", what, ex.what());
+    }
+}
+
 static bool sycl_stream_evict_at(sycl::queue &q, sycl_stream_tier_state &st, size_t idx) {
     if (idx >= st.resident.size()) return false;
     sycl_stream_resident_expert &e = st.resident[idx];
     const auto evicted_key = sycl_stream_entry_key(e);
     if (e.base) {
+        sycl_stream_reclaim_wait(q, st, "streaming resident evict");
         if (e.pooled) {
             st.free_slots.push_back(e.base);
         } else {
@@ -448,6 +501,11 @@ static int sycl_stream_resident_alloc(sycl::queue &q, sycl_stream_tier_state &st
 }
 
 static void sycl_stream_resident_release_all(sycl::queue &q, sycl_stream_tier_state &st) {
+    /* Same reclaim-before-reuse invariant as sycl_stream_evict_at above,
+     * covering this function's own bulk frees: ds4_gpu_set_ssd_streaming
+     * calls this (via sycl_stream_teardown_all) with the queue possibly
+     * still live, not only from the fully-drained ds4_gpu_cleanup path. */
+    sycl_stream_reclaim_wait(q, st, "streaming resident release");
     for (sycl_stream_resident_expert &e : st.resident) {
         if (e.base && !e.pooled) {
             try {
@@ -643,6 +701,8 @@ static int sycl_stream_resident_seed_experts(
 }
 
 static void sycl_stream_selected_release(sycl::queue &q, sycl_stream_tier_state &st) {
+    /* Same reclaim-before-reuse invariant as sycl_stream_evict_at above. */
+    sycl_stream_reclaim_wait(q, st, "streaming selected release");
     if (st.selected.gate) {
         try { sycl::free(st.selected.gate, q); }
         catch (const sycl::exception &ex) {
@@ -692,9 +752,27 @@ static void sycl_stream_teardown_all(void) {
 static bool sycl_stream_selected_ensure_buffers(sycl::queue &q, sycl_stream_tier_state &st,
                                                 uint64_t gate_bytes, uint64_t down_bytes) {
     if (gate_bytes == 0 || down_bytes == 0) return false;
+    /* Same reclaim-before-reuse invariant as sycl_stream_evict_at above: a
+     * capacity grow here frees the old scratch buffer before replacing it,
+     * exactly the same shape as an eviction. Also wraps every free below in
+     * try/catch, matching every other free site in this file; these three
+     * were the one place in the file that did not before. */
+    sycl_stream_reclaim_wait(q, st, "streaming selected buffer grow");
     if (st.selected.gate_capacity < gate_bytes) {
-        if (st.selected.gate) sycl::free(st.selected.gate, q);
-        if (st.selected.up) sycl::free(st.selected.up, q);
+        if (st.selected.gate) {
+            try { sycl::free(st.selected.gate, q); }
+            catch (const sycl::exception &ex) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "streaming selected buffer grow free failed: %s\n", ex.what());
+            }
+        }
+        if (st.selected.up) {
+            try { sycl::free(st.selected.up, q); }
+            catch (const sycl::exception &ex) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "streaming selected buffer grow free failed: %s\n", ex.what());
+            }
+        }
         st.selected.gate = (char *)sycl::malloc_device((size_t)gate_bytes, q);
         st.selected.up = (char *)sycl::malloc_device((size_t)gate_bytes, q);
         st.selected.gate_capacity = 0;
@@ -702,7 +780,13 @@ static bool sycl_stream_selected_ensure_buffers(sycl::queue &q, sycl_stream_tier
         st.selected.gate_capacity = gate_bytes;
     }
     if (st.selected.down_capacity < down_bytes) {
-        if (st.selected.down) sycl::free(st.selected.down, q);
+        if (st.selected.down) {
+            try { sycl::free(st.selected.down, q); }
+            catch (const sycl::exception &ex) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "streaming selected buffer grow free failed: %s\n", ex.what());
+            }
+        }
         st.selected.down = (char *)sycl::malloc_device((size_t)down_bytes, q);
         st.selected.down_capacity = 0;
         if (!st.selected.down) return false;
@@ -1245,6 +1329,17 @@ extern "C" void ds4_sycl_stream_test_hit_miss(uint64_t *hits, uint64_t *misses) 
     const sycl_stream_tier_state &st = sycl_stream_state_for(g_current_tier);
     if (hits) *hits = st.hits;
     if (misses) *misses = st.misses;
+}
+
+/* Spec 6g: a use-after-free of device memory produces no crash, no
+ * diagnostic and no test difference on this hardware, so a test cannot
+ * prove sycl_stream_evict_at's ordering fix by observing corruption. This
+ * counts how many times sycl_stream_reclaim_wait actually ran instead,
+ * which a test CAN assert against: it pins "an eviction drains the queue
+ * before touching the freed slab" by construction rather than by hoping to
+ * catch its absence. */
+extern "C" uint64_t ds4_sycl_stream_test_reclaim_wait_count(void) {
+    return sycl_stream_state_for(g_current_tier).reclaim_waits;
 }
 
 extern "C" int ds4_sycl_stream_test_batch_dedup(

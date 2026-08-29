@@ -34,6 +34,7 @@ extern void ds4_sycl_stream_test_reset(void);
 extern int  ds4_sycl_stream_test_read_selected(uint32_t slot, void *gate_out,
                                                void *up_out, void *down_out);
 extern void ds4_sycl_stream_test_hit_miss(uint64_t *hits, uint64_t *misses);
+extern uint64_t ds4_sycl_stream_test_reclaim_wait_count(void);
 extern int  ds4_sycl_stream_test_batch_dedup(const int32_t *ids, uint32_t n_tokens,
                                              uint32_t n_selected,
                                              uint32_t n_total_expert,
@@ -184,6 +185,54 @@ static int test_lru_eviction_across_calls(void) {
                                   down_offset, GATE_BYTES, DOWN_BYTES),
           "lru: expert 3 should be resident");
     fprintf(stderr, "  test_lru_eviction_across_calls OK\n");
+    return 0;
+}
+
+/* Spec 6g: a use-after-free of device memory is not observable on this
+ * hardware as a crash or a content difference, so this cannot test the
+ * hazard sycl_stream_evict_at fixes (freeing or pooling a slab a kernel
+ * might still be reading) by demonstrating corruption. What it CAN test,
+ * by construction, is that an eviction actually drains the queue first:
+ * ds4_sycl_stream_test_reclaim_wait_count() must not move while every
+ * seeded expert still fits the budget, and must advance by exactly one per
+ * eviction once a later seed forces one out, matching
+ * test_lru_eviction_across_calls's own eviction shape one call at a time
+ * so the count can be attributed to a single, known eviction. This proves
+ * the wait ran; it cannot prove a wait was the only thing standing between
+ * this driver and a real corruption. */
+static int test_evict_drains_queue_before_reuse(void) {
+    ds4_sycl_stream_test_reset();
+    enum { N_EXPERT = 8, GATE_BYTES = 32, DOWN_BYTES = 32, LAYER = 0, BUDGET = 3 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+
+    int32_t first[] = {0, 1, 2};
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, first, NULL, 3) != 0,
+          "evict_wait: first seed failed");
+    CHECK(ds4_sycl_stream_test_reclaim_wait_count() == 0,
+          "evict_wait: filling exactly to budget must not evict, so no wait yet");
+
+    int32_t second[] = {3};
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, second, NULL, 1) != 0,
+          "evict_wait: second seed failed");
+    CHECK(ds4_sycl_stream_test_reclaim_wait_count() == 1,
+          "evict_wait: one forced eviction must drain the queue exactly once");
+
+    int32_t third[] = {4};
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, third, NULL, 1) != 0,
+          "evict_wait: third seed failed");
+    CHECK(ds4_sycl_stream_test_reclaim_wait_count() == 2,
+          "evict_wait: a second forced eviction must drain the queue again");
+    fprintf(stderr, "  test_evict_drains_queue_before_reuse OK\n");
     return 0;
 }
 
@@ -1015,6 +1064,7 @@ int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_seed_fewer_than_budget() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_lru_eviction_across_calls() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_evict_drains_queue_before_reuse() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_priority_ordering() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_budget_zero_is_noop_success() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_null_table_is_failure() != 0) { ds4_gpu_cleanup(); return 1; }
