@@ -898,6 +898,504 @@ static int test_decode_batch_validation(void) {
     return 0;
 }
 
+/* ---- Indexed decode and small-window static prefill --------------------
+ *
+ * Oracle: ds4_gpu_attention_indexed_mixed_batch_heads_tensor's per-(t,h)
+ * math is identical to the mixed (non-indexed) decode oracle above --
+ * layer_attention_mixed_one's raw+comp softmax -- with one difference: the
+ * set of visible compressed rows is whatever the topk list selects (capped
+ * at 1024 and at `visible_comp`), rather than every row below
+ * `visible_comp`. ds4.c has no CPU function that consumes a raw int32 topk
+ * array directly (indexer_allowed_decode_one instead produces a boolean
+ * allowed mask consumed by layer_attention_mixed_one's comp_allowed
+ * parameter), so the oracle below is this file's own transcription of the
+ * GPU kernels' shared math (attention_indexed_mixed_kernel and
+ * attention_indexed_mixed_heads8_online_kernel, rocm/ds4_rocm_attention.cuh),
+ * read directly rather than assumed, combined with layer_attention_mixed_one's
+ * already-established softmax shape. */
+
+static void oracle_attention_indexed_batch(
+        float *out_heads, const float *sinks, const float *q, const float *raw_kv,
+        uint32_t n_tokens, uint32_t pos0, uint32_t n_raw, uint32_t raw_cap,
+        uint32_t raw_start, const float *comp_kv, uint32_t n_comp, const int32_t *topk,
+        uint32_t top_k, uint32_t window, uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    const uint32_t first_raw_pos = pos0 + n_tokens - n_raw;
+    uint32_t *comp_rows = (uint32_t *)malloc(1024u * sizeof(uint32_t));
+    float *scores = (float *)malloc((size_t)(256u + 1024u + 1u) * sizeof(float));
+
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t qpos = pos0 + t;
+        uint32_t visible_comp = n_comp;
+        if (ratio != 0u) {
+            visible_comp = (qpos + 1u) / ratio;
+            if (visible_comp > n_comp) visible_comp = n_comp;
+        }
+        uint32_t raw_count = 0u, raw_first_idx = 0u;
+        if (n_raw != 0u) {
+            const uint32_t raw_last_pos = first_raw_pos + n_raw - 1u;
+            if (qpos >= first_raw_pos) {
+                uint32_t lo = first_raw_pos;
+                if (window != 0u && qpos + 1u > window) {
+                    const uint32_t wlo = qpos + 1u - window;
+                    if (wlo > lo) lo = wlo;
+                }
+                const uint32_t hi = qpos < raw_last_pos ? qpos : raw_last_pos;
+                if (hi >= lo) {
+                    raw_first_idx = lo - first_raw_pos;
+                    raw_count = hi - lo + 1u;
+                    if (raw_count > 256u) raw_count = 256u;
+                }
+            }
+        }
+        uint32_t comp_count = 0u;
+        for (uint32_t i = 0; i < top_k && comp_count < 1024u; i++) {
+            const int32_t ci = topk[(uint64_t)t * top_k + i];
+            if (ci >= 0 && (uint32_t)ci < visible_comp) comp_rows[comp_count++] = (uint32_t)ci;
+        }
+
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+            float max_score = sinks[h];
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const uint32_t row = (raw_start + raw_first_idx + r) % raw_cap;
+                const float *kv = raw_kv + (uint64_t)row * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                scores[r] = dot * scale;
+                if (scores[r] > max_score) max_score = scores[r];
+            }
+            for (uint32_t c = 0; c < comp_count; c++) {
+                const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                scores[raw_count + c] = dot * scale;
+                if (scores[raw_count + c] > max_score) max_score = scores[raw_count + c];
+            }
+
+            float *oh = out_heads + ((uint64_t)t * n_head + h) * head_dim;
+            memset(oh, 0, (size_t)head_dim * sizeof(float));
+            float denom = expf(sinks[h] - max_score);
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float w = expf(scores[r] - max_score);
+                denom += w;
+                const uint32_t row = (raw_start + raw_first_idx + r) % raw_cap;
+                const float *kv = raw_kv + (uint64_t)row * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t c = 0; c < comp_count; c++) {
+                const float w = expf(scores[raw_count + c] - max_score);
+                denom += w;
+                const float *kv = comp_kv + (uint64_t)comp_rows[c] * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] /= denom;
+        }
+    }
+    free(comp_rows);
+    free(scores);
+}
+
+/* Fills a top_k-wide topk row per token with a pseudo-random SUBSET of
+ * [0, n_comp): distinct indices, so the selection is a genuine strict
+ * subset whenever top_k < visible n_comp, which is what makes the "ignore
+ * the index list" ablation observable. Padded with -1 sentinels past
+ * n_selected, matching the indexer's own real output shape. */
+static void fill_topk_subset(int32_t *topk, uint32_t n_tokens, uint32_t top_k,
+                             uint32_t n_comp, uint32_t n_selected, uint32_t seed) {
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        int32_t *row = topk + (uint64_t)t * top_k;
+        for (uint32_t i = 0; i < top_k; i++) row[i] = -1;
+        uint32_t placed = 0;
+        uint32_t start = (uint32_t)(test_prand(t, seed, 1u) * 0.5f * (float)n_comp) + n_comp;
+        for (uint32_t k = 0; k < n_comp && placed < n_selected; k++) {
+            const uint32_t c = (start + k * 7u + 3u) % n_comp;
+            bool dup = false;
+            for (uint32_t j = 0; j < placed; j++) {
+                if (row[j] == (int32_t)c) { dup = true; break; }
+            }
+            if (!dup) row[placed++] = (int32_t)c;
+        }
+    }
+}
+
+#define IX_N_HEAD 3u
+#define IX_HEAD_DIM 16u
+#define IX_N_TOKENS 4u
+#define IX_POS0 60u
+#define IX_N_RAW 40u
+#define IX_RAW_CAP 48u
+#define IX_RAW_START 10u
+#define IX_WINDOW 15u
+#define IX_N_COMP 60u
+#define IX_TOP_K 8u
+#define IX_N_SELECTED 5u
+#define IX_RATIO 2u
+
+static int test_indexed_mixed_general(void) {
+    float sinks[IX_N_HEAD];
+    for (uint32_t h = 0; h < IX_N_HEAD; h++) sinks[h] = test_prand(h, 111u, 1u) * 2.0f;
+    float *q = malloc((size_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    float *raw_kv = malloc((size_t)IX_RAW_CAP * IX_HEAD_DIM * sizeof(float));
+    float *comp_kv = malloc((size_t)IX_N_COMP * IX_HEAD_DIM * sizeof(float));
+    int32_t *topk = malloc((size_t)IX_N_TOKENS * IX_TOP_K * sizeof(int32_t));
+    for (uint32_t i = 0; i < IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM; i++) q[i] = test_prand(i, 112u, 2u);
+    for (uint32_t i = 0; i < IX_RAW_CAP * IX_HEAD_DIM; i++) raw_kv[i] = test_prand(i, 113u, 3u);
+    for (uint32_t i = 0; i < IX_N_COMP * IX_HEAD_DIM; i++) comp_kv[i] = test_prand(i, 114u, 4u);
+    fill_topk_subset(topk, IX_N_TOKENS, IX_TOP_K, IX_N_COMP, IX_N_SELECTED, 115u);
+
+    dh_model model = dh_model_build(sinks, IX_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)IX_RAW_CAP * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc((uint64_t)IX_N_COMP * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *ttopk = ds4_gpu_tensor_alloc((uint64_t)IX_N_TOKENS * IX_TOP_K * sizeof(int32_t));
+    CHECK(theads && tq && traw && tcomp && ttopk, "indexed general: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, (uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float)) != 0,
+          "indexed general: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, (uint64_t)IX_RAW_CAP * IX_HEAD_DIM * sizeof(float)) != 0,
+          "indexed general: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, (uint64_t)IX_N_COMP * IX_HEAD_DIM * sizeof(float)) != 0,
+          "indexed general: comp_kv write failed");
+    CHECK(ds4_gpu_tensor_write(ttopk, 0, topk, (uint64_t)IX_N_TOKENS * IX_TOP_K * sizeof(int32_t)) != 0,
+          "indexed general: topk write failed");
+
+    CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              ttopk, IX_N_TOKENS, IX_POS0, IX_N_RAW, IX_RAW_CAP, IX_RAW_START, IX_N_COMP,
+              IX_TOP_K, IX_WINDOW, IX_RATIO, IX_N_HEAD, IX_HEAD_DIM) != 0,
+          "indexed general: launch failed");
+
+    float *got = malloc((size_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, (uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float)) != 0,
+          "indexed general: read failed");
+    float *want = malloc((size_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    oracle_attention_indexed_batch(want, sinks, q, raw_kv, IX_N_TOKENS, IX_POS0, IX_N_RAW,
+                                   IX_RAW_CAP, IX_RAW_START, comp_kv, IX_N_COMP, topk,
+                                   IX_TOP_K, IX_WINDOW, IX_RATIO, IX_N_HEAD, IX_HEAD_DIM);
+    for (uint32_t i = 0; i < IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-3, "indexed general: heads mismatch");
+    }
+
+    free(q); free(raw_kv); free(comp_kv); free(topk); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp); ds4_gpu_tensor_free(ttopk);
+    fprintf(stderr, "  test_indexed_mixed_general OK\n");
+    return 0;
+}
+
+#define IXO_N_HEAD 20u
+#define IXO_HEAD_DIM 512u
+#define IXO_N_TOKENS 3u
+#define IXO_POS0 30u
+#define IXO_N_RAW 25u
+#define IXO_RAW_CAP 32u
+#define IXO_RAW_START 5u
+#define IXO_WINDOW 10u
+#define IXO_N_COMP 40u
+#define IXO_N_SELECTED 6u
+#define IXO_RATIO 2u
+
+/* Runs the head_dim == 512 online path at the given top_k (64: the plain
+ * online kernel; 512: forces the indexed_topk_sort_512_asc_kernel path
+ * first, since n_tokens > 1 && top_k == 512, this is the first consumer of
+ * that sort kernel) and checks against the oracle. n_head == 20 spans
+ * more than one 16-head work-group (grid_y = ceil(20/16) = 2), exercising
+ * the second, partially-empty group. */
+static int test_indexed_mixed_online(uint32_t top_k) {
+    float sinks[IXO_N_HEAD];
+    for (uint32_t h = 0; h < IXO_N_HEAD; h++) sinks[h] = test_prand(h, 121u, 5u) * 2.0f;
+    const uint64_t qn = (uint64_t)IXO_N_TOKENS * IXO_N_HEAD * IXO_HEAD_DIM;
+    const uint64_t rawn = (uint64_t)IXO_RAW_CAP * IXO_HEAD_DIM;
+    const uint64_t compn = (uint64_t)IXO_N_COMP * IXO_HEAD_DIM;
+    float *q = malloc((size_t)qn * sizeof(float));
+    float *raw_kv = malloc((size_t)rawn * sizeof(float));
+    float *comp_kv = malloc((size_t)compn * sizeof(float));
+    int32_t *topk = malloc((size_t)IXO_N_TOKENS * top_k * sizeof(int32_t));
+    for (uint64_t i = 0; i < qn; i++) q[i] = test_prand((uint32_t)i, 122u, 6u);
+    for (uint64_t i = 0; i < rawn; i++) raw_kv[i] = test_prand((uint32_t)i, 123u, 7u);
+    for (uint64_t i = 0; i < compn; i++) comp_kv[i] = test_prand((uint32_t)i, 124u, 8u);
+    fill_topk_subset(topk, IXO_N_TOKENS, top_k, IXO_N_COMP, IXO_N_SELECTED, 125u);
+
+    dh_model model = dh_model_build(sinks, IXO_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc(rawn * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc(compn * sizeof(float));
+    ds4_gpu_tensor *ttopk = ds4_gpu_tensor_alloc((uint64_t)IXO_N_TOKENS * top_k * sizeof(int32_t));
+    CHECK(theads && tq && traw && tcomp && ttopk, "indexed online: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, qn * sizeof(float)) != 0, "indexed online: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, rawn * sizeof(float)) != 0, "indexed online: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, compn * sizeof(float)) != 0, "indexed online: comp_kv write failed");
+    CHECK(ds4_gpu_tensor_write(ttopk, 0, topk, (uint64_t)IXO_N_TOKENS * top_k * sizeof(int32_t)) != 0,
+          "indexed online: topk write failed");
+
+    CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              ttopk, IXO_N_TOKENS, IXO_POS0, IXO_N_RAW, IXO_RAW_CAP, IXO_RAW_START, IXO_N_COMP,
+              top_k, IXO_WINDOW, IXO_RATIO, IXO_N_HEAD, IXO_HEAD_DIM) != 0,
+          "indexed online: launch failed");
+
+    float *got = malloc((size_t)qn * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, qn * sizeof(float)) != 0, "indexed online: read failed");
+    float *want = malloc((size_t)qn * sizeof(float));
+    oracle_attention_indexed_batch(want, sinks, q, raw_kv, IXO_N_TOKENS, IXO_POS0, IXO_N_RAW,
+                                   IXO_RAW_CAP, IXO_RAW_START, comp_kv, IXO_N_COMP, topk,
+                                   top_k, IXO_WINDOW, IXO_RATIO, IXO_N_HEAD, IXO_HEAD_DIM);
+    for (uint64_t i = 0; i < qn; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-3, "indexed online: heads mismatch");
+    }
+
+    free(q); free(raw_kv); free(comp_kv); free(topk); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp); ds4_gpu_tensor_free(ttopk);
+    fprintf(stderr, "  test_indexed_mixed_online(top_k=%u) OK\n", top_k);
+    return 0;
+}
+
+/* Index list entry out of range: one selected index is deliberately
+ * n_comp + 3 (past the end of the compressed cache), which the kernels
+ * must skip via their `c < n_comp` bounds check rather than reading past
+ * comp_kv. Constructed as a normal (non-ablated) test: the correct
+ * production code must handle this input gracefully, since a real topk
+ * tensor is a device buffer this entry does not otherwise validate
+ * per-element. */
+static int test_indexed_mixed_out_of_range_index(void) {
+    float sinks[IX_N_HEAD];
+    for (uint32_t h = 0; h < IX_N_HEAD; h++) sinks[h] = test_prand(h, 131u, 9u) * 2.0f;
+    float *q = malloc((size_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    float *raw_kv = malloc((size_t)IX_RAW_CAP * IX_HEAD_DIM * sizeof(float));
+    float *comp_kv = malloc((size_t)IX_N_COMP * IX_HEAD_DIM * sizeof(float));
+    int32_t *topk = malloc((size_t)IX_N_TOKENS * IX_TOP_K * sizeof(int32_t));
+    for (uint32_t i = 0; i < IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM; i++) q[i] = test_prand(i, 132u, 10u);
+    for (uint32_t i = 0; i < IX_RAW_CAP * IX_HEAD_DIM; i++) raw_kv[i] = test_prand(i, 133u, 11u);
+    for (uint32_t i = 0; i < IX_N_COMP * IX_HEAD_DIM; i++) comp_kv[i] = test_prand(i, 134u, 12u);
+    fill_topk_subset(topk, IX_N_TOKENS, IX_TOP_K, IX_N_COMP, IX_N_SELECTED, 135u);
+    /* Corrupt one selected slot per token to an out-of-range index. */
+    for (uint32_t t = 0; t < IX_N_TOKENS; t++) topk[t * IX_TOP_K + 0] = (int32_t)(IX_N_COMP + 3u);
+
+    dh_model model = dh_model_build(sinks, IX_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)IX_RAW_CAP * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc((uint64_t)IX_N_COMP * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *ttopk = ds4_gpu_tensor_alloc((uint64_t)IX_N_TOKENS * IX_TOP_K * sizeof(int32_t));
+    CHECK(theads && tq && traw && tcomp && ttopk, "indexed oor: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, (uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float)) != 0,
+          "indexed oor: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, (uint64_t)IX_RAW_CAP * IX_HEAD_DIM * sizeof(float)) != 0,
+          "indexed oor: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, (uint64_t)IX_N_COMP * IX_HEAD_DIM * sizeof(float)) != 0,
+          "indexed oor: comp_kv write failed");
+    CHECK(ds4_gpu_tensor_write(ttopk, 0, topk, (uint64_t)IX_N_TOKENS * IX_TOP_K * sizeof(int32_t)) != 0,
+          "indexed oor: topk write failed");
+
+    CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              ttopk, IX_N_TOKENS, IX_POS0, IX_N_RAW, IX_RAW_CAP, IX_RAW_START, IX_N_COMP,
+              IX_TOP_K, IX_WINDOW, IX_RATIO, IX_N_HEAD, IX_HEAD_DIM) != 0,
+          "indexed oor: launch failed");
+
+    float *got = malloc((size_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, (uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float)) != 0,
+          "indexed oor: read failed");
+    float *want = malloc((size_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    oracle_attention_indexed_batch(want, sinks, q, raw_kv, IX_N_TOKENS, IX_POS0, IX_N_RAW,
+                                   IX_RAW_CAP, IX_RAW_START, comp_kv, IX_N_COMP, topk,
+                                   IX_TOP_K, IX_WINDOW, IX_RATIO, IX_N_HEAD, IX_HEAD_DIM);
+    for (uint32_t i = 0; i < IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM; i++) {
+        CHECK(isfinite(got[i]), "indexed oor: got a non-finite value");
+        CHECK_CLOSE(got[i], want[i], 1e-3, "indexed oor: heads mismatch");
+    }
+
+    free(q); free(raw_kv); free(comp_kv); free(topk); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp); ds4_gpu_tensor_free(ttopk);
+    fprintf(stderr, "  test_indexed_mixed_out_of_range_index OK\n");
+    return 0;
+}
+
+static int test_indexed_batch_validation(void) {
+    float sinks[IX_N_HEAD] = {0};
+    dh_model model = dh_model_build(sinks, IX_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)IX_N_TOKENS * IX_N_HEAD * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)IX_RAW_CAP * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc((uint64_t)IX_N_COMP * IX_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *ttopk = ds4_gpu_tensor_alloc((uint64_t)IX_N_TOKENS * IX_TOP_K * sizeof(int32_t));
+    CHECK(theads && tq && traw && tcomp && ttopk, "indexed validation: alloc failed");
+
+    CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, /*comp_kv_f16=*/1u,
+              ttopk, IX_N_TOKENS, IX_POS0, IX_N_RAW, IX_RAW_CAP, IX_RAW_START, IX_N_COMP,
+              IX_TOP_K, IX_WINDOW, IX_RATIO, IX_N_HEAD, IX_HEAD_DIM) == 0,
+          "indexed validation: comp_kv_f16 must be rejected");
+    CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              ttopk, IX_N_TOKENS, IX_POS0, IX_N_RAW, IX_RAW_CAP, IX_RAW_START, /*n_comp=*/0u,
+              IX_TOP_K, IX_WINDOW, IX_RATIO, IX_N_HEAD, IX_HEAD_DIM) == 0,
+          "indexed validation: n_comp == 0 must be rejected");
+    CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              ttopk, IX_N_TOKENS, IX_POS0, IX_N_RAW, IX_RAW_CAP, IX_RAW_START, IX_N_COMP,
+              /*top_k=*/1025u, IX_WINDOW, IX_RATIO, IX_N_HEAD, IX_HEAD_DIM) == 0,
+          "indexed validation: top_k above cap must be rejected");
+
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp); ds4_gpu_tensor_free(ttopk);
+    free(model.bytes);
+    fprintf(stderr, "  test_indexed_batch_validation OK\n");
+    return 0;
+}
+
+/* ---- Small-window static prefill ---------------------------------------
+ *
+ * Oracle: layer_attention_prefix_batch_worker's math (ds4.c:12840-12897)
+ * specialised to the non-indexed, unmasked shape this entry serves --
+ * raw_count derived from `t + 1` capped at a window bound, comp visibility
+ * from `ratio` alone, no allowed-bits mask -- read directly against
+ * attention_static_mixed_heads8_online_kernel's own raw_count/comp_count
+ * derivation (rocm/ds4_rocm_attention.cuh:1288-1294), which is identical:
+ * both derive `raw_count = window && t+1 > window ? window : t+1` from the
+ * token's LOCAL prefix index `t`, not an absolute position, since this
+ * entry has no pos0 parameter (a fresh prefill chunk always starts at
+ * position 0). */
+static void oracle_attention_static_prefill(
+        float *out_heads, const float *sinks, const float *q, const float *raw_kv,
+        uint32_t n_tokens, const float *comp_kv, uint32_t n_comp, uint32_t window,
+        uint32_t ratio, uint32_t n_head, uint32_t head_dim) {
+    const float scale = 1.0f / sqrtf((float)head_dim);
+    float *scores = (float *)malloc((size_t)(768u + 1u) * sizeof(float));
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        const uint32_t raw_count = (window != 0u && t + 1u > window) ? window : t + 1u;
+        const uint32_t raw_start = t + 1u - raw_count;
+        uint32_t comp_count = 0u;
+        if (n_comp != 0u && ratio != 0u) {
+            comp_count = (t + 1u) / ratio;
+            if (comp_count > n_comp) comp_count = n_comp;
+        }
+        for (uint32_t h = 0; h < n_head; h++) {
+            const float *qh = q + ((uint64_t)t * n_head + h) * head_dim;
+            float max_score = sinks[h];
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float *kv = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                scores[r] = dot * scale;
+                if (scores[r] > max_score) max_score = scores[r];
+            }
+            for (uint32_t c = 0; c < comp_count; c++) {
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; d++) dot += qh[d] * kv[d];
+                scores[raw_count + c] = dot * scale;
+                if (scores[raw_count + c] > max_score) max_score = scores[raw_count + c];
+            }
+            float *oh = out_heads + ((uint64_t)t * n_head + h) * head_dim;
+            memset(oh, 0, (size_t)head_dim * sizeof(float));
+            float denom = expf(sinks[h] - max_score);
+            for (uint32_t r = 0; r < raw_count; r++) {
+                const float w = expf(scores[r] - max_score);
+                denom += w;
+                const float *kv = raw_kv + (uint64_t)(raw_start + r) * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t c = 0; c < comp_count; c++) {
+                const float w = expf(scores[raw_count + c] - max_score);
+                denom += w;
+                const float *kv = comp_kv + (uint64_t)c * head_dim;
+                for (uint32_t d = 0; d < head_dim; d++) oh[d] += w * kv[d];
+            }
+            for (uint32_t d = 0; d < head_dim; d++) oh[d] /= denom;
+        }
+    }
+    free(scores);
+}
+
+#define SP_N_HEAD 10u
+#define SP_HEAD_DIM 512u
+#define SP_N_TOKENS 6u
+#define SP_WINDOW 8u
+#define SP_N_COMP 5u
+#define SP_RATIO 2u
+
+static int test_static_prefill_small_window(void) {
+    float sinks[SP_N_HEAD];
+    for (uint32_t h = 0; h < SP_N_HEAD; h++) sinks[h] = test_prand(h, 141u, 13u) * 2.0f;
+    const uint64_t qn = (uint64_t)SP_N_TOKENS * SP_N_HEAD * SP_HEAD_DIM;
+    const uint64_t rawn = (uint64_t)SP_N_TOKENS * SP_HEAD_DIM;
+    const uint64_t compn = (uint64_t)SP_N_COMP * SP_HEAD_DIM;
+    float *q = malloc((size_t)qn * sizeof(float));
+    float *raw_kv = malloc((size_t)rawn * sizeof(float));
+    float *comp_kv = malloc((size_t)compn * sizeof(float));
+    for (uint64_t i = 0; i < qn; i++) q[i] = test_prand((uint32_t)i, 142u, 14u);
+    for (uint64_t i = 0; i < rawn; i++) raw_kv[i] = test_prand((uint32_t)i, 143u, 15u);
+    for (uint64_t i = 0; i < compn; i++) comp_kv[i] = test_prand((uint32_t)i, 144u, 16u);
+
+    dh_model model = dh_model_build(sinks, SP_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(qn * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc(rawn * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc(compn * sizeof(float));
+    CHECK(theads && tq && traw && tcomp, "static prefill: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, qn * sizeof(float)) != 0, "static prefill: q write failed");
+    CHECK(ds4_gpu_tensor_write(traw, 0, raw_kv, rawn * sizeof(float)) != 0, "static prefill: raw_kv write failed");
+    CHECK(ds4_gpu_tensor_write(tcomp, 0, comp_kv, compn * sizeof(float)) != 0, "static prefill: comp_kv write failed");
+
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              SP_N_TOKENS, SP_N_COMP, SP_WINDOW, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM) != 0,
+          "static prefill: launch failed");
+
+    float *got = malloc((size_t)qn * sizeof(float));
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, qn * sizeof(float)) != 0, "static prefill: read failed");
+    float *want = malloc((size_t)qn * sizeof(float));
+    oracle_attention_static_prefill(want, sinks, q, raw_kv, SP_N_TOKENS, comp_kv, SP_N_COMP,
+                                    SP_WINDOW, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM);
+    for (uint64_t i = 0; i < qn; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-3, "static prefill: heads mismatch");
+    }
+
+    free(q); free(raw_kv); free(comp_kv); free(got); free(want); free(model.bytes);
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp);
+    fprintf(stderr, "  test_static_prefill_small_window OK\n");
+    return 0;
+}
+
+/* The window bound this entry enforces (window + n_comp <= 768): a call
+ * exceeding it must be refused rather than silently computing anything,
+ * since no cuBLAS path or scalar fallback is ported for this entry (see
+ * this header's scope note). */
+static int test_static_prefill_window_bound_refused(void) {
+    float sinks[SP_N_HEAD] = {0};
+    dh_model model = dh_model_build(sinks, SP_N_HEAD);
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)SP_N_TOKENS * SP_N_HEAD * SP_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)SP_N_TOKENS * SP_N_HEAD * SP_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)SP_N_TOKENS * SP_HEAD_DIM * sizeof(float));
+    ds4_gpu_tensor *tcomp = ds4_gpu_tensor_alloc((uint64_t)SP_N_COMP * SP_HEAD_DIM * sizeof(float));
+    CHECK(theads && tq && traw && tcomp, "static prefill bound: alloc failed");
+
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              SP_N_TOKENS, SP_N_COMP, /*window=*/800u, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM) == 0,
+          "static prefill bound: oversized window must be refused");
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, 0u,
+              /*n_tokens=*/1u, SP_N_COMP, SP_WINDOW, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM) == 0,
+          "static prefill bound: n_tokens == 1 must be refused (no cuBLAS/scalar fallback)");
+    CHECK(ds4_gpu_attention_prefill_static_mixed_heads_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, traw, tcomp, /*comp_kv_f16=*/1u,
+              SP_N_TOKENS, SP_N_COMP, SP_WINDOW, SP_RATIO, SP_N_HEAD, SP_HEAD_DIM) == 0,
+          "static prefill bound: comp_kv_f16 must be rejected");
+
+    ds4_gpu_tensor_free(theads); ds4_gpu_tensor_free(tq); ds4_gpu_tensor_free(traw);
+    ds4_gpu_tensor_free(tcomp);
+    free(model.bytes);
+    fprintf(stderr, "  test_static_prefill_window_bound_refused OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_store_raw_kv() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -911,6 +1409,13 @@ int main(void) {
     if (test_decode_mixed_batch_online_vs_general() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_decode_mixed_batch_online_running_max() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_decode_batch_validation() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_indexed_mixed_general() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_indexed_mixed_online(64u) != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_indexed_mixed_online(512u) != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_indexed_mixed_out_of_range_index() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_indexed_batch_validation() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_static_prefill_small_window() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_static_prefill_window_bound_refused() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_attention OK\n");
     return 0;
