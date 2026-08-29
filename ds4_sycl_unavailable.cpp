@@ -74,6 +74,10 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_suspend_expert_sharding)
 /* int returns. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add_xdev_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_argmax_tensor)
+/* ds4_gpu_args_probe_auto_cuda: 0 on success, nonzero on failure (see
+ * ds4_gpu_args.h and ds4_rocm_compat.cu:146).  Failing loud here means
+ * --gpu-vram auto gets a clean refusal instead of a zeroed config. */
+SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_args_probe_auto_cuda)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_decode_heads_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_decode_mixed_batch_heads_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_decode_raw_batch_heads_tensor)
@@ -117,10 +121,11 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_decode_graphs_supported)
  * a successful cache install when nothing was cached. */
 SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_device_cache_support_tensors)
 SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_device_cache_tensors)
+/* ds4_gpu_dspark_markov_argmax_tensor: DSpark speculative-decoding
+ * support-model path (DS4_SUPPORT_DSPARK, ds4.c:2532), not part of
+ * baseline DeepSeek V4 Flash. Out of scope; stays stubbed. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dspark_markov_argmax_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dsv4_indexer_qat_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_dsv4_topk_mask_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_embed_token_quant_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_embed_tokens_quant_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_end_commands)
@@ -155,9 +160,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_store_compact_kv_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_store_indexer_k_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_value_project_typed_batch_heads_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_score_one_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_scores_decode_batch_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_scores_prefill_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_top1_value_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_topk_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_kv_fp8_store_raw_decode_rows_tensor)
