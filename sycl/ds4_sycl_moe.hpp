@@ -824,6 +824,638 @@ static void sycl_moe_q4k_down_tile8(
      }).wait_and_throw();
 }
 
+/* ---- IQ2_XXS ----------------------------------------------------------
+ *
+ * cuda_block_iq2_xxs, ds4_rocm.cu:85-88: 256-value superblock, half scale,
+ * 32 packed u16 "grid" codes.  This is DS4 Flash's shipped gate/up format
+ * (spec section 6e); the kernels that consume it, moe_gate_up_mid_kernel
+ * and its siblings, carry NO format suffix in their names despite
+ * hardcoding this cast (verified at moe.cuh:984, inside
+ * moe_gate_up_mid_qwarp32_kernel) -- a trap for anyone assuming kernel
+ * names describe their formats.  The grid/sign tables below are copied verbatim from
+ * ds4_iq2_tables_cuda.inc, which rocm/ds4_rocm.cu:104 includes unchanged;
+ * ROCm and CUDA share one physical table, so there is only one table to
+ * port. */
+
+struct sycl_block_iq2_xxs {
+    uint16_t d;
+    uint16_t qs[32];
+};
+
+/* cuda_ksigns_iq2xs, ds4_iq2_tables_cuda.inc:1-9: 128 entries, each an
+ * 8-bit sign pattern with bit 7 not yet parity-corrected (see
+ * sycl_iq2_fix_sign_byte below, mirroring dev_unpack_iq2_signs,
+ * moe.cuh:19-23). */
+static constexpr uint8_t kIq2Signs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+/* cuda_iq2xxs_grid, ds4_iq2_tables_cuda.inc:12-77: 256 entries, each 8
+ * packed magnitude bytes (values in {0x08, 0x19, 0x2b}) for one group of 8
+ * elements. */
+static constexpr uint64_t kIq2Grid[256] = {
+    0x0808080808080808, 0x080808080808082b, 0x0808080808081919, 0x0808080808082b08,
+    0x0808080808082b2b, 0x0808080808190819, 0x0808080808191908, 0x08080808082b0808,
+    0x08080808082b082b, 0x08080808082b2b08, 0x08080808082b2b2b, 0x0808080819080819,
+    0x0808080819081908, 0x0808080819190808, 0x0808080819192b08, 0x08080808192b0819,
+    0x08080808192b1908, 0x080808082b080808, 0x080808082b08082b, 0x080808082b082b2b,
+    0x080808082b2b082b, 0x0808081908080819, 0x0808081908081908, 0x0808081908190808,
+    0x0808081908191919, 0x0808081919080808, 0x080808192b081908, 0x080808192b192b08,
+    0x0808082b08080808, 0x0808082b0808082b, 0x0808082b082b082b, 0x0808082b2b08082b,
+    0x0808190808080819, 0x0808190808081908, 0x0808190808190808, 0x08081908082b0819,
+    0x08081908082b1908, 0x0808190819080808, 0x080819081908082b, 0x0808190819082b08,
+    0x08081908192b0808, 0x080819082b080819, 0x080819082b081908, 0x080819082b190808,
+    0x080819082b2b1908, 0x0808191908080808, 0x080819190808082b, 0x0808191908082b08,
+    0x08081919082b0808, 0x080819191908192b, 0x08081919192b2b19, 0x080819192b080808,
+    0x080819192b190819, 0x0808192b08082b19, 0x0808192b08190808, 0x0808192b19080808,
+    0x0808192b2b081908, 0x0808192b2b2b1908, 0x08082b0808080808, 0x08082b0808081919,
+    0x08082b0808082b08, 0x08082b0808191908, 0x08082b08082b2b08, 0x08082b0819080819,
+    0x08082b0819081908, 0x08082b0819190808, 0x08082b081919082b, 0x08082b082b082b08,
+    0x08082b1908081908, 0x08082b1919080808, 0x08082b2b0808082b, 0x08082b2b08191908,
+    0x0819080808080819, 0x0819080808081908, 0x0819080808190808, 0x08190808082b0819,
+    0x0819080819080808, 0x08190808192b0808, 0x081908082b081908, 0x081908082b190808,
+    0x081908082b191919, 0x0819081908080808, 0x0819081908082b08, 0x08190819082b0808,
+    0x0819081919190808, 0x0819081919192b2b, 0x081908192b080808, 0x0819082b082b1908,
+    0x0819082b19081919, 0x0819190808080808, 0x0819190808082b08, 0x08191908082b0808,
+    0x08191908082b1919, 0x0819190819082b19, 0x081919082b080808, 0x0819191908192b08,
+    0x08191919192b082b, 0x0819192b08080808, 0x0819192b0819192b, 0x08192b0808080819,
+    0x08192b0808081908, 0x08192b0808190808, 0x08192b0819080808, 0x08192b082b080819,
+    0x08192b1908080808, 0x08192b1908081919, 0x08192b192b2b0808, 0x08192b2b19190819,
+    0x082b080808080808, 0x082b08080808082b, 0x082b080808082b2b, 0x082b080819081908,
+    0x082b0808192b0819, 0x082b08082b080808, 0x082b08082b08082b, 0x082b0819082b2b19,
+    0x082b081919082b08, 0x082b082b08080808, 0x082b082b0808082b, 0x082b190808080819,
+    0x082b190808081908, 0x082b190808190808, 0x082b190819080808, 0x082b19081919192b,
+    0x082b191908080808, 0x082b191919080819, 0x082b1919192b1908, 0x082b192b2b190808,
+    0x082b2b0808082b08, 0x082b2b08082b0808, 0x082b2b082b191908, 0x082b2b2b19081908,
+    0x1908080808080819, 0x1908080808081908, 0x1908080808190808, 0x1908080808192b08,
+    0x19080808082b0819, 0x19080808082b1908, 0x1908080819080808, 0x1908080819082b08,
+    0x190808081919192b, 0x19080808192b0808, 0x190808082b080819, 0x190808082b081908,
+    0x190808082b190808, 0x1908081908080808, 0x19080819082b0808, 0x19080819192b0819,
+    0x190808192b080808, 0x190808192b081919, 0x1908082b08080819, 0x1908082b08190808,
+    0x1908082b19082b08, 0x1908082b1919192b, 0x1908082b192b2b08, 0x1908190808080808,
+    0x1908190808082b08, 0x19081908082b0808, 0x190819082b080808, 0x190819082b192b19,
+    0x190819190819082b, 0x19081919082b1908, 0x1908192b08080808, 0x19082b0808080819,
+    0x19082b0808081908, 0x19082b0808190808, 0x19082b0819080808, 0x19082b0819081919,
+    0x19082b1908080808, 0x19082b1919192b08, 0x19082b19192b0819, 0x19082b192b08082b,
+    0x19082b2b19081919, 0x19082b2b2b190808, 0x1919080808080808, 0x1919080808082b08,
+    0x1919080808190819, 0x1919080808192b19, 0x19190808082b0808, 0x191908082b080808,
+    0x191908082b082b08, 0x1919081908081908, 0x191908191908082b, 0x191908192b2b1908,
+    0x1919082b2b190819, 0x191919082b190808, 0x191919082b19082b, 0x1919191908082b2b,
+    0x1919192b08080819, 0x1919192b19191908, 0x19192b0808080808, 0x19192b0808190819,
+    0x19192b0808192b19, 0x19192b08192b1908, 0x19192b1919080808, 0x19192b2b08082b08,
+    0x192b080808081908, 0x192b080808190808, 0x192b080819080808, 0x192b0808192b2b08,
+    0x192b081908080808, 0x192b081919191919, 0x192b082b08192b08, 0x192b082b192b0808,
+    0x192b190808080808, 0x192b190808081919, 0x192b191908190808, 0x192b19190819082b,
+    0x192b19192b081908, 0x192b2b081908082b, 0x2b08080808080808, 0x2b0808080808082b,
+    0x2b08080808082b2b, 0x2b08080819080819, 0x2b0808082b08082b, 0x2b08081908081908,
+    0x2b08081908192b08, 0x2b08081919080808, 0x2b08082b08190819, 0x2b08190808080819,
+    0x2b08190808081908, 0x2b08190808190808, 0x2b08190808191919, 0x2b08190819080808,
+    0x2b081908192b0808, 0x2b08191908080808, 0x2b0819191908192b, 0x2b0819192b191908,
+    0x2b08192b08082b19, 0x2b08192b19080808, 0x2b08192b192b0808, 0x2b082b080808082b,
+    0x2b082b1908081908, 0x2b082b2b08190819, 0x2b19080808081908, 0x2b19080808190808,
+    0x2b190808082b1908, 0x2b19080819080808, 0x2b1908082b2b0819, 0x2b1908190819192b,
+    0x2b1908192b080808, 0x2b19082b19081919, 0x2b19190808080808, 0x2b191908082b082b,
+    0x2b19190819081908, 0x2b19191919190819, 0x2b192b082b080819, 0x2b192b19082b0808,
+    0x2b2b08080808082b, 0x2b2b080819190808, 0x2b2b08082b081919, 0x2b2b081908082b19,
+    0x2b2b082b08080808, 0x2b2b190808192b08, 0x2b2b2b0819190808, 0x2b2b2b1908081908,
+};
+
+static inline uint32_t sycl_popcount_u32(uint32_t v) {
+    v = v - ((v >> 1) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    v = (v + (v >> 4)) & 0x0f0f0f0fu;
+    return (v * 0x01010101u) >> 24;
+}
+
+/* dev_unpack_iq2_signs, moe.cuh:19-23: the ksigns table stores 7 sign bits
+ * plus a not-yet-corrected bit 7; this recovers the true 8-bit pattern by
+ * forcing overall byte parity, then applies it as one sign per grid byte.
+ * Written as a direct scalar loop rather than porting the dp4a/vsub4/
+ * vcmpne4 SIMD-in-a-register trick literally: verified by hand that
+ * "(byte XOR 0xFF) - 0xFF" is exactly two's-complement negation, which is
+ * what CUDA's per-byte vsub4 does when the sign mask byte is 0xFF, so this
+ * scalar form and the ROCm SIMD form compute the identical integer per
+ * byte. */
+static inline int32_t sycl_iq2_grid_dot8(uint8_t grid_idx, uint8_t sign_idx, const int8_t *q8) {
+    const uint64_t grid = kIq2Grid[grid_idx];
+    const uint8_t raw = kIq2Signs[sign_idx & 127u];
+    const uint32_t parity = sycl_popcount_u32((uint32_t)raw) & 1u;
+    const uint8_t s = (uint8_t)(raw ^ (uint8_t)(parity << 7));
+    int32_t sum = 0;
+    for (uint32_t b = 0; b < 8u; b++) {
+        int32_t v = (int32_t)(int8_t)((grid >> (b * 8u)) & 0xffu);
+        if ((s >> b) & 1u) v = -v;
+        sum += v * (int32_t)q8[b];
+    }
+    return sum;
+}
+
+static inline int32_t sycl_iq2_pair_dot16(uint8_t grid0, uint8_t sign0, uint8_t grid1,
+                                          uint8_t sign1, const int8_t *q8) {
+    return sycl_iq2_grid_dot8(grid0, sign0, q8) + sycl_iq2_grid_dot8(grid1, sign1, q8 + 8);
+}
+
+/* dev_dot_iq2_xxs_q8_K_block, moe.cuh:101-123: one IQ2_XXS weight block
+ * dotted against one Q8_K activation block. */
+static inline float sycl_dev_dot_iq2_xxs_q8_k_block(const sycl_block_iq2_xxs *x,
+                                                    const sycl_block_q8_K *y) {
+    const float d = sycl_moe_f16_to_f32(x->d) * y->d;
+    const uint16_t *q2 = x->qs;
+    const int8_t *q8 = y->qs;
+    int32_t bsum = 0;
+    for (int ib32 = 0; ib32 < (int)(kMoeQK / 32u); ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
+        const uint8_t a0 = (uint8_t)(aux0 & 0xffu);
+        const uint8_t a1 = (uint8_t)((aux0 >> 8) & 0xffu);
+        const uint8_t a2 = (uint8_t)((aux0 >> 16) & 0xffu);
+        const uint8_t a3 = (uint8_t)((aux0 >> 24) & 0xffu);
+        int32_t sumi = sycl_iq2_pair_dot16(a0, (uint8_t)((aux1 >> 0) & 127u), a1,
+                                           (uint8_t)((aux1 >> 7) & 127u), q8);
+        q8 += 16;
+        sumi += sycl_iq2_pair_dot16(a2, (uint8_t)((aux1 >> 14) & 127u), a3,
+                                    (uint8_t)((aux1 >> 21) & 127u), q8);
+        q8 += 16;
+        bsum += sumi * (int32_t)ls;
+    }
+    return 0.125f * d * (float)bsum;
+}
+
+/* Scalar re-derivation of dev_dot_iq2_xxs_q8_K_block8 (moe.cuh:211-248,
+ * DS4_ROCM_UNUSED there because CUDA's own tile kernel uses a LUT-staged
+ * variant instead): same aux0/aux1/ls decode as the single-block form
+ * above, batched across up to 8 activation blocks at once for the
+ * expert-tile kernels.  Not a port of dead code, since nothing here is
+ * reused verbatim from the unused CUDA kernel; only the arithmetic shape
+ * is shared. */
+static inline void sycl_dev_dot_iq2_xxs_q8_k_block8(
+        const sycl_block_iq2_xxs *x, const sycl_block_q8_K *const ys[8],
+        uint32_t n, float acc[8]) {
+    const float xd = sycl_moe_f16_to_f32(x->d);
+    const uint16_t *q2 = x->qs;
+    int32_t bsum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int ib32 = 0; ib32 < (int)(kMoeQK / 32u); ib32++) {
+        const uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        const uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        const uint32_t ls = 2u * (aux1 >> 28) + 1u;
+        const uint8_t a0 = (uint8_t)(aux0 & 0xffu);
+        const uint8_t a1 = (uint8_t)((aux0 >> 8) & 0xffu);
+        const uint8_t a2 = (uint8_t)((aux0 >> 16) & 0xffu);
+        const uint8_t a3 = (uint8_t)((aux0 >> 24) & 0xffu);
+        const uint8_t s0i = (uint8_t)((aux1 >> 0) & 127u);
+        const uint8_t s1i = (uint8_t)((aux1 >> 7) & 127u);
+        const uint8_t s2i = (uint8_t)((aux1 >> 14) & 127u);
+        const uint8_t s3i = (uint8_t)((aux1 >> 21) & 127u);
+        for (uint32_t p = 0; p < n; p++) {
+            const int8_t *q8 = ys[p]->qs + ib32 * 32;
+            int32_t sumi = sycl_iq2_pair_dot16(a0, s0i, a1, s1i, q8) +
+                           sycl_iq2_pair_dot16(a2, s2i, a3, s3i, q8 + 16);
+            bsum[p] += sumi * (int32_t)ls;
+        }
+    }
+    for (uint32_t p = 0; p < n; p++) acc[p] += 0.125f * xd * ys[p]->d * (float)bsum[p];
+}
+
+/* moe_gate_up_mid_qwarp32_kernel, moe.cuh:955-1006 (the untagged family;
+ * hardcodes cuda_block_iq2_xxs, verified at moe.cuh:984).  ROCm's decode
+ * dispatch prefers moe_gate_up_mid_decode_lut_qwarp32_kernel
+ * (moe.cuh:1121-1185) whenever xq_blocks <= 16, which is DS4 Flash's real
+ * shape (MODEL_DIM=4096 => xq_blocks=16).  Read side by side, the LUT
+ * kernel's dev_dot_iq2_xxs_q8_K_block_lut and this kernel's
+ * dev_dot_iq2_xxs_q8_K_block decode the identical aux0/aux1/ls fields,
+ * apply the identical sign unpack, and differ only in whether the
+ * grid/signs tables are staged into a work-group's local memory first --
+ * a shared-memory bandwidth optimisation, not a different computation.
+ * This port implements only the plain (non-LUT) form and reads the tables
+ * directly, which is mathematically identical and needs no local-memory
+ * staging of the tables themselves.  write_gate_up is always 0 at every
+ * live call site (moe_launch.cuh:761's write_gate_up constant), so
+ * gate_out/up_out are never written here either, matching the Q4_K decode
+ * kernel's precedent above. */
+static void sycl_moe_iq2_gate_up_mid_decode(
+        sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
+        const sycl_block_q8_K *xq, const int32_t *selected, const float *weights,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint32_t xq_blocks,
+        uint32_t expert_mid_dim, uint32_t n_expert, uint32_t pair_count, float clamp) {
+    const uint32_t row_blocks = (expert_mid_dim + 127u) / 128u;
+    if (row_blocks == 0u || pair_count == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, pair_count),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row_lane = (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t row_block = (uint32_t)it.get_group(0);
+                 const uint32_t pair = (uint32_t)it.get_group(1);
+                 const uint32_t tok = pair / n_expert;
+                 const uint32_t slot = pair - tok * n_expert;
+                 int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+                 if (expert_i < 0) expert_i = 0;
+                 const uint32_t expert = (uint32_t)expert_i;
+                 const sycl_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+                 for (uint32_t rr = 0; rr < 4u; rr++) {
+                     const uint32_t row = row_block * 128u + row_lane + rr * 32u;
+                     if (row >= expert_mid_dim) continue;
+                     const sycl_block_iq2_xxs *gr = (const sycl_block_iq2_xxs *)
+                             (gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                     const sycl_block_iq2_xxs *ur = (const sycl_block_iq2_xxs *)
+                             (up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                     float gate = 0.0f, up = 0.0f;
+                     for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+                         gate += sycl_dev_dot_iq2_xxs_q8_k_block(gr + b, xqb + b);
+                         up += sycl_dev_dot_iq2_xxs_q8_k_block(ur + b, xqb + b);
+                     }
+                     gate = sycl_moe_subgroup_sum<8>(sg, gate);
+                     up = sycl_moe_subgroup_sum<8>(sg, up);
+                     if (lane == 0u) {
+                         if (clamp > 1.0e-6f) {
+                             if (gate > clamp) gate = clamp;
+                             if (up > clamp) up = clamp;
+                             if (up < -clamp) up = -clamp;
+                         }
+                         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+                         mid_out[off] = (gate / (1.0f + sycl::exp(-gate))) * up *
+                                        weights[(uint64_t)tok * n_expert + slot];
+                     }
+                 }
+             });
+     }).wait_and_throw();
+}
+
+/* moe_gate_up_mid_expert_tile8_row32_kernel, moe.cuh:1545-1638: n_tokens >
+ * 1 tiled batched path (iq2_path has NO ">= 32" threshold the way q4k_path
+ * does -- verified directly against moe_launch.cuh:754-758:
+ * use_sorted_pairs collapses to plain "n_tokens > 1u" once q4k_path is
+ * false, so ROCm takes this tiled path for every batched call, not only
+ * large ones).
+ *
+ * Mandatory correctness fix, not a port: ROCm's kernel takes a max_count
+ * parameter (moe.cuh:1564,1573) fed from iq2_gate_scalar_max
+ * (moe_launch.cuh:1139), which skips ("excludes") any tile whose expert
+ * has count >= max_count on the assumption that
+ * moe_gate_up_mid_iq2_hotlist_wmma_n2_kernel will compute those experts
+ * instead.  That WMMA launch is `#if HIP`-guarded (moe_launch.cuh:1552),
+ * but use_iq2_gate_wmma itself, and the loop that populates
+ * iq2_gate_hot_count from it, are NOT guarded (moe_launch.cuh:1113-1139) --
+ * verified directly, not inferred from the launch site alone. On this SYCL
+ * backend, which never defines the HIP macros, adopting max_count as
+ * written would silently skip every "hot" (>=8-pair) expert with nothing
+ * ever computing it. This port does not implement the WMMA kernels and
+ * does NOT implement the exclusion either: every tile is always
+ * unconditionally computed, matching what ROCm's own non-HIP builds do at
+ * the two down-side guard sites (moe_launch.cuh:240-246, :2023-2030),
+ * which force their own equivalent scalar_max to 0. */
+static void sycl_moe_iq2_gate_up_mid_tile8(
+        sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
+        const sycl_block_q8_K *xq, const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total, const uint32_t *tile_experts,
+        const uint32_t *tile_starts, const float *weights, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t n_expert, uint32_t tile_capacity, float clamp) {
+    const uint32_t row_blocks = (expert_mid_dim + 31u) / 32u;
+    if (row_blocks == 0u || tile_capacity == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         sycl::local_accessor<sycl_block_q8_K, 2> sxq(sycl::range<2>(8, 16), h);
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, tile_capacity),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 const uint32_t tile = (uint32_t)it.get_group(1);
+                 if (tile >= *tile_total) return;
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u + (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t expert = tile_experts[tile];
+                 const uint32_t count = counts[expert];
+                 const uint32_t local_start = tile_starts[tile];
+
+                 uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 const sycl_block_q8_K *xqb[8] = {nullptr, nullptr, nullptr, nullptr,
+                                                  nullptr, nullptr, nullptr, nullptr};
+                 uint32_t np = 0;
+                 for (; np < 8u; np++) {
+                     const uint32_t local_pair = local_start + np;
+                     if (local_pair >= count) break;
+                     pair[np] = sorted_pairs[offsets[expert] + local_pair];
+                     tok[np] = pair[np] / n_expert;
+                     slot[np] = pair[np] - tok[np] * n_expert;
+                     xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
+                 }
+                 if (xq_blocks <= 16u) {
+                     const uint32_t lid = (uint32_t)it.get_local_id(0);
+                     for (uint32_t i = lid; i < np * xq_blocks; i += 256u) {
+                         const uint32_t p = i / xq_blocks;
+                         const uint32_t b = i - p * xq_blocks;
+                         sxq[p][b] = xqb[p][b];
+                     }
+                     it.barrier(sycl::access::fence_space::local_space);
+                     for (uint32_t p = 0; p < np; p++) xqb[p] = &sxq[p][0];
+                 }
+                 if (row >= expert_mid_dim) return;
+                 const sycl_block_iq2_xxs *gr = (const sycl_block_iq2_xxs *)
+                         (gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                 const sycl_block_iq2_xxs *ur = (const sycl_block_iq2_xxs *)
+                         (up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                 float gate[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 float up[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+                     sycl_dev_dot_iq2_xxs_q8_k_block8(gr + b, xqb, np, gate);
+                     sycl_dev_dot_iq2_xxs_q8_k_block8(ur + b, xqb, np, up);
+                 }
+                 for (uint32_t p = 0; p < np; p++) {
+                     gate[p] = sycl_moe_subgroup_sum<8>(sg, gate[p]);
+                     up[p] = sycl_moe_subgroup_sum<8>(sg, up[p]);
+                     if (lane == 0u) {
+                         float g = gate[p], u = up[p];
+                         if (clamp > 1.0e-6f) {
+                             if (g > clamp) g = clamp;
+                             if (u > clamp) u = clamp;
+                             if (u < -clamp) u = -clamp;
+                         }
+                         const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
+                         mid_out[off] = (g / (1.0f + sycl::exp(-g))) * u *
+                                        weights[(uint64_t)tok[p] * n_expert + slot[p]];
+                     }
+                 }
+             });
+     }).wait_and_throw();
+}
+
+/* ---- Q2_K --------------------------------------------------------------
+ *
+ * cuda_block_q2_K, ds4_rocm.cu:65-70: 256-value superblock, 16 bytes of
+ * packed (scale, min) nibble pairs (one byte per 16-value sub-block), 64
+ * bytes of 2-bit codes, half scale and min.  Two independent uses in this
+ * plan: the down-projection half of iq2_path's production path (the
+ * untagged "down" family, moe.cuh:2603-3876, hardcodes this cast,
+ * verified at moe.cuh:2705) and the standalone q2k_path
+ * (gate_type==10 && down_type==10). */
+
+struct sycl_block_q2_K {
+    uint8_t scales[16];
+    uint8_t qs[64];
+    uint16_t d;
+    uint16_t dmin;
+};
+
+/* dev_dot_q2_16, moe.cuh:36-44: dots 16 packed 2-bit codes (shifted by
+ * `shift`) against 16 signed Q8_K codes. */
+static inline int32_t sycl_dev_dot_q2_16(const uint8_t *q2, const int8_t *q8, int shift) {
+    int32_t sum = 0;
+    for (uint32_t i = 0; i < 16u; i++) {
+        sum += (int32_t)((q2[i] >> shift) & 0x03) * (int32_t)q8[i];
+    }
+    return sum;
+}
+
+/* dev_dot_q2_K_q8_K_block, moe.cuh:622-645. */
+static inline float sycl_dev_dot_q2_k_q8_k_block(const sycl_block_q2_K *x, const sycl_block_q8_K *y) {
+    const uint8_t *q2 = x->qs;
+    const int8_t *q8 = y->qs;
+    const uint8_t *sc = x->scales;
+    int32_t summs = 0;
+    for (int j = 0; j < 16; j++) summs += (int32_t)y->bsums[j] * (int32_t)(sc[j] >> 4);
+    const float dall = y->d * sycl_moe_f16_to_f32(x->d);
+    const float dmin = y->d * sycl_moe_f16_to_f32(x->dmin);
+    int32_t isum = 0;
+    int is = 0;
+    for (int k = 0; k < (int)(kMoeQK / 128u); k++) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            int d = sc[is++] & 0x0f;
+            isum += d * sycl_dev_dot_q2_16(q2, q8, shift);
+            d = sc[is++] & 0x0f;
+            isum += d * sycl_dev_dot_q2_16(q2 + 16, q8 + 16, shift);
+            shift += 2;
+            q8 += 32;
+        }
+        q2 += 32;
+    }
+    return dall * (float)isum - dmin * (float)summs;
+}
+
+/* dev_dot_q2_K_q8_K_block8, moe.cuh:688-730: the same dot product against
+ * up to 8 activation blocks at once. */
+static inline void sycl_dev_dot_q2_k_q8_k_block8(
+        const sycl_block_q2_K *x, const sycl_block_q8_K *const ys[8],
+        uint32_t n, float acc[8]) {
+    const uint8_t *sc = x->scales;
+    const float xd = sycl_moe_f16_to_f32(x->d);
+    const float xmin = sycl_moe_f16_to_f32(x->dmin);
+    int32_t isum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32_t summs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (uint32_t p = 0; p < n; p++) {
+        for (int j = 0; j < 16; j++) summs[p] += (int32_t)ys[p]->bsums[j] * (int32_t)(sc[j] >> 4);
+    }
+    for (uint32_t p = 0; p < n; p++) {
+        const uint8_t *q2 = x->qs;
+        const int8_t *q8 = ys[p]->qs;
+        int is = 0;
+        for (int k = 0; k < (int)(kMoeQK / 128u); k++) {
+            int shift = 0;
+            for (int j = 0; j < 4; j++) {
+                int d = sc[is++] & 0x0f;
+                isum[p] += d * sycl_dev_dot_q2_16(q2, q8, shift);
+                d = sc[is++] & 0x0f;
+                isum[p] += d * sycl_dev_dot_q2_16(q2 + 16, q8 + 16, shift);
+                shift += 2;
+                q8 += 32;
+            }
+            q2 += 32;
+        }
+    }
+    for (uint32_t p = 0; p < n; p++) {
+        const float yd = ys[p]->d;
+        acc[p] += yd * xd * (float)isum[p] - yd * xmin * (float)summs[p];
+    }
+}
+
+/* moe_down_sum6_qwarp32_kernel, moe.cuh:2909-2936, generalised from
+ * single-token (selected[slot], out[row]) to n_tokens tokens
+ * (selected[tok*n_expert+slot], out[tok*out_dim+row]).  For n_tokens == 1
+ * this computes exactly what the ROCm kernel computes (tok is always 0,
+ * so selected[0*n_expert+slot] == selected[slot]).  Traced by data flow
+ * (moe_launch.cuh:746 excludes q2k_path from the whole shared block that
+ * would otherwise reach the untagged down family's other kernels;
+ * moe_launch.cuh:1627-1898 shows iq2_path's batched down always takes
+ * use_iq2_q2_float_down instead, so every OTHER kernel in the untagged
+ * down family besides this one is unreachable for any format implemented
+ * here) -- this one
+ * kernel, generalised over the token dimension, is what the decode path,
+ * iq2_path's batched down, and q2k_path (both regimes)
+ * all need, so it is written once here rather than three times. Reusing
+ * it for iq2_path's batch is a deliberate divergence from ROCm's own
+ * choice there (routed_moe_q2_float_down_launch's raw-float
+ * moe_down_q2K_expert_batch_sharedmid_kernel, which skips Q8_K-quantising
+ * mid) -- see the plan report for why: the mandated CPU oracle
+ * (matvec_q2_k_experts_accum_prequant, ds4.c:8297) always dots against a
+ * Q8_K-prequantised activation, and matching that at tight tolerance
+ * takes priority over matching ROCm's specific batched-kernel choice. */
+static void sycl_moe_q2k_down_direct(
+        sycl::queue &q, float *out, const char *down_base, const sycl_block_q8_K *midq,
+        const int32_t *selected, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t midq_blocks, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    const uint32_t row_blocks = (out_dim + 31u) / 32u;
+    if (row_blocks == 0u || n_tokens == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, n_tokens),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u + (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t tok = (uint32_t)it.get_group(1);
+                 if (row >= out_dim) return;
+                 float total = 0.0f;
+                 for (uint32_t slot = 0; slot < 8u /* DS4_ROCM_N_EXPERT_USED */; slot++) {
+                     if (slot >= n_expert) continue;
+                     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+                     if (expert_i < 0) expert_i = 0;
+                     const sycl_block_q2_K *wr = (const sycl_block_q2_K *)
+                             (down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+                     const sycl_block_q8_K *xqb = midq + ((uint64_t)tok * n_expert + slot) * midq_blocks;
+                     float acc = 0.0f;
+                     for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+                         acc += sycl_dev_dot_q2_k_q8_k_block(wr + b, xqb + b);
+                     }
+                     acc = sycl_moe_subgroup_sum<8>(sg, acc);
+                     if (lane == 0u) total += acc;
+                 }
+                 if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
+             });
+     }).wait_and_throw();
+}
+
+/* moe_down_iq2_sum_qwarp32_batch_kernel, moe.cuh:3001-3036: iq2_iq2_path's
+ * down (down_type == 16, so this is genuinely IQ2_XXS-cast, unlike every
+ * other down kernel in this file).  Already per-token in ROCm (blockIdx.y
+ * = tok), so this is a faithful port, not a generalisation like the
+ * kernel above. */
+static void sycl_moe_iq2_down_direct(
+        sycl::queue &q, float *out, const char *down_base, const sycl_block_q8_K *midq,
+        const int32_t *selected, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t midq_blocks, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    const uint32_t row_blocks = (out_dim + 31u) / 32u;
+    if (row_blocks == 0u || n_tokens == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, n_tokens),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u + (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t tok = (uint32_t)it.get_group(1);
+                 if (row >= out_dim) return;
+                 float total = 0.0f;
+                 for (uint32_t slot = 0; slot < 8u /* DS4_ROCM_N_EXPERT_USED */; slot++) {
+                     if (slot >= n_expert) continue;
+                     int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+                     if (expert_i < 0) expert_i = 0;
+                     const sycl_block_iq2_xxs *wr = (const sycl_block_iq2_xxs *)
+                             (down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+                     const sycl_block_q8_K *xqb = midq + ((uint64_t)tok * n_expert + slot) * midq_blocks;
+                     float acc = 0.0f;
+                     for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+                         acc += sycl_dev_dot_iq2_xxs_q8_k_block(wr + b, xqb + b);
+                     }
+                     acc = sycl_moe_subgroup_sum<8>(sg, acc);
+                     if (lane == 0u) total += acc;
+                 }
+                 if (lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
+             });
+     }).wait_and_throw();
+}
+
+/* moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel, moe.cuh:2849-2907:
+ * q2k_path's Q8_K-quantised-activation gate/up kernel, 16-lane sub-groups.
+ * ROCm reaches this only via q8k_gateup (moe_launch.cuh:2255-2256,
+ * "!g_quality_mode && n_tokens==1u"), and reaches a raw-float
+ * dequant-and-dot kernel (moe_gate_up_mid_q2K_rows_rpb1_w32/rows_w32,
+ * moe_gate_up_mid_q2K_expert_batch_sharedx) for every other n_tokens.
+ * This port takes the opposite choice deliberately: it uses THIS kernel,
+ * generalised over no code change at all (pair = blockIdx.y already
+ * covers any pair_count), for every n_tokens, because the mandated CPU
+ * oracle (matvec_q2_k_experts_mid_prequant, ds4.c:8377, dispatched from
+ * layer_routed_moe_one_prealloc via matvec_experts_mid_prequant) always
+ * dots against a Q8_K-prequantised x -- the raw-float kernels compute a
+ * genuinely different (unquantised-activation) value that cannot agree at
+ * tight tolerance regardless of how faithfully they are ported.  See the
+ * plan report. */
+static void sycl_moe_q2k_gate_up_mid_decode(
+        sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
+        const sycl_block_q8_K *xq, const int32_t *selected, const float *weights,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint32_t xq_blocks,
+        uint32_t expert_mid_dim, uint32_t n_expert, uint32_t pair_count, float clamp) {
+    const uint32_t row_blocks = (expert_mid_dim + 255u) / 256u;
+    if (row_blocks == 0u || pair_count == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         sycl::local_accessor<sycl_block_q8_K, 1> sxq(sycl::range<1>(16), h);
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, pair_count),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row_lane = (uint32_t)(it.get_local_id(0) >> 4);
+                 const uint32_t row_block = (uint32_t)it.get_group(0);
+                 const uint32_t pair = (uint32_t)it.get_group(1);
+                 const uint32_t tok = pair / n_expert;
+                 const uint32_t slot = pair - tok * n_expert;
+                 int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+                 if (expert_i < 0) expert_i = 0;
+                 const uint32_t expert = (uint32_t)expert_i;
+                 const sycl_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+                 const uint32_t lid = (uint32_t)it.get_local_id(0);
+                 if (xq_blocks <= 16u) {
+                     for (uint32_t i = lid; i < xq_blocks; i += 256u) sxq[i] = xqb[i];
+                     it.barrier(sycl::access::fence_space::local_space);
+                     xqb = &sxq[0];
+                 }
+                 for (uint32_t rr = 0; rr < 16u; rr++) {
+                     const uint32_t row = row_block * 256u + row_lane + rr * 16u;
+                     if (row >= expert_mid_dim) continue;
+                     const sycl_block_q2_K *gr = (const sycl_block_q2_K *)
+                             (gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                     const sycl_block_q2_K *ur = (const sycl_block_q2_K *)
+                             (up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                     float gate = 0.0f, up = 0.0f;
+                     for (uint32_t b = lane; b < xq_blocks; b += 16u) {
+                         gate += sycl_dev_dot_q2_k_q8_k_block(gr + b, xqb + b);
+                         up += sycl_dev_dot_q2_k_q8_k_block(ur + b, xqb + b);
+                     }
+                     gate = sycl_moe_subgroup_sum<16>(sg, gate);
+                     up = sycl_moe_subgroup_sum<16>(sg, up);
+                     if (lane == 0u) {
+                         if (clamp > 1.0e-6f) {
+                             if (gate > clamp) gate = clamp;
+                             if (up > clamp) up = clamp;
+                             if (up < -clamp) up = -clamp;
+                         }
+                         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+                         mid_out[off] = (gate / (1.0f + sycl::exp(-gate))) * up *
+                                        weights[(uint64_t)tok * n_expert + slot];
+                     }
+                 }
+             });
+     }).wait_and_throw();
+}
+
 }  // namespace
 
 /* ---- Test-only side doors ------------------------------------------

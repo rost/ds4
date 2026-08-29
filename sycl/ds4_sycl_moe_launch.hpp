@@ -117,6 +117,17 @@ static bool sycl_stream_layer_expert_cache_apply_lookup() { return false; }
 static bool sycl_stream_selected_apply_split_lookup() { return false; }
 static bool sycl_stream_selected_apply_lookup() { return false; }
 
+/* cuda_stream_batch_selected_apply_split and the batch-selected prepare it
+ * feeds (cuda_stream_batch_selected_prepare), moe_launch.cuh:612-661:
+ * gated on `iq2_gate_path || q2k_path`, so unreachable until a format
+ * that reaches them is implemented.  Both are left unported for that
+ * reason; both are pure lookups returning false whenever streaming is
+ * disabled, which is the only state this backend is ever in (see the
+ * block comment above).  The resident streaming expert cache is what would make
+ * these meaningful; nothing wires it into this dispatcher yet. */
+[[maybe_unused]] static bool sycl_stream_batch_selected_apply_split_lookup() { return false; }
+[[maybe_unused]] static bool sycl_stream_batch_selected_prepare_lookup() { return false; }
+
 /* routed_moe_full_table_is_cached, moe_launch.cuh:511-521: checks whether
  * the model's mmap pages for gate/up/down are already resident in ROCm's
  * own page-cache bookkeeping (cuda_model_range_is_cached).  This backend
@@ -215,6 +226,139 @@ static int sycl_routed_moe_q4k_dispatch(
     return 1;
 }
 
+/* ---- IQ2_XXS gate/up format block (iq2_path, iq2_iq2_path) -----------
+ *
+ * Dispatch mirrors moe_launch.cuh:750-759 restricted to iq2_gate_path:
+ * `use_sorted_pairs = n_tokens > 1u && !disable_resident_iq2_sorted`
+ * collapses, once q4k_path and mxfp4_path are excluded, to plain
+ * `n_tokens > 1u` -- there is no ">= 32" threshold for this format the
+ * way there is for q4k_path.  Two regimes only:
+ *   n_tokens == 1: decode gate/up, direct-to-out down.
+ *   n_tokens > 1:  sorted-pairs tile8 gate/up, direct-to-out down.
+ * down_type distinguishes the two down projections: iq2_path
+ * (down_type==10) uses the Q2_K-cast direct-sum kernel; iq2_iq2_path
+ * (down_type==16) uses the IQ2_XXS-cast one. Both are direct-to-out
+ * (no separate down-scratch-plus-combine pass is needed for either). */
+static int sycl_routed_moe_iq2_dispatch(
+        sycl::queue &q, ds4_gpu_tensor *out, ds4_gpu_tensor *mid, sycl_block_q8_K *xq,
+        sycl_block_q8_K *midq, const char *gate_w, const char *up_w, const char *down_w,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t xq_blocks, uint32_t midq_blocks,
+        uint32_t expert_mid_dim, uint32_t out_dim, uint32_t n_total_expert,
+        uint32_t n_expert, uint32_t n_tokens, uint32_t pair_count, float clamp,
+        bool iq2_iq2_path) {
+    const int32_t *sel = (const int32_t *)selected->ptr;
+    const float *w = (const float *)weights->ptr;
+    float *out_ptr = (float *)out->ptr;
+    float *mid_ptr = (float *)mid->ptr;
+
+    void *tile_scratch = nullptr;
+    sycl_moe_sorted_pairs sp;
+    const bool use_sorted_pairs = n_tokens > 1u;
+    if (use_sorted_pairs) {
+        if (!sycl_moe_build_sorted_pairs(q, sel, pair_count, n_total_expert, 8u,
+                                         &tile_scratch, &sp)) {
+            return 0;
+        }
+    }
+    sycl_device_scratch_guard tile_guard(q, tile_scratch);
+
+    if (use_sorted_pairs) {
+        sycl_moe_iq2_gate_up_mid_tile8(q, mid_ptr, gate_w, up_w, xq, sp.sorted_pairs,
+                                       sp.offsets, sp.counts, sp.tile_total,
+                                       sp.tile_experts, sp.tile_starts, w,
+                                       gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                       expert_mid_dim, n_expert, sp.tile_capacity, clamp);
+    } else {
+        sycl_moe_iq2_gate_up_mid_decode(q, mid_ptr, gate_w, up_w, xq, sel, w,
+                                        gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                        expert_mid_dim, n_expert, pair_count, clamp);
+    }
+
+    sycl_moe_q8_k_quantize(q, midq, mid_ptr, expert_mid_dim, pair_count);
+
+    if (iq2_iq2_path) {
+        sycl_moe_iq2_down_direct(q, out_ptr, down_w, midq, sel, down_expert_bytes,
+                                 down_row_bytes, midq_blocks, out_dim, n_expert, n_tokens);
+    } else {
+        sycl_moe_q2k_down_direct(q, out_ptr, down_w, midq, sel, down_expert_bytes,
+                                 down_row_bytes, midq_blocks, out_dim, n_expert, n_tokens);
+    }
+    return 1;
+}
+
+/* ---- Standalone Q2_K format block (q2k_path) --------------------------
+ *
+ * gate_type==10 && down_type==10: a genuinely separate implementation
+ * from iq2_path's down side, not a reuse (moe_launch.cuh:1908 excludes
+ * q2k_path from the whole shared block above; it owns its own 670-line
+ * exclusive block at moe_launch.cuh:1909-2578).  This port deliberately
+ * takes a different shape from ROCm's: it always quantises the
+ * activation to Q8_K and uses the Q8_K-quantised gate/up and down
+ * kernels (moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel and
+ * moe_down_sum6_qwarp32_kernel, generalised over the token dimension) for
+ * every n_tokens, never ROCm's raw-float dequant-and-dot kernels
+ * (moe_gate_up_mid_q2K_rows_rpb1_w32/rows_w32/expert_batch_sharedx,
+ * moe_down_q2K_sum_rows_w32/expert_batch_sharedmid).  ROCm itself only
+ * takes the Q8_K path at n_tokens==1 with g_quality_mode off
+ * (moe_launch.cuh:2255-2256, :2464-2465); this port takes it always,
+ * because the mandated CPU oracle (matvec_q2_k_experts_mid_prequant /
+ * matvec_q2_k_experts_accum_prequant) always operates on Q8_K-prequantised
+ * activations, and the raw-float kernels compute a value that cannot
+ * agree with that oracle at tight tolerance regardless of how faithfully
+ * they are ported. See the plan report. */
+static int sycl_routed_moe_q2k_dispatch(
+        sycl::queue &q, ds4_gpu_tensor *out, ds4_gpu_tensor *mid, sycl_block_q8_K *xq,
+        sycl_block_q8_K *midq, const char *gate_w, const char *up_w, const char *down_w,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t xq_blocks, uint32_t midq_blocks,
+        uint32_t expert_mid_dim, uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens,
+        uint32_t pair_count, float clamp) {
+    const int32_t *sel = (const int32_t *)selected->ptr;
+    const float *w = (const float *)weights->ptr;
+    float *out_ptr = (float *)out->ptr;
+    float *mid_ptr = (float *)mid->ptr;
+
+    sycl_moe_q2k_gate_up_mid_decode(q, mid_ptr, gate_w, up_w, xq, sel, w, gate_expert_bytes,
+                                    gate_row_bytes, xq_blocks, expert_mid_dim, n_expert,
+                                    pair_count, clamp);
+    sycl_moe_q8_k_quantize(q, midq, mid_ptr, expert_mid_dim, pair_count);
+    sycl_moe_q2k_down_direct(q, out_ptr, down_w, midq, sel, down_expert_bytes, down_row_bytes,
+                             midq_blocks, out_dim, n_expert, n_tokens);
+    return 1;
+}
+
+/* Spec 6l: a SYCL kernel cannot dereference the host mmap, so gate_w/up_w/
+ * down_w (ordinary host memory, or a host-backed test fixture) must be
+ * copied to device memory before any kernel reads them.  q4k_path needed
+ * this first; iq2_path/iq2_iq2_path and q2k_path need the identical copy a
+ * second and third time, so it is factored here
+ * rather than written a fourth time.  Callers still own their own
+ * sycl_device_scratch_guard triple for the returned pointers (this
+ * function never partially succeeds without freeing what it allocated,
+ * but ownership of a successful stage passes to the caller). */
+static bool sycl_moe_stage_weights(sycl::queue &q, const char *gate_w, const char *up_w,
+                                   const char *down_w, uint64_t gate_bytes, uint64_t down_bytes,
+                                   void **gate_dev, void **up_dev, void **down_dev) {
+    *gate_dev = sycl::malloc_device((size_t)gate_bytes, q);
+    *up_dev = sycl::malloc_device((size_t)gate_bytes, q);
+    *down_dev = sycl::malloc_device((size_t)down_bytes, q);
+    if (!*gate_dev || !*up_dev || !*down_dev) {
+        if (*gate_dev) sycl::free(*gate_dev, q);
+        if (*up_dev) sycl::free(*up_dev, q);
+        if (*down_dev) sycl::free(*down_dev, q);
+        *gate_dev = *up_dev = *down_dev = nullptr;
+        return false;
+    }
+    q.memcpy(*gate_dev, gate_w, (size_t)gate_bytes);
+    q.memcpy(*up_dev, up_w, (size_t)gate_bytes);
+    q.memcpy(*down_dev, down_w, (size_t)down_bytes);
+    q.wait_and_throw();
+    return true;
+}
+
 /* ---- The shared launcher ---------------------------------------------
  *
  * Mirrors routed_moe_launch (moe_launch.cuh:523-745 for the preamble
@@ -297,12 +441,11 @@ static int sycl_routed_moe_launch(
          * moe.cuh:5464) block casts regardless of the caller's actual
          * gate_type/down_type -- despite its name, "F32 fallback" means
          * "activations stay F32-unquantised", not "weights are F32".
-         * Reusing it for Q4_K, MXFP4 or IQ2_XXS-paired-with-IQ2_XXS-down
-         * would silently misinterpret weight bytes. This dispatcher does
-         * not yet implement IQ2_XXS or Q2_K, so there is no format it
-         * can correctly take that fallback for; a
-         * precondition failure is therefore a clean failure here rather
-         * than ROCm's fallback path. */
+         * Reusing it for Q4_K, MXFP4, IQ2_XXS-paired-with-IQ2_XXS-down or
+         * Q2_K-both-sides would silently misinterpret weight bytes. No
+         * format this dispatcher implements can correctly take that
+         * fallback; a precondition failure is therefore a clean failure
+         * here rather than ROCm's fallback path. */
         const uint32_t xq_blocks = expert_in_dim / kMoeQK;
         const uint32_t midq_blocks = expert_mid_dim / kMoeQK;
         uint64_t xq_count = 0, midq_count = 0, xq_bytes = 0, midq_bytes = 0;
@@ -320,43 +463,35 @@ static int sycl_routed_moe_launch(
         sycl_block_q8_K *midq = (sycl_block_q8_K *)gate->ptr;
         sycl_moe_q8_k_quantize(q, xq, (const float *)x->ptr, expert_in_dim, n_tokens);
 
-        if (plan.q4k_path) {
-            /* gate_w/up_w/down_w point into model_map, ordinary host
-             * memory (or a plain host-backed test fixture): a SYCL
-             * kernel cannot dereference an arbitrary host pointer the
-             * way a CUDA/HIP kernel can under unified virtual
-             * addressing (spec section 6a's "known gap" is the general
-             * case of this; ROCm's own routed_moe_launch reads gate_w/
-             * up_w/down_w directly inside its kernels and gets away with
-             * it for exactly this reason).  Every other SYCL kernel in
-             * this backend that reads a model-mapped weight range copies
-             * it to device memory first (ds4_sycl_embedding.hpp's
-             * per-token row copy, ds4_sycl_compressor.hpp's APE-table
-             * staging); this is that same pattern applied to the whole
-             * per-layer gate/up/down table, since MoE does not know
-             * which experts `selected` names until the device has
-             * already computed it.  Real zero-copy residency is
-             * ds4_gpu_register_model_map_no_copy's job, still a stub in
-             * this backend; this is a correctness-first placeholder that
-             * costs a full-table copy on every call until that (or the
-             * resident streaming expert cache) is wired in here. */
-            void *gate_dev = sycl::malloc_device((size_t)plan.gate_bytes, q);
-            void *up_dev = sycl::malloc_device((size_t)plan.gate_bytes, q);
-            void *down_dev = sycl::malloc_device((size_t)plan.down_bytes, q);
-            if (!gate_dev || !up_dev || !down_dev) {
-                if (gate_dev) sycl::free(gate_dev, q);
-                if (up_dev) sycl::free(up_dev, q);
-                if (down_dev) sycl::free(down_dev, q);
-                return 0;
-            }
-            sycl_device_scratch_guard gate_guard(q, gate_dev);
-            sycl_device_scratch_guard up_guard(q, up_dev);
-            sycl_device_scratch_guard down_guard(q, down_dev);
-            q.memcpy(gate_dev, gate_w, (size_t)plan.gate_bytes);
-            q.memcpy(up_dev, up_w, (size_t)plan.gate_bytes);
-            q.memcpy(down_dev, down_w, (size_t)plan.down_bytes);
-            q.wait_and_throw();
+        /* gate_w/up_w/down_w point into model_map, ordinary host memory (or
+         * a plain host-backed test fixture): a SYCL kernel cannot
+         * dereference an arbitrary host pointer the way a CUDA/HIP kernel
+         * can under unified virtual addressing (spec section 6a's "known
+         * gap" is the general case of this; ROCm's own routed_moe_launch
+         * reads gate_w/up_w/down_w directly inside its kernels and gets
+         * away with it for exactly this reason).  Every other SYCL kernel
+         * in this backend that reads a model-mapped weight range copies it
+         * to device memory first; every format block below applies that
+         * same pattern to the whole per-layer gate/up/down table, since
+         * MoE does not know which experts `selected` names until the
+         * device has already computed it.  Real zero-copy residency is
+         * ds4_gpu_register_model_map_no_copy's job, still a stub in this
+         * backend; this is a correctness-first placeholder that costs a
+         * full-table copy on every call until that (or the resident
+         * streaming expert cache) is wired in here.  Skipped for mxfp4_path,
+         * which is not yet implemented and still a clean stub below; there
+         * is no point staging a table nothing will read. */
+        void *gate_dev = nullptr, *up_dev = nullptr, *down_dev = nullptr;
+        if (!plan.mxfp4_path &&
+            !sycl_moe_stage_weights(q, gate_w, up_w, down_w, plan.gate_bytes, plan.down_bytes,
+                                    &gate_dev, &up_dev, &down_dev)) {
+            return 0;
+        }
+        sycl_device_scratch_guard gate_guard(q, gate_dev);
+        sycl_device_scratch_guard up_guard(q, up_dev);
+        sycl_device_scratch_guard down_guard(q, down_dev);
 
+        if (plan.q4k_path) {
             return sycl_routed_moe_q4k_dispatch(
                     q, out, mid, down, xq, midq, (const char *)gate_dev,
                     (const char *)up_dev, (const char *)down_dev, weights,
@@ -365,14 +500,20 @@ static int sycl_routed_moe_launch(
                     n_total_expert, n_expert, n_tokens, pair_count, clamp);
         }
         if (plan.iq2_path || plan.iq2_iq2_path) {
-            /* IQ2_XXS gate/up (+ Q2_K down for iq2_path); not yet implemented. */
-            return 0;
+            return sycl_routed_moe_iq2_dispatch(
+                    q, out, mid, xq, midq, (const char *)gate_dev, (const char *)up_dev,
+                    (const char *)down_dev, weights, selected, gate_expert_bytes,
+                    gate_row_bytes, down_expert_bytes, down_row_bytes, xq_blocks,
+                    midq_blocks, expert_mid_dim, out_dim, n_total_expert, n_expert,
+                    n_tokens, pair_count, clamp, plan.iq2_iq2_path);
         }
         if (plan.q2k_path) {
-            /* Standalone Q2_K both-sides path, including the WMMA
-             * hotlist kernels and its own dedicated scratch launcher
-             * (routed_moe_q2_float_down_launch); not yet implemented. */
-            return 0;
+            return sycl_routed_moe_q2k_dispatch(
+                    q, out, mid, xq, midq, (const char *)gate_dev, (const char *)up_dev,
+                    (const char *)down_dev, weights, selected, gate_expert_bytes,
+                    gate_row_bytes, down_expert_bytes, down_row_bytes, xq_blocks,
+                    midq_blocks, expert_mid_dim, out_dim, n_expert, n_tokens, pair_count,
+                    clamp);
         }
         if (plan.mxfp4_path) {
             /* Not yet implemented; no CPU oracle exists for this format at all. */

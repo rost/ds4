@@ -503,16 +503,20 @@ typedef struct {
     uint64_t       down_expert_bytes, down_row_bytes;
 } rm_model;
 
-/* type: 12 = Q4_K (used for gate_row_bytes sizing regardless of the
- * gate_type/down_type the caller then passes; only the byte layout
- * needs to be self-consistent for the model-range bounds checks to
- * pass, and every format the dispatcher can currently reach
- * (implemented or stubbed) uses 256-wide superblocks). */
-static rm_model rm_build_model(void) {
+enum {
+    RM_IQ2_BLOCK_BYTES = 66, /* cuda_block_iq2_xxs, ds4_rocm.cu:85-88 */
+    RM_Q2K_BLOCK_BYTES = 84, /* cuda_block_q2_K, ds4_rocm.cu:65-70 */
+};
+
+/* Generalised model builder: gate/up always share one block size (both
+ * paired formats implemented here use the same weight type for gate
+ * and up), down may use a different one (iq2_path pairs IQ2_XXS gate/up
+ * with Q2_K down). */
+static rm_model rm_build_model_ex(uint32_t gate_block_bytes, uint32_t down_block_bytes) {
     rm_model m;
-    m.gate_row_bytes = (RM_EXPERT_IN_DIM / 256u) * RM_Q4K_BLOCK_BYTES;
+    m.gate_row_bytes = (RM_EXPERT_IN_DIM / 256u) * gate_block_bytes;
     m.gate_expert_bytes = (uint64_t)RM_EXPERT_MID_DIM * m.gate_row_bytes;
-    m.down_row_bytes = (RM_EXPERT_MID_DIM / 256u) * RM_Q4K_BLOCK_BYTES;
+    m.down_row_bytes = (RM_EXPERT_MID_DIM / 256u) * down_block_bytes;
     m.down_expert_bytes = (uint64_t)RM_OUT_DIM * m.down_row_bytes;
     m.gate_offset = 0;
     m.up_offset = m.gate_expert_bytes * RM_N_TOTAL_EXPERT;
@@ -520,6 +524,15 @@ static rm_model rm_build_model(void) {
     m.model_size = m.down_offset + m.down_expert_bytes * RM_N_TOTAL_EXPERT;
     m.model = calloc(1, (size_t)m.model_size);
     return m;
+}
+
+/* type: 12 = Q4_K (used for gate_row_bytes sizing regardless of the
+ * gate_type/down_type the caller then passes; only the byte layout
+ * needs to be self-consistent for the model-range bounds checks to
+ * pass, and every format the dispatcher can currently reach
+ * (implemented or stubbed) uses 256-wide superblocks). */
+static rm_model rm_build_model(void) {
+    return rm_build_model_ex(RM_Q4K_BLOCK_BYTES, RM_Q4K_BLOCK_BYTES);
 }
 
 typedef struct {
@@ -598,29 +611,29 @@ static int test_dispatcher_unrecognised_format_fails(void) {
     return 0;
 }
 
-/* Each of the three formats not yet implemented here must fail
- * cleanly with a well-formed call (reaching its own delimited dispatcher
- * block, not failing on validation), and each of these three tests is
- * exactly the test that must flip when that format is implemented. */
-static int test_dispatcher_iq2_not_yet_implemented(void) {
-    rm_model m = rm_build_model();
+/* Both iq2_path and q2k_path formats are now implemented: they now
+ * reach their own delimited dispatcher block and succeed on a
+ * well-formed call, not fail as "not yet implemented". The mxfp4_path
+ * sibling test below is unchanged; that format is implemented separately below. */
+static int test_dispatcher_iq2_succeeds(void) {
+    rm_model m = rm_build_model_ex(RM_IQ2_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES);
     rm_tensors t = rm_build_tensors();
-    CHECK(rm_call_batch(&m, &t, 16u, 10u, RM_N_TOKENS, NULL) == 0,
-          "dispatcher: iq2_path must fail until it is implemented");
+    CHECK(rm_call_batch(&m, &t, 16u, 10u, RM_N_TOKENS, NULL) != 0,
+          "dispatcher: iq2_path must succeed now that it is implemented");
     rm_free_tensors(&t);
     free(m.model);
-    fprintf(stderr, "  test_dispatcher_iq2_not_yet_implemented OK\n");
+    fprintf(stderr, "  test_dispatcher_iq2_succeeds OK\n");
     return 0;
 }
 
-static int test_dispatcher_q2k_not_yet_implemented(void) {
-    rm_model m = rm_build_model();
+static int test_dispatcher_q2k_succeeds(void) {
+    rm_model m = rm_build_model_ex(RM_Q2K_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES);
     rm_tensors t = rm_build_tensors();
-    CHECK(rm_call_batch(&m, &t, 10u, 10u, RM_N_TOKENS, NULL) == 0,
-          "dispatcher: q2k_path must fail until it is implemented");
+    CHECK(rm_call_batch(&m, &t, 10u, 10u, RM_N_TOKENS, NULL) != 0,
+          "dispatcher: q2k_path must succeed now that it is implemented");
     rm_free_tensors(&t);
     free(m.model);
-    fprintf(stderr, "  test_dispatcher_q2k_not_yet_implemented OK\n");
+    fprintf(stderr, "  test_dispatcher_q2k_succeeds OK\n");
     return 0;
 }
 
@@ -1205,6 +1218,671 @@ static int test_q4k_scratch_precondition_failure(void) {
     return 0;
 }
 
+/* ---- IQ2_XXS and Q2_K: full decode/batch paths against scalar oracles --
+ *
+ * Both oracles reimplement layer_routed_moe_one_prealloc's dispatch for
+ * these formats: matvec_iq2_xxs_experts_mid_prequant / matvec_q2_k_experts_
+ * mid_prequant (ds4.c:8079, 8377) for gate/up, matvec_iq2_xxs_experts_
+ * accum_prequant / matvec_q2_k_experts_accum_prequant (ds4.c:8580, 8297)
+ * for down, both dispatched from matvec_experts_mid_prequant /
+ * matvec_experts_down_accum_prequant (ds4.c:9452, 9480).  ds4_vec_dot_
+ * q2_K_q8_K (ds4.c:3376) and ds4_vec_dot_iq2_xxs_q8_K (ds4.c:3933) were
+ * read directly (non-NEON branch, since this machine is x86) and verified
+ * field-for-field against dev_dot_q2_K_q8_K_block / dev_dot_iq2_xxs_q8_K_
+ * block (moe.cuh:622-645, 101-123): identical aux0/aux1/ls decode, scale
+ * indexing and accumulation order in both cases.  As with Q4_K, ds4.c's
+ * own scalar routines cannot be linked (static, ds4.c not part of this
+ * build), so every helper below is an independent reimplementation. */
+
+/* cuda_iq2xxs_grid / cuda_ksigns_iq2xs, ds4_iq2_tables_cuda.inc: the exact
+ * same tables sycl/ds4_sycl_moe.hpp embeds for the kernels under test.
+ * Duplicated here rather than shared because this is a plain C
+ * translation unit and ds4.c's own IQ2_XXS tables (iq2xxs_signed_grid) are
+ * precomputed in a different, though mathematically equivalent, shape
+ * (grid and sign already combined) that this file has no way to link to
+ * either. */
+static const uint8_t g_iq2_signs[128] = {
+      0, 129, 130,   3, 132,   5,   6, 135, 136,   9,  10, 139,  12, 141, 142,  15,
+    144,  17,  18, 147,  20, 149, 150,  23,  24, 153, 154,  27, 156,  29,  30, 159,
+    160,  33,  34, 163,  36, 165, 166,  39,  40, 169, 170,  43, 172,  45,  46, 175,
+     48, 177, 178,  51, 180,  53,  54, 183, 184,  57,  58, 187,  60, 189, 190,  63,
+    192,  65,  66, 195,  68, 197, 198,  71,  72, 201, 202,  75, 204,  77,  78, 207,
+     80, 209, 210,  83, 212,  85,  86, 215, 216,  89,  90, 219,  92, 221, 222,  95,
+     96, 225, 226,  99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+static const uint64_t g_iq2_grid[256] = {
+    0x0808080808080808ULL, 0x080808080808082bULL, 0x0808080808081919ULL, 0x0808080808082b08ULL,
+    0x0808080808082b2bULL, 0x0808080808190819ULL, 0x0808080808191908ULL, 0x08080808082b0808ULL,
+    0x08080808082b082bULL, 0x08080808082b2b08ULL, 0x08080808082b2b2bULL, 0x0808080819080819ULL,
+    0x0808080819081908ULL, 0x0808080819190808ULL, 0x0808080819192b08ULL, 0x08080808192b0819ULL,
+    0x08080808192b1908ULL, 0x080808082b080808ULL, 0x080808082b08082bULL, 0x080808082b082b2bULL,
+    0x080808082b2b082bULL, 0x0808081908080819ULL, 0x0808081908081908ULL, 0x0808081908190808ULL,
+    0x0808081908191919ULL, 0x0808081919080808ULL, 0x080808192b081908ULL, 0x080808192b192b08ULL,
+    0x0808082b08080808ULL, 0x0808082b0808082bULL, 0x0808082b082b082bULL, 0x0808082b2b08082bULL,
+    0x0808190808080819ULL, 0x0808190808081908ULL, 0x0808190808190808ULL, 0x08081908082b0819ULL,
+    0x08081908082b1908ULL, 0x0808190819080808ULL, 0x080819081908082bULL, 0x0808190819082b08ULL,
+    0x08081908192b0808ULL, 0x080819082b080819ULL, 0x080819082b081908ULL, 0x080819082b190808ULL,
+    0x080819082b2b1908ULL, 0x0808191908080808ULL, 0x080819190808082bULL, 0x0808191908082b08ULL,
+    0x08081919082b0808ULL, 0x080819191908192bULL, 0x08081919192b2b19ULL, 0x080819192b080808ULL,
+    0x080819192b190819ULL, 0x0808192b08082b19ULL, 0x0808192b08190808ULL, 0x0808192b19080808ULL,
+    0x0808192b2b081908ULL, 0x0808192b2b2b1908ULL, 0x08082b0808080808ULL, 0x08082b0808081919ULL,
+    0x08082b0808082b08ULL, 0x08082b0808191908ULL, 0x08082b08082b2b08ULL, 0x08082b0819080819ULL,
+    0x08082b0819081908ULL, 0x08082b0819190808ULL, 0x08082b081919082bULL, 0x08082b082b082b08ULL,
+    0x08082b1908081908ULL, 0x08082b1919080808ULL, 0x08082b2b0808082bULL, 0x08082b2b08191908ULL,
+    0x0819080808080819ULL, 0x0819080808081908ULL, 0x0819080808190808ULL, 0x08190808082b0819ULL,
+    0x0819080819080808ULL, 0x08190808192b0808ULL, 0x081908082b081908ULL, 0x081908082b190808ULL,
+    0x081908082b191919ULL, 0x0819081908080808ULL, 0x0819081908082b08ULL, 0x08190819082b0808ULL,
+    0x0819081919190808ULL, 0x0819081919192b2bULL, 0x081908192b080808ULL, 0x0819082b082b1908ULL,
+    0x0819082b19081919ULL, 0x0819190808080808ULL, 0x0819190808082b08ULL, 0x08191908082b0808ULL,
+    0x08191908082b1919ULL, 0x0819190819082b19ULL, 0x081919082b080808ULL, 0x0819191908192b08ULL,
+    0x08191919192b082bULL, 0x0819192b08080808ULL, 0x0819192b0819192bULL, 0x08192b0808080819ULL,
+    0x08192b0808081908ULL, 0x08192b0808190808ULL, 0x08192b0819080808ULL, 0x08192b082b080819ULL,
+    0x08192b1908080808ULL, 0x08192b1908081919ULL, 0x08192b192b2b0808ULL, 0x08192b2b19190819ULL,
+    0x082b080808080808ULL, 0x082b08080808082bULL, 0x082b080808082b2bULL, 0x082b080819081908ULL,
+    0x082b0808192b0819ULL, 0x082b08082b080808ULL, 0x082b08082b08082bULL, 0x082b0819082b2b19ULL,
+    0x082b081919082b08ULL, 0x082b082b08080808ULL, 0x082b082b0808082bULL, 0x082b190808080819ULL,
+    0x082b190808081908ULL, 0x082b190808190808ULL, 0x082b190819080808ULL, 0x082b19081919192bULL,
+    0x082b191908080808ULL, 0x082b191919080819ULL, 0x082b1919192b1908ULL, 0x082b192b2b190808ULL,
+    0x082b2b0808082b08ULL, 0x082b2b08082b0808ULL, 0x082b2b082b191908ULL, 0x082b2b2b19081908ULL,
+    0x1908080808080819ULL, 0x1908080808081908ULL, 0x1908080808190808ULL, 0x1908080808192b08ULL,
+    0x19080808082b0819ULL, 0x19080808082b1908ULL, 0x1908080819080808ULL, 0x1908080819082b08ULL,
+    0x190808081919192bULL, 0x19080808192b0808ULL, 0x190808082b080819ULL, 0x190808082b081908ULL,
+    0x190808082b190808ULL, 0x1908081908080808ULL, 0x19080819082b0808ULL, 0x19080819192b0819ULL,
+    0x190808192b080808ULL, 0x190808192b081919ULL, 0x1908082b08080819ULL, 0x1908082b08190808ULL,
+    0x1908082b19082b08ULL, 0x1908082b1919192bULL, 0x1908082b192b2b08ULL, 0x1908190808080808ULL,
+    0x1908190808082b08ULL, 0x19081908082b0808ULL, 0x190819082b080808ULL, 0x190819082b192b19ULL,
+    0x190819190819082bULL, 0x19081919082b1908ULL, 0x1908192b08080808ULL, 0x19082b0808080819ULL,
+    0x19082b0808081908ULL, 0x19082b0808190808ULL, 0x19082b0819080808ULL, 0x19082b0819081919ULL,
+    0x19082b1908080808ULL, 0x19082b1919192b08ULL, 0x19082b19192b0819ULL, 0x19082b192b08082bULL,
+    0x19082b2b19081919ULL, 0x19082b2b2b190808ULL, 0x1919080808080808ULL, 0x1919080808082b08ULL,
+    0x1919080808190819ULL, 0x1919080808192b19ULL, 0x19190808082b0808ULL, 0x191908082b080808ULL,
+    0x191908082b082b08ULL, 0x1919081908081908ULL, 0x191908191908082bULL, 0x191908192b2b1908ULL,
+    0x1919082b2b190819ULL, 0x191919082b190808ULL, 0x191919082b19082bULL, 0x1919191908082b2bULL,
+    0x1919192b08080819ULL, 0x1919192b19191908ULL, 0x19192b0808080808ULL, 0x19192b0808190819ULL,
+    0x19192b0808192b19ULL, 0x19192b08192b1908ULL, 0x19192b1919080808ULL, 0x19192b2b08082b08ULL,
+    0x192b080808081908ULL, 0x192b080808190808ULL, 0x192b080819080808ULL, 0x192b0808192b2b08ULL,
+    0x192b081908080808ULL, 0x192b081919191919ULL, 0x192b082b08192b08ULL, 0x192b082b192b0808ULL,
+    0x192b190808080808ULL, 0x192b190808081919ULL, 0x192b191908190808ULL, 0x192b19190819082bULL,
+    0x192b19192b081908ULL, 0x192b2b081908082bULL, 0x2b08080808080808ULL, 0x2b0808080808082bULL,
+    0x2b08080808082b2bULL, 0x2b08080819080819ULL, 0x2b0808082b08082bULL, 0x2b08081908081908ULL,
+    0x2b08081908192b08ULL, 0x2b08081919080808ULL, 0x2b08082b08190819ULL, 0x2b08190808080819ULL,
+    0x2b08190808081908ULL, 0x2b08190808190808ULL, 0x2b08190808191919ULL, 0x2b08190819080808ULL,
+    0x2b081908192b0808ULL, 0x2b08191908080808ULL, 0x2b0819191908192bULL, 0x2b0819192b191908ULL,
+    0x2b08192b08082b19ULL, 0x2b08192b19080808ULL, 0x2b08192b192b0808ULL, 0x2b082b080808082bULL,
+    0x2b082b1908081908ULL, 0x2b082b2b08190819ULL, 0x2b19080808081908ULL, 0x2b19080808190808ULL,
+    0x2b190808082b1908ULL, 0x2b19080819080808ULL, 0x2b1908082b2b0819ULL, 0x2b1908190819192bULL,
+    0x2b1908192b080808ULL, 0x2b19082b19081919ULL, 0x2b19190808080808ULL, 0x2b191908082b082bULL,
+    0x2b19190819081908ULL, 0x2b19191919190819ULL, 0x2b192b082b080819ULL, 0x2b192b19082b0808ULL,
+    0x2b2b08080808082bULL, 0x2b2b080819190808ULL, 0x2b2b08082b081919ULL, 0x2b2b081908082b19ULL,
+    0x2b2b082b08080808ULL, 0x2b2b190808192b08ULL, 0x2b2b2b0819190808ULL, 0x2b2b2b1908081908ULL,
+};
+
+static uint32_t oracle_popcount_u32(uint32_t v) {
+    v = v - ((v >> 1) & 0x55555555u);
+    v = (v & 0x33333333u) + ((v >> 2) & 0x33333333u);
+    v = (v + (v >> 4)) & 0x0f0f0f0fu;
+    return (v * 0x01010101u) >> 24;
+}
+
+static int32_t oracle_iq2_grid_dot8(uint8_t grid_idx, uint8_t sign_idx, const int8_t *q8) {
+    uint64_t grid = g_iq2_grid[grid_idx];
+    uint8_t raw = g_iq2_signs[sign_idx & 127u];
+    uint32_t parity = oracle_popcount_u32((uint32_t)raw) & 1u;
+    uint8_t s = (uint8_t)(raw ^ (uint8_t)(parity << 7));
+    int32_t sum = 0;
+    for (int b = 0; b < 8; b++) {
+        int32_t v = (int32_t)(int8_t)((grid >> (b * 8)) & 0xffu);
+        if ((s >> b) & 1u) v = -v;
+        sum += v * (int32_t)q8[b];
+    }
+    return sum;
+}
+
+static int32_t oracle_iq2_pair_dot16(uint8_t g0, uint8_t s0, uint8_t g1, uint8_t s1, const int8_t *q8) {
+    return oracle_iq2_grid_dot8(g0, s0, q8) + oracle_iq2_grid_dot8(g1, s1, q8 + 8);
+}
+
+/* Packs one ib32 group (32 elements: 4 grid indices, 4 sign indices, 1
+ * scale nibble) into the 4 uint16 codes the real format uses, inverting
+ * dev_dot_iq2_xxs_q8_K_block's aux0/aux1 decode exactly. */
+static void oracle_iq2_pack_ib32(uint16_t out4[4], uint8_t a0, uint8_t a1, uint8_t a2, uint8_t a3,
+                                 uint32_t s0, uint32_t s1, uint32_t s2, uint32_t s3,
+                                 uint32_t ls_nibble) {
+    uint32_t aux0 = (uint32_t)a0 | ((uint32_t)a1 << 8) | ((uint32_t)a2 << 16) | ((uint32_t)a3 << 24);
+    uint32_t aux1 = (s0 & 127u) | ((s1 & 127u) << 7) | ((s2 & 127u) << 14) | ((s3 & 127u) << 21) |
+                    ((ls_nibble & 15u) << 28);
+    out4[0] = (uint16_t)(aux0 & 0xffffu);
+    out4[1] = (uint16_t)(aux0 >> 16);
+    out4[2] = (uint16_t)(aux1 & 0xffffu);
+    out4[3] = (uint16_t)(aux1 >> 16);
+}
+
+/* Packs one 66-byte cuda_block_iq2_xxs (ds4_rocm.cu:85-88): d (f16) plus
+ * 32 packed u16 codes, 8 groups of 4. */
+static void oracle_iq2_pack_block(uint8_t out[66], float d, const uint16_t qs[32]) {
+    uint16_t dh = f32_to_f16_bits(d);
+    memcpy(out, &dh, 2);
+    memcpy(out + 2, qs, 64);
+}
+
+static void iq2_fill_row(uint8_t out[66], uint32_t phase, uint32_t expert, uint32_t row) {
+    uint16_t qs[32];
+    for (uint32_t g = 0; g < 8u; g++) {
+        uint8_t a0 = (uint8_t)((phase * 7u + expert * 13u + row * 5u + g * 3u) % 256u);
+        uint8_t a1 = (uint8_t)((phase * 11u + expert * 17u + row * 7u + g * 5u + (expert * row) % 17u) % 256u);
+        uint8_t a2 = (uint8_t)((phase * 13u + expert * 19u + row * 11u + g * 7u) % 256u);
+        uint8_t a3 = (uint8_t)((phase * 17u + expert * 23u + row * 13u + g * 11u + (g * row) % 13u) % 256u);
+        uint32_t s0 = (phase + expert * 3u + row * 2u + g) % 128u;
+        uint32_t s1 = (phase * 2u + expert + row * 5u + g * 2u) % 128u;
+        uint32_t s2 = (phase * 3u + expert * 5u + row + g * 3u) % 128u;
+        uint32_t s3 = (phase * 5u + expert * 2u + row * 3u + g * 5u) % 128u;
+        uint32_t ls_nibble = (phase + expert + row + g) % 16u;
+        oracle_iq2_pack_ib32(&qs[g * 4u], a0, a1, a2, a3, s0, s1, s2, s3, ls_nibble);
+    }
+    const float d = 0.01f + 0.001f * (float)((phase + expert + row) % 7u);
+    oracle_iq2_pack_block(out, d, qs);
+}
+
+static float oracle_iq2_dot_block(const uint8_t *blk, const oracle_q8k_block *y) {
+    uint16_t dbits;
+    memcpy(&dbits, blk, 2);
+    const float xd = f16_bits_to_f32(dbits);
+    const uint16_t *q2 = (const uint16_t *)(blk + 2);
+    const int8_t *q8 = y->qs;
+    int32_t bsum = 0;
+    for (int ib32 = 0; ib32 < 8; ib32++) {
+        uint32_t aux0 = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
+        uint32_t aux1 = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
+        q2 += 4;
+        uint32_t ls = 2u * (aux1 >> 28) + 1u;
+        uint8_t a0 = (uint8_t)(aux0 & 0xffu);
+        uint8_t a1 = (uint8_t)((aux0 >> 8) & 0xffu);
+        uint8_t a2 = (uint8_t)((aux0 >> 16) & 0xffu);
+        uint8_t a3 = (uint8_t)((aux0 >> 24) & 0xffu);
+        int32_t sumi = oracle_iq2_pair_dot16(a0, (uint8_t)((aux1 >> 0) & 127u), a1,
+                                             (uint8_t)((aux1 >> 7) & 127u), q8);
+        q8 += 16;
+        sumi += oracle_iq2_pair_dot16(a2, (uint8_t)((aux1 >> 14) & 127u), a3,
+                                      (uint8_t)((aux1 >> 21) & 127u), q8);
+        q8 += 16;
+        bsum += sumi * (int32_t)ls;
+    }
+    return 0.125f * xd * y->d * (float)bsum;
+}
+
+/* Packs one 84-byte cuda_block_q2_K (ds4_rocm.cu:65-70): 16 bytes of
+ * packed (scale, min) nibble pairs, 64 bytes of 2-bit codes, d and dmin
+ * as f16.  The per-element byte/shift placement is lifted directly from
+ * ds4.c's own accessor q2_k_value_f32 (ds4.c:3494-3505: group = idx/16,
+ * q_base = 32*(group/8) + 16*(group&1), shift = ((group/2)&3)*2), which
+ * this test also uses as ground truth for the roundtrip check below --
+ * not derived by hand from the dot-product loop nesting, to avoid
+ * transcribing that nesting incorrectly. */
+static void oracle_q2k_pack_block(uint8_t out[84], float d, float dmin,
+                                  const uint8_t scales[16], const uint8_t nib[256]) {
+    memset(out, 0, 84);
+    memcpy(out, scales, 16);
+    for (uint32_t idx = 0; idx < 256u; idx++) {
+        uint32_t group = idx / 16u;
+        uint32_t l = idx - group * 16u;
+        uint32_t q_base = 32u * (group / 8u) + 16u * (group & 1u);
+        uint32_t shift = ((group / 2u) & 3u) * 2u;
+        out[16u + q_base + l] = (uint8_t)(out[16u + q_base + l] | ((nib[idx] & 3u) << shift));
+    }
+    uint16_t dh = f32_to_f16_bits(d), dminh = f32_to_f16_bits(dmin);
+    memcpy(out + 80, &dh, 2);
+    memcpy(out + 82, &dminh, 2);
+}
+
+/* Read back one packed element the same way q2_k_value_f32 would (minus
+ * the dequant scale), to self-check oracle_q2k_pack_block before trusting
+ * it for anything else. */
+static uint8_t oracle_q2k_read_nib(const uint8_t blk[84], uint32_t idx) {
+    uint32_t group = idx / 16u;
+    uint32_t l = idx - group * 16u;
+    uint32_t q_base = 32u * (group / 8u) + 16u * (group & 1u);
+    uint32_t shift = ((group / 2u) & 3u) * 2u;
+    return (uint8_t)((blk[16u + q_base + l] >> shift) & 3u);
+}
+
+static int test_q2k_pack_roundtrip(void) {
+    uint8_t scales[16], nib[256], blk[84];
+    for (int i = 0; i < 16; i++) scales[i] = (uint8_t)((i * 13 + 7) & 0xff);
+    for (int i = 0; i < 256; i++) nib[i] = (uint8_t)((i * 3 + i / 7) & 3);
+    oracle_q2k_pack_block(blk, 0.5f, 0.25f, scales, nib);
+    for (uint32_t idx = 0; idx < 256u; idx++) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "q2k_pack_roundtrip: idx %u mismatch", idx);
+        CHECK(oracle_q2k_read_nib(blk, idx) == nib[idx], msg);
+    }
+    fprintf(stderr, "  test_q2k_pack_roundtrip OK\n");
+    return 0;
+}
+
+static void q2k_fill_row(uint8_t out[84], uint32_t phase, uint32_t expert, uint32_t row) {
+    uint8_t scales[16], nib[256];
+    for (int g = 0; g < 16; g++) {
+        uint8_t sc = (uint8_t)(1u + (phase * 5u + expert * 7u + row * 3u + (uint32_t)g * 5u) % 15u);
+        uint8_t mn = (uint8_t)((phase * 3u + expert * 11u + row * 2u + (uint32_t)g * 13u) % 15u);
+        scales[g] = (uint8_t)((sc & 0x0fu) | (uint8_t)(mn << 4));
+    }
+    for (int k = 0; k < 256; k++) {
+        nib[k] = (uint8_t)((phase * 19u + expert * 13u + row * 17u + (uint32_t)k +
+                            (expert * row) % 5u + ((uint32_t)k * row) % 7u) % 4u);
+    }
+    const float d = 0.01f + 0.001f * (float)((phase + expert + row) % 7u);
+    const float dmin = 0.001f * (float)((phase + expert * 2u + row) % 5u);
+    oracle_q2k_pack_block(out, d, dmin, scales, nib);
+}
+
+static float oracle_q2k_dot_block16(const uint8_t *q2, const int8_t *q8, int shift) {
+    int32_t sum = 0;
+    for (int i = 0; i < 16; i++) sum += (int32_t)((q2[i] >> shift) & 3) * (int32_t)q8[i];
+    return (float)sum;
+}
+
+static float oracle_q2k_dot_block(const uint8_t *blk, const oracle_q8k_block *y) {
+    const uint8_t *sc = blk;
+    const uint8_t *q2 = blk + 16;
+    uint16_t dbits, dminbits;
+    memcpy(&dbits, blk + 80, 2);
+    memcpy(&dminbits, blk + 82, 2);
+    const float dall = y->d * f16_bits_to_f32(dbits);
+    const float dmin = y->d * f16_bits_to_f32(dminbits);
+    int32_t summs = 0;
+    for (int j = 0; j < 16; j++) summs += (int32_t)y->bsums[j] * (int32_t)(sc[j] >> 4);
+    int32_t isum = 0;
+    int is = 0;
+    const int8_t *q8 = y->qs;
+    for (int k = 0; k < 2; k++) {
+        int shift = 0;
+        for (int j = 0; j < 4; j++) {
+            int d = sc[is++] & 0x0f;
+            isum += d * (int32_t)oracle_q2k_dot_block16(q2, q8, shift);
+            d = sc[is++] & 0x0f;
+            isum += d * (int32_t)oracle_q2k_dot_block16(q2 + 16, q8 + 16, shift);
+            shift += 2;
+            q8 += 32;
+        }
+        q2 += 32;
+    }
+    return dall * (float)isum - dmin * (float)summs;
+}
+
+typedef float (*oracle_dot_fn)(const uint8_t *blk, const oracle_q8k_block *y);
+
+/* Generic one-token oracle: layer_routed_moe_one_prealloc's shape (gate/up
+ * against Q8_K-quantised x, SwiGLU, requantise mid, down against
+ * Q8_K-quantised mid, ascending slot-order sum), parameterised over which
+ * dot product gate/up and down each use.  Covers Q4_K (gate_dot==down_dot
+ * == oracle_q4k_dot_block would work too, though the existing per-format
+ * test above predates this and is left as-is), IQ2_XXS/Q2_K (iq2_path),
+ * IQ2_XXS/IQ2_XXS (iq2_iq2_path) and Q2_K/Q2_K (q2k_path). */
+static void oracle_moe_one_token(const rm_model *m, uint32_t mid_dim, uint32_t out_dim,
+                                 uint32_t n_expert, const int32_t *sel, const float *w,
+                                 const float *x, float clamp, oracle_dot_fn gate_dot,
+                                 oracle_dot_fn down_dot, float *out) {
+    oracle_q8k_block xq;
+    oracle_q8k_quantize_block(x, &xq);
+
+    float *mid = malloc((size_t)n_expert * mid_dim * sizeof(float));
+    for (uint32_t s = 0; s < n_expert; s++) {
+        const uint32_t expert = (uint32_t)sel[s];
+        for (uint32_t row = 0; row < mid_dim; row++) {
+            const uint8_t *gate_blk = m->model + m->gate_offset + (uint64_t)expert * m->gate_expert_bytes +
+                                      (uint64_t)row * m->gate_row_bytes;
+            const uint8_t *up_blk = m->model + m->up_offset + (uint64_t)expert * m->gate_expert_bytes +
+                                    (uint64_t)row * m->gate_row_bytes;
+            float gate = gate_dot(gate_blk, &xq);
+            float up = gate_dot(up_blk, &xq);
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            mid[(size_t)s * mid_dim + row] = oracle_silu(gate) * up * w[s];
+        }
+    }
+
+    oracle_q8k_block *midq = malloc((size_t)n_expert * sizeof(oracle_q8k_block));
+    for (uint32_t s = 0; s < n_expert; s++) {
+        oracle_q8k_quantize_block(mid + (size_t)s * mid_dim, &midq[s]);
+    }
+
+    for (uint32_t row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        for (uint32_t s = 0; s < n_expert; s++) {
+            const uint32_t expert = (uint32_t)sel[s];
+            const uint8_t *down_blk = m->model + m->down_offset + (uint64_t)expert * m->down_expert_bytes +
+                                      (uint64_t)row * m->down_row_bytes;
+            acc += down_dot(down_blk, &midq[s]);
+        }
+        out[row] = acc;
+    }
+    free(mid);
+    free(midq);
+}
+
+static void iq2_fill_model(rm_model *m, uint32_t n_total_expert, uint32_t mid_dim, uint32_t out_dim) {
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        for (uint32_t row = 0; row < mid_dim; row++) {
+            uint8_t blk[RM_IQ2_BLOCK_BYTES];
+            iq2_fill_row(blk, Q4K_PHASE_GATE, e, row);
+            memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
+                   blk, sizeof(blk));
+            iq2_fill_row(blk, Q4K_PHASE_UP, e, row);
+            memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
+                   blk, sizeof(blk));
+        }
+        for (uint32_t row = 0; row < out_dim; row++) {
+            uint8_t blk[RM_Q2K_BLOCK_BYTES];
+            q2k_fill_row(blk, Q4K_PHASE_DOWN, e, row);
+            memcpy(m->model + m->down_offset + e * m->down_expert_bytes + (uint64_t)row * m->down_row_bytes,
+                   blk, sizeof(blk));
+        }
+    }
+}
+
+static void iq2iq2_fill_model(rm_model *m, uint32_t n_total_expert, uint32_t mid_dim, uint32_t out_dim) {
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        for (uint32_t row = 0; row < mid_dim; row++) {
+            uint8_t blk[RM_IQ2_BLOCK_BYTES];
+            iq2_fill_row(blk, Q4K_PHASE_GATE, e, row);
+            memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
+                   blk, sizeof(blk));
+            iq2_fill_row(blk, Q4K_PHASE_UP, e, row);
+            memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
+                   blk, sizeof(blk));
+        }
+        for (uint32_t row = 0; row < out_dim; row++) {
+            uint8_t blk[RM_IQ2_BLOCK_BYTES];
+            iq2_fill_row(blk, Q4K_PHASE_DOWN, e, row);
+            memcpy(m->model + m->down_offset + e * m->down_expert_bytes + (uint64_t)row * m->down_row_bytes,
+                   blk, sizeof(blk));
+        }
+    }
+}
+
+static void q2k_fill_model(rm_model *m, uint32_t n_total_expert, uint32_t mid_dim, uint32_t out_dim) {
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        for (uint32_t row = 0; row < mid_dim; row++) {
+            uint8_t blk[RM_Q2K_BLOCK_BYTES];
+            q2k_fill_row(blk, Q4K_PHASE_GATE, e, row);
+            memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
+                   blk, sizeof(blk));
+            q2k_fill_row(blk, Q4K_PHASE_UP, e, row);
+            memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
+                   blk, sizeof(blk));
+        }
+        for (uint32_t row = 0; row < out_dim; row++) {
+            uint8_t blk[RM_Q2K_BLOCK_BYTES];
+            q2k_fill_row(blk, Q4K_PHASE_DOWN, e, row);
+            memcpy(m->model + m->down_offset + e * m->down_expert_bytes + (uint64_t)row * m->down_row_bytes,
+                   blk, sizeof(blk));
+        }
+    }
+}
+
+/* rm_call_one/batch wrappers per format, mirroring the Q4_K precedent
+ * (test_q4k_decode/test_q4k_batch) but parameterised over gate_type/
+ * down_type and the pair of oracle dot functions, to avoid tripling the
+ * decode/batch/decode-matches-batch boilerplate across the three
+ * additional formats. */
+static int rm_decode_test(const char *name, uint32_t gate_type, uint32_t down_type,
+                          uint32_t gate_block_bytes, uint32_t down_block_bytes,
+                          void (*fill_model)(rm_model *, uint32_t, uint32_t, uint32_t),
+                          oracle_dot_fn gate_dot, oracle_dot_fn down_dot) {
+    rm_model m = rm_build_model_ex(gate_block_bytes, down_block_bytes);
+    fill_model(&m, RM_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+    rm_tensors t = rm_build_tensors();
+
+    int32_t sel[RM_N_EXPERT];
+    float w[RM_N_EXPERT];
+    float x[RM_EXPERT_IN_DIM];
+    q4k_fill_selected(sel, w, /*tok=*/0, RM_N_EXPERT, RM_N_TOTAL_EXPERT);
+    q4k_fill_x_row(x, RM_EXPERT_IN_DIM, /*tok=*/0);
+    ds4_gpu_tensor_write(t.selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(t.weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(t.x, 0, x, sizeof(x));
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s: call failed", name);
+    CHECK(ds4_gpu_routed_moe_one_tensor(
+              t.out, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, gate_type, down_type,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t.x,
+              /*add_in=*/NULL, /*layer_index=*/0u, /*force_resident=*/false) != 0,
+          msg);
+
+    float want[RM_OUT_DIM];
+    oracle_moe_one_token(&m, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT, sel, w, x, 0.0f,
+                         gate_dot, down_dot, want);
+    float got[RM_OUT_DIM];
+    ds4_gpu_tensor_read(t.out, 0, got, sizeof(got));
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        snprintf(msg, sizeof(msg), "%s: value mismatch", name);
+        CHECK_CLOSE(got[i], want[i], fabs(want[i]) * 1e-3 + 1e-4, msg);
+    }
+
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  %s OK\n", name);
+    return 0;
+}
+
+static int rm_batch_test(const char *name, uint32_t gate_type, uint32_t down_type,
+                         uint32_t gate_block_bytes, uint32_t down_block_bytes,
+                         uint32_t n_tokens,
+                         void (*fill_model)(rm_model *, uint32_t, uint32_t, uint32_t),
+                         oracle_dot_fn gate_dot, oracle_dot_fn down_dot) {
+    rm_model m = rm_build_model_ex(gate_block_bytes, down_block_bytes);
+    fill_model(&m, RM_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_EXPERT_IN_DIM * sizeof(float));
+
+    int32_t *sel = malloc((size_t)n_tokens * RM_N_EXPERT * sizeof(int32_t));
+    float *w = malloc((size_t)n_tokens * RM_N_EXPERT * sizeof(float));
+    float *xv = malloc((size_t)n_tokens * RM_EXPERT_IN_DIM * sizeof(float));
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        q4k_fill_selected(sel + (size_t)t * RM_N_EXPERT, w + (size_t)t * RM_N_EXPERT, t,
+                          RM_N_EXPERT, RM_N_TOTAL_EXPERT);
+        q4k_fill_x_row(xv + (size_t)t * RM_EXPERT_IN_DIM, RM_EXPERT_IN_DIM, t);
+    }
+    ds4_gpu_tensor_write(selected, 0, sel, (uint64_t)n_tokens * RM_N_EXPERT * sizeof(int32_t));
+    ds4_gpu_tensor_write(weights, 0, w, (uint64_t)n_tokens * RM_N_EXPERT * sizeof(float));
+    ds4_gpu_tensor_write(x, 0, xv, (uint64_t)n_tokens * RM_EXPERT_IN_DIM * sizeof(float));
+
+    bool mid_is_f16 = true;
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s(n=%u): call failed", name, n_tokens);
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              out, gate, up, mid, down, m.model, m.model_size, m.gate_offset,
+              m.up_offset, m.down_offset, gate_type, down_type, m.gate_expert_bytes,
+              m.gate_row_bytes, m.down_expert_bytes, m.down_row_bytes,
+              RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, selected, weights,
+              RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, x, /*layer_index=*/0u, n_tokens,
+              &mid_is_f16, /*force_resident=*/false) != 0,
+          msg);
+    snprintf(msg, sizeof(msg), "%s(n=%u): mid_is_f16 must be written false", name, n_tokens);
+    CHECK(mid_is_f16 == false, msg);
+
+    float *got = malloc((size_t)n_tokens * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor_read(out, 0, got, (uint64_t)n_tokens * RM_OUT_DIM * sizeof(float));
+
+    float want_row[RM_OUT_DIM];
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        oracle_moe_one_token(&m, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT,
+                             sel + (size_t)t * RM_N_EXPERT, w + (size_t)t * RM_N_EXPERT,
+                             xv + (size_t)t * RM_EXPERT_IN_DIM, 0.0f, gate_dot, down_dot,
+                             want_row);
+        for (int i = 0; i < RM_OUT_DIM; i++) {
+            snprintf(msg, sizeof(msg), "%s(n=%u): token %u value mismatch", name, n_tokens, t);
+            CHECK_CLOSE(got[(size_t)t * RM_OUT_DIM + i], want_row[i],
+                       fabs(want_row[i]) * 1e-3 + 1e-4, msg);
+        }
+    }
+
+    free(sel);
+    free(w);
+    free(xv);
+    free(got);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(x);
+    free(m.model);
+    fprintf(stderr, "  %s(n_tokens=%u) OK\n", name, n_tokens);
+    return 0;
+}
+
+/* Decode versus batch(n=1) cross-check, mirroring test_q4k_decode_matches_
+ * batch_of_one: both dispatch to the same decode gate/up kernel and the
+ * same direct-to-out down kernel, so they must agree exactly (well within
+ * float-reordering tolerance) on identical input. */
+static int rm_decode_matches_batch_of_one(const char *name, uint32_t gate_type,
+                                          uint32_t down_type, uint32_t gate_block_bytes,
+                                          uint32_t down_block_bytes,
+                                          void (*fill_model)(rm_model *, uint32_t, uint32_t,
+                                                             uint32_t)) {
+    rm_model m = rm_build_model_ex(gate_block_bytes, down_block_bytes);
+    fill_model(&m, RM_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+    rm_tensors t1 = rm_build_tensors();
+    rm_tensors t2 = rm_build_tensors();
+
+    int32_t sel[RM_N_EXPERT];
+    float w[RM_N_EXPERT];
+    float x[RM_EXPERT_IN_DIM];
+    q4k_fill_selected(sel, w, /*tok=*/2, RM_N_EXPERT, RM_N_TOTAL_EXPERT);
+    q4k_fill_x_row(x, RM_EXPERT_IN_DIM, /*tok=*/2);
+    ds4_gpu_tensor_write(t1.selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(t1.weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(t1.x, 0, x, sizeof(x));
+    ds4_gpu_tensor_write(t2.selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(t2.weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(t2.x, 0, x, sizeof(x));
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s: decode call failed", name);
+    CHECK(ds4_gpu_routed_moe_one_tensor(
+              t1.out, t1.gate, t1.up, t1.mid, t1.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, gate_type, down_type,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t1.selected, t1.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t1.x,
+              NULL, 0u, false) != 0,
+          msg);
+    snprintf(msg, sizeof(msg), "%s: batch(n=1) call failed", name);
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              t2.out, t2.gate, t2.up, t2.mid, t2.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, gate_type, down_type,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t2.selected, t2.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t2.x,
+              0u, /*n_tokens=*/1u, NULL, false) != 0,
+          msg);
+
+    float got1[RM_OUT_DIM], got2[RM_OUT_DIM];
+    ds4_gpu_tensor_read(t1.out, 0, got1, sizeof(got1));
+    ds4_gpu_tensor_read(t2.out, 0, got2, sizeof(got2));
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        snprintf(msg, sizeof(msg), "%s: decode vs batch(n=1) mismatch", name);
+        CHECK_CLOSE(got1[i], got2[i], fabs(got1[i]) * 1e-4 + 1e-5, msg);
+    }
+
+    rm_free_tensors(&t1);
+    rm_free_tensors(&t2);
+    free(m.model);
+    fprintf(stderr, "  %s OK\n", name);
+    return 0;
+}
+
+/* ---- iq2_path: gate_type==16 (IQ2_XXS), down_type==10 (Q2_K) ---------- */
+
+static int test_iq2_decode(void) {
+    return rm_decode_test("test_iq2_decode", 16u, 10u, RM_IQ2_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES,
+                          iq2_fill_model, oracle_iq2_dot_block, oracle_q2k_dot_block);
+}
+static int test_iq2_batch_small(void) {
+    return rm_batch_test("test_iq2_batch", 16u, 10u, RM_IQ2_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES, 3u,
+                         iq2_fill_model, oracle_iq2_dot_block, oracle_q2k_dot_block);
+}
+static int test_iq2_batch_large(void) {
+    return rm_batch_test("test_iq2_batch", 16u, 10u, RM_IQ2_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES, 40u,
+                         iq2_fill_model, oracle_iq2_dot_block, oracle_q2k_dot_block);
+}
+static int test_iq2_decode_matches_batch_of_one(void) {
+    return rm_decode_matches_batch_of_one("test_iq2_decode_matches_batch_of_one", 16u, 10u,
+                                          RM_IQ2_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES, iq2_fill_model);
+}
+
+/* ---- iq2_iq2_path: gate_type==16, down_type==16 (both IQ2_XXS) -------- */
+
+static int test_iq2iq2_decode(void) {
+    return rm_decode_test("test_iq2iq2_decode", 16u, 16u, RM_IQ2_BLOCK_BYTES, RM_IQ2_BLOCK_BYTES,
+                          iq2iq2_fill_model, oracle_iq2_dot_block, oracle_iq2_dot_block);
+}
+static int test_iq2iq2_batch(void) {
+    return rm_batch_test("test_iq2iq2_batch", 16u, 16u, RM_IQ2_BLOCK_BYTES, RM_IQ2_BLOCK_BYTES, 12u,
+                         iq2iq2_fill_model, oracle_iq2_dot_block, oracle_iq2_dot_block);
+}
+static int test_iq2iq2_decode_matches_batch_of_one(void) {
+    return rm_decode_matches_batch_of_one("test_iq2iq2_decode_matches_batch_of_one", 16u, 16u,
+                                          RM_IQ2_BLOCK_BYTES, RM_IQ2_BLOCK_BYTES,
+                                          iq2iq2_fill_model);
+}
+
+/* ---- q2k_path: gate_type==10, down_type==10 (both Q2_K) --------------- */
+
+static int test_q2k_decode(void) {
+    return rm_decode_test("test_q2k_decode", 10u, 10u, RM_Q2K_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES,
+                          q2k_fill_model, oracle_q2k_dot_block, oracle_q2k_dot_block);
+}
+static int test_q2k_batch_small(void) {
+    return rm_batch_test("test_q2k_batch", 10u, 10u, RM_Q2K_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES, 5u,
+                         q2k_fill_model, oracle_q2k_dot_block, oracle_q2k_dot_block);
+}
+static int test_q2k_batch_large(void) {
+    return rm_batch_test("test_q2k_batch", 10u, 10u, RM_Q2K_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES, 40u,
+                         q2k_fill_model, oracle_q2k_dot_block, oracle_q2k_dot_block);
+}
+static int test_q2k_decode_matches_batch_of_one(void) {
+    return rm_decode_matches_batch_of_one("test_q2k_decode_matches_batch_of_one", 10u, 10u,
+                                          RM_Q2K_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES, q2k_fill_model);
+}
+
+/* An ablation ("route q2k_path inputs through the
+ * untagged down kernels and confirm the test catches the difference") is
+ * the second, explicitly anticipated outcome rather than the first: in
+ * this port, q2k_path's down projection and iq2_path's down projection
+ * are the same function, sycl_moe_q2k_down_direct
+ * (sycl/ds4_sycl_moe.hpp), because both are validated against the same
+ * Q8_K-prequantised-mid CPU oracle (matvec_q2_k_experts_accum_prequant,
+ * ds4.c:8297) rather than against ROCm's own kernel selection. There is
+ * no separate "route through the other kernel" test to write: both
+ * test_q2k_decode/test_q2k_batch above and test_iq2_decode/test_iq2_batch
+ * already exercise this identical function (confirmed by reading the
+ * dispatch call sites in sycl/ds4_sycl_moe_launch.hpp, not inferred), so
+ * running one format's test already is running the other's down kernel.
+ * ROCm's own q2k_path and iq2_path down kernels genuinely differ
+ * (moe_down_q2K_expert_batch_sharedmid_kernel's raw-float mid versus
+ * moe_down_sum6_qwarp32_kernel's Q8_K-quantised mid); this port merges
+ * them deliberately, so they are alike by design here, not by an
+ * ablation that failed to discriminate. */
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_q8_k_quantize() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1215,8 +1893,8 @@ int main(void) {
     if (test_sort_tile_sizes() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_zero_tokens_fails() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_unrecognised_format_fails() != 0) { ds4_gpu_cleanup(); return 1; }
-    if (test_dispatcher_iq2_not_yet_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
-    if (test_dispatcher_q2k_not_yet_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_iq2_succeeds() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_q2k_succeeds() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_mxfp4_not_yet_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_add_in_rejected() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_mid_is_f16_written_false() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1227,6 +1905,18 @@ int main(void) {
     if (test_q4k_batch(40u) != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q4k_decode_matches_batch_of_one() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q4k_scratch_precondition_failure() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q2k_pack_roundtrip() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_iq2_decode() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_iq2_batch_small() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_iq2_batch_large() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_iq2_decode_matches_batch_of_one() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_iq2iq2_decode() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_iq2iq2_batch() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_iq2iq2_decode_matches_batch_of_one() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q2k_decode() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q2k_batch_small() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q2k_batch_large() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q2k_decode_matches_batch_of_one() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_moe OK\n");
     return 0;
