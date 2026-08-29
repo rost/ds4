@@ -207,6 +207,43 @@ extern "C" int ds4_gpu_matmul_q8_0_tensor(
                                     in_dim, out_dim, x, n_tok);
 }
 
+/* Single-token decode paths for the Q8_0 dense matmul.  ROCm's own
+ * entries (rocm/ds4_rocm_matmul.cuh:531-549 and :551-569) are, like
+ * ds4_gpu_matmul_q8_0_tensor above, two-line wrappers over
+ * cuda_matmul_q8_0_tensor_labeled with model_map, weight_offset and every
+ * other argument identical to the plain entry's call; the only difference
+ * between all three ROCm entries is the diagnostic label string passed
+ * ("q8_0" / "q8_0_decode" / "q8_0_decode_model_view"), which only
+ * otherwise selects the omitted GEMM cache path. All three are therefore
+ * functionally identical in ROCm: do not "fix" this by inventing a
+ * behavioural difference between the two entries below, or between them
+ * and ds4_gpu_matmul_q8_0_tensor. */
+extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    return sycl_q8_0_matmul_general(out, model_map, model_size, weight_offset,
+                                    in_dim, out_dim, x, n_tok);
+}
+
+extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    return sycl_q8_0_matmul_general(out, model_map, model_size, weight_offset,
+                                    in_dim, out_dim, x, n_tok);
+}
+
 /* Optional Metal decode fusion (paired projection plus recurrent
  * compressor-state store).  This backend has no such fused path; ROCm's
  * own implementation (rocm/ds4_rocm_matmul.cuh:933-965) is `(void)` on
