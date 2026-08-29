@@ -515,9 +515,14 @@ static inline float sycl_dev_dot_q4_k_q8_k_block(const sycl_block_q4_K *x,
 /* dev_dot_q4_K_q8_K_block8, moe.cuh:588-617: the same dot product against
  * up to 8 activation blocks at once, accumulating into acc[8], used by
  * the expert-tile kernels which process 8 (token,slot) pairs per tile. */
+/* yb selects which Q8_K chunk of each token's activation to dot against,
+ * matching the weight block x.  The single-token helper above takes an
+ * already-offset pointer; this one takes the base plus an index because
+ * its callers stage the whole activation into local memory and then reuse
+ * the same base for every block. */
 static inline void sycl_dev_dot_q4_k_q8_k_block8(
         const sycl_block_q4_K *x, const sycl_block_q8_K *const ys[8],
-        uint32_t n, float acc[8]) {
+        uint32_t yb, uint32_t n, float acc[8]) {
     const float xd = sycl_moe_f16_to_f32(x->d);
     const float xmin = sycl_moe_f16_to_f32(x->dmin);
     int32_t isum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -529,12 +534,15 @@ static inline void sycl_dev_dot_q4_k_q8_k_block8(
         const int shift = (j & 1u) ? 4 : 0;
         for (uint32_t p = 0; p < n; p++) {
             if (!ys[p]) continue;
-            summs[p] += (int32_t)m * (int32_t)(ys[p]->bsums[2u * j] + ys[p]->bsums[2u * j + 1u]);
-            isum[p] += (int32_t)sc * sycl_dev_dot_q4_32(x->qs + byte_off, ys[p]->qs + j * 32u, shift);
+            const sycl_block_q8_K *y = ys[p] + yb;
+            summs[p] += (int32_t)m * (int32_t)(y->bsums[2u * j] + y->bsums[2u * j + 1u]);
+            isum[p] += (int32_t)sc * sycl_dev_dot_q4_32(x->qs + byte_off, y->qs + j * 32u, shift);
         }
     }
     for (uint32_t p = 0; p < n; p++) {
-        if (ys[p]) acc[p] += ys[p]->d * xd * (float)isum[p] - ys[p]->d * xmin * (float)summs[p];
+        if (!ys[p]) continue;
+        const sycl_block_q8_K *y = ys[p] + yb;
+        acc[p] += y->d * xd * (float)isum[p] - y->d * xmin * (float)summs[p];
     }
 }
 
@@ -661,8 +669,8 @@ static void sycl_moe_q4k_gate_up_mid_tile8(
                  float gate[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                  float up[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                  for (uint32_t b = lane; b < xq_blocks; b += 8u) {
-                     sycl_dev_dot_q4_k_q8_k_block8(gr + b, xqb, np, gate);
-                     sycl_dev_dot_q4_k_q8_k_block8(ur + b, xqb, np, up);
+                     sycl_dev_dot_q4_k_q8_k_block8(gr + b, xqb, b, np, gate);
+                     sycl_dev_dot_q4_k_q8_k_block8(ur + b, xqb, b, np, up);
                  }
                  for (uint32_t p = 0; p < np; p++) {
                      gate[p] = sycl_moe_subgroup_sum<8>(sg, gate[p]);
@@ -814,7 +822,7 @@ static void sycl_moe_q4k_down_tile8(
                          (down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
                  float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
                  for (uint32_t b = lane; b < midq_blocks; b += 8u) {
-                     sycl_dev_dot_q4_k_q8_k_block8(wr + b, xqb, np, acc);
+                     sycl_dev_dot_q4_k_q8_k_block8(wr + b, xqb, b, np, acc);
                  }
                  for (uint32_t p = 0; p < np; p++) {
                      acc[p] = sycl_moe_subgroup_sum<8>(sg, acc[p]);
