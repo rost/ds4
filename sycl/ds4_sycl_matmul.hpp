@@ -244,6 +244,87 @@ extern "C" int ds4_gpu_matmul_q8_0_decode_mpp_model_view_tensor(
                                     in_dim, out_dim, x, n_tok);
 }
 
+/* ROCm's own entry (rocm/ds4_rocm_matmul.cuh:571-583) is dead code: every
+ * one of its 8 parameters is cast to (void) and it unconditionally
+ * `return 0;`.  It is uncalled anywhere reachable on a non-Apple build (the
+ * only path to it is a CUDA-stub wrapper reached solely from Metal-decode-
+ * graph orchestration in ds4.c), and ds4_gpu.h documents it in the same
+ * "Dense Projections" section with the exact same signature shape as
+ * ds4_gpu_matmul_q8_0_tensor above, with no "optional" framing
+ * distinguishing it from a required primitive.  Rather than port a
+ * permanently non-functional no-op, this entry is a real, correct Q8_0
+ * dense matmul with the same validation, return polarity, and numerical
+ * contract as ds4_gpu_matmul_q8_0_tensor, delegating to the same
+ * sycl_q8_0_matmul_general helper.  This is a deliberate divergence from
+ * the ROCm reference, not a literal port. */
+extern "C" int ds4_gpu_matmul_q8_0_rows_scalar_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    return sycl_q8_0_matmul_general(out, model_map, model_size, weight_offset,
+                                    in_dim, out_dim, x, n_tok);
+}
+
+/* Paired dense Q8_0 projection: two independent Q8_0 weight tables applied
+ * to the same activations in one call, ported from
+ * rocm/ds4_rocm_matmul.cuh:585-688.  Own validation ported from that
+ * entry's null/zero/oversized checks (:597-601) and weight-range checks
+ * (:608-622), generalised to every n_tok rather than only n_tok == 1 the
+ * way ROCm's weight-range checks are (ROCm only runs them ahead of its
+ * dedicated single-token kernel; for n_tok != 1 it instead calls the
+ * shared labeled function twice, which does its own validation), mirroring
+ * ds4_gpu_matmul_f16_pair_tensor above.  For the actual compute this entry
+ * calls sycl_q8_0_matmul_general (the helper built for
+ * ds4_gpu_matmul_q8_0_tensor) twice, once per weight offset, for every
+ * n_tok including n_tok == 1: ROCm's dedicated n_tok == 1 pair kernel
+ * (:628-656) and its prequantized-to-int8 variant (:658-687) are
+ * shape-specific performance specialisations with no correctness
+ * difference from calling the general path twice, the same class of
+ * ROCm/CUDA vendor tuning sycl_q8_0_matmul_general's own comment already
+ * declines. */
+extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
+        ds4_gpu_tensor       *out0,
+        ds4_gpu_tensor       *out1,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight0_offset,
+        uint64_t                weight1_offset,
+        uint64_t                in_dim,
+        uint64_t                out0_dim,
+        uint64_t                out1_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    if (!out0 || !out1 || !x || !model_map || in_dim == 0u || out0_dim == 0u ||
+        out1_dim == 0u || n_tok == 0u || in_dim > UINT32_MAX ||
+        out0_dim > UINT32_MAX || out1_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    uint64_t row_bytes = 0, weight0_bytes = 0, weight1_bytes = 0;
+    if (!sycl_q8_0_row_bytes_checked(in_dim, &row_bytes) ||
+        !sycl_u64_mul_checked(out0_dim, row_bytes, &weight0_bytes) ||
+        !sycl_u64_mul_checked(out1_dim, row_bytes, &weight1_bytes) ||
+        !sycl_model_range_fits(model_size, weight0_offset, weight0_bytes) ||
+        !sycl_model_range_fits(model_size, weight1_offset, weight1_bytes) ||
+        !sycl_tensor_has_elems2(x, n_tok, in_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems2(out0, n_tok, out0_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems2(out1, n_tok, out1_dim, sizeof(float))) {
+        return 0;
+    }
+
+    return sycl_q8_0_matmul_general(out0, model_map, model_size,
+                                    weight0_offset, in_dim, out0_dim, x,
+                                    n_tok) &&
+           sycl_q8_0_matmul_general(out1, model_map, model_size,
+                                    weight1_offset, in_dim, out1_dim, x,
+                                    n_tok);
+}
+
 /* Optional Metal decode fusion (paired projection plus recurrent
  * compressor-state store).  This backend has no such fused path; ROCm's
  * own implementation (rocm/ds4_rocm_matmul.cuh:933-965) is `(void)` on

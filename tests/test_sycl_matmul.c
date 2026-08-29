@@ -409,6 +409,183 @@ static int test_matmul_q8_0_decode_mpp_model_view(void) {
     return 0;
 }
 
+/* ds4_gpu_matmul_q8_0_rows_scalar_tensor has no ROCm reference behaviour to
+ * exercise: ROCm's own entry (rocm/ds4_rocm_matmul.cuh:571-583) casts every
+ * parameter to void and unconditionally returns 0, dead code uncalled on
+ * any reachable non-Apple path.  This backend implements it as a real Q8_0
+ * dense matmul identical in contract to ds4_gpu_matmul_q8_0_tensor, so a
+ * light test suffices: one case confirming this entry point independently
+ * wires through to a correct result (catching a copy-paste mistake), with
+ * dimensions distinct from every other test in this file, plus the
+ * standard validation-failure checks. */
+static int test_matmul_q8_0_rows_scalar(void) {
+    enum { IN_DIM = 23, OUT_DIM = 9, N_TOK = 2 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+
+    unsigned char weights[OUT_DIM * 34]; /* row_bytes <= 1*34 = 34 here */
+    float          x[N_TOK * IN_DIM];
+    float          want[N_TOK * OUT_DIM];
+    float          got[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(weights + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+    oracle_matmul_q8_0(want, x, weights, IN_DIM, OUT_DIM, N_TOK, row_bytes);
+
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * row_bytes;
+
+    ds4_gpu_tensor *tx  = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tx != NULL && tout != NULL,
+          "matmul_q8_0_rows_scalar: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "matmul_q8_0_rows_scalar: write x");
+
+    CHECK(ds4_gpu_matmul_q8_0_rows_scalar_tensor(tout, weights, weight_bytes,
+                                                 0, IN_DIM, OUT_DIM, tx,
+                                                 N_TOK) != 0,
+          "matmul_q8_0_rows_scalar: call");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got, sizeof(got)) != 0,
+          "matmul_q8_0_rows_scalar: read out");
+
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-2, "matmul_q8_0_rows_scalar: out mismatch");
+    }
+
+    CHECK(ds4_gpu_matmul_q8_0_rows_scalar_tensor(tout, weights, weight_bytes,
+                                                 0, 0, OUT_DIM, tx,
+                                                 N_TOK) == 0,
+          "matmul_q8_0_rows_scalar: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_rows_scalar_tensor(tout, weights, weight_bytes,
+                                                 0, IN_DIM, OUT_DIM, tx,
+                                                 0) == 0,
+          "matmul_q8_0_rows_scalar: zero n_tok must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_rows_scalar_tensor(tout, weights, weight_bytes,
+                                                 weight_bytes, IN_DIM,
+                                                 OUT_DIM, tx, N_TOK) == 0,
+          "matmul_q8_0_rows_scalar: out-of-range weight offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_matmul_q8_0_rows_scalar OK\n");
+    return 0;
+}
+
+/* ds4_gpu_matmul_q8_0_pair_tensor computes two independent Q8_0
+ * projections of the same activations in one call, cited to
+ * rocm/ds4_rocm_matmul.cuh:585-688.  Two distinct weight buffers and
+ * distinct out0_dim/out1_dim (so the two outputs cannot coincidentally
+ * match each other), n_tok > 1, and dimensions distinct from every other
+ * test in this file.  Reuses test_encode_q8_0_row/oracle_matmul_q8_0
+ * applied independently to each weight table/output pair. */
+static int test_matmul_q8_0_pair(void) {
+    enum { IN_DIM = 17, OUT0_DIM = 6, OUT1_DIM = 11, N_TOK = 3 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+
+    unsigned char weights0[OUT0_DIM * 34]; /* row_bytes <= 1*34 = 34 here */
+    unsigned char weights1[OUT1_DIM * 34];
+    float          x[N_TOK * IN_DIM];
+    float          want0[N_TOK * OUT0_DIM];
+    float          want1[N_TOK * OUT1_DIM];
+    float          got0[N_TOK * OUT0_DIM];
+    float          got1[N_TOK * OUT1_DIM];
+
+    for (uint32_t o = 0; o < OUT0_DIM; o++) {
+        test_encode_q8_0_row(weights0 + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t o = 0; o < OUT1_DIM; o++) {
+        test_encode_q8_0_row(weights1 + (size_t)o * row_bytes, IN_DIM,
+                             o + 100u);
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+    oracle_matmul_q8_0(want0, x, weights0, IN_DIM, OUT0_DIM, N_TOK, row_bytes);
+    oracle_matmul_q8_0(want1, x, weights1, IN_DIM, OUT1_DIM, N_TOK, row_bytes);
+
+    ds4_gpu_tensor *tx   = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tout0 = ds4_gpu_tensor_alloc(sizeof(got0));
+    ds4_gpu_tensor *tout1 = ds4_gpu_tensor_alloc(sizeof(got1));
+    CHECK(tx != NULL && tout0 != NULL && tout1 != NULL,
+          "matmul_q8_0_pair: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "matmul_q8_0_pair: write x");
+
+    /* weights0 and weights1 are independent allocations in this test, so
+     * the pair call is exercised against a single combined model buffer
+     * that concatenates both weight tables, matching how the real graph
+     * lays out one mmapped model file. */
+    unsigned char combined[sizeof(weights0) + sizeof(weights1)];
+    memcpy(combined, weights0, sizeof(weights0));
+    memcpy(combined + sizeof(weights0), weights1, sizeof(weights1));
+    const uint64_t weight0_offset = 0;
+    const uint64_t weight1_offset = sizeof(weights0);
+    const uint64_t model_size = sizeof(combined);
+
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(tout0, tout1, combined, model_size,
+                                          weight0_offset, weight1_offset,
+                                          IN_DIM, OUT0_DIM, OUT1_DIM, tx,
+                                          N_TOK) != 0,
+          "matmul_q8_0_pair: call");
+    CHECK(ds4_gpu_tensor_read(tout0, 0, got0, sizeof(got0)) != 0,
+          "matmul_q8_0_pair: read out0");
+    CHECK(ds4_gpu_tensor_read(tout1, 0, got1, sizeof(got1)) != 0,
+          "matmul_q8_0_pair: read out1");
+
+    for (int i = 0; i < N_TOK * OUT0_DIM; i++) {
+        CHECK_CLOSE(got0[i], want0[i], 1e-2, "matmul_q8_0_pair: out0 mismatch");
+    }
+    for (int i = 0; i < N_TOK * OUT1_DIM; i++) {
+        CHECK_CLOSE(got1[i], want1[i], 1e-2, "matmul_q8_0_pair: out1 mismatch");
+    }
+
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(tout0, tout1, combined, model_size,
+                                          weight0_offset, weight1_offset, 0,
+                                          OUT0_DIM, OUT1_DIM, tx,
+                                          N_TOK) == 0,
+          "matmul_q8_0_pair: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(tout0, tout1, combined, model_size,
+                                          weight0_offset, weight1_offset,
+                                          IN_DIM, 0, OUT1_DIM, tx,
+                                          N_TOK) == 0,
+          "matmul_q8_0_pair: zero out0_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(tout0, tout1, combined, model_size,
+                                          weight0_offset, weight1_offset,
+                                          IN_DIM, OUT0_DIM, 0, tx,
+                                          N_TOK) == 0,
+          "matmul_q8_0_pair: zero out1_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(tout0, tout1, combined, model_size,
+                                          weight0_offset, weight1_offset,
+                                          IN_DIM, OUT0_DIM, OUT1_DIM, tx,
+                                          0) == 0,
+          "matmul_q8_0_pair: zero n_tok must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(tout0, tout1, combined, model_size,
+                                          model_size, weight1_offset, IN_DIM,
+                                          OUT0_DIM, OUT1_DIM, tx,
+                                          N_TOK) == 0,
+          "matmul_q8_0_pair: out-of-range weight0 offset must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(tout0, tout1, combined, model_size,
+                                          weight0_offset, model_size, IN_DIM,
+                                          OUT0_DIM, OUT1_DIM, tx,
+                                          N_TOK) == 0,
+          "matmul_q8_0_pair: out-of-range weight1 offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout0);
+    ds4_gpu_tensor_free(tout1);
+    fprintf(stderr, "  test_matmul_q8_0_pair OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_matmul_f16_pair() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -416,6 +593,8 @@ int main(void) {
     if (test_matmul_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_decode_mpp() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_decode_mpp_model_view() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0_rows_scalar() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0_pair() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_matmul OK\n");
     return 0;
