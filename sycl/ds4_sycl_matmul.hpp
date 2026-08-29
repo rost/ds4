@@ -7,6 +7,94 @@
 
 #include "ds4_sycl_common.hpp"
 
+/* ds4_sycl_test_gemm_batch_smoke: proves oneMKL's strided-batched gemm_batch
+ * is wired correctly (build flags, column-major argument order, the
+ * stride_a == 0 KV-broadcast case) against a hand-computed result,
+ * independent of any production matmul or attention entry, so the tasks
+ * that follow debug their own kernels rather than the BLAS wiring
+ * underneath them. Not part of the ABI: a backend-internal test hook in the
+ * same spirit as ds4_sycl_device_count (ds4_sycl.cpp), called directly by
+ * tests/test_sycl_gemm_batch_smoke.c.
+ *
+ * Shape mirrors the real raw-prefill score GEMM
+ * (rocm/ds4_rocm_attention_launch.cuh:261-278, scores = K^T Q): head_dim
+ * (k) = 3, n_keys (m) = 2, n_tokens (n) = 2, batch = 2 "heads". A = the KV
+ * table, broadcast across every head via stride_a == 0, transa = trans (A
+ * is stored column-major head_dim x n_keys, matching a row-major
+ * n_keys x head_dim buffer exactly the way raw_kv->ptr is laid out in the
+ * real launch); B = per-head Q, transb = nontrans. B carries one padding
+ * row per column (ldb = head_dim + 1, distinct from lda = head_dim) so an
+ * lda/ldb swap is a genuine ablation rather than a no-op: the real launch's
+ * B operand is itself a strided sub-view whose leading dimension
+ * (n_head * head_dim) differs from A's (head_dim), and lda == ldb here
+ * would let that class of argument-order bug go undetected.
+ *
+ * Hand-computed: raw_kv rows (key0=[1,2,3], key1=[4,5,6]); head 0's Q
+ * columns (token0=[1,0,0], token1=[0,1,0]) pick out raw_kv's first and
+ * second entries, so C0 = [[1,4],[2,5]] (column-major, key-major); head 1's
+ * Q columns (token0=[0,0,1], token1=[1,1,1]) pick out the third entry and
+ * the row sum, so C1 = [[3,6],[6,15]]. */
+extern "C" int ds4_sycl_test_gemm_batch_smoke(void) {
+    if (g_devices.empty()) return 0;
+    try {
+        sycl::queue &q = ds4_sycl_current_queue();
+        const int64_t head_dim = 3, n_keys = 2, n_tokens = 2, n_head = 2;
+        const int64_t ldb = head_dim + 1;
+
+        const float h_kv[6] = {1, 2, 3, 4, 5, 6};
+        const float h_q[16] = {
+                1, 0, 0, -9,  0, 1, 0, -9,   /* head 0, one pad row per column */
+                0, 0, 1, -9,  1, 1, 1, -9};  /* head 1 */
+        const float expected[8] = {
+                1, 4, 2, 5,    /* head 0 */
+                3, 6, 6, 15};  /* head 1 */
+
+        float *a = sycl::malloc_device<float>((size_t)(head_dim * n_keys), q);
+        float *b = sycl::malloc_device<float>((size_t)(ldb * n_tokens * n_head), q);
+        float *c = sycl::malloc_device<float>((size_t)(n_keys * n_tokens * n_head), q);
+        if (!a || !b || !c) {
+            if (a) sycl::free(a, q);
+            if (b) sycl::free(b, q);
+            if (c) sycl::free(c, q);
+            return 0;
+        }
+        sycl_device_scratch_guard a_guard(q, a);
+        sycl_device_scratch_guard b_guard(q, b);
+        sycl_device_scratch_guard c_guard(q, c);
+
+        q.memcpy(a, h_kv, sizeof(h_kv)).wait_and_throw();
+        q.memcpy(b, h_q, sizeof(h_q)).wait_and_throw();
+
+        sycl::event ev = sycl_gemm_batch_f32(
+                q, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                n_keys, n_tokens, head_dim,
+                1.0f,
+                a, head_dim, 0,
+                b, ldb, ldb * n_tokens,
+                0.0f,
+                c, n_keys, n_keys * n_tokens,
+                n_head);
+        ev.wait_and_throw();
+
+        float got[8];
+        q.memcpy(got, c, sizeof(got)).wait_and_throw();
+
+        for (int i = 0; i < 8; i++) {
+            const float diff = got[i] - expected[i];
+            if (diff < -1e-4f || diff > 1e-4f) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "gemm_batch smoke mismatch at %d: got %f want %f\n",
+                        i, (double)got[i], (double)expected[i]);
+                return 0;
+            }
+        }
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "gemm_batch smoke failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
 /* Submits (without waiting) out[t][o] = sum_k x[t][k] * f16_to_f32(w[o][k])
  * for one weight table, row-major out_dim rows of in_dim half values each.
  * Shared by both weight offsets of ds4_gpu_matmul_f16_pair_tensor below.

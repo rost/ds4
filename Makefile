@@ -60,17 +60,26 @@ ROCM_LDLIBS ?= -lm -pthread -lhipblas -lhipblaslt
 ICPX ?= $(shell command -v icpx 2>/dev/null || echo /opt/intel/oneapi/compiler/2025.3/bin/icpx)
 SYCL_SRCS := $(wildcard sycl/*.hpp)
 SYCL_HOST_CFLAGS ?= -fPIC
-SYCL_CFLAGS ?= -fsycl -O3 -g -ffast-math -fno-finite-math-only -pthread -Wall -Wextra
+# -qmkl=sequential wires oneMKL's include paths and link libraries in one
+# flag; sequential rather than the threaded variant because this backend
+# manages its own parallelism through SYCL, not through MKL's own threading
+# layer. Tried first and it worked cleanly (headers resolve, link
+# resolves, a strided gemm_batch smoke test runs and produces the expected
+# result) -- no fallback to explicit -I$(MKLROOT)/include plus -lmkl_sycl
+# -lmkl_intel_ilp64 -lmkl_sequential -lmkl_core was needed.
+SYCL_CFLAGS ?= -fsycl -qmkl=sequential -O3 -g -ffast-math -fno-finite-math-only -pthread -Wall -Wextra
 # -lze_loader resolves the Level Zero Sysman calls (zesDeviceEnumMemoryModules,
 # zesMemoryGetState) in sycl/ds4_sycl_common.hpp's free-VRAM helper, pulled
-# into every binary and test through ds4_sycl.o.
-SYCL_LDLIBS ?= -fsycl -lm -pthread -lze_loader
+# into every binary and test through ds4_sycl.o. -qmkl=sequential on the link
+# line resolves oneMKL's own libraries (mkl_sycl, mkl_intel_ilp64,
+# mkl_sequential, mkl_core) for every binary and test that links ds4_sycl.o.
+SYCL_LDLIBS ?= -fsycl -qmkl=sequential -lm -pthread -lze_loader
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl test-sycl-streaming test-sycl-matmul test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-kernels test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output
+.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-gemm-batch-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl test-sycl-streaming test-sycl-matmul test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-kernels test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -413,6 +422,15 @@ tests/test_sycl_smoke: tests/test_sycl_smoke.o ds4_sycl.o ds4_sycl_unavailable.o
 test-sycl-smoke: tests/test_sycl_smoke
 	./tests/test_sycl_smoke
 
+tests/test_sycl_gemm_batch_smoke.o: tests/test_sycl_gemm_batch_smoke.c ds4_gpu.h ds4_gpu_mgpu.h
+	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
+
+tests/test_sycl_gemm_batch_smoke: tests/test_sycl_gemm_batch_smoke.o ds4_sycl.o ds4_sycl_unavailable.o
+	$(ICPX) $(SYCL_CFLAGS) -o $@ $^ $(SYCL_LDLIBS)
+
+test-sycl-gemm-batch-smoke: tests/test_sycl_gemm_batch_smoke
+	./tests/test_sycl_gemm_batch_smoke
+
 tests/test_sycl_output.o: tests/test_sycl_output.c ds4_gpu.h ds4_gpu_mgpu.h tests/test_sycl_harness.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
 
@@ -458,7 +476,7 @@ tests/test_sycl_matmul: tests/test_sycl_matmul.o ds4_sycl.o ds4_sycl_unavailable
 test-sycl-matmul: tests/test_sycl_matmul
 	./tests/test_sycl_matmul
 
-test-sycl: test-sycl-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl-matmul test-sycl-streaming test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output test-sycl-engine-streaming-mgpu
+test-sycl: test-sycl-smoke test-sycl-gemm-batch-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl-matmul test-sycl-streaming test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output test-sycl-engine-streaming-mgpu
 tests/test_sycl_shared_expert.o: tests/test_sycl_shared_expert.c ds4_gpu.h ds4_gpu_mgpu.h tests/test_sycl_harness.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
 
@@ -723,4 +741,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_sycl_smoke tests/test_sycl_session_smoke tests/test_sycl_output tests/test_sycl_embedding tests/test_sycl_norm_rope tests/test_sycl_compressor tests/test_sycl_streaming tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_sycl_matmul tests/test_sycl_router tests/test_sycl_fp8_kv tests/test_sycl_shared_expert tests/test_sycl_kernels tests/test_sycl_moe tests/test_sycl_mgpu tests/test_sycl_hc tests/test_sycl_indexer tests/test_sycl_attention tests/test_sycl_attention_output tests/test_sycl_engine_streaming_mgpu
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_sycl_smoke tests/test_sycl_gemm_batch_smoke tests/test_sycl_session_smoke tests/test_sycl_output tests/test_sycl_embedding tests/test_sycl_norm_rope tests/test_sycl_compressor tests/test_sycl_streaming tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_sycl_matmul tests/test_sycl_router tests/test_sycl_fp8_kv tests/test_sycl_shared_expert tests/test_sycl_kernels tests/test_sycl_moe tests/test_sycl_mgpu tests/test_sycl_hc tests/test_sycl_indexer tests/test_sycl_attention tests/test_sycl_attention_output tests/test_sycl_engine_streaming_mgpu

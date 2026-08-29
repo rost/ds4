@@ -266,8 +266,23 @@ source /opt/intel/oneapi/tbb/latest/env/vars.sh
 source /opt/intel/oneapi/mkl/2025.3/env/vars.sh
 ```
 
-Pin the versions. `/opt/intel/oneapi/` holds several side by side, and oneMKL
-must match the compiler the build uses.
+The fourth is oneMKL, pinned to 2025.3 to match the compiler: `/opt/intel/oneapi/`
+also holds 2024.2 and 2026.1, and the build is not tested against either.
+
+**oneMKL is wired in with `-qmkl=sequential`**, on both `SYCL_CFLAGS` and
+`SYCL_LDLIBS`. That single flag resolves oneMKL's include paths for compiling
+and its link libraries (`mkl_sycl`, `mkl_intel_ilp64`, `mkl_sequential`,
+`mkl_core`) for linking; it worked cleanly on the first try, so there was no
+need to fall back to explicit `-I$(MKLROOT)/include` plus explicit `-l` flags.
+`sequential` rather than the threaded variant because this backend manages its
+own parallelism through SYCL, not through MKL's own threading layer.
+
+oneMKL's `oneapi::mkl::blas::gemm_batch` (USM, strided form) is the batched
+GEMM prefill attention and one dense matmul entry need; it is column-major,
+like cuBLAS, and returns a `sycl::event` rather than ordering work on a
+stream. See `sycl/ds4_sycl_common.hpp`'s `sycl_gemm_batch_f32` for the shared
+wrapper and `tests/test_sycl_gemm_batch_smoke.c` for a minimal correctness
+check against a hand-computed result.
 
 ## Device and tier model
 

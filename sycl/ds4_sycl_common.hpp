@@ -15,6 +15,8 @@
 
 #include <level_zero/zes_api.h>
 
+#include <oneapi/mkl/blas.hpp>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -328,6 +330,46 @@ static inline float sycl_block_row_reduce(Item it, const sycl::local_accessor<fl
         it.barrier(sycl::access::fence_space::local_space);
     }
     return local[0];
+}
+
+/* Strided-batched F32 GEMM via oneMKL's oneapi::mkl::blas::gemm_batch (USM,
+ * strided form), the direct analogue of cublasSgemmStridedBatched used
+ * throughout rocm/ds4_rocm_attention_launch.cuh and
+ * rocm/ds4_rocm_matmul.cuh's cuBLAS fast paths. oneMKL's `blas::` namespace
+ * is column-major by default (blas::column_major is an inline namespace),
+ * matching cuBLAS: port each caller's transpose flags and leading
+ * dimensions directly from the ROCm source's cublasSgemmStridedBatched
+ * arguments rather than re-deriving the maths.
+ *
+ * `stride_a == 0` broadcasts one A matrix across every batch element, which
+ * is what ROCm's raw-KV prefill path uses to share one KV table across every
+ * head (a real batch dimension). The C operand's stride has no such
+ * broadcast case: an actual per-batch output stride is required even at
+ * batch_size == 1, confirmed empirically (a stride_c of 0 raises
+ * oneapi::mkl::invalid_argument at runtime) -- this is a real difference
+ * from cuBLAS's own tolerance and every caller here must pass a genuine
+ * stride_c.
+ *
+ * oneMKL returns a sycl::event rather than ordering work on a stream the way
+ * cuBLAS does. Per spec 6t this backend's queues are out-of-order raw-USM
+ * queues, so this returned event is the caller's only handle on ordering: it
+ * must be passed as a dependency to whatever reads `c` next (kernel or
+ * another GEMM), or waited on directly, or both this call and the
+ * consumer's own dependency chain race on `c`. */
+static inline sycl::event sycl_gemm_batch_f32(
+        sycl::queue &q,
+        oneapi::mkl::transpose transa, oneapi::mkl::transpose transb,
+        int64_t m, int64_t n, int64_t k,
+        float alpha,
+        const float *a, int64_t lda, int64_t stride_a,
+        const float *b, int64_t ldb, int64_t stride_b,
+        float beta,
+        float *c, int64_t ldc, int64_t stride_c,
+        int64_t batch_size,
+        const std::vector<sycl::event> &deps = {}) {
+    return oneapi::mkl::blas::gemm_batch(q, transa, transb, m, n, k, alpha, a,
+                                         lda, stride_a, b, ldb, stride_b, beta,
+                                         c, ldc, stride_c, batch_size, deps);
 }
 
 }  // namespace
