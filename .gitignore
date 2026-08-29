@@ -51,6 +51,7 @@
 /tests/test_sycl_attention_output
 /tests/test_sycl_engine_streaming_mgpu
 /tests/test_sycl_readback
+/tests/test_sycl_subgroup_guard
 *.o
 *.dSYM/
 __pycache__/
