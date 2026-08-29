@@ -57385,6 +57385,128 @@ int ds4_test_session_read_logits(ds4_session *s, float *out,
 const int *ds4_test_engine_placement(const ds4_engine *e) {
     return e ? e->placement : NULL;
 }
+
+/* Drives metal_graph_alloc_raw_cap, the graph allocator ds4_session_create
+ * calls for every real session (see the non-GLM branch of ds4_session_create
+ * a few thousand lines below), with a synthetic single-layer shape built by
+ * hand instead of a loaded model.
+ *
+ * This closes a blind spot the SYCL backend's own state notes describe:
+ * every existing kernel test calls a ds4_gpu_* ABI entry directly with a
+ * synthetic buffer, so a stub this function calls during real session setup
+ * is invisible to the whole suite until a real session is created. That is
+ * exactly what let ds4_gpu_tensor_alloc_ptr_on/_managed_on ship stubbed to
+ * an unconditional NULL for tier 0: no test drove the code path that calls
+ * them. This hook drives that path without needing model weights, since
+ * metal_graph_alloc_raw_cap only reads tensor dims to size its allocations,
+ * never tensor data.
+ *
+ * Single-tier, no MTP, no CUDA tensor parallelism, no shared prefill
+ * workspace: the same parameters a plain single-GPU session uses. Returns 1
+ * if every allocation the real path performs succeeded, 0 otherwise. */
+int ds4_test_graph_alloc_smoke(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+
+    g_ds4_shape = (ds4_shape){
+        .name = "test-tiny",
+        .family = DS4_MODEL_FAMILY_DEEPSEEK4,
+        .variant = DS4_VARIANT_FLASH,
+        .n_layer = 1,
+        .n_embd = 64,
+        .n_vocab = 128,
+        .n_head = 2,
+        .n_head_kv = 1,
+        .n_head_dim = 16,
+        .n_value_dim = 16,
+        .n_rot = 8,
+        .n_out_group = 1,
+        .n_lora_q = 16,
+        .n_lora_o = 16,
+        .n_expert = 4,
+        .n_expert_used = 2,
+        .n_expert_shared = 1,
+        .n_ff_exp = 32,
+        .n_ff_dense = 32,
+        .n_hash_layer = 0,
+        .n_swa = 8,
+        .n_indexer_head = 2,
+        .n_indexer_head_dim = 8,
+        .n_indexer_top_k = 4,
+        .n_hc = 4,
+        .n_hc_sinkhorn_iter = 1,
+        .rms_eps = DS4_DEFAULT_RMS_EPS,
+        .hc_eps = DS4_DEFAULT_HC_EPS,
+        .expert_weight_scale = 1.0f,
+        .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+        .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+        .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+        .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+        .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+        .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+        .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+    };
+    /* Compress ratio 0 for the one bound layer: skips the attn-compressor
+     * and indexer allocations (a separate, already-landed subsystem) so
+     * this hook stays focused on the always-on per-tier scratch/state/output
+     * allocations that every session performs regardless of compression. */
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    ds4_tensor dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    dummy.ndim = 2;
+    dummy.dim[0] = 1;
+    dummy.dim[1] = 1;
+
+    /* Only these four tensors' dims are read by metal_graph_alloc_raw_cap
+     * for sizing; every other required tensor only needs to be non-NULL. */
+    ds4_tensor q_a = dummy;         q_a.dim[1] = 16;  /* q_rank */
+    ds4_tensor gate_shexp = dummy;  gate_shexp.dim[1] = 32;  /* shared_dim */
+    ds4_tensor gate_exps = dummy;   gate_exps.dim[1] = 32;   /* routed_mid_dim */
+    ds4_tensor output_t = dummy;    output_t.dim[1] = 128;   /* vocab_dim */
+
+    ds4_weights weights;
+    memset(&weights, 0, sizeof(weights));
+    weights.output = &output_t;
+
+    ds4_layer_weights *l = &weights.layer[0];
+    l->hc_attn_fn = &dummy;
+    l->hc_attn_scale = &dummy;
+    l->hc_attn_base = &dummy;
+    l->attn_norm = &dummy;
+    l->attn_q_a = &q_a;
+    l->attn_q_a_norm = &dummy;
+    l->attn_q_b = &dummy;
+    l->attn_kv = &dummy;
+    l->attn_kv_a_norm = &dummy;
+    l->attn_sinks = &dummy;
+    l->attn_output_a = &dummy;
+    l->attn_output_b = &dummy;
+    l->hc_ffn_fn = &dummy;
+    l->hc_ffn_scale = &dummy;
+    l->hc_ffn_base = &dummy;
+    l->ffn_norm = &dummy;
+    l->ffn_gate_inp = &dummy;
+    l->ffn_gate_exps = &gate_exps;
+    l->ffn_up_exps = &dummy;
+    l->ffn_down_exps = &dummy;
+    l->ffn_gate_shexp = &gate_shexp;
+    l->ffn_up_shexp = &dummy;
+    l->ffn_down_shexp = &dummy;
+
+    ds4_gpu_graph g;
+    memset(&g, 0, sizeof(g));
+    const bool ok = metal_graph_alloc_raw_cap(&g, &weights, l,
+                                              /*raw_cap=*/8, /*ctx_size=*/8,
+                                              /*prefill_cap=*/2,
+                                              /*enable_mtp=*/false,
+                                              /*placement=*/NULL,
+                                              /*cuda_tensor_parallel=*/false,
+                                              /*shared_prefill_workspace=*/NULL);
+    if (ok) metal_graph_free(&g);
+
+    g_ds4_shape = saved_shape;
+    return ok ? 1 : 0;
+}
 #endif /* DS4_TEST_HOOKS */
 
 static int engine_install_dspark_support_cache(ds4_engine *e);

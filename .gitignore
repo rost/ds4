@@ -32,6 +32,7 @@
 /tests/test_q4k_dot
 /tests/test_sampling
 /tests/test_sycl_smoke
+/tests/test_sycl_session_smoke
 /tests/test_sycl_output
 /tests/test_sycl_embedding
 /tests/test_sycl_norm_rope
