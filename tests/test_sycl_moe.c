@@ -740,15 +740,27 @@ static int test_sort_tile_sizes(void) {
 
 /* ---- Dispatcher skeleton and the two entry points --------------------
  *
- * Shapes small enough that the scratch-buffer-reuse precondition
- * (gate/down tensors doubling as Q8_K quantisation scratch) is always
- * satisfied by construction: gate holds n_tokens*n_expert*expert_mid_dim
- * floats, which for these sizes is comfortably larger than the Q8_K
- * scratch it would need to double as. */
+ * IN_DIM/MID_DIM are two Q8_K superblocks wide (512), not one (256): a
+ * width of exactly one block makes every per-chunk loop in the kernels
+ * under test ("for b in 0..xq_blocks") execute a single iteration, which
+ * cannot discriminate a kernel that dots every weight block against
+ * activation chunk 0 instead of its own chunk b (see 35852c0, which fixed
+ * exactly that for sycl_dev_dot_q4_k_q8_k_block8). OUT_DIM is widened to
+ * 128 alongside them: the down tensor doubles as Q8_K quantisation
+ * scratch for the activations (moe_launch.cuh:746's scratch-reuse
+ * precondition, `down->bytes >= xq_bytes`), and at IN_DIM=512 (xq_blocks=2)
+ * that needs n_expert*OUT_DIM*4 >= xq_blocks*292, i.e. OUT_DIM >= 73 for
+ * RM_N_EXPERT=2; 128 is verified sufficient below and keeps headroom.
+ * gate similarly doubles as midq scratch but that precondition
+ * (expert_mid_dim*4 >= midq_blocks*292) holds for any multiple-of-256
+ * MID_DIM, since 4*256 > 292 already at one block. No separate narrow
+ * shape is kept: at these sizes the whole suite still runs in a few
+ * seconds (see the report), so a second, narrower constant set would only
+ * add maintenance cost for no measured speed benefit. */
 enum {
-    RM_EXPERT_IN_DIM  = 256,
-    RM_EXPERT_MID_DIM = 256,
-    RM_OUT_DIM        = 64,
+    RM_EXPERT_IN_DIM  = 512,
+    RM_EXPERT_MID_DIM = 512,
+    RM_OUT_DIM        = 128,
     RM_N_EXPERT       = 2,
     RM_N_TOKENS       = 2,
     RM_N_TOTAL_EXPERT = 4,
@@ -1166,75 +1178,122 @@ static float oracle_q4k_dot_block(const uint8_t blk[144], const oracle_q8k_block
 
 static float oracle_silu(float x) { return x / (1.0f + expf(-x)); }
 
-/* Deterministic per-(expert,row) weight-block generator with a
+/* Deterministic per-(expert,row,block) weight-block generator with a
  * non-linear interaction term (spec 6f: pure affine test data makes
- * every element mutually proportional and hides scale-only bugs). */
-static void q4k_fill_row(uint8_t out[144], uint32_t phase, uint32_t expert, uint32_t row) {
+ * every element mutually proportional and hides scale-only bugs).  `blk`
+ * selects which 256-wide Q8_K chunk of the row this block covers: it is
+ * salted into every one of sc/m/nib/d/dmin with its own multiplier so
+ * chunk 1 is not a shifted or scaled copy of chunk 0 (spec 6i: adjacent
+ * test data must not let a wrong-chunk dot accidentally reproduce the
+ * right-chunk answer). */
+static void q4k_fill_row(uint8_t out[144], uint32_t phase, uint32_t expert, uint32_t row,
+                         uint32_t blk) {
     uint8_t sc[8], m[8], nib[256];
     for (int j = 0; j < 8; j++) {
-        sc[j] = (uint8_t)(1u + (phase * 5u + expert * 7u + row * 3u + (uint32_t)j * 5u) % 40u);
-        m[j] = (uint8_t)((phase * 3u + expert * 11u + row * 2u + (uint32_t)j * 13u) % 20u);
+        sc[j] = (uint8_t)(1u + (phase * 5u + expert * 7u + row * 3u + blk * 41u +
+                                (uint32_t)j * 5u) % 40u);
+        m[j] = (uint8_t)((phase * 3u + expert * 11u + row * 2u + blk * 31u +
+                          (uint32_t)j * 13u) % 20u);
     }
     for (int k = 0; k < 256; k++) {
-        nib[k] = (uint8_t)((phase * 19u + expert * 13u + row * 17u + (uint32_t)k +
-                            (expert * row) % 5u + ((uint32_t)k * row) % 7u) % 16u);
+        nib[k] = (uint8_t)((phase * 19u + expert * 13u + row * 17u + blk * 53u + (uint32_t)k +
+                            (expert * row) % 5u + ((uint32_t)k * row) % 7u +
+                            ((uint32_t)k * blk) % 11u) % 16u);
     }
-    const float d = 0.01f + 0.001f * (float)((phase + expert + row) % 7u);
-    const float dmin = 0.001f * (float)((phase + expert * 2u + row) % 5u);
+    const float d = 0.01f + 0.001f * (float)((phase + expert + row + blk * 3u) % 7u);
+    const float dmin = 0.001f * (float)((phase + expert * 2u + row + blk * 2u) % 5u);
     oracle_q4k_pack_block(out, d, dmin, sc, m, nib);
 }
 
+/* Spec 6n: clean multiples of 0.01 land iscale*x[i] (Q8_K's quantisation
+ * input) on an exact int8 rounding tie far more often than real
+ * activations do, and this GPU and the host CPU do not always resolve
+ * such a tie the same way (an ULP-level difference in -ffast-math's
+ * division, not a logic error). Confirmed by direct measurement: the
+ * plain affine formula below, before this dither was added, put 2-7
+ * exact ties in every 256-element block across the first eight tokens at
+ * IN_DIM=512, one of which (tok=3, block 1) produced a real mismatch once
+ * the multi-chunk tests below started exercising block 1 at all. The
+ * per-element hashed dither (same construction rm_batch_test_dithered
+ * uses at a coarser 1e-2 scale for its stress shape) is small enough to
+ * leave every block's magnitude and sign pattern intact but large enough
+ * to move iscale*x[i] off the knife edge for both engines: re-measured at
+ * zero exact ties (1e-5 tolerance) across 128 blocks spanning 64 tokens
+ * after adding it. */
 static void q4k_fill_x_row(float *x, uint32_t in_dim, uint32_t tok) {
     for (uint32_t k = 0; k < in_dim; k++) {
-        x[k] = 0.01f * (float)((int)((tok * 37u + k * 11u + (tok * k) % 13u + 5u) % 200u) - 100);
+        const float base = 0.01f * (float)((int)((tok * 37u + k * 11u + (tok * k) % 13u + 5u) % 200u) - 100);
+        uint32_t h = (tok * 2654435761u) ^ (k * 40503u);
+        h ^= h >> 15;
+        h *= 2246822519u;
+        h ^= h >> 13;
+        const float frac = (float)(h % 10007u) / 10007.0f - 0.5f; /* [-0.5, 0.5) */
+        x[k] = base + 1.0e-3f * frac;
     }
 }
 
 enum { Q4K_PHASE_GATE = 0, Q4K_PHASE_UP = 100, Q4K_PHASE_DOWN = 200 };
 
 /* Fills an rm_model's gate/up/down sections with q4k_fill_row blocks,
- * one block per row (in_dim == 256 for gate/up, mid_dim == 256 for down,
- * so xq_blocks == midq_blocks == 1 for every test in this section). */
+ * xq_blocks = RM_EXPERT_IN_DIM/256 blocks per gate/up row and
+ * midq_blocks = mid_dim/256 blocks per down row, each block distinct
+ * (see q4k_fill_row). */
 static void q4k_fill_model(rm_model *m, uint32_t n_total_expert, uint32_t mid_dim,
                            uint32_t out_dim) {
+    const uint32_t xq_blocks = RM_EXPERT_IN_DIM / 256u;
+    const uint32_t midq_blocks = mid_dim / 256u;
     for (uint32_t e = 0; e < n_total_expert; e++) {
         for (uint32_t row = 0; row < mid_dim; row++) {
-            uint8_t blk[144];
-            q4k_fill_row(blk, Q4K_PHASE_GATE, e, row);
-            memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
-                   blk, sizeof(blk));
-            q4k_fill_row(blk, Q4K_PHASE_UP, e, row);
-            memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
-                   blk, sizeof(blk));
+            for (uint32_t b = 0; b < xq_blocks; b++) {
+                uint8_t blk[144];
+                const uint64_t row_off = (uint64_t)row * m->gate_row_bytes + (uint64_t)b * RM_Q4K_BLOCK_BYTES;
+                q4k_fill_row(blk, Q4K_PHASE_GATE, e, row, b);
+                memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + row_off, blk, sizeof(blk));
+                q4k_fill_row(blk, Q4K_PHASE_UP, e, row, b);
+                memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + row_off, blk, sizeof(blk));
+            }
         }
         for (uint32_t row = 0; row < out_dim; row++) {
-            uint8_t blk[144];
-            q4k_fill_row(blk, Q4K_PHASE_DOWN, e, row);
-            memcpy(m->model + m->down_offset + e * m->down_expert_bytes + (uint64_t)row * m->down_row_bytes,
-                   blk, sizeof(blk));
+            for (uint32_t b = 0; b < midq_blocks; b++) {
+                uint8_t blk[144];
+                q4k_fill_row(blk, Q4K_PHASE_DOWN, e, row, b);
+                memcpy(m->model + m->down_offset + e * m->down_expert_bytes +
+                               (uint64_t)row * m->down_row_bytes + (uint64_t)b * RM_Q4K_BLOCK_BYTES,
+                       blk, sizeof(blk));
+            }
         }
     }
 }
 
-/* layer_routed_moe_one_prealloc for the Q4_K case, one token at a time. */
+/* layer_routed_moe_one_prealloc for the Q4_K case, one token at a time.
+ * Quantises x into in_dim/256 Q8_K chunks and mid into mid_dim/256
+ * chunks, dotting weight block b against activation chunk b and summing
+ * over chunks -- the property the chunk-index ablation in the report
+ * exercises. */
 static void oracle_q4k_one_token(const rm_model *m, uint32_t in_dim, uint32_t mid_dim,
                                  uint32_t out_dim, uint32_t n_expert,
                                  const int32_t *sel, const float *w, const float *x,
                                  float clamp, float *out) {
-    (void)in_dim; /* == 256 assumed throughout (single Q8_K block per row) */
-    oracle_q8k_block xq;
-    oracle_q8k_quantize_block(x, &xq);
+    const uint32_t xq_blocks = in_dim / 256u;
+    const uint32_t midq_blocks = mid_dim / 256u;
+    oracle_q8k_block *xq = malloc((size_t)xq_blocks * sizeof(oracle_q8k_block));
+    for (uint32_t b = 0; b < xq_blocks; b++) {
+        oracle_q8k_quantize_block(x + (size_t)b * 256u, &xq[b]);
+    }
 
     float *mid = malloc((size_t)n_expert * mid_dim * sizeof(float));
     for (uint32_t s = 0; s < n_expert; s++) {
         const uint32_t expert = (uint32_t)sel[s];
         for (uint32_t row = 0; row < mid_dim; row++) {
-            const uint8_t *gate_blk = m->model + m->gate_offset + (uint64_t)expert * m->gate_expert_bytes +
+            const uint8_t *gate_row = m->model + m->gate_offset + (uint64_t)expert * m->gate_expert_bytes +
                                       (uint64_t)row * m->gate_row_bytes;
-            const uint8_t *up_blk = m->model + m->up_offset + (uint64_t)expert * m->gate_expert_bytes +
+            const uint8_t *up_row = m->model + m->up_offset + (uint64_t)expert * m->gate_expert_bytes +
                                     (uint64_t)row * m->gate_row_bytes;
-            float gate = oracle_q4k_dot_block(gate_blk, &xq);
-            float up = oracle_q4k_dot_block(up_blk, &xq);
+            float gate = 0.0f, up = 0.0f;
+            for (uint32_t b = 0; b < xq_blocks; b++) {
+                gate += oracle_q4k_dot_block(gate_row + (size_t)b * RM_Q4K_BLOCK_BYTES, &xq[b]);
+                up += oracle_q4k_dot_block(up_row + (size_t)b * RM_Q4K_BLOCK_BYTES, &xq[b]);
+            }
             if (clamp > 1.0e-6f) {
                 if (gate > clamp) gate = clamp;
                 if (up > clamp) up = clamp;
@@ -1244,21 +1303,28 @@ static void oracle_q4k_one_token(const rm_model *m, uint32_t in_dim, uint32_t mi
         }
     }
 
-    oracle_q8k_block *midq = malloc((size_t)n_expert * sizeof(oracle_q8k_block));
+    oracle_q8k_block *midq = malloc((size_t)n_expert * midq_blocks * sizeof(oracle_q8k_block));
     for (uint32_t s = 0; s < n_expert; s++) {
-        oracle_q8k_quantize_block(mid + (size_t)s * mid_dim, &midq[s]); /* mid_dim == 256 */
+        for (uint32_t b = 0; b < midq_blocks; b++) {
+            oracle_q8k_quantize_block(mid + (size_t)s * mid_dim + (size_t)b * 256u,
+                                      &midq[(size_t)s * midq_blocks + b]);
+        }
     }
 
     for (uint32_t row = 0; row < out_dim; row++) {
         float acc = 0.0f;
         for (uint32_t s = 0; s < n_expert; s++) { /* ascending slot order */
             const uint32_t expert = (uint32_t)sel[s];
-            const uint8_t *down_blk = m->model + m->down_offset + (uint64_t)expert * m->down_expert_bytes +
+            const uint8_t *down_row = m->model + m->down_offset + (uint64_t)expert * m->down_expert_bytes +
                                       (uint64_t)row * m->down_row_bytes;
-            acc += oracle_q4k_dot_block(down_blk, &midq[s]);
+            for (uint32_t b = 0; b < midq_blocks; b++) {
+                acc += oracle_q4k_dot_block(down_row + (size_t)b * RM_Q4K_BLOCK_BYTES,
+                                            &midq[(size_t)s * midq_blocks + b]);
+            }
         }
         out[row] = acc;
     }
+    free(xq);
     free(mid);
     free(midq);
 }
@@ -1635,21 +1701,25 @@ static void oracle_iq2_pack_block(uint8_t out[66], float d, const uint16_t qs[32
     memcpy(out + 2, qs, 64);
 }
 
-static void iq2_fill_row(uint8_t out[66], uint32_t phase, uint32_t expert, uint32_t row) {
+/* `blk` selects the 256-wide Q8_K chunk this block covers, salted
+ * distinctly into every field (see q4k_fill_row's comment for why). */
+static void iq2_fill_row(uint8_t out[66], uint32_t phase, uint32_t expert, uint32_t row, uint32_t blk) {
     uint16_t qs[32];
     for (uint32_t g = 0; g < 8u; g++) {
-        uint8_t a0 = (uint8_t)((phase * 7u + expert * 13u + row * 5u + g * 3u) % 256u);
-        uint8_t a1 = (uint8_t)((phase * 11u + expert * 17u + row * 7u + g * 5u + (expert * row) % 17u) % 256u);
-        uint8_t a2 = (uint8_t)((phase * 13u + expert * 19u + row * 11u + g * 7u) % 256u);
-        uint8_t a3 = (uint8_t)((phase * 17u + expert * 23u + row * 13u + g * 11u + (g * row) % 13u) % 256u);
-        uint32_t s0 = (phase + expert * 3u + row * 2u + g) % 128u;
-        uint32_t s1 = (phase * 2u + expert + row * 5u + g * 2u) % 128u;
-        uint32_t s2 = (phase * 3u + expert * 5u + row + g * 3u) % 128u;
-        uint32_t s3 = (phase * 5u + expert * 2u + row * 3u + g * 5u) % 128u;
-        uint32_t ls_nibble = (phase + expert + row + g) % 16u;
+        uint8_t a0 = (uint8_t)((phase * 7u + expert * 13u + row * 5u + blk * 61u + g * 3u) % 256u);
+        uint8_t a1 = (uint8_t)((phase * 11u + expert * 17u + row * 7u + blk * 67u + g * 5u +
+                                (expert * row) % 17u) % 256u);
+        uint8_t a2 = (uint8_t)((phase * 13u + expert * 19u + row * 11u + blk * 71u + g * 7u) % 256u);
+        uint8_t a3 = (uint8_t)((phase * 17u + expert * 23u + row * 13u + blk * 73u + g * 11u +
+                                (g * row) % 13u) % 256u);
+        uint32_t s0 = (phase + expert * 3u + row * 2u + blk * 19u + g) % 128u;
+        uint32_t s1 = (phase * 2u + expert + row * 5u + blk * 23u + g * 2u) % 128u;
+        uint32_t s2 = (phase * 3u + expert * 5u + row + blk * 29u + g * 3u) % 128u;
+        uint32_t s3 = (phase * 5u + expert * 2u + row * 3u + blk * 37u + g * 5u) % 128u;
+        uint32_t ls_nibble = (phase + expert + row + blk * 5u + g) % 16u;
         oracle_iq2_pack_ib32(&qs[g * 4u], a0, a1, a2, a3, s0, s1, s2, s3, ls_nibble);
     }
-    const float d = 0.01f + 0.001f * (float)((phase + expert + row) % 7u);
+    const float d = 0.01f + 0.001f * (float)((phase + expert + row + blk * 3u) % 7u);
     oracle_iq2_pack_block(out, d, qs);
 }
 
@@ -1729,19 +1799,24 @@ static int test_q2k_pack_roundtrip(void) {
     return 0;
 }
 
-static void q2k_fill_row(uint8_t out[84], uint32_t phase, uint32_t expert, uint32_t row) {
+/* `blk` selects the 256-wide Q8_K chunk this block covers, salted
+ * distinctly into every field (see q4k_fill_row's comment for why). */
+static void q2k_fill_row(uint8_t out[84], uint32_t phase, uint32_t expert, uint32_t row, uint32_t blk) {
     uint8_t scales[16], nib[256];
     for (int g = 0; g < 16; g++) {
-        uint8_t sc = (uint8_t)(1u + (phase * 5u + expert * 7u + row * 3u + (uint32_t)g * 5u) % 15u);
-        uint8_t mn = (uint8_t)((phase * 3u + expert * 11u + row * 2u + (uint32_t)g * 13u) % 15u);
+        uint8_t sc = (uint8_t)(1u + (phase * 5u + expert * 7u + row * 3u + blk * 43u +
+                                     (uint32_t)g * 5u) % 15u);
+        uint8_t mn = (uint8_t)((phase * 3u + expert * 11u + row * 2u + blk * 47u +
+                               (uint32_t)g * 13u) % 15u);
         scales[g] = (uint8_t)((sc & 0x0fu) | (uint8_t)(mn << 4));
     }
     for (int k = 0; k < 256; k++) {
-        nib[k] = (uint8_t)((phase * 19u + expert * 13u + row * 17u + (uint32_t)k +
-                            (expert * row) % 5u + ((uint32_t)k * row) % 7u) % 4u);
+        nib[k] = (uint8_t)((phase * 19u + expert * 13u + row * 17u + blk * 59u + (uint32_t)k +
+                            (expert * row) % 5u + ((uint32_t)k * row) % 7u +
+                            ((uint32_t)k * blk) % 11u) % 4u);
     }
-    const float d = 0.01f + 0.001f * (float)((phase + expert + row) % 7u);
-    const float dmin = 0.001f * (float)((phase + expert * 2u + row) % 5u);
+    const float d = 0.01f + 0.001f * (float)((phase + expert + row + blk * 3u) % 7u);
+    const float dmin = 0.001f * (float)((phase + expert * 2u + row + blk * 2u) % 5u);
     oracle_q2k_pack_block(out, d, dmin, scales, nib);
 }
 
@@ -1787,24 +1862,41 @@ typedef float (*oracle_dot_fn)(const uint8_t *blk, const oracle_q8k_block *y);
  * dot product gate/up and down each use.  Covers Q4_K (gate_dot==down_dot
  * == oracle_q4k_dot_block would work too, though the existing per-format
  * test above predates this and is left as-is), IQ2_XXS/Q2_K (iq2_path),
- * IQ2_XXS/IQ2_XXS (iq2_iq2_path) and Q2_K/Q2_K (q2k_path). */
-static void oracle_moe_one_token(const rm_model *m, uint32_t mid_dim, uint32_t out_dim,
-                                 uint32_t n_expert, const int32_t *sel, const float *w,
-                                 const float *x, float clamp, oracle_dot_fn gate_dot,
+ * IQ2_XXS/IQ2_XXS (iq2_iq2_path) and Q2_K/Q2_K (q2k_path).
+ *
+ * Generalised over chunk count: x is quantised into in_dim/256 Q8_K
+ * blocks and mid into mid_dim/256, weight block b dotted against
+ * activation chunk b and summed over chunks, matching the shape every
+ * tiled kernel under test computes (see oracle_q4k_one_token's twin
+ * comment; kept as two functions rather than merged, since this one
+ * additionally threads block-byte-size and dot-function parameters the
+ * Q4_K-only oracle does not need). */
+static void oracle_moe_one_token(const rm_model *m, uint32_t in_dim, uint32_t mid_dim,
+                                 uint32_t out_dim, uint32_t gate_block_bytes,
+                                 uint32_t down_block_bytes, uint32_t n_expert,
+                                 const int32_t *sel, const float *w, const float *x,
+                                 float clamp, oracle_dot_fn gate_dot,
                                  oracle_dot_fn down_dot, float *out) {
-    oracle_q8k_block xq;
-    oracle_q8k_quantize_block(x, &xq);
+    const uint32_t xq_blocks = in_dim / 256u;
+    const uint32_t midq_blocks = mid_dim / 256u;
+    oracle_q8k_block *xq = malloc((size_t)xq_blocks * sizeof(oracle_q8k_block));
+    for (uint32_t b = 0; b < xq_blocks; b++) {
+        oracle_q8k_quantize_block(x + (size_t)b * 256u, &xq[b]);
+    }
 
     float *mid = malloc((size_t)n_expert * mid_dim * sizeof(float));
     for (uint32_t s = 0; s < n_expert; s++) {
         const uint32_t expert = (uint32_t)sel[s];
         for (uint32_t row = 0; row < mid_dim; row++) {
-            const uint8_t *gate_blk = m->model + m->gate_offset + (uint64_t)expert * m->gate_expert_bytes +
+            const uint8_t *gate_row = m->model + m->gate_offset + (uint64_t)expert * m->gate_expert_bytes +
                                       (uint64_t)row * m->gate_row_bytes;
-            const uint8_t *up_blk = m->model + m->up_offset + (uint64_t)expert * m->gate_expert_bytes +
+            const uint8_t *up_row = m->model + m->up_offset + (uint64_t)expert * m->gate_expert_bytes +
                                     (uint64_t)row * m->gate_row_bytes;
-            float gate = gate_dot(gate_blk, &xq);
-            float up = gate_dot(up_blk, &xq);
+            float gate = 0.0f, up = 0.0f;
+            for (uint32_t b = 0; b < xq_blocks; b++) {
+                gate += gate_dot(gate_row + (size_t)b * gate_block_bytes, &xq[b]);
+                up += gate_dot(up_row + (size_t)b * gate_block_bytes, &xq[b]);
+            }
             if (clamp > 1.0e-6f) {
                 if (gate > clamp) gate = clamp;
                 if (up > clamp) up = clamp;
@@ -1814,81 +1906,108 @@ static void oracle_moe_one_token(const rm_model *m, uint32_t mid_dim, uint32_t o
         }
     }
 
-    oracle_q8k_block *midq = malloc((size_t)n_expert * sizeof(oracle_q8k_block));
+    oracle_q8k_block *midq = malloc((size_t)n_expert * midq_blocks * sizeof(oracle_q8k_block));
     for (uint32_t s = 0; s < n_expert; s++) {
-        oracle_q8k_quantize_block(mid + (size_t)s * mid_dim, &midq[s]);
+        for (uint32_t b = 0; b < midq_blocks; b++) {
+            oracle_q8k_quantize_block(mid + (size_t)s * mid_dim + (size_t)b * 256u,
+                                      &midq[(size_t)s * midq_blocks + b]);
+        }
     }
 
     for (uint32_t row = 0; row < out_dim; row++) {
         float acc = 0.0f;
         for (uint32_t s = 0; s < n_expert; s++) {
             const uint32_t expert = (uint32_t)sel[s];
-            const uint8_t *down_blk = m->model + m->down_offset + (uint64_t)expert * m->down_expert_bytes +
+            const uint8_t *down_row = m->model + m->down_offset + (uint64_t)expert * m->down_expert_bytes +
                                       (uint64_t)row * m->down_row_bytes;
-            acc += down_dot(down_blk, &midq[s]);
+            for (uint32_t b = 0; b < midq_blocks; b++) {
+                acc += down_dot(down_row + (size_t)b * down_block_bytes,
+                                &midq[(size_t)s * midq_blocks + b]);
+            }
         }
         out[row] = acc;
     }
+    free(xq);
     free(mid);
     free(midq);
 }
 
+/* xq_blocks = RM_EXPERT_IN_DIM/256 blocks per gate/up row, midq_blocks =
+ * mid_dim/256 per down row, each distinct (see iq2_fill_row/q2k_fill_row). */
 static void iq2_fill_model(rm_model *m, uint32_t n_total_expert, uint32_t mid_dim, uint32_t out_dim) {
+    const uint32_t xq_blocks = RM_EXPERT_IN_DIM / 256u;
+    const uint32_t midq_blocks = mid_dim / 256u;
     for (uint32_t e = 0; e < n_total_expert; e++) {
         for (uint32_t row = 0; row < mid_dim; row++) {
-            uint8_t blk[RM_IQ2_BLOCK_BYTES];
-            iq2_fill_row(blk, Q4K_PHASE_GATE, e, row);
-            memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
-                   blk, sizeof(blk));
-            iq2_fill_row(blk, Q4K_PHASE_UP, e, row);
-            memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
-                   blk, sizeof(blk));
+            for (uint32_t b = 0; b < xq_blocks; b++) {
+                uint8_t blk[RM_IQ2_BLOCK_BYTES];
+                const uint64_t row_off = (uint64_t)row * m->gate_row_bytes + (uint64_t)b * RM_IQ2_BLOCK_BYTES;
+                iq2_fill_row(blk, Q4K_PHASE_GATE, e, row, b);
+                memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + row_off, blk, sizeof(blk));
+                iq2_fill_row(blk, Q4K_PHASE_UP, e, row, b);
+                memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + row_off, blk, sizeof(blk));
+            }
         }
         for (uint32_t row = 0; row < out_dim; row++) {
-            uint8_t blk[RM_Q2K_BLOCK_BYTES];
-            q2k_fill_row(blk, Q4K_PHASE_DOWN, e, row);
-            memcpy(m->model + m->down_offset + e * m->down_expert_bytes + (uint64_t)row * m->down_row_bytes,
-                   blk, sizeof(blk));
+            for (uint32_t b = 0; b < midq_blocks; b++) {
+                uint8_t blk[RM_Q2K_BLOCK_BYTES];
+                q2k_fill_row(blk, Q4K_PHASE_DOWN, e, row, b);
+                memcpy(m->model + m->down_offset + e * m->down_expert_bytes +
+                               (uint64_t)row * m->down_row_bytes + (uint64_t)b * RM_Q2K_BLOCK_BYTES,
+                       blk, sizeof(blk));
+            }
         }
     }
 }
 
 static void iq2iq2_fill_model(rm_model *m, uint32_t n_total_expert, uint32_t mid_dim, uint32_t out_dim) {
+    const uint32_t xq_blocks = RM_EXPERT_IN_DIM / 256u;
+    const uint32_t midq_blocks = mid_dim / 256u;
     for (uint32_t e = 0; e < n_total_expert; e++) {
         for (uint32_t row = 0; row < mid_dim; row++) {
-            uint8_t blk[RM_IQ2_BLOCK_BYTES];
-            iq2_fill_row(blk, Q4K_PHASE_GATE, e, row);
-            memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
-                   blk, sizeof(blk));
-            iq2_fill_row(blk, Q4K_PHASE_UP, e, row);
-            memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
-                   blk, sizeof(blk));
+            for (uint32_t b = 0; b < xq_blocks; b++) {
+                uint8_t blk[RM_IQ2_BLOCK_BYTES];
+                const uint64_t row_off = (uint64_t)row * m->gate_row_bytes + (uint64_t)b * RM_IQ2_BLOCK_BYTES;
+                iq2_fill_row(blk, Q4K_PHASE_GATE, e, row, b);
+                memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + row_off, blk, sizeof(blk));
+                iq2_fill_row(blk, Q4K_PHASE_UP, e, row, b);
+                memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + row_off, blk, sizeof(blk));
+            }
         }
         for (uint32_t row = 0; row < out_dim; row++) {
-            uint8_t blk[RM_IQ2_BLOCK_BYTES];
-            iq2_fill_row(blk, Q4K_PHASE_DOWN, e, row);
-            memcpy(m->model + m->down_offset + e * m->down_expert_bytes + (uint64_t)row * m->down_row_bytes,
-                   blk, sizeof(blk));
+            for (uint32_t b = 0; b < midq_blocks; b++) {
+                uint8_t blk[RM_IQ2_BLOCK_BYTES];
+                iq2_fill_row(blk, Q4K_PHASE_DOWN, e, row, b);
+                memcpy(m->model + m->down_offset + e * m->down_expert_bytes +
+                               (uint64_t)row * m->down_row_bytes + (uint64_t)b * RM_IQ2_BLOCK_BYTES,
+                       blk, sizeof(blk));
+            }
         }
     }
 }
 
 static void q2k_fill_model(rm_model *m, uint32_t n_total_expert, uint32_t mid_dim, uint32_t out_dim) {
+    const uint32_t xq_blocks = RM_EXPERT_IN_DIM / 256u;
+    const uint32_t midq_blocks = mid_dim / 256u;
     for (uint32_t e = 0; e < n_total_expert; e++) {
         for (uint32_t row = 0; row < mid_dim; row++) {
-            uint8_t blk[RM_Q2K_BLOCK_BYTES];
-            q2k_fill_row(blk, Q4K_PHASE_GATE, e, row);
-            memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
-                   blk, sizeof(blk));
-            q2k_fill_row(blk, Q4K_PHASE_UP, e, row);
-            memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
-                   blk, sizeof(blk));
+            for (uint32_t b = 0; b < xq_blocks; b++) {
+                uint8_t blk[RM_Q2K_BLOCK_BYTES];
+                const uint64_t row_off = (uint64_t)row * m->gate_row_bytes + (uint64_t)b * RM_Q2K_BLOCK_BYTES;
+                q2k_fill_row(blk, Q4K_PHASE_GATE, e, row, b);
+                memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + row_off, blk, sizeof(blk));
+                q2k_fill_row(blk, Q4K_PHASE_UP, e, row, b);
+                memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + row_off, blk, sizeof(blk));
+            }
         }
         for (uint32_t row = 0; row < out_dim; row++) {
-            uint8_t blk[RM_Q2K_BLOCK_BYTES];
-            q2k_fill_row(blk, Q4K_PHASE_DOWN, e, row);
-            memcpy(m->model + m->down_offset + e * m->down_expert_bytes + (uint64_t)row * m->down_row_bytes,
-                   blk, sizeof(blk));
+            for (uint32_t b = 0; b < midq_blocks; b++) {
+                uint8_t blk[RM_Q2K_BLOCK_BYTES];
+                q2k_fill_row(blk, Q4K_PHASE_DOWN, e, row, b);
+                memcpy(m->model + m->down_offset + e * m->down_expert_bytes +
+                               (uint64_t)row * m->down_row_bytes + (uint64_t)b * RM_Q2K_BLOCK_BYTES,
+                       blk, sizeof(blk));
+            }
         }
     }
 }
@@ -1927,8 +2046,8 @@ static int rm_decode_test(const char *name, uint32_t gate_type, uint32_t down_ty
           msg);
 
     float want[RM_OUT_DIM];
-    oracle_moe_one_token(&m, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT, sel, w, x, 0.0f,
-                         gate_dot, down_dot, want);
+    oracle_moe_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, gate_block_bytes,
+                         down_block_bytes, RM_N_EXPERT, sel, w, x, 0.0f, gate_dot, down_dot, want);
     float got[RM_OUT_DIM];
     ds4_gpu_tensor_read(t.out, 0, got, sizeof(got));
     for (int i = 0; i < RM_OUT_DIM; i++) {
@@ -2023,10 +2142,10 @@ static int rm_batch_test_dithered(const char *name, uint32_t gate_type, uint32_t
     if (x_dither == 0.0f) {
         /* Ordinary correctness call: every value must match tightly. */
         for (uint32_t t = 0; t < n_tokens; t++) {
-            oracle_moe_one_token(&m, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT,
-                                 sel + (size_t)t * RM_N_EXPERT, w + (size_t)t * RM_N_EXPERT,
-                                 xv + (size_t)t * RM_EXPERT_IN_DIM, 0.0f, gate_dot, down_dot,
-                                 want_row);
+            oracle_moe_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, gate_block_bytes,
+                                 down_block_bytes, RM_N_EXPERT, sel + (size_t)t * RM_N_EXPERT,
+                                 w + (size_t)t * RM_N_EXPERT, xv + (size_t)t * RM_EXPERT_IN_DIM, 0.0f,
+                                 gate_dot, down_dot, want_row);
             for (int i = 0; i < RM_OUT_DIM; i++) {
                 snprintf(msg, sizeof(msg), "%s(n=%u): token %u value mismatch", name, n_tokens, t);
                 CHECK_CLOSE(got[(size_t)t * RM_OUT_DIM + i], want_row[i],
@@ -2061,10 +2180,10 @@ static int rm_batch_test_dithered(const char *name, uint32_t gate_type, uint32_t
          * produces, rather than requiring every single value to match. */
         uint64_t total = 0, mismatches = 0;
         for (uint32_t t = 0; t < n_tokens; t++) {
-            oracle_moe_one_token(&m, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT,
-                                 sel + (size_t)t * RM_N_EXPERT, w + (size_t)t * RM_N_EXPERT,
-                                 xv + (size_t)t * RM_EXPERT_IN_DIM, 0.0f, gate_dot, down_dot,
-                                 want_row);
+            oracle_moe_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, gate_block_bytes,
+                                 down_block_bytes, RM_N_EXPERT, sel + (size_t)t * RM_N_EXPERT,
+                                 w + (size_t)t * RM_N_EXPERT, xv + (size_t)t * RM_EXPERT_IN_DIM, 0.0f,
+                                 gate_dot, down_dot, want_row);
             for (int i = 0; i < RM_OUT_DIM; i++) {
                 float g = got[(size_t)t * RM_OUT_DIM + i];
                 float wv = want_row[i];
