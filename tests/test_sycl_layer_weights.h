@@ -85,8 +85,8 @@
 #define DS4_TW_N_OUT_GROUP           1u
 #define DS4_TW_N_LORA_Q              64u
 #define DS4_TW_N_LORA_O              32u
-#define DS4_TW_N_EXPERT              4u
-#define DS4_TW_N_EXPERT_USED         2u
+#define DS4_TW_N_EXPERT            256u
+#define DS4_TW_N_EXPERT_USED         6u
 #define DS4_TW_N_EXPERT_SHARED       1u
 #define DS4_TW_N_FF_EXP              256u
 #define DS4_TW_N_HC                  4u
