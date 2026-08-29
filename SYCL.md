@@ -198,9 +198,22 @@ a test nothing runs is worse than no test.
 
 **Two things this cannot check.** MXFP4 has no CPU oracle in `ds4.c` at all, so
 it is validated against an independently written scalar reference instead, which
-is a weaker guarantee. And nothing here exercises the engine's own setup path in
-`ds4.c`, so "the engine calls an entry this backend stubbed" is invisible to the
-suite; that blind spot hid a defect that made session creation impossible.
+is a weaker guarantee. And the same is true of indexed decode attention, where
+no CPU function consumes a raw top-k array.
+
+**The blind spot that mattered most.** Every test above calls a `ds4_gpu_*`
+entry directly. None of them goes through the engine. So the entire class of
+"the engine calls an entry this backend left stubbed to its failure value" was
+invisible, and it hid three separate catastrophic defects: no session could be
+created, no model could be opened, and no token could be decoded. Each was found
+by reading, not by testing.
+
+`tests/test_sycl_session_smoke.c` closes that gap from the other side. It uses
+`DS4_TEST_HOOKS` entry points in `ds4.c` to drive the engine's own graph
+allocator and then the real `begin_commands`, kernel, `end_commands`,
+`synchronize` encode sequence, on a synthetic model with no weights. **Both of
+its hooks found a defect the first time they ran.** If you add an engine-facing
+entry, extend that file, not just a kernel test.
 
 ### Ablation
 
@@ -243,14 +256,18 @@ includes, which is exactly what is wanted. Proven empirically, not assumed.
 not, because several kernels rely on Inf and NaN behaving properly. Dropping the
 second flag silently elides a guard in the compressor.
 
-The environment needs three oneAPI scripts sourced in the same shell as the
+The environment needs four oneAPI scripts sourced in the same shell as the
 build. Do not use `setvars.sh`:
 
 ```sh
 source /opt/intel/oneapi/compiler/2025.3/env/vars.sh
 source /opt/intel/oneapi/umf/latest/env/vars.sh
 source /opt/intel/oneapi/tbb/latest/env/vars.sh
+source /opt/intel/oneapi/mkl/2025.3/env/vars.sh
 ```
+
+Pin the versions. `/opt/intel/oneapi/` holds several side by side, and oneMKL
+must match the compiler the build uses.
 
 ## Device and tier model
 
@@ -277,15 +294,22 @@ plausible-looking wrong answer.
 
 ## Known gaps
 
-* **Attention, the indexer and hyper-connections** are not ported. This is the
-  last large body of kernel work.
-* **Multi-GPU** is enumerated but not driven.
-* **oneMKL is not installed**, which blocks three dense-matmul entries and,
-  more seriously, the batched GEMM that prefill attention's fast path needs at
-  Flash's actual head dimension. The scalar fallback refuses above 2048 combined
-  keys, so long-context prefill has no correct path until this is resolved.
+* **Long-context prefill attention** is in progress. oneMKL is now installed and
+  provides the batched GEMM the fast path needs; until that work lands, the
+  scalar fallback refuses above 2048 combined keys.
+* **Multi-GPU is written but unverified.** Tier switching, per-tier allocation,
+  cross-device copies and per-tier streaming caches are all implemented, but
+  this development machine has one GPU. In particular the peer-access
+  byte-validation protocol has never run off-diagonal. That protocol exists
+  because CUDA's peer-access reporting lied on real hardware, and the target
+  cards are two dies behind a PCIe switch, so it is the most likely thing to
+  bite on first contact with the real machine.
 * **No end-to-end run against real weights** has happened. Every subsystem is
-  verified against a CPU oracle on synthetic data.
+  verified against a CPU oracle on synthetic data, which is real verification
+  but is not the same as producing a token.
+* **One known unfixed hazard**: `sycl_stream_evict_at` frees a cache slab
+  without waiting when evicting under memory pressure. A use-after-free shape
+  that nothing on this hardware can test.
 * **Performance is untuned.** Weight staging is per call with no cross-call
   cache, and no tuning result from the development A770 should be trusted for
   the Battlemage target.
