@@ -5,35 +5,20 @@
  * file: the "model map" used to exercise mmap staging is a plain host
  * float buffer standing in for one.
  *
- * This is a self-contained file per this project's convention: it defines
- * its own CHECK/CHECK_CLOSE macros rather than sharing test_sycl_harness.h,
- * and does not touch any other test file. */
+ * Shares CHECK/CHECK_CLOSE and oracle_rms_norm_weight with
+ * test_sycl_harness.h (the fused norm entry's oracle needs exactly that
+ * weighted RMS norm); every other oracle here is specific to this
+ * subsystem and lives in this file. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
+
+#include "test_sycl_harness.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define CHECK(cond, msg)                                                    \
-    do {                                                                    \
-        if (!(cond)) {                                                      \
-            fprintf(stderr, "FAIL: %s\n", (msg));                           \
-            return 1;                                                       \
-        }                                                                   \
-    } while (0)
-
-#define CHECK_CLOSE(got, want, tol, msg)                                    \
-    do {                                                                    \
-        double d_ = fabs((double)(got) - (double)(want));                   \
-        if (!(d_ <= (tol))) {                                               \
-            fprintf(stderr, "FAIL: %s (got %.9g want %.9g delta %.3g)\n",   \
-                    (msg), (double)(got), (double)(want), d_);              \
-            return 1;                                                       \
-        }                                                                   \
-    } while (0)
 
 enum { N_HC = 4, MIX_HC = 2 * N_HC + N_HC * N_HC /* 24 */ };
 
@@ -646,6 +631,264 @@ static int test_hc_expand_add_split_half_add(void) {
     return 0;
 }
 
+/* Fuses hc_split_sinkhorn_one and hc_weighted_sum_one for n_rows tokens in
+ * one launch, per rocm/ds4_rocm_hc_output_launch.cuh:101-145.  Verified
+ * against: (a) the same composed oracle used by test_hc_split_sinkhorn and
+ * test_hc_weighted_sum_split; (b) a differential check that the SAME split
+ * scratch tensor this entry writes agrees with what ds4_gpu_hc_split_
+ * sinkhorn_tensor alone would have produced (the fused kernel must still
+ * emit a genuine split, not just fold it away internally); (c) a rejection
+ * of n_hc != 4. */
+static int test_hc_split_weighted_sum(void) {
+    enum { N_ROWS = 5, N_EMBD = 20, ITERS = 6 };
+    const float eps = 1.0e-6f;
+    float mix[N_ROWS * MIX_HC];
+    float residual[N_ROWS * N_HC * N_EMBD];
+    for (int r = 0; r < N_ROWS; r++) {
+        for (int i = 0; i < MIX_HC; i++) mix[r * MIX_HC + i] = fill_val((uint32_t)r, (uint32_t)i) * 1.7f;
+        for (int h = 0; h < N_HC; h++)
+            for (int i = 0; i < N_EMBD; i++)
+                residual[(r * N_HC + h) * N_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 1.0f;
+    }
+    float model[3 + MIX_HC];
+    model[0] = 0.95f; model[1] = 1.05f; model[2] = 0.85f;
+    for (int i = 0; i < MIX_HC; i++) model[3 + i] = fill_val(77, (uint32_t)i) * 0.25f;
+    const uint64_t scale_offset = 0, base_offset = 3 * sizeof(float);
+
+    float want_split[N_ROWS * MIX_HC], want_out[N_ROWS * N_EMBD];
+    for (int r = 0; r < N_ROWS; r++) {
+        oracle_hc_split_sinkhorn_one(want_split + r * MIX_HC, mix + r * MIX_HC, model, model + 3,
+                                     ITERS, eps);
+        oracle_hc_weighted_sum_one(want_out + r * N_EMBD, residual + (uint64_t)r * N_HC * N_EMBD,
+                                   want_split + r * MIX_HC, N_EMBD, N_HC);
+    }
+
+    ds4_gpu_tensor *tmix = alloc_write(mix, sizeof(mix));
+    ds4_gpu_tensor *tres = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tsplit = ds4_gpu_tensor_alloc(sizeof(want_split));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(want_out));
+    CHECK(tmix && tres && tsplit && tout, "hc_split_weighted_sum: alloc failed");
+
+    CHECK(ds4_gpu_hc_split_weighted_sum_tensor(tout, tsplit, tmix, tres, model, sizeof(model),
+                                               scale_offset, base_offset, N_EMBD, N_HC, ITERS,
+                                               eps) != 0,
+          "hc_split_weighted_sum: call");
+
+    float got_split[N_ROWS * MIX_HC], got_out[N_ROWS * N_EMBD];
+    CHECK(ds4_gpu_tensor_read(tsplit, 0, got_split, sizeof(got_split)) != 0,
+          "hc_split_weighted_sum: read split");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got_out, sizeof(got_out)) != 0,
+          "hc_split_weighted_sum: read out");
+    for (int i = 0; i < N_ROWS * MIX_HC; i++)
+        CHECK_CLOSE(got_split[i], want_split[i], 1e-4, "hc_split_weighted_sum: split mismatch");
+    for (int i = 0; i < N_ROWS * N_EMBD; i++)
+        CHECK_CLOSE(got_out[i], want_out[i], 1e-4, "hc_split_weighted_sum: out mismatch");
+
+    /* Differential: the fused entry's split output must agree with the
+     * standalone hc_split_sinkhorn_tensor on the same inputs. */
+    ds4_gpu_tensor *tsplit_ref = ds4_gpu_tensor_alloc(sizeof(want_split));
+    CHECK(tsplit_ref, "hc_split_weighted_sum: ref alloc failed");
+    CHECK(ds4_gpu_hc_split_sinkhorn_tensor(tsplit_ref, tmix, model, sizeof(model), scale_offset,
+                                           base_offset, N_HC, ITERS, eps) != 0,
+          "hc_split_weighted_sum: reference split call");
+    float got_split_ref[N_ROWS * MIX_HC];
+    CHECK(ds4_gpu_tensor_read(tsplit_ref, 0, got_split_ref, sizeof(got_split_ref)) != 0,
+          "hc_split_weighted_sum: read ref split");
+    for (int i = 0; i < N_ROWS * MIX_HC; i++)
+        CHECK_CLOSE(got_split[i], got_split_ref[i], 1e-4,
+                    "hc_split_weighted_sum: fused/standalone split differential mismatch");
+
+    /* Differential: the fused entry's out output must agree with
+     * hc_split_sinkhorn_tensor followed by hc_weighted_sum_split_
+     * tensor on the same inputs (split then weighted sum, unfused). */
+    ds4_gpu_tensor *tout_ref = ds4_gpu_tensor_alloc(sizeof(want_out));
+    CHECK(tout_ref, "hc_split_weighted_sum: ref out alloc failed");
+    CHECK(ds4_gpu_hc_weighted_sum_split_tensor(tout_ref, tres, tsplit_ref, N_EMBD, N_HC) != 0,
+          "hc_split_weighted_sum: reference weighted sum call");
+    float got_out_ref[N_ROWS * N_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout_ref, 0, got_out_ref, sizeof(got_out_ref)) != 0,
+          "hc_split_weighted_sum: read ref out");
+    for (int i = 0; i < N_ROWS * N_EMBD; i++)
+        CHECK_CLOSE(got_out[i], got_out_ref[i], 1e-4,
+                    "hc_split_weighted_sum: fused/unfused out differential mismatch");
+
+    CHECK(ds4_gpu_hc_split_weighted_sum_tensor(tout, tsplit, tmix, tres, model, sizeof(model),
+                                               scale_offset, base_offset, N_EMBD, 3, ITERS, eps) == 0,
+          "hc_split_weighted_sum: n_hc != 4 must be rejected");
+
+    ds4_gpu_tensor_free(tmix);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tsplit_ref);
+    ds4_gpu_tensor_free(tout_ref);
+    fprintf(stderr, "  test_hc_split_weighted_sum OK\n");
+    return 0;
+}
+
+/* Fuses the split and weighted sum above with a further RMS norm over
+ * n_embd, per rocm/ds4_rocm_hc_output_launch.cuh:146-202.  N_EMBD = 37 is
+ * deliberately smaller than the kernel's fixed 256-wide work group, so
+ * some lanes' per-lane accumulation loop runs zero iterations; per design-
+ * spec section 6b those lanes must still contribute their (zero) value to
+ * the reduction.  residual_hc's branches are built from fill_val, which is
+ * NOT affine in its indices (design-spec section 6f): the branches are not
+ * scalar multiples of one another, which is what makes a single-branch
+ * weight perturbation change the RESULT'S DIRECTION rather than only its
+ * magnitude, and therefore observable through the RMS-normalised output
+ * rather than divided out by it. */
+static int test_hc_split_weighted_sum_norm(void) {
+    enum { N_ROWS = 4, N_EMBD = 37, ITERS = 6 };
+    const float eps = 1.0e-6f, norm_eps = 1.0e-5f;
+    float mix[N_ROWS * MIX_HC];
+    float residual[N_ROWS * N_HC * N_EMBD];
+    for (int r = 0; r < N_ROWS; r++) {
+        for (int i = 0; i < MIX_HC; i++) mix[r * MIX_HC + i] = fill_val((uint32_t)r, (uint32_t)i + 30) * 1.3f;
+        for (int h = 0; h < N_HC; h++)
+            for (int i = 0; i < N_EMBD; i++)
+                residual[(r * N_HC + h) * N_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 1.5f;
+    }
+    float model[3 + MIX_HC];
+    model[0] = 1.05f; model[1] = 0.9f; model[2] = 1.1f;
+    for (int i = 0; i < MIX_HC; i++) model[3 + i] = fill_val(55, (uint32_t)i) * 0.2f;
+    float norm_w[N_EMBD];
+    for (int i = 0; i < N_EMBD; i++) norm_w[i] = 0.5f + 0.02f * (float)i;
+    const uint64_t scale_offset = 0, base_offset = 3 * sizeof(float);
+    const uint64_t norm_weight_offset = base_offset + MIX_HC * sizeof(float);
+
+    float model_buf[3 + MIX_HC + N_EMBD];
+    memcpy(model_buf, model, sizeof(model));
+    memcpy((char *)model_buf + norm_weight_offset, norm_w, sizeof(norm_w));
+
+    float want_split[N_ROWS * MIX_HC], want_out[N_ROWS * N_EMBD], want_norm[N_ROWS * N_EMBD];
+    for (int r = 0; r < N_ROWS; r++) {
+        oracle_hc_split_sinkhorn_one(want_split + r * MIX_HC, mix + r * MIX_HC, model, model + 3,
+                                     ITERS, eps);
+        oracle_hc_weighted_sum_one(want_out + r * N_EMBD, residual + (uint64_t)r * N_HC * N_EMBD,
+                                   want_split + r * MIX_HC, N_EMBD, N_HC);
+        oracle_rms_norm_weight(want_norm + r * N_EMBD, want_out + r * N_EMBD, norm_w, N_EMBD, norm_eps);
+    }
+
+    ds4_gpu_tensor *tmix = alloc_write(mix, sizeof(mix));
+    ds4_gpu_tensor *tres = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tsplit = ds4_gpu_tensor_alloc(sizeof(want_split));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(want_out));
+    ds4_gpu_tensor *tnorm = ds4_gpu_tensor_alloc(sizeof(want_norm));
+    CHECK(tmix && tres && tsplit && tout && tnorm, "hc_split_weighted_sum_norm: alloc failed");
+
+    CHECK(ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                  tout, tnorm, tsplit, tmix, tres, model_buf, sizeof(model_buf), scale_offset,
+                  base_offset, norm_weight_offset, N_EMBD, N_HC, ITERS, eps, norm_eps) != 0,
+          "hc_split_weighted_sum_norm: call");
+
+    float got_out[N_ROWS * N_EMBD], got_norm[N_ROWS * N_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout, 0, got_out, sizeof(got_out)) != 0,
+          "hc_split_weighted_sum_norm: read out");
+    CHECK(ds4_gpu_tensor_read(tnorm, 0, got_norm, sizeof(got_norm)) != 0,
+          "hc_split_weighted_sum_norm: read norm");
+    for (int i = 0; i < N_ROWS * N_EMBD; i++)
+        CHECK_CLOSE(got_out[i], want_out[i], 1e-4, "hc_split_weighted_sum_norm: out mismatch");
+    for (int i = 0; i < N_ROWS * N_EMBD; i++)
+        CHECK_CLOSE(got_norm[i], want_norm[i], 1e-4, "hc_split_weighted_sum_norm: norm mismatch");
+
+    CHECK(ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                  tout, tnorm, tsplit, tmix, tres, model_buf, sizeof(model_buf), scale_offset,
+                  base_offset, norm_weight_offset, N_EMBD, 3, ITERS, eps, norm_eps) == 0,
+          "hc_split_weighted_sum_norm: n_hc != 4 must be rejected");
+
+    ds4_gpu_tensor_free(tmix);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tnorm);
+    fprintf(stderr, "  test_hc_split_weighted_sum_norm OK\n");
+    return 0;
+}
+
+/* Large-scale regression case for the fused norm kernel's reduction-barrier
+ * ablation.  N_EMBD == 256 == the kernel's fixed work-group width is
+ * load-bearing, not just N_ROWS: an earlier attempt at this same ablation
+ * used N_EMBD = 64 at up to 131072 rows (8.4M+ work-items) and never failed,
+ * because 192 of the 256 lanes in every group then pass the reduction's
+ * identity value (0.0f), and combining mostly-zero values out of order is
+ * invisible.  That is design-spec section 6i's mechanism (an ablation can
+ * pass falsely because of the value you chose), not insufficient
+ * contention: holding N_ROWS at 65536 and only changing N_EMBD from 64 to
+ * 256 was what made the dropped barrier reproduce wrong output, confirmed
+ * by running both shapes.  Kept permanently at this shape, not deleted
+ * after the ablation that motivated it, per the sibling barrier audit's
+ * own precedent (design-spec section 6j). */
+static int test_hc_split_weighted_sum_norm_stress(void) {
+    enum { N_ROWS = 65536, N_EMBD = 256, ITERS = 4 };
+    const float eps = 1.0e-6f, norm_eps = 1.0e-5f;
+    size_t mix_bytes = (size_t)N_ROWS * MIX_HC * sizeof(float);
+    size_t res_bytes = (size_t)N_ROWS * N_HC * N_EMBD * sizeof(float);
+    size_t out_bytes = (size_t)N_ROWS * N_EMBD * sizeof(float);
+    float *mix = malloc(mix_bytes);
+    float *residual = malloc(res_bytes);
+    float *want_out = malloc(out_bytes);
+    float *want_norm = malloc(out_bytes);
+    float *got_out = malloc(out_bytes);
+    float *got_norm = malloc(out_bytes);
+    CHECK(mix && residual && want_out && want_norm && got_out && got_norm,
+          "hc_split_weighted_sum_norm(stress): host alloc failed");
+
+    float model[3 + MIX_HC];
+    model[0] = 1.02f; model[1] = 0.98f; model[2] = 1.04f;
+    for (int i = 0; i < MIX_HC; i++) model[3 + i] = fill_val(33, (uint32_t)i) * 0.2f;
+    float norm_w[N_EMBD];
+    for (int i = 0; i < N_EMBD; i++) norm_w[i] = 0.6f + 0.01f * (float)i;
+    const uint64_t scale_offset = 0, base_offset = 3 * sizeof(float);
+    const uint64_t norm_weight_offset = base_offset + MIX_HC * sizeof(float);
+    float model_buf[3 + MIX_HC + N_EMBD];
+    memcpy(model_buf, model, sizeof(model));
+    memcpy((char *)model_buf + norm_weight_offset, norm_w, sizeof(norm_w));
+
+    float split_row[MIX_HC];
+    for (int r = 0; r < N_ROWS; r++) {
+        for (int i = 0; i < MIX_HC; i++)
+            mix[(size_t)r * MIX_HC + i] = fill_val((uint32_t)r, (uint32_t)i + 15) * 1.1f;
+        for (int h = 0; h < N_HC; h++)
+            for (int i = 0; i < N_EMBD; i++)
+                residual[((size_t)r * N_HC + h) * N_EMBD + i] = fill_val((uint32_t)(h * 131 + r), (uint32_t)i) + 1.0f;
+        oracle_hc_split_sinkhorn_one(split_row, mix + (size_t)r * MIX_HC, model, model + 3, ITERS, eps);
+        oracle_hc_weighted_sum_one(want_out + (size_t)r * N_EMBD,
+                                   residual + (size_t)r * N_HC * N_EMBD, split_row, N_EMBD, N_HC);
+        oracle_rms_norm_weight(want_norm + (size_t)r * N_EMBD, want_out + (size_t)r * N_EMBD, norm_w,
+                               N_EMBD, norm_eps);
+    }
+
+    ds4_gpu_tensor *tmix = alloc_write(mix, mix_bytes);
+    ds4_gpu_tensor *tres = alloc_write(residual, res_bytes);
+    ds4_gpu_tensor *tsplit = ds4_gpu_tensor_alloc((size_t)N_ROWS * MIX_HC * sizeof(float));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(out_bytes);
+    ds4_gpu_tensor *tnorm = ds4_gpu_tensor_alloc(out_bytes);
+    CHECK(tmix && tres && tsplit && tout && tnorm,
+          "hc_split_weighted_sum_norm(stress): device alloc failed");
+
+    CHECK(ds4_gpu_hc_split_weighted_sum_norm_tensor(
+                  tout, tnorm, tsplit, tmix, tres, model_buf, sizeof(model_buf), scale_offset,
+                  base_offset, norm_weight_offset, N_EMBD, N_HC, ITERS, eps, norm_eps) != 0,
+          "hc_split_weighted_sum_norm(stress): call");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got_out, out_bytes) != 0,
+          "hc_split_weighted_sum_norm(stress): read out");
+    CHECK(ds4_gpu_tensor_read(tnorm, 0, got_norm, out_bytes) != 0,
+          "hc_split_weighted_sum_norm(stress): read norm");
+
+    for (size_t i = 0; i < (size_t)N_ROWS * N_EMBD; i++)
+        CHECK_CLOSE(got_norm[i], want_norm[i], 2e-3,
+                    "hc_split_weighted_sum_norm(stress): norm mismatch");
+
+    ds4_gpu_tensor_free(tmix);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tnorm);
+    free(mix); free(residual); free(want_out); free(want_norm); free(got_out); free(got_norm);
+    fprintf(stderr, "  test_hc_split_weighted_sum_norm_stress OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_repeat_hc() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -659,6 +902,9 @@ int main(void) {
     if (test_hc_expand_split_half() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_expand_add_split() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_expand_add_split_half_add() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_hc_split_weighted_sum() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_hc_split_weighted_sum_norm() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_hc_split_weighted_sum_norm_stress() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_hc OK\n");
     return 0;

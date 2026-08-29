@@ -757,3 +757,220 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
     }
     return 1;
 }
+
+/* Fuses hc_split_sinkhorn_kernel and hc_weighted_sum_kernel into one launch,
+ * one work group per token: lane 0 computes the Sinkhorn split into the
+ * `split` output tensor (a genuine output, not just internal scratch), a
+ * barrier makes that write visible to the rest of the group, then every
+ * lane strides across n_embd computing the weighted sum.  Ported from
+ * ds4_gpu_hc_split_weighted_sum_tensor, rocm/ds4_rocm_hc_output_launch.cuh:
+ * 101-145 (kernel: hc_split_weighted_sum_fused_kernel, rocm/ds4_rocm_hc.cuh:
+ * 300-326).
+ *
+ * The kernel-level `n_hc != 4` guard is preserved even though the entry
+ * above it already rejects n_hc != 4 before ever launching: ROCm's own
+ * kernel carries this same redundant check (hc.cuh:304), and a guard that
+ * can never fire in practice is exactly the kind a later reader deletes
+ * as dead unless it is ported deliberately. */
+extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *split, const ds4_gpu_tensor *mix,
+        const ds4_gpu_tensor *residual_hc, const void *model_map, uint64_t model_size,
+        uint64_t scale_offset, uint64_t base_offset, uint32_t n_embd, uint32_t n_hc,
+        uint32_t sinkhorn_iters, float eps) {
+    if (!out || !split || !mix || !residual_hc || !model_map || n_embd == 0u || n_hc != 4u) {
+        return 0;
+    }
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    uint64_t mix_bytes = 0, out_row_bytes = 0, residual_row_bytes = 0;
+    if (!sycl_u64_mul_checked(mix_hc, sizeof(float), &mix_bytes) ||
+        !sycl_u64_mul_checked(n_embd, sizeof(float), &out_row_bytes) ||
+        !sycl_u64_mul3_checked(n_hc, n_embd, sizeof(float), &residual_row_bytes) ||
+        out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0u ||
+        !sycl_model_range_fits(model_size, scale_offset, 3ull * sizeof(float)) ||
+        !sycl_model_range_fits(model_size, base_offset, mix_bytes)) {
+        return 0;
+    }
+    const uint64_t n_rows = out->bytes / out_row_bytes;
+    uint64_t mix_needed = 0, residual_needed = 0;
+    if (n_rows == 0u || n_rows > UINT32_MAX ||
+        !sycl_u64_mul_checked(n_rows, mix_bytes, &mix_needed) ||
+        !sycl_u64_mul_checked(n_rows, residual_row_bytes, &residual_needed) ||
+        mix->bytes < mix_needed || split->bytes < mix_needed ||
+        residual_hc->bytes < residual_needed) {
+        return 0;
+    }
+    const char *scale_p = sycl_model_range_ptr(model_map, scale_offset, 3ull * sizeof(float),
+                                                model_size, "hc_scale");
+    const char *base_p = sycl_model_range_ptr(model_map, base_offset, mix_bytes, model_size, "hc_base");
+    if (!scale_p || !base_p) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out->device_id);
+        sycl_device_scratch_guard scale_guard =
+                sycl_stage_host_bytes(q, scale_p, 3ull * sizeof(float));
+        if (!scale_guard.p) return 0;
+        sycl_device_scratch_guard base_guard = sycl_stage_host_bytes(q, base_p, mix_bytes);
+        if (!base_guard.p) return 0;
+
+        float       *o     = (float *)out->ptr;
+        float       *sp0   = (float *)split->ptr;
+        const float *m     = (const float *)mix->ptr;
+        const float *res   = (const float *)residual_hc->ptr;
+        const float *scale = (const float *)scale_guard.p;
+        const float *base  = (const float *)base_guard.p;
+        const uint32_t rows  = (uint32_t)n_rows;
+        const uint32_t embd  = n_embd;
+        const uint32_t hc    = n_hc;
+        const uint32_t iters = sinkhorn_iters;
+        const float    epsv  = eps;
+
+        q.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>((size_t)rows * kSyclHcRowGroup),
+                                  sycl::range<1>(kSyclHcRowGroup)),
+                [=](sycl::nd_item<1> it) {
+                    const uint32_t t = (uint32_t)it.get_group(0);
+                    const uint32_t d = (uint32_t)it.get_local_id(0);
+                    /* t depends only on the group id, so this early return
+                     * is group-uniform: every lane in a given group agrees
+                     * on it, and the barrier below is reached by either
+                     * every lane in the group or none of them. */
+                    if (t >= rows || hc != 4u) return;
+                    float *sp = sp0 + (uint64_t)t * 24;
+                    if (d == 0u) sycl_hc4_split_one(sp, m + (uint64_t)t * 24, scale, base, iters, epsv);
+                    /* global_and_local: sp is a pointer into device global
+                     * memory (the split output tensor), written by lane 0
+                     * and read by every lane below, so the fence must cover
+                     * global memory, not just the (unused here) local
+                     * accessor space. */
+                    it.barrier(sycl::access::fence_space::global_and_local);
+                    for (uint32_t col = d; col < embd; col += kSyclHcRowGroup) {
+                        float acc = 0.0f;
+                        for (uint32_t h = 0; h < 4u; h++) {
+                            acc += res[(uint64_t)t * 4u * embd + (uint64_t)h * embd + col] * sp[h];
+                        }
+                        o[(uint64_t)t * embd + col] = acc;
+                    }
+                });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_weighted_sum failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* As ds4_gpu_hc_split_weighted_sum_tensor, plus a fused RMS norm over the
+ * weighted-sum output using the shared sycl_block_row_reduce helper
+ * (ds4_sycl_common.hpp): every lane's per-lane sum-of-squares accumulates
+ * across its strided columns (0.0f for a lane whose loop ran zero times,
+ * satisfying design-spec section 6b), then the whole group reduces those
+ * partial sums to one total before computing the norm scale.  Ported from
+ * ds4_gpu_hc_split_weighted_sum_norm_tensor, rocm/ds4_rocm_hc_output_
+ * launch.cuh:146-202 (kernel: hc_split_weighted_sum_norm_fused_kernel,
+ * rocm/ds4_rocm_hc.cuh:328-373). */
+extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *norm_out, ds4_gpu_tensor *split,
+        const ds4_gpu_tensor *mix, const ds4_gpu_tensor *residual_hc, const void *model_map,
+        uint64_t model_size, uint64_t scale_offset, uint64_t base_offset, uint64_t norm_weight_offset,
+        uint32_t n_embd, uint32_t n_hc, uint32_t sinkhorn_iters, float eps, float norm_eps) {
+    if (!out || !norm_out || !split || !mix || !residual_hc || !model_map || n_embd == 0u ||
+        n_hc != 4u) {
+        return 0;
+    }
+    const uint64_t mix_hc = 2ull * n_hc + (uint64_t)n_hc * n_hc;
+    uint64_t mix_bytes = 0, out_row_bytes = 0, residual_row_bytes = 0, norm_w_bytes = 0;
+    if (!sycl_u64_mul_checked(mix_hc, sizeof(float), &mix_bytes) ||
+        !sycl_u64_mul_checked(n_embd, sizeof(float), &out_row_bytes) ||
+        !sycl_u64_mul3_checked(n_hc, n_embd, sizeof(float), &residual_row_bytes) ||
+        !sycl_u64_mul_checked(n_embd, sizeof(float), &norm_w_bytes) ||
+        out->bytes < out_row_bytes || out->bytes % out_row_bytes != 0u ||
+        norm_out->bytes < out->bytes ||
+        !sycl_model_range_fits(model_size, scale_offset, 3ull * sizeof(float)) ||
+        !sycl_model_range_fits(model_size, base_offset, mix_bytes) ||
+        !sycl_model_range_fits(model_size, norm_weight_offset, norm_w_bytes)) {
+        return 0;
+    }
+    const uint64_t n_rows = out->bytes / out_row_bytes;
+    uint64_t mix_needed = 0, residual_needed = 0;
+    if (n_rows == 0u || n_rows > UINT32_MAX ||
+        !sycl_u64_mul_checked(n_rows, mix_bytes, &mix_needed) ||
+        !sycl_u64_mul_checked(n_rows, residual_row_bytes, &residual_needed) ||
+        mix->bytes < mix_needed || split->bytes < mix_needed ||
+        residual_hc->bytes < residual_needed) {
+        return 0;
+    }
+    const char *scale_p = sycl_model_range_ptr(model_map, scale_offset, 3ull * sizeof(float),
+                                                model_size, "hc_scale");
+    const char *base_p = sycl_model_range_ptr(model_map, base_offset, mix_bytes, model_size, "hc_base");
+    const char *norm_w_p = sycl_model_range_ptr(model_map, norm_weight_offset, norm_w_bytes,
+                                                model_size, "hc_norm_weight");
+    if (!scale_p || !base_p || !norm_w_p) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out->device_id);
+        sycl_device_scratch_guard scale_guard =
+                sycl_stage_host_bytes(q, scale_p, 3ull * sizeof(float));
+        if (!scale_guard.p) return 0;
+        sycl_device_scratch_guard base_guard = sycl_stage_host_bytes(q, base_p, mix_bytes);
+        if (!base_guard.p) return 0;
+        sycl_device_scratch_guard norm_w_guard = sycl_stage_host_bytes(q, norm_w_p, norm_w_bytes);
+        if (!norm_w_guard.p) return 0;
+
+        float       *o      = (float *)out->ptr;
+        float       *no     = (float *)norm_out->ptr;
+        float       *sp0    = (float *)split->ptr;
+        const float *m      = (const float *)mix->ptr;
+        const float *res    = (const float *)residual_hc->ptr;
+        const float *scale  = (const float *)scale_guard.p;
+        const float *base   = (const float *)base_guard.p;
+        const float *norm_w = (const float *)norm_w_guard.p;
+        const uint32_t rows      = (uint32_t)n_rows;
+        const uint32_t embd      = n_embd;
+        const uint32_t hc        = n_hc;
+        const uint32_t iters     = sinkhorn_iters;
+        const float    epsv      = eps;
+        const float    norm_epsv = norm_eps;
+
+        q.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> partial(sycl::range<1>(kSyclHcRowGroup), h);
+            h.parallel_for(
+                    sycl::nd_range<1>(sycl::range<1>((size_t)rows * kSyclHcRowGroup),
+                                      sycl::range<1>(kSyclHcRowGroup)),
+                    [=](sycl::nd_item<1> it) {
+                        const uint32_t t = (uint32_t)it.get_group(0);
+                        const uint32_t d = (uint32_t)it.get_local_id(0);
+                        if (t >= rows || hc != 4u) return;
+                        float *sp = sp0 + (uint64_t)t * 24;
+                        if (d == 0u) {
+                            sycl_hc4_split_one(sp, m + (uint64_t)t * 24, scale, base, iters, epsv);
+                        }
+                        it.barrier(sycl::access::fence_space::global_and_local);
+
+                        float sum = 0.0f;
+                        for (uint32_t col = d; col < embd; col += kSyclHcRowGroup) {
+                            float acc = 0.0f;
+                            for (uint32_t h = 0; h < 4u; h++) {
+                                acc += res[(uint64_t)t * 4u * embd + (uint64_t)h * embd + col] * sp[h];
+                            }
+                            o[(uint64_t)t * embd + col] = acc;
+                            sum += acc * acc;
+                        }
+
+                        const float total = sycl_block_row_reduce(
+                                it, partial, sum, [](float a, float b) { return a + b; });
+                        const float norm_scale = sycl::rsqrt(total / (float)embd + norm_epsv);
+                        for (uint32_t col = d; col < embd; col += kSyclHcRowGroup) {
+                            const float v = o[(uint64_t)t * embd + col];
+                            no[(uint64_t)t * embd + col] = v * norm_scale * norm_w[col];
+                        }
+                    });
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_weighted_sum_norm failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
