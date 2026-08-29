@@ -92,6 +92,13 @@ extern int ds4_sycl_moe_test_iq2_down_direct(
         uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t n_total_expert,
         float *out);
 
+/* Instrumentation: how many experts, and how many gate+up+down
+ * bytes, the most recently completed dispatcher call actually staged
+ * host-to-device. Compaction is invisible in the numeric output (spec
+ * 6w), so these are what the distinguishing test below reads. */
+extern uint32_t ds4_sycl_moe_test_last_staged_expert_count(void);
+extern uint64_t ds4_sycl_moe_test_last_staged_bytes(void);
+
 enum { Q8_K_BLOCK_BYTES = 292 };
 
 /* d (float, offset 0), qs (int8[256], offset 4), bsums (int16[16], offset 260). */
@@ -791,19 +798,27 @@ enum {
 /* Generalised model builder: gate/up always share one block size (both
  * paired formats implemented here use the same weight type for gate
  * and up), down may use a different one (iq2_path pairs IQ2_XXS gate/up
- * with Q2_K down). */
-static rm_model rm_build_model_ex(uint32_t gate_block_bytes, uint32_t down_block_bytes) {
+ * with Q2_K down), and the table holds n_total_expert experts rather than
+ * always RM_N_TOTAL_EXPERT -- the compaction tests need a table
+ * bigger than RM_N_TOTAL_EXPERT to make "staged only the selected
+ * experts" distinguishable from "staged everything" at all. */
+static rm_model rm_build_model_n(uint32_t n_total_expert, uint32_t gate_block_bytes,
+                                 uint32_t down_block_bytes) {
     rm_model m;
     m.gate_row_bytes = (RM_EXPERT_IN_DIM / 256u) * gate_block_bytes;
     m.gate_expert_bytes = (uint64_t)RM_EXPERT_MID_DIM * m.gate_row_bytes;
     m.down_row_bytes = (RM_EXPERT_MID_DIM / 256u) * down_block_bytes;
     m.down_expert_bytes = (uint64_t)RM_OUT_DIM * m.down_row_bytes;
     m.gate_offset = 0;
-    m.up_offset = m.gate_expert_bytes * RM_N_TOTAL_EXPERT;
-    m.down_offset = m.up_offset + m.gate_expert_bytes * RM_N_TOTAL_EXPERT;
-    m.model_size = m.down_offset + m.down_expert_bytes * RM_N_TOTAL_EXPERT;
+    m.up_offset = m.gate_expert_bytes * n_total_expert;
+    m.down_offset = m.up_offset + m.gate_expert_bytes * n_total_expert;
+    m.model_size = m.down_offset + m.down_expert_bytes * n_total_expert;
     m.model = calloc(1, (size_t)m.model_size);
     return m;
+}
+
+static rm_model rm_build_model_ex(uint32_t gate_block_bytes, uint32_t down_block_bytes) {
+    return rm_build_model_n(RM_N_TOTAL_EXPERT, gate_block_bytes, down_block_bytes);
 }
 
 /* type: 12 = Q4_K (used for gate_row_bytes sizing regardless of the
@@ -1558,6 +1573,313 @@ static int test_q4k_scratch_precondition_failure(void) {
     ds4_gpu_tensor_free(x);
     free(m.model);
     fprintf(stderr, "  test_q4k_scratch_precondition_failure OK\n");
+    return 0;
+}
+
+/* ---- Selected-expert staging ---------------------------------
+ *
+ * test_q4k_decode_stages_only_selected is the distinguishing test spec
+ * 6w demands: the existing decode/batch tests above pass identically
+ * whether or not compaction happened, because compaction changes what
+ * gets copied, not what the copy computes. A table of 64 experts with
+ * only RM_N_EXPERT (2) selected makes "staged 2" and "staged 64" two
+ * different, directly assertable numbers.
+ *
+ * test_q4k_batch_wide_union_falls_back checks the other side of the same
+ * mechanism: once the union of selected experts across a batch is large
+ * enough, the dispatcher must fall back to staging the whole table rather
+ * than compacting it.
+ *
+ * test_q4k_decode_identity_remap_ablation is the ablation spec 6n
+ * requires: a clean baseline run first, then DS4_ROUTED_MOE_DEBUG_IDENTITY_
+ * REMAP forcing compaction to keep the table small while breaking the id
+ * remap, confirmed to produce a wrong answer against the same oracle the
+ * baseline just matched. */
+
+enum { RM_WIDE_N_TOTAL_EXPERT = 64u };
+
+static int test_q4k_decode_stages_only_selected(void) {
+    rm_model m = rm_build_model_n(RM_WIDE_N_TOTAL_EXPERT, RM_Q4K_BLOCK_BYTES, RM_Q4K_BLOCK_BYTES);
+    q4k_fill_model(&m, RM_WIDE_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+    rm_tensors t = rm_build_tensors();
+
+    int32_t sel[RM_N_EXPERT];
+    float w[RM_N_EXPERT];
+    float x[RM_EXPERT_IN_DIM];
+    q4k_fill_selected(sel, w, /*tok=*/0, RM_N_EXPERT, RM_WIDE_N_TOTAL_EXPERT);
+    CHECK(sel[0] != sel[1], "compaction: test fixture must select distinct experts");
+    q4k_fill_x_row(x, RM_EXPERT_IN_DIM, /*tok=*/0);
+    ds4_gpu_tensor_write(t.selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(t.weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(t.x, 0, x, sizeof(x));
+
+    CHECK(ds4_gpu_routed_moe_one_tensor(
+              t.out, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_WIDE_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t.x,
+              /*add_in=*/NULL, /*layer_index=*/0u, /*force_resident=*/false) != 0,
+          "compaction: decode call failed");
+
+    const uint32_t staged_experts = ds4_sycl_moe_test_last_staged_expert_count();
+    const uint64_t staged_bytes = ds4_sycl_moe_test_last_staged_bytes();
+    const uint64_t want_bytes = 2ull * RM_N_EXPERT * m.gate_expert_bytes +
+                               (uint64_t)RM_N_EXPERT * m.down_expert_bytes;
+    const uint64_t full_table_bytes = 2ull * RM_WIDE_N_TOTAL_EXPERT * m.gate_expert_bytes +
+                                      (uint64_t)RM_WIDE_N_TOTAL_EXPERT * m.down_expert_bytes;
+    CHECK(staged_experts == RM_N_EXPERT,
+          "compaction: decode must stage exactly n_expert_used experts, not the full table");
+    CHECK(staged_bytes == want_bytes,
+          "compaction: staged byte count must match the compacted table exactly");
+    CHECK(staged_bytes < full_table_bytes,
+          "compaction: staged bytes must be less than a full-table stage");
+
+    float want[RM_OUT_DIM];
+    oracle_q4k_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT,
+                         sel, w, x, 0.0f, want);
+    float got[RM_OUT_DIM];
+    ds4_gpu_tensor_read(t.out, 0, got, sizeof(got));
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], fabs(want[i]) * 1e-3 + 1e-4,
+                    "compaction: value mismatch against the full-table oracle");
+    }
+
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_q4k_decode_stages_only_selected OK (staged %u/%u experts, "
+                    "%llu/%llu bytes)\n",
+            staged_experts, (unsigned)RM_WIDE_N_TOTAL_EXPERT,
+            (unsigned long long)staged_bytes, (unsigned long long)full_table_bytes);
+    return 0;
+}
+
+/* q4k_fill_selected(tok, RM_N_EXPERT=2, RM_N_TOTAL_EXPERT=4) for tok in
+ * 0..3 gives {1,3}, {0,2}, {3,1}, {2,0}: the union across all four tokens
+ * is every expert in the table (all 4), which exceeds the n_total_expert
+ * / 2 fallback threshold (2), so this batch must fall back to staging the
+ * full table exactly as a wide prefill batch would. */
+static int test_q4k_batch_wide_union_falls_back(void) {
+    enum { N_TOKENS = 4u };
+    rm_model m = rm_build_model();
+    q4k_fill_model(&m, RM_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_EXPERT_IN_DIM * sizeof(float));
+
+    int32_t sel[N_TOKENS * RM_N_EXPERT];
+    float w[N_TOKENS * RM_N_EXPERT];
+    for (uint32_t tok = 0; tok < N_TOKENS; tok++) {
+        q4k_fill_selected(sel + (size_t)tok * RM_N_EXPERT, w + (size_t)tok * RM_N_EXPERT, tok,
+                          RM_N_EXPERT, RM_N_TOTAL_EXPERT);
+    }
+    ds4_gpu_tensor_write(selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(weights, 0, w, sizeof(w));
+    float xv[N_TOKENS * RM_EXPERT_IN_DIM];
+    for (uint32_t tok = 0; tok < N_TOKENS; tok++) {
+        q4k_fill_x_row(xv + (size_t)tok * RM_EXPERT_IN_DIM, RM_EXPERT_IN_DIM, tok);
+    }
+    ds4_gpu_tensor_write(x, 0, xv, sizeof(xv));
+
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              out, gate, up, mid, down, m.model, m.model_size, m.gate_offset,
+              m.up_offset, m.down_offset, 12u, 12u, m.gate_expert_bytes,
+              m.gate_row_bytes, m.down_expert_bytes, m.down_row_bytes,
+              RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, selected, weights,
+              RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, x, 0u, N_TOKENS, NULL,
+              false) != 0,
+          "compaction: wide-union batch call failed");
+
+    CHECK(ds4_sycl_moe_test_last_staged_expert_count() == RM_N_TOTAL_EXPERT,
+          "compaction: a union above the fallback threshold must stage the full table");
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(x);
+    free(m.model);
+    fprintf(stderr, "  test_q4k_batch_wide_union_falls_back OK\n");
+    return 0;
+}
+
+/* The sorted-pairs trap, tested directly: q4k_path only builds sorted
+ * pairs (sycl_moe_build_sorted_pairs) once n_tokens >= 32, and that path
+ * must see the remapped ids too, not the global ones -- addressing a
+ * compacted buffer with an unremapped id "reads whatever happens to be
+ * at that offset and returns plausible wrong numbers" per the plan.  A
+ * table of 64 experts with every one of 40 tokens drawing from a fixed
+ * 4-expert pool keeps the union at 4 (well under the fallback threshold
+ * of 32), while n_tokens=40 forces q4k_path into the sorted-pairs regime,
+ * so this is the one test in the suite that exercises compaction and
+ * sorted pairs together. */
+static int test_q4k_batch_compaction_with_sorted_pairs(void) {
+    enum { N_TOKENS = 40u, POOL_SIZE = 4u };
+    static const int32_t pool[POOL_SIZE] = {5, 19, 31, 47};
+    rm_model m = rm_build_model_n(RM_WIDE_N_TOTAL_EXPERT, RM_Q4K_BLOCK_BYTES, RM_Q4K_BLOCK_BYTES);
+    q4k_fill_model(&m, RM_WIDE_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)N_TOKENS * RM_EXPERT_IN_DIM * sizeof(float));
+
+    int32_t sel[N_TOKENS * RM_N_EXPERT];
+    float w[N_TOKENS * RM_N_EXPERT];
+    float xv[N_TOKENS * RM_EXPERT_IN_DIM];
+    for (uint32_t tok = 0; tok < N_TOKENS; tok++) {
+        sel[tok * RM_N_EXPERT + 0] = pool[tok % POOL_SIZE];
+        sel[tok * RM_N_EXPERT + 1] = pool[(tok + 1u) % POOL_SIZE];
+        w[tok * RM_N_EXPERT + 0] = 0.5f + 0.25f * (float)(tok % 3u);
+        w[tok * RM_N_EXPERT + 1] = 0.5f + 0.25f * (float)((tok + 1u) % 3u);
+        q4k_fill_x_row(xv + (size_t)tok * RM_EXPERT_IN_DIM, RM_EXPERT_IN_DIM, tok);
+    }
+    ds4_gpu_tensor_write(selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(x, 0, xv, sizeof(xv));
+
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              out, gate, up, mid, down, m.model, m.model_size, m.gate_offset,
+              m.up_offset, m.down_offset, 12u, 12u, m.gate_expert_bytes,
+              m.gate_row_bytes, m.down_expert_bytes, m.down_row_bytes,
+              RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, selected, weights,
+              RM_WIDE_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, x, 0u, N_TOKENS, NULL,
+              false) != 0,
+          "compaction+sorted-pairs: batch call failed");
+
+    CHECK(ds4_sycl_moe_test_last_staged_expert_count() == POOL_SIZE,
+          "compaction+sorted-pairs: must stage exactly the 4-expert pool, not the full table");
+
+    float *got = malloc((size_t)N_TOKENS * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor_read(out, 0, got, (uint64_t)N_TOKENS * RM_OUT_DIM * sizeof(float));
+    float want_row[RM_OUT_DIM];
+    for (uint32_t tok = 0; tok < N_TOKENS; tok++) {
+        oracle_q4k_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT,
+                             sel + (size_t)tok * RM_N_EXPERT, w + (size_t)tok * RM_N_EXPERT,
+                             xv + (size_t)tok * RM_EXPERT_IN_DIM, 0.0f, want_row);
+        for (int i = 0; i < RM_OUT_DIM; i++) {
+            char msg[80];
+            snprintf(msg, sizeof(msg),
+                    "compaction+sorted-pairs: token %u value mismatch", tok);
+            CHECK_CLOSE(got[(size_t)tok * RM_OUT_DIM + i], want_row[i],
+                       fabs(want_row[i]) * 1e-3 + 1e-4, msg);
+        }
+    }
+
+    free(got);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(x);
+    free(m.model);
+    fprintf(stderr, "  test_q4k_batch_compaction_with_sorted_pairs OK\n");
+    return 0;
+}
+
+/* Spec 6n: establish a clean baseline at the exact shape and data the
+ * ablation will use before touching anything, so a pre-existing mismatch
+ * is never mistaken for the ablation's effect. Reuses
+ * test_q4k_decode_stages_only_selected's fixture (64 experts, 2 selected,
+ * well inside the compaction threshold) because the ablation only has
+ * something to corrupt when compaction is actually active. */
+static int test_q4k_decode_identity_remap_ablation(void) {
+    rm_model m = rm_build_model_n(RM_WIDE_N_TOTAL_EXPERT, RM_Q4K_BLOCK_BYTES, RM_Q4K_BLOCK_BYTES);
+    q4k_fill_model(&m, RM_WIDE_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+    rm_tensors t = rm_build_tensors();
+
+    int32_t sel[RM_N_EXPERT];
+    float w[RM_N_EXPERT];
+    float x[RM_EXPERT_IN_DIM];
+    q4k_fill_selected(sel, w, /*tok=*/0, RM_N_EXPERT, RM_WIDE_N_TOTAL_EXPERT);
+    q4k_fill_x_row(x, RM_EXPERT_IN_DIM, /*tok=*/0);
+    ds4_gpu_tensor_write(t.selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(t.weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(t.x, 0, x, sizeof(x));
+
+    float want[RM_OUT_DIM];
+    oracle_q4k_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT,
+                         sel, w, x, 0.0f, want);
+
+    /* Clean baseline, no ablation active. */
+    CHECK(ds4_gpu_routed_moe_one_tensor(
+              t.out, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_WIDE_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t.x,
+              /*add_in=*/NULL, /*layer_index=*/0u, /*force_resident=*/false) != 0,
+          "ablation baseline: decode call failed");
+    float got_baseline[RM_OUT_DIM];
+    ds4_gpu_tensor_read(t.out, 0, got_baseline, sizeof(got_baseline));
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        CHECK_CLOSE(got_baseline[i], want[i], fabs(want[i]) * 1e-3 + 1e-4,
+                    "ablation baseline: must match the oracle before the ablation runs");
+    }
+
+    /* Ablated: compaction still runs (same 2-of-64 shape), but the id
+     * remap is replaced with (global id) mod (unique count), so the
+     * kernels address the compacted table with the wrong slot for every
+     * selected expert whose slot position differs from its id mod 2. */
+    setenv("DS4_ROUTED_MOE_DEBUG_IDENTITY_REMAP", "1", 1);
+    CHECK(ds4_gpu_routed_moe_one_tensor(
+              t.out, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_WIDE_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t.x,
+              /*add_in=*/NULL, /*layer_index=*/0u, /*force_resident=*/false) != 0,
+          "ablation: decode call failed");
+    unsetenv("DS4_ROUTED_MOE_DEBUG_IDENTITY_REMAP");
+
+    float got_ablated[RM_OUT_DIM];
+    ds4_gpu_tensor_read(t.out, 0, got_ablated, sizeof(got_ablated));
+    int mismatched = 0;
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        if (fabs((double)got_ablated[i] - (double)want[i]) > fabs(want[i]) * 1e-3 + 1e-4) {
+            mismatched = 1;
+            break;
+        }
+    }
+    CHECK(mismatched,
+          "ablation: identity-mod remap must diverge from the oracle, and did not");
+
+    /* Restored: the same call after unsetenv must match the oracle again,
+     * proving the ablation knob does not leave residual state behind. */
+    CHECK(ds4_gpu_routed_moe_one_tensor(
+              t.out, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_WIDE_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t.x,
+              /*add_in=*/NULL, /*layer_index=*/0u, /*force_resident=*/false) != 0,
+          "ablation restore: decode call failed");
+    float got_restored[RM_OUT_DIM];
+    ds4_gpu_tensor_read(t.out, 0, got_restored, sizeof(got_restored));
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        CHECK_CLOSE(got_restored[i], want[i], fabs(want[i]) * 1e-3 + 1e-4,
+                    "ablation restore: must match the oracle again once unset");
+    }
+
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_q4k_decode_identity_remap_ablation OK\n");
     return 0;
 }
 
@@ -3123,6 +3445,10 @@ int main(void) {
     if (test_q4k_batch(40u) != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q4k_decode_matches_batch_of_one() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q4k_scratch_precondition_failure() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_decode_stages_only_selected() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_batch_wide_union_falls_back() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_batch_compaction_with_sorted_pairs() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_decode_identity_remap_ablation() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q2k_pack_roundtrip() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_iq2_decode() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_iq2_batch_small() != 0) { ds4_gpu_cleanup(); return 1; }
