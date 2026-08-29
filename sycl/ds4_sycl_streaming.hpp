@@ -28,8 +28,20 @@
  *     below substitutes a static ceiling (total device memory minus a
  *     fixed reserve), which is strictly more conservative than a live
  *     query (it never overestimates headroom, and only gets safer as VRAM
- *     fragments).  Level Zero Sysman is what a later plan could use to
- *     restore a live check. */
+ *     fragments).  A later measurement (spec 6p) found the live Sysman
+ *     free-memory reading does not move under real allocation pressure on
+ *     this driver, so the static ceiling stays; see that section before
+ *     wiring a live query in here.
+ *
+ * Per-tier state: one resident cache, one selected-scratch cache and one
+ * slab pool PER LOGICAL TIER, held as an array of sycl_stream_tier_state
+ * parallel to g_devices (ds4_sycl.cpp), indexed the same way. Every entry
+ * below (the 16 hot-path entries -- seed_experts, begin_selected_load,
+ * prepare_selected_batch and the rest -- and the five plain
+ * ds4_gpu_stream_expert_cache_* / ds4_gpu_set_streaming_expert_cache_*
+ * config entries) resolves its tier from g_current_tier at call time: no
+ * ABI change, since the engine already calls
+ * ds4_gpu_set_current_device(tier) before per-tier work runs. */
 
 #include "ds4_sycl_common.hpp"
 
@@ -100,22 +112,85 @@ struct sycl_stream_resident_key_hash {
     }
 };
 
-static std::vector<sycl_stream_resident_expert> g_sycl_stream_resident;
-static std::unordered_map<sycl_stream_resident_key, size_t, sycl_stream_resident_key_hash>
-        g_sycl_stream_resident_index;
-static uint64_t      g_sycl_stream_resident_bytes = 0;
-static uint64_t      g_sycl_stream_resident_clock = 0;
-static std::vector<sycl_stream_expert_slab> g_sycl_stream_slabs;
-static std::vector<char *>  g_sycl_stream_free_slots;
-static uint64_t      g_sycl_stream_slot_bytes = 0;
-static uint32_t      g_sycl_stream_slot_count = 0;
-static uint32_t      g_sycl_stream_cache_budget = 0;
+/* Selected-expert scratch cache: one reusable compacted buffer holding
+ * the current decode step's up-to-DS4_SYCL_STREAM_N_EXPERT_USED selected
+ * experts' gate/up/down bytes, back to back in slot order.  Grow-only
+ * capacity, matching rocm/ds4_rocm_runtime.cuh:82-104 and
+ * cuda_stream_selected_ensure_buffers (:1036-1074), minus the
+ * pinned-host-staging and device-side pointer-array pieces this port
+ * does not need: see the "always resolve synchronously" note on
+ * sycl_stream_selected_load below for why. */
+struct sycl_stream_selected_cache {
+    int         loaded = 0;
+    const void *model_map = nullptr;
+    uint32_t    layer = 0;
+    uint32_t    n_total_expert = 0;
+    uint32_t    n_selected = 0;
+    uint64_t    gate_expert_bytes = 0;
+    uint64_t    down_expert_bytes = 0;
+    int32_t     selected_ids[DS4_SYCL_STREAM_N_EXPERT_USED] = {};
+    char       *gate = nullptr;
+    char       *up = nullptr;
+    char       *down = nullptr;
+    uint64_t    gate_capacity = 0;
+    uint64_t    down_capacity = 0;
+};
+
+/* One tier's worth of streaming cache state: the resident slab pool and
+ * its index, the selected-scratch cache, and the test-only hit/miss
+ * counters.  Held as an array of this struct rather than as N parallel
+ * global arrays, so every field that must move together (an eviction
+ * touches the resident vector, its index and the byte counter in the
+ * same operation) actually does, and so a bug that reads tier A's field
+ * next to tier B's cannot compile -- there is only one array to index,
+ * not eight kept in lockstep by convention. */
+struct sycl_stream_tier_state {
+    std::vector<sycl_stream_resident_expert> resident;
+    std::unordered_map<sycl_stream_resident_key, size_t, sycl_stream_resident_key_hash>
+                                        resident_index;
+    uint64_t                            resident_bytes = 0;
+    uint64_t                            resident_clock = 0;
+    std::vector<sycl_stream_expert_slab> slabs;
+    std::vector<char *>                 free_slots;
+    uint64_t                            slot_bytes = 0;
+    uint32_t                            slot_count = 0;
+    uint32_t                            cache_budget = 0;
+    sycl_stream_selected_cache          selected;
+    /* Resident-cache hit/miss counters, incremented only by the two
+     * admission loops (selected load and batch prepare): a hit is a
+     * sycl_stream_resident_find success (no mmap-to-device copy needed),
+     * a miss is a sycl_stream_resident_alloc call (a genuine admission
+     * that does copy).  Test-only instrumentation; not part of the ABI. */
+    uint64_t                            hits = 0;
+    uint64_t                            misses = 0;
+};
+
+/* Parallel to g_devices (ds4_sycl.cpp): one entry per logical tier,
+ * defaulting to size 1 so single-tier behaviour (the only shape shipped,
+ * and the only one this hardware can run for real) needs no
+ * resize at all.  Grows on demand in sycl_stream_state_for below rather
+ * than being resized from ds4_gpu_init_multi, so this file has no
+ * dependency on when or whether multi-device init runs. */
+static std::vector<sycl_stream_tier_state> g_sycl_stream_tier(1);
 
 /* Mirrors ROCm's g_ssd_streaming_mode (rocm/ds4_rocm_current_api_compat.cuh:119-126).
- * Only ds4_gpu_set_ssd_streaming ever sets this; see that entry's
- * implementation below for why it releases the resident cache
- * unconditionally, not only when disabling. */
+ * A single engine-wide switch, not per tier: streaming is either on for
+ * the whole run or off for the whole run.  Only ds4_gpu_set_ssd_streaming
+ * ever sets this; see that entry's implementation below for why it
+ * releases every tier's resident cache unconditionally, not only when
+ * disabling. */
 static bool g_sycl_stream_mode = false;
+
+/* Returns the state for `tier`, growing the array if `tier` is beyond its
+ * current size.  A negative tier clamps to 0 rather than indexing
+ * out-of-bounds; callers that must reject a negative or too-large tier
+ * (the "_on(tier)" entries below, which are the only ones fed a tier that
+ * did not come from g_current_tier) validate before calling this. */
+static sycl_stream_tier_state &sycl_stream_state_for(int tier) {
+    const size_t idx = tier > 0 ? (size_t)tier : 0;
+    if (idx >= g_sycl_stream_tier.size()) g_sycl_stream_tier.resize(idx + 1);
+    return g_sycl_stream_tier[idx];
+}
 
 static sycl_stream_resident_key sycl_stream_make_key(
         const void *model_map, uint32_t layer, int32_t expert,
@@ -137,15 +212,15 @@ static sycl_stream_resident_key sycl_stream_entry_key(const sycl_stream_resident
  * seed_experts below), so a pure lookup with no intent to use the entry
  * stays side-effect-free. */
 static int sycl_stream_resident_find(
+        const sycl_stream_tier_state &st,
         const void *model_map, uint32_t layer, int32_t expert,
         uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
         uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
     const auto key = sycl_stream_make_key(model_map, layer, expert, gate_offset,
                                           up_offset, down_offset,
                                           gate_expert_bytes, down_expert_bytes);
-    const auto it = g_sycl_stream_resident_index.find(key);
-    if (it != g_sycl_stream_resident_index.end() &&
-        it->second < g_sycl_stream_resident.size()) {
+    const auto it = st.resident_index.find(key);
+    if (it != st.resident_index.end() && it->second < st.resident.size()) {
         return (int)it->second;
     }
     return -1;
@@ -164,13 +239,13 @@ static bool sycl_stream_is_protected(const sycl_stream_resident_expert &e, uint3
     return false;
 }
 
-static bool sycl_stream_evict_at(sycl::queue &q, size_t idx) {
-    if (idx >= g_sycl_stream_resident.size()) return false;
-    sycl_stream_resident_expert &e = g_sycl_stream_resident[idx];
+static bool sycl_stream_evict_at(sycl::queue &q, sycl_stream_tier_state &st, size_t idx) {
+    if (idx >= st.resident.size()) return false;
+    sycl_stream_resident_expert &e = st.resident[idx];
     const auto evicted_key = sycl_stream_entry_key(e);
     if (e.base) {
         if (e.pooled) {
-            g_sycl_stream_free_slots.push_back(e.base);
+            st.free_slots.push_back(e.base);
         } else {
             try {
                 sycl::free(e.base, q);
@@ -180,27 +255,25 @@ static bool sycl_stream_evict_at(sycl::queue &q, size_t idx) {
             }
         }
     }
-    g_sycl_stream_resident_bytes = g_sycl_stream_resident_bytes >= e.bytes
-                                       ? g_sycl_stream_resident_bytes - e.bytes
-                                       : 0;
-    g_sycl_stream_resident_index.erase(evicted_key);
+    st.resident_bytes = st.resident_bytes >= e.bytes ? st.resident_bytes - e.bytes : 0;
+    st.resident_index.erase(evicted_key);
     /* Swap-remove keeps this O(1): move the last element into the evicted
      * slot, then fix up its index entry, rather than a vector erase. */
-    const size_t last = g_sycl_stream_resident.size() - 1u;
+    const size_t last = st.resident.size() - 1u;
     if (idx != last) {
-        g_sycl_stream_resident[idx] = g_sycl_stream_resident[last];
-        g_sycl_stream_resident_index[sycl_stream_entry_key(g_sycl_stream_resident[idx])] = idx;
+        st.resident[idx] = st.resident[last];
+        st.resident_index[sycl_stream_entry_key(st.resident[idx])] = idx;
     }
-    g_sycl_stream_resident.pop_back();
+    st.resident.pop_back();
     return true;
 }
 
-static bool sycl_stream_evict_one(sycl::queue &q, uint32_t layer,
+static bool sycl_stream_evict_one(sycl::queue &q, sycl_stream_tier_state &st, uint32_t layer,
                            const int32_t *protected_ids, uint32_t n_protected) {
     size_t   victim = (size_t)-1;
     uint64_t oldest = UINT64_MAX;
-    for (size_t i = 0; i < g_sycl_stream_resident.size(); i++) {
-        const sycl_stream_resident_expert &e = g_sycl_stream_resident[i];
+    for (size_t i = 0; i < st.resident.size(); i++) {
+        const sycl_stream_resident_expert &e = st.resident[i];
         if (sycl_stream_is_protected(e, layer, protected_ids, n_protected)) continue;
         if (e.last_used < oldest) {
             oldest = e.last_used;
@@ -208,7 +281,7 @@ static bool sycl_stream_evict_one(sycl::queue &q, uint32_t layer,
         }
     }
     if (victim == (size_t)-1) return false;
-    return sycl_stream_evict_at(q, victim);
+    return sycl_stream_evict_at(q, st, victim);
 }
 
 static uint64_t sycl_stream_vram_ceiling(sycl::queue &q) {
@@ -223,26 +296,27 @@ static uint64_t sycl_stream_vram_ceiling(sycl::queue &q) {
     return total > reserve ? total - reserve : 0;
 }
 
-static bool sycl_stream_resident_make_room(sycl::queue &q, uint64_t bytes, uint32_t layer,
+static bool sycl_stream_resident_make_room(sycl::queue &q, sycl_stream_tier_state &st,
+                                    uint64_t bytes, uint32_t layer,
                                     const int32_t *protected_ids, uint32_t n_protected) {
-    while (g_sycl_stream_resident.size() >= g_sycl_stream_cache_budget) {
-        if (!sycl_stream_evict_one(q, layer, protected_ids, n_protected)) return false;
+    while (st.resident.size() >= st.cache_budget) {
+        if (!sycl_stream_evict_one(q, st, layer, protected_ids, n_protected)) return false;
     }
     const uint64_t ceiling = sycl_stream_vram_ceiling(q);
-    while (g_sycl_stream_resident_bytes > ceiling ||
-           bytes > ceiling - g_sycl_stream_resident_bytes) {
-        if (!sycl_stream_evict_one(q, layer, protected_ids, n_protected)) return false;
+    while (st.resident_bytes > ceiling || bytes > ceiling - st.resident_bytes) {
+        if (!sycl_stream_evict_one(q, st, layer, protected_ids, n_protected)) return false;
     }
     return true;
 }
 
-static bool sycl_stream_expert_slab_grow(sycl::queue &q, uint64_t slot_bytes) {
+static bool sycl_stream_expert_slab_grow(sycl::queue &q, sycl_stream_tier_state &st,
+                                          uint64_t slot_bytes) {
     constexpr uint64_t slab_target_bytes = 1024ull * 1024 * 1024;
-    if (g_sycl_stream_slot_count >= g_sycl_stream_cache_budget) return false;
+    if (st.slot_count >= st.cache_budget) return false;
     uint32_t slab_slots = slot_bytes >= slab_target_bytes
                               ? 1u
                               : (uint32_t)(slab_target_bytes / slot_bytes);
-    const uint32_t want = g_sycl_stream_cache_budget - g_sycl_stream_slot_count;
+    const uint32_t want = st.cache_budget - st.slot_count;
     if (slab_slots > want) slab_slots = want;
 
     while (slab_slots != 0) {
@@ -252,8 +326,7 @@ static bool sycl_stream_expert_slab_grow(sycl::queue &q, uint64_t slot_bytes) {
             continue;
         }
         const uint64_t ceiling = sycl_stream_vram_ceiling(q);
-        if (g_sycl_stream_resident_bytes > ceiling ||
-            slab_bytes > ceiling - g_sycl_stream_resident_bytes) {
+        if (st.resident_bytes > ceiling || slab_bytes > ceiling - st.resident_bytes) {
             slab_slots >>= 1u;
             continue;
         }
@@ -262,12 +335,12 @@ static bool sycl_stream_expert_slab_grow(sycl::queue &q, uint64_t slot_bytes) {
             slab_slots >>= 1u;
             continue;
         }
-        g_sycl_stream_slabs.push_back({(char *)base, slab_bytes});
-        g_sycl_stream_free_slots.reserve(g_sycl_stream_free_slots.size() + slab_slots);
+        st.slabs.push_back({(char *)base, slab_bytes});
+        st.free_slots.reserve(st.free_slots.size() + slab_slots);
         for (uint32_t i = 0; i < slab_slots; i++) {
-            g_sycl_stream_free_slots.push_back((char *)base + (uint64_t)i * slot_bytes);
+            st.free_slots.push_back((char *)base + (uint64_t)i * slot_bytes);
         }
-        g_sycl_stream_slot_count += slab_slots;
+        st.slot_count += slab_slots;
         return true;
     }
     return false;
@@ -277,30 +350,31 @@ static bool sycl_stream_expert_slab_grow(sycl::queue &q, uint64_t slot_bytes) {
  * later call whose bytes differ returns nullptr for a genuine size-class
  * mismatch (not exhaustion), which the caller (alloc) uses to decide
  * whether to fall back to a dedicated allocation. */
-static char *sycl_stream_expert_slot_acquire(sycl::queue &q, uint64_t bytes, uint32_t layer,
+static char *sycl_stream_expert_slot_acquire(sycl::queue &q, sycl_stream_tier_state &st,
+                                      uint64_t bytes, uint32_t layer,
                                       const int32_t *protected_ids, uint32_t n_protected) {
-    if (g_sycl_stream_slot_bytes == 0) g_sycl_stream_slot_bytes = bytes;
-    if (bytes != g_sycl_stream_slot_bytes) return nullptr;
+    if (st.slot_bytes == 0) st.slot_bytes = bytes;
+    if (bytes != st.slot_bytes) return nullptr;
     for (;;) {
-        if (!g_sycl_stream_free_slots.empty()) {
-            char *slot = g_sycl_stream_free_slots.back();
-            g_sycl_stream_free_slots.pop_back();
+        if (!st.free_slots.empty()) {
+            char *slot = st.free_slots.back();
+            st.free_slots.pop_back();
             return slot;
         }
-        if (g_sycl_stream_slot_count < g_sycl_stream_cache_budget &&
-            sycl_stream_expert_slab_grow(q, bytes)) {
+        if (st.slot_count < st.cache_budget && sycl_stream_expert_slab_grow(q, st, bytes)) {
             continue;
         }
-        if (!sycl_stream_evict_one(q, layer, protected_ids, n_protected)) return nullptr;
+        if (!sycl_stream_evict_one(q, st, layer, protected_ids, n_protected)) return nullptr;
     }
 }
 
-static int sycl_stream_resident_alloc(sycl::queue &q, const void *model_map, uint32_t layer,
+static int sycl_stream_resident_alloc(sycl::queue &q, sycl_stream_tier_state &st,
+                               const void *model_map, uint32_t layer,
                                int32_t expert, const int32_t *protected_ids,
                                uint32_t n_protected, uint64_t gate_offset,
                                uint64_t up_offset, uint64_t down_offset,
                                uint64_t gate_expert_bytes, uint64_t down_expert_bytes) {
-    if (g_sycl_stream_cache_budget == 0) return -1;
+    if (st.cache_budget == 0) return -1;
 
     uint64_t gate_pair = 0;
     if (!sycl_u64_mul_checked(2u, gate_expert_bytes, &gate_pair) ||
@@ -309,10 +383,10 @@ static int sycl_stream_resident_alloc(sycl::queue &q, const void *model_map, uin
     }
     const uint64_t bytes = gate_pair + down_expert_bytes;
 
-    char *base = sycl_stream_expert_slot_acquire(q, bytes, layer, protected_ids,
+    char *base = sycl_stream_expert_slot_acquire(q, st, bytes, layer, protected_ids,
                                                  n_protected);
     bool pooled = base != nullptr;
-    if (!pooled && bytes == g_sycl_stream_slot_bytes) {
+    if (!pooled && bytes == st.slot_bytes) {
         /* Size class matches but the pool is genuinely exhausted (no free
          * slot, no room to grow, nothing evictable): a dedicated
          * allocation would just duplicate the pool, so fail outright
@@ -326,7 +400,7 @@ static int sycl_stream_resident_alloc(sycl::queue &q, const void *model_map, uin
     if (!pooled) {
         /* Genuine size-class mismatch: fall back to a dedicated
          * allocation, matching rocm/ds4_rocm_runtime.cuh:1678-1710. */
-        if (!sycl_stream_resident_make_room(q, bytes, layer, protected_ids,
+        if (!sycl_stream_resident_make_room(q, st, bytes, layer, protected_ids,
                                             n_protected)) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "streaming expert cache cannot keep %.2f MiB for layer=%u "
@@ -336,7 +410,7 @@ static int sycl_stream_resident_alloc(sycl::queue &q, const void *model_map, uin
         }
         base = (char *)sycl::malloc_device((size_t)bytes, q);
         while (base == nullptr &&
-               sycl_stream_evict_one(q, layer, protected_ids, n_protected)) {
+               sycl_stream_evict_one(q, st, layer, protected_ids, n_protected)) {
             base = (char *)sycl::malloc_device((size_t)bytes, q);
         }
         if (base == nullptr) {
@@ -362,17 +436,16 @@ static int sycl_stream_resident_alloc(sycl::queue &q, const void *model_map, uin
     e.up                 = base + gate_expert_bytes;
     e.down               = base + 2u * gate_expert_bytes;
     e.bytes              = bytes;
-    e.last_used          = ++g_sycl_stream_resident_clock;
+    e.last_used          = ++st.resident_clock;
     e.pooled             = pooled;
-    g_sycl_stream_resident.push_back(e);
-    g_sycl_stream_resident_index[sycl_stream_entry_key(e)] =
-            g_sycl_stream_resident.size() - 1u;
-    g_sycl_stream_resident_bytes += bytes;
-    return (int)g_sycl_stream_resident.size() - 1;
+    st.resident.push_back(e);
+    st.resident_index[sycl_stream_entry_key(e)] = st.resident.size() - 1u;
+    st.resident_bytes += bytes;
+    return (int)st.resident.size() - 1;
 }
 
-static void sycl_stream_resident_release_all(sycl::queue &q) {
-    for (sycl_stream_resident_expert &e : g_sycl_stream_resident) {
+static void sycl_stream_resident_release_all(sycl::queue &q, sycl_stream_tier_state &st) {
+    for (sycl_stream_resident_expert &e : st.resident) {
         if (e.base && !e.pooled) {
             try {
                 sycl::free(e.base, q);
@@ -382,11 +455,11 @@ static void sycl_stream_resident_release_all(sycl::queue &q) {
             }
         }
     }
-    g_sycl_stream_resident.clear();
-    g_sycl_stream_resident_index.clear();
-    g_sycl_stream_resident_bytes = 0;
-    g_sycl_stream_resident_clock = 0;
-    for (sycl_stream_expert_slab &slab : g_sycl_stream_slabs) {
+    st.resident.clear();
+    st.resident_index.clear();
+    st.resident_bytes = 0;
+    st.resident_clock = 0;
+    for (sycl_stream_expert_slab &slab : st.slabs) {
         if (slab.base) {
             try {
                 sycl::free(slab.base, q);
@@ -396,10 +469,10 @@ static void sycl_stream_resident_release_all(sycl::queue &q) {
             }
         }
     }
-    g_sycl_stream_slabs.clear();
-    g_sycl_stream_free_slots.clear();
-    g_sycl_stream_slot_bytes = 0;
-    g_sycl_stream_slot_count = 0;
+    st.slabs.clear();
+    st.free_slots.clear();
+    st.slot_bytes = 0;
+    st.slot_count = 0;
 }
 
 /* Deduplicates expert_ids by expert value (keeping the highest-priority
@@ -444,6 +517,9 @@ static std::vector<uint32_t> sycl_stream_select_chosen_ascending(
     return ascending;
 }
 
+/* Operates on the CURRENT tier's cache (g_current_tier at call time): no
+ * ABI change needed, since the engine already switches the current
+ * device before per-tier hot-path work runs (spec section 5). */
 static int sycl_stream_resident_seed_experts(
         const void *model_map, uint64_t model_size, uint32_t layer,
         const int32_t *expert_ids, const uint32_t *expert_priorities,
@@ -461,11 +537,12 @@ static int sycl_stream_resident_seed_experts(
         down_expert_bytes == 0) {
         return 0;
     }
+    sycl_stream_tier_state &st = sycl_stream_state_for(g_current_tier);
     /* budget == 0 is the other zero-work-succeeds case here, distinct
      * from the malformed-input checks above which return 0 (see the
      * ds4_gpu_stream_expert_cache_seed_experts wrapper for the null-table
      * case, which fails before this function is ever called). */
-    if (g_sycl_stream_cache_budget == 0) return 1;
+    if (st.cache_budget == 0) return 1;
 
     for (uint32_t i = 0; i < n_experts; i++) {
         const int32_t expert_i = expert_ids[i];
@@ -489,7 +566,7 @@ static int sycl_stream_resident_seed_experts(
     }
 
     const uint32_t seed_cap =
-            std::min({n_experts, g_sycl_stream_cache_budget, DS4_SYCL_STREAM_MAX_N_EXPERT});
+            std::min({n_experts, st.cache_budget, DS4_SYCL_STREAM_MAX_N_EXPERT});
     if (seed_cap == 0) return 1;
 
     const std::vector<uint32_t> chosen = sycl_stream_select_chosen_ascending(
@@ -504,15 +581,15 @@ static int sycl_stream_resident_seed_experts(
     bool         ok = true;
     for (uint32_t i = 0; ok && i < chosen_count; i++) {
         const int32_t expert_i = expert_ids[chosen[i]];
-        int idx = sycl_stream_resident_find(model_map, layer, expert_i, gate_offset,
+        int idx = sycl_stream_resident_find(st, model_map, layer, expert_i, gate_offset,
                                             up_offset, down_offset, gate_expert_bytes,
                                             down_expert_bytes);
         if (idx >= 0) {
-            g_sycl_stream_resident[(size_t)idx].last_used = ++g_sycl_stream_resident_clock;
+            st.resident[(size_t)idx].last_used = ++st.resident_clock;
             continue;
         }
 
-        idx = sycl_stream_resident_alloc(q, model_map, layer, expert_i,
+        idx = sycl_stream_resident_alloc(q, st, model_map, layer, expert_i,
                                          protected_ids.data(), chosen_count,
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, down_expert_bytes);
@@ -529,7 +606,7 @@ static int sycl_stream_resident_seed_experts(
             break;
         }
 
-        sycl_stream_resident_expert &entry = g_sycl_stream_resident[(size_t)idx];
+        sycl_stream_resident_expert &entry = st.resident[(size_t)idx];
         try {
             /* Mechanism A: direct mmap-to-device copy, synchronous in
              * effect via the single wait after the batch. UP uses the
@@ -556,111 +633,85 @@ static int sycl_stream_resident_seed_experts(
          * no-op success (1) to the caller, not a hard failure: it is
          * distinct from the malformed-input checks above, which do
          * return 0. */
-        sycl_stream_resident_release_all(q);
+        sycl_stream_resident_release_all(q, st);
         return 1;
     }
     return 1;
 }
 
-/* Selected-expert scratch cache: one reusable compacted buffer holding
- * the current decode step's up-to-DS4_SYCL_STREAM_N_EXPERT_USED selected
- * experts' gate/up/down bytes, back to back in slot order.  Grow-only
- * capacity, matching rocm/ds4_rocm_runtime.cuh:82-104 and
- * cuda_stream_selected_ensure_buffers (:1036-1074), minus the
- * pinned-host-staging and device-side pointer-array pieces this port
- * does not need: see the "always resolve synchronously" note on
- * sycl_stream_selected_load below for why. */
-struct sycl_stream_selected_cache {
-    int         loaded = 0;
-    const void *model_map = nullptr;
-    uint32_t    layer = 0;
-    uint32_t    n_total_expert = 0;
-    uint32_t    n_selected = 0;
-    uint64_t    gate_expert_bytes = 0;
-    uint64_t    down_expert_bytes = 0;
-    int32_t     selected_ids[DS4_SYCL_STREAM_N_EXPERT_USED] = {};
-    char       *gate = nullptr;
-    char       *up = nullptr;
-    char       *down = nullptr;
-    uint64_t    gate_capacity = 0;
-    uint64_t    down_capacity = 0;
-};
-
-static sycl_stream_selected_cache g_sycl_stream_selected;
-
-/* Resident-cache hit/miss counters, incremented only by the two
- * admission loops below (selected load and batch prepare): a hit is a
- * sycl_stream_resident_find success (no mmap-to-device copy needed), a
- * miss is a sycl_stream_resident_alloc call (a genuine admission that
- * does copy).  Test-only instrumentation proving the "a resident hit
- * short-circuits re-copying" property; not part of the ABI. */
-static uint64_t g_sycl_stream_hits = 0;
-static uint64_t g_sycl_stream_misses = 0;
-
-static void sycl_stream_selected_release(sycl::queue &q) {
-    if (g_sycl_stream_selected.gate) {
-        try { sycl::free(g_sycl_stream_selected.gate, q); }
+static void sycl_stream_selected_release(sycl::queue &q, sycl_stream_tier_state &st) {
+    if (st.selected.gate) {
+        try { sycl::free(st.selected.gate, q); }
         catch (const sycl::exception &ex) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "streaming selected cache release failed: %s\n", ex.what());
         }
     }
-    if (g_sycl_stream_selected.up) {
-        try { sycl::free(g_sycl_stream_selected.up, q); }
+    if (st.selected.up) {
+        try { sycl::free(st.selected.up, q); }
         catch (const sycl::exception &ex) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "streaming selected cache release failed: %s\n", ex.what());
         }
     }
-    if (g_sycl_stream_selected.down) {
-        try { sycl::free(g_sycl_stream_selected.down, q); }
+    if (st.selected.down) {
+        try { sycl::free(st.selected.down, q); }
         catch (const sycl::exception &ex) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
                     "streaming selected cache release failed: %s\n", ex.what());
         }
     }
-    g_sycl_stream_selected = sycl_stream_selected_cache{};
+    st.selected = sycl_stream_selected_cache{};
 }
 
-/* Master teardown, mirroring ROCm's cuda_stream_selected_cache_release
- * fan-out (rocm/ds4_rocm_runtime.cuh:758-786) reduced to the two
- * structures this port actually holds (the resident cache and the
- * selected scratch cache; there is no batch-selected-cache-specific
- * device state to free since prepare_selected_batch never allocates its
- * own buffers here, see its comment above).  Called from
+/* Tears down every tier's resident and selected caches, each with its own
+ * queue, while every tier's queue is still alive.  An earlier single-tier
+ * version took one queue argument and froze whichever tier happened to be
+ * current at the call site; with more than one live tier that only ever
+ * freed the current tier and leaked every other tier's device memory (a
+ * latent bug that could not manifest before multi-tier streaming support
+ * existed, since ssd_streaming and multi_tier were mutually exclusive).  Mirrors ROCm's
+ * cuda_stream_selected_cache_release fan-out (rocm/ds4_rocm_runtime.cuh:758-786)
+ * reduced to the two structures this port actually holds (there is no
+ * batch-selected-cache-specific device state to free: prepare_selected_batch
+ * never allocates its own buffers, see its comment below).  Called from
  * ds4_gpu_set_ssd_streaming and from ds4_gpu_cleanup (forward-declared in
- * ds4_sycl.cpp, defined here) while the queue used for every allocation
- * is still alive. */
-static void sycl_stream_teardown_all(sycl::queue &q) {
-    sycl_stream_resident_release_all(q);
-    sycl_stream_selected_release(q);
+ * ds4_sycl.cpp, defined here). */
+static void sycl_stream_teardown_all(void) {
+    const size_t n = std::min(g_sycl_stream_tier.size(), g_devices.size());
+    for (size_t t = 0; t < n; t++) {
+        sycl::queue &q = ds4_sycl_queue((int)t);
+        sycl_stream_resident_release_all(q, g_sycl_stream_tier[t]);
+        sycl_stream_selected_release(q, g_sycl_stream_tier[t]);
+    }
 }
 
-static bool sycl_stream_selected_ensure_buffers(sycl::queue &q, uint64_t gate_bytes,
-                                                uint64_t down_bytes) {
+static bool sycl_stream_selected_ensure_buffers(sycl::queue &q, sycl_stream_tier_state &st,
+                                                uint64_t gate_bytes, uint64_t down_bytes) {
     if (gate_bytes == 0 || down_bytes == 0) return false;
-    if (g_sycl_stream_selected.gate_capacity < gate_bytes) {
-        if (g_sycl_stream_selected.gate) sycl::free(g_sycl_stream_selected.gate, q);
-        if (g_sycl_stream_selected.up) sycl::free(g_sycl_stream_selected.up, q);
-        g_sycl_stream_selected.gate = (char *)sycl::malloc_device((size_t)gate_bytes, q);
-        g_sycl_stream_selected.up = (char *)sycl::malloc_device((size_t)gate_bytes, q);
-        g_sycl_stream_selected.gate_capacity = 0;
-        if (!g_sycl_stream_selected.gate || !g_sycl_stream_selected.up) return false;
-        g_sycl_stream_selected.gate_capacity = gate_bytes;
+    if (st.selected.gate_capacity < gate_bytes) {
+        if (st.selected.gate) sycl::free(st.selected.gate, q);
+        if (st.selected.up) sycl::free(st.selected.up, q);
+        st.selected.gate = (char *)sycl::malloc_device((size_t)gate_bytes, q);
+        st.selected.up = (char *)sycl::malloc_device((size_t)gate_bytes, q);
+        st.selected.gate_capacity = 0;
+        if (!st.selected.gate || !st.selected.up) return false;
+        st.selected.gate_capacity = gate_bytes;
     }
-    if (g_sycl_stream_selected.down_capacity < down_bytes) {
-        if (g_sycl_stream_selected.down) sycl::free(g_sycl_stream_selected.down, q);
-        g_sycl_stream_selected.down = (char *)sycl::malloc_device((size_t)down_bytes, q);
-        g_sycl_stream_selected.down_capacity = 0;
-        if (!g_sycl_stream_selected.down) return false;
-        g_sycl_stream_selected.down_capacity = down_bytes;
+    if (st.selected.down_capacity < down_bytes) {
+        if (st.selected.down) sycl::free(st.selected.down, q);
+        st.selected.down = (char *)sycl::malloc_device((size_t)down_bytes, q);
+        st.selected.down_capacity = 0;
+        if (!st.selected.down) return false;
+        st.selected.down_capacity = down_bytes;
     }
     return true;
 }
 
 /* Backs both ds4_gpu_stream_expert_cache_begin_selected_load and
  * ds4_gpu_stream_expert_cache_seed_selected (ROCm's cuda_stream_selected_load,
- * rocm/ds4_rocm_runtime.cuh:4041 onward).
+ * rocm/ds4_rocm_runtime.cuh:4041 onward).  Operates on the CURRENT tier's
+ * cache, same rationale as sycl_stream_resident_seed_experts above.
  *
  * ROCm defers finishing this call (leaving g_stream_selected_pending.active
  * set, building device-side pointer arrays instead of a compacted buffer)
@@ -734,47 +785,48 @@ static int sycl_stream_selected_load(
     }
 
     sycl::queue &q = ds4_sycl_current_queue();
-    if (!sycl_stream_selected_ensure_buffers(q, gate_bytes, down_bytes)) return 0;
+    sycl_stream_tier_state &st = sycl_stream_state_for(g_current_tier);
+    if (!sycl_stream_selected_ensure_buffers(q, st, gate_bytes, down_bytes)) return 0;
 
-    g_sycl_stream_selected.model_map = model_map;
-    g_sycl_stream_selected.layer = layer;
-    g_sycl_stream_selected.n_total_expert = n_total_expert;
-    g_sycl_stream_selected.n_selected = n_selected;
-    g_sycl_stream_selected.gate_expert_bytes = gate_expert_bytes;
-    g_sycl_stream_selected.down_expert_bytes = down_expert_bytes;
+    st.selected.model_map = model_map;
+    st.selected.layer = layer;
+    st.selected.n_total_expert = n_total_expert;
+    st.selected.n_selected = n_selected;
+    st.selected.gate_expert_bytes = gate_expert_bytes;
+    st.selected.down_expert_bytes = down_expert_bytes;
     for (uint32_t i = 0; i < n_selected; i++) {
-        g_sycl_stream_selected.selected_ids[i] = selected_ids[i];
+        st.selected.selected_ids[i] = selected_ids[i];
     }
 
     for (uint32_t i = 0; i < n_selected; i++) {
         const int32_t expert_i = selected_ids[i];
-        int idx = sycl_stream_resident_find(model_map, layer, expert_i, gate_offset,
+        int idx = sycl_stream_resident_find(st, model_map, layer, expert_i, gate_offset,
                                             up_offset, down_offset, gate_expert_bytes,
                                             down_expert_bytes);
         if (idx >= 0) {
-            g_sycl_stream_resident[(size_t)idx].last_used = ++g_sycl_stream_resident_clock;
-            g_sycl_stream_hits++;
+            st.resident[(size_t)idx].last_used = ++st.resident_clock;
+            st.hits++;
             continue;
         }
 
-        idx = sycl_stream_resident_alloc(q, model_map, layer, expert_i, selected_ids,
+        idx = sycl_stream_resident_alloc(q, st, model_map, layer, expert_i, selected_ids,
                                          n_selected, gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, down_expert_bytes);
         if (idx < 0) {
-            sycl_stream_resident_release_all(q);
+            sycl_stream_resident_release_all(q, st);
             return 0;
         }
-        g_sycl_stream_misses++;
+        st.misses++;
 
         const uint64_t expert = (uint64_t)(uint32_t)expert_i;
         uint64_t       gate_rel = 0, down_rel = 0;
         if (!sycl_u64_mul_checked(expert, gate_expert_bytes, &gate_rel) ||
             !sycl_u64_mul_checked(expert, down_expert_bytes, &down_rel)) {
-            sycl_stream_resident_release_all(q);
+            sycl_stream_resident_release_all(q, st);
             return 0;
         }
 
-        sycl_stream_resident_expert &entry = g_sycl_stream_resident[(size_t)idx];
+        sycl_stream_resident_expert &entry = st.resident[(size_t)idx];
         try {
             q.memcpy(entry.gate, (const char *)model_map + gate_offset + gate_rel,
                      gate_expert_bytes);
@@ -786,7 +838,7 @@ static int sycl_stream_selected_load(
         } catch (const sycl::exception &ex) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected upload failed: %s\n",
                     ex.what());
-            sycl_stream_resident_release_all(q);
+            sycl_stream_resident_release_all(q, st);
             return 0;
         }
     }
@@ -799,30 +851,30 @@ static int sycl_stream_selected_load(
     try {
         for (uint32_t i = 0; i < n_selected; i++) {
             const int idx = sycl_stream_resident_find(
-                    model_map, layer, selected_ids[i], gate_offset, up_offset,
+                    st, model_map, layer, selected_ids[i], gate_offset, up_offset,
                     down_offset, gate_expert_bytes, down_expert_bytes);
             if (idx < 0) {
-                sycl_stream_resident_release_all(q);
+                sycl_stream_resident_release_all(q, st);
                 return 0;
             }
-            sycl_stream_resident_expert &entry = g_sycl_stream_resident[(size_t)idx];
-            entry.last_used = ++g_sycl_stream_resident_clock;
-            q.memcpy(g_sycl_stream_selected.gate + (uint64_t)i * gate_expert_bytes,
+            sycl_stream_resident_expert &entry = st.resident[(size_t)idx];
+            entry.last_used = ++st.resident_clock;
+            q.memcpy(st.selected.gate + (uint64_t)i * gate_expert_bytes,
                      entry.gate, gate_expert_bytes);
-            q.memcpy(g_sycl_stream_selected.up + (uint64_t)i * gate_expert_bytes,
+            q.memcpy(st.selected.up + (uint64_t)i * gate_expert_bytes,
                      entry.up, gate_expert_bytes);
-            q.memcpy(g_sycl_stream_selected.down + (uint64_t)i * down_expert_bytes,
+            q.memcpy(st.selected.down + (uint64_t)i * down_expert_bytes,
                      entry.down, down_expert_bytes);
         }
         q.wait_and_throw();
     } catch (const sycl::exception &ex) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected compact failed: %s\n",
                 ex.what());
-        sycl_stream_resident_release_all(q);
+        sycl_stream_resident_release_all(q, st);
         return 0;
     }
 
-    g_sycl_stream_selected.loaded = 1;
+    st.selected.loaded = 1;
     return 1;
 }
 
@@ -856,11 +908,13 @@ static bool sycl_stream_batch_dedup(const int32_t *ids, uint32_t n_tokens,
 
 /* Backs ds4_gpu_stream_expert_cache_prepare_selected_batch (ROCm's
  * cuda_stream_batch_selected_prepare_from_host, rocm/ds4_rocm_runtime.cuh:3109
- * onward).  Does not build or upload the device-side pointer-array /
- * pair_missing tables ROCm uploads for its MoE-launch consumer: no
- * compute kernel here reads them.  What is tested here
- * is the host-side dedup mapping (exposed via a test-only hook) and that
- * every unique expert ends up resident with the right bytes. */
+ * onward).  Operates on the CURRENT tier's cache, same rationale as
+ * sycl_stream_resident_seed_experts above.  Does not build or upload the
+ * device-side pointer-array / pair_missing tables ROCm uploads for its
+ * MoE-launch consumer: no compute kernel here reads them.
+ * What is tested here is the host-side dedup mapping (exposed via a
+ * test-only hook) and that every unique expert ends up resident with the
+ * right bytes. */
 static int sycl_stream_batch_selected_prepare(
         const void *model_map, uint64_t model_size, uint32_t layer,
         const int32_t *ids, uint32_t n_tokens, uint32_t n_total_expert,
@@ -911,17 +965,18 @@ static int sycl_stream_batch_selected_prepare(
     }
 
     sycl::queue &q = ds4_sycl_current_queue();
+    sycl_stream_tier_state &st = sycl_stream_state_for(g_current_tier);
     for (int32_t expert_i : unique_ids) {
-        int idx = sycl_stream_resident_find(model_map, layer, expert_i, gate_offset,
+        int idx = sycl_stream_resident_find(st, model_map, layer, expert_i, gate_offset,
                                             up_offset, down_offset, gate_expert_bytes,
                                             down_expert_bytes);
         if (idx >= 0) {
-            g_sycl_stream_resident[(size_t)idx].last_used = ++g_sycl_stream_resident_clock;
-            g_sycl_stream_hits++;
+            st.resident[(size_t)idx].last_used = ++st.resident_clock;
+            st.hits++;
             continue;
         }
 
-        idx = sycl_stream_resident_alloc(q, model_map, layer, expert_i,
+        idx = sycl_stream_resident_alloc(q, st, model_map, layer, expert_i,
                                          unique_ids.data(), (uint32_t)unique_ids.size(),
                                          gate_offset, up_offset, down_offset,
                                          gate_expert_bytes, down_expert_bytes);
@@ -931,7 +986,7 @@ static int sycl_stream_batch_selected_prepare(
          * path, which does release.  Matched deliberately, not an
          * oversight. */
         if (idx < 0) return 0;
-        g_sycl_stream_misses++;
+        st.misses++;
 
         const uint64_t expert = (uint64_t)(uint32_t)expert_i;
         uint64_t       gate_rel = 0, down_rel = 0;
@@ -940,7 +995,7 @@ static int sycl_stream_batch_selected_prepare(
             return 0;
         }
 
-        sycl_stream_resident_expert &entry = g_sycl_stream_resident[(size_t)idx];
+        sycl_stream_resident_expert &entry = st.resident[(size_t)idx];
         try {
             q.memcpy(entry.gate, (const char *)model_map + gate_offset + gate_rel,
                      gate_expert_bytes);
@@ -959,18 +1014,18 @@ static int sycl_stream_batch_selected_prepare(
 }
 
 extern "C" void ds4_gpu_set_streaming_expert_cache_budget(uint32_t experts) {
-    g_sycl_stream_cache_budget = experts;
+    sycl_stream_state_for(g_current_tier).cache_budget = experts;
 }
 
 /* Matches rocm/ds4_rocm_current_api_compat.cuh:155 exactly: 0 while
  * streaming is disabled even if a budget was configured, the configured
  * budget once it is enabled. */
 extern "C" uint32_t ds4_gpu_stream_expert_cache_configured_count(void) {
-    return g_sycl_stream_mode ? g_sycl_stream_cache_budget : 0;
+    return g_sycl_stream_mode ? sycl_stream_state_for(g_current_tier).cache_budget : 0;
 }
 
 extern "C" uint32_t ds4_gpu_stream_expert_cache_current_count(void) {
-    return (uint32_t)g_sycl_stream_resident.size();
+    return (uint32_t)sycl_stream_state_for(g_current_tier).resident.size();
 }
 
 /* Ignores both byte arguments, exactly like ROCm
@@ -1041,16 +1096,19 @@ extern "C" int ds4_gpu_stream_expert_cache_prepare_selected_batch(
             table->down_expert_bytes);
 }
 
-/* Releases unconditionally on EVERY call, whether enabling or disabling,
- * matching rocm/ds4_rocm_current_api_compat.cuh:119-126 exactly
- * (ds4_gpu_set_ssd_streaming there calls cuda_model_range_release_all,
+/* Releases every tier's cache unconditionally on EVERY call, whether
+ * enabling or disabling, matching rocm/ds4_rocm_current_api_compat.cuh:119-126
+ * exactly (ds4_gpu_set_ssd_streaming there calls cuda_model_range_release_all,
  * which unconditionally calls cuda_stream_resident_cache_release, plus
  * resets both scratch caches' loaded flags, regardless of the `enabled`
  * argument).  This is not "release only when disabling": re-enabling an
- * already-configured cache also wipes it, which callers must expect. */
+ * already-configured cache also wipes it, which callers must expect.
+ * Streaming mode itself is a single engine-wide switch (not per tier, see
+ * g_sycl_stream_mode's declaration), so every tier's cache is torn down
+ * together. */
 extern "C" void ds4_gpu_set_ssd_streaming(bool enabled) {
     g_sycl_stream_mode = enabled;
-    if (!g_devices.empty()) sycl_stream_teardown_all(ds4_sycl_current_queue());
+    if (!g_devices.empty()) sycl_stream_teardown_all();
 }
 
 extern "C" void ds4_gpu_set_glm_streaming_prefill_full_layer(bool enabled) {
@@ -1089,12 +1147,17 @@ extern "C" uint64_t ds4_gpu_recommended_working_set_size(void) {
 /* Test-only side doors.  None of the entries above expose the resident
  * cache's or the selected cache's device-side bytes, the hit/miss
  * counters, the batch dedup mapping, or a way to reset all of it between
- * test cases.  Forward-declared only in tests/test_sycl_streaming.c,
- * never added to ds4_gpu.h. */
+ * test cases.  Forward-declared only in tests/test_sycl_streaming.c and
+ * tests/test_sycl_mgpu.c, never added to ds4_gpu.h.  Each reads the
+ * CURRENT tier's state, exactly like the ABI entries above: a test that
+ * needs a specific tier's state calls ds4_gpu_set_current_device(tier)
+ * first, the same way production code selects a tier before touching the
+ * cache. */
 extern "C" int ds4_sycl_stream_test_read_resident(uint32_t layer, int32_t expert,
                                                   void *gate_out, void *up_out,
                                                   void *down_out) {
-    for (const sycl_stream_resident_expert &e : g_sycl_stream_resident) {
+    const sycl_stream_tier_state &st = sycl_stream_state_for(g_current_tier);
+    for (const sycl_stream_resident_expert &e : st.resident) {
         if (e.layer != layer || e.expert != expert) continue;
         sycl::queue &q = ds4_sycl_current_queue();
         try {
@@ -1114,24 +1177,20 @@ extern "C" int ds4_sycl_stream_test_read_resident(uint32_t layer, int32_t expert
 
 extern "C" int ds4_sycl_stream_test_read_selected(uint32_t slot, void *gate_out,
                                                   void *up_out, void *down_out) {
-    if (!g_sycl_stream_selected.loaded || slot >= g_sycl_stream_selected.n_selected) {
-        return 0;
-    }
+    sycl_stream_tier_state &st = sycl_stream_state_for(g_current_tier);
+    if (!st.selected.loaded || slot >= st.selected.n_selected) return 0;
     sycl::queue &q = ds4_sycl_current_queue();
-    const uint64_t gate_bytes = g_sycl_stream_selected.gate_expert_bytes;
-    const uint64_t down_bytes = g_sycl_stream_selected.down_expert_bytes;
+    const uint64_t gate_bytes = st.selected.gate_expert_bytes;
+    const uint64_t down_bytes = st.selected.down_expert_bytes;
     try {
         if (gate_out) {
-            q.memcpy(gate_out, g_sycl_stream_selected.gate + (uint64_t)slot * gate_bytes,
-                     gate_bytes);
+            q.memcpy(gate_out, st.selected.gate + (uint64_t)slot * gate_bytes, gate_bytes);
         }
         if (up_out) {
-            q.memcpy(up_out, g_sycl_stream_selected.up + (uint64_t)slot * gate_bytes,
-                     gate_bytes);
+            q.memcpy(up_out, st.selected.up + (uint64_t)slot * gate_bytes, gate_bytes);
         }
         if (down_out) {
-            q.memcpy(down_out, g_sycl_stream_selected.down + (uint64_t)slot * down_bytes,
-                     down_bytes);
+            q.memcpy(down_out, st.selected.down + (uint64_t)slot * down_bytes, down_bytes);
         }
         q.wait_and_throw();
     } catch (const sycl::exception &ex) {
@@ -1143,8 +1202,9 @@ extern "C" int ds4_sycl_stream_test_read_selected(uint32_t slot, void *gate_out,
 }
 
 extern "C" void ds4_sycl_stream_test_hit_miss(uint64_t *hits, uint64_t *misses) {
-    if (hits) *hits = g_sycl_stream_hits;
-    if (misses) *misses = g_sycl_stream_misses;
+    const sycl_stream_tier_state &st = sycl_stream_state_for(g_current_tier);
+    if (hits) *hits = st.hits;
+    if (misses) *misses = st.misses;
 }
 
 extern "C" int ds4_sycl_stream_test_batch_dedup(
@@ -1164,11 +1224,13 @@ extern "C" int ds4_sycl_stream_test_batch_dedup(
     return 1;
 }
 
+/* Resets every tier currently tracked (not just the current one), so a
+ * test that switched tiers earlier cannot leak state into the next test
+ * via a tier this call forgot about. Re-sized down to one entry afterward
+ * so a test suite that never goes multi-tier keeps the original shape. */
 extern "C" void ds4_sycl_stream_test_reset(void) {
-    if (!g_devices.empty()) sycl_stream_teardown_all(ds4_sycl_current_queue());
-    g_sycl_stream_cache_budget = 0;
-    g_sycl_stream_hits = 0;
-    g_sycl_stream_misses = 0;
+    if (!g_devices.empty()) sycl_stream_teardown_all();
+    g_sycl_stream_tier.assign(1, sycl_stream_tier_state{});
     /* Every test in this file exercises the cache itself, so default to
      * streaming enabled here; tests specifically about
      * ds4_gpu_set_ssd_streaming's own lifecycle call it directly to

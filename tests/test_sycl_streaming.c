@@ -854,6 +854,126 @@ static int test_mode_off_prepare_selected_batch_fails(void) {
     return 0;
 }
 
+/* ---- Per-tier cache state ----------------------------------------------
+ *
+ * This machine has one physical GPU, so these use ds4_gpu_init_multi with
+ * BOTH device_indices pointing at index 0: ds4_gpu_init_multi validates
+ * only that each requested index is < the enumerated device count, not
+ * that requested indices are distinct, and ds4_sycl_build_devices builds
+ * one real sycl::queue per requested entry regardless of duplicates. The
+ * result is two logical tiers, each with its own queue sharing one
+ * context, backed by the same physical card -- exactly the technique
+ * tests/test_sycl_mgpu.c's test_copy_xdev_same_device already relies on
+ * to exercise multi-tier plumbing on single-GPU hardware. This proves the
+ * per-tier array's own indexing and isolation for real (a genuine host-side
+ * data-structure property); it cannot and does not claim anything about
+ * real cross-die memory behaviour, which needs a second physical device
+ * (the B60 fleet). */
+
+static int start_two_logical_tiers(void) {
+    ds4_gpu_cleanup();
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 0;
+    cfg.device_indices[1] = 0;
+    if (ds4_gpu_init_multi(&cfg) == 0) return 0;
+    ds4_gpu_set_ssd_streaming(true);
+    return 1;
+}
+
+static int test_two_tiers_resident_cache_isolated(void) {
+    CHECK(start_two_logical_tiers(), "init_multi for two logical tiers");
+
+    enum { N_EXPERT = 4, GATE_BYTES = 8, DOWN_BYTES = 8, LAYER = 0, BUDGET = 4 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+
+    CHECK(ds4_gpu_set_current_device(0) == 0, "select tier 0");
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    int32_t ids0[] = {0, 1};
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, ids0, NULL, 2) != 0,
+          "seed on tier 0");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 2,
+          "tier 0 resident count after its own seed");
+    CHECK(expert_resident_matches(model, LAYER, 0, gate_offset, up_offset, down_offset,
+                                  GATE_BYTES, DOWN_BYTES),
+          "tier 0 resident expert 0 content");
+
+    CHECK(ds4_gpu_set_current_device(1) == 0, "select tier 1");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 0,
+          "tier 1 must start with an empty resident cache, not tier 0's");
+    CHECK(!ds4_sycl_stream_test_read_resident(LAYER, 0, NULL, NULL, NULL),
+          "tier 1 must not see tier 0's resident expert 0");
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    int32_t ids1[] = {2, 3};
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, ids1, NULL, 2) != 0,
+          "seed on tier 1");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 2,
+          "tier 1 resident count after its own seed");
+
+    CHECK(ds4_gpu_set_current_device(0) == 0, "back to tier 0");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 2,
+          "tier 0's own cache must be undisturbed by tier 1's seed");
+    CHECK(!ds4_sycl_stream_test_read_resident(LAYER, 2, NULL, NULL, NULL),
+          "tier 0 must not see tier 1's resident expert 2");
+    CHECK(expert_resident_matches(model, LAYER, 0, gate_offset, up_offset, down_offset,
+                                  GATE_BYTES, DOWN_BYTES),
+          "tier 0 resident expert 0 still intact after tier 1 activity");
+
+    ds4_gpu_cleanup();
+    fprintf(stderr, "  test_two_tiers_resident_cache_isolated OK\n");
+    return 0;
+}
+
+static int test_teardown_frees_every_tier(void) {
+    CHECK(start_two_logical_tiers(), "init_multi for teardown test");
+
+    enum { N_EXPERT = 4, GATE_BYTES = 8, DOWN_BYTES = 8, LAYER = 0, BUDGET = 4 };
+    unsigned char model[N_EXPERT * (2 * GATE_BYTES + DOWN_BYTES)];
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = N_EXPERT * GATE_BYTES;
+    const uint64_t down_offset = 2u * N_EXPERT * GATE_BYTES;
+    fill_model(model, LAYER, N_EXPERT, GATE_BYTES, DOWN_BYTES, gate_offset,
+              up_offset, down_offset);
+    ds4_gpu_stream_expert_table table = {
+        model, sizeof(model), LAYER, N_EXPERT, gate_offset, up_offset,
+        down_offset, GATE_BYTES, DOWN_BYTES};
+    int32_t ids[] = {0, 1};
+
+    CHECK(ds4_gpu_set_current_device(0) == 0, "select tier 0");
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, ids, NULL, 2) != 0,
+          "seed tier 0");
+
+    CHECK(ds4_gpu_set_current_device(1) == 0, "select tier 1");
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    CHECK(ds4_gpu_stream_expert_cache_seed_experts(&table, ids, NULL, 2) != 0,
+          "seed tier 1");
+
+    /* Toggling streaming mode must release BOTH tiers' resident caches,
+     * not just whichever tier happened to be current at the call site
+     * (the bug an earlier single-queue teardown had once a second tier
+     * could exist). Still positioned on tier 1 here, so check it first. */
+    ds4_gpu_set_ssd_streaming(false);
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 0,
+          "tier 1 must be emptied by set_ssd_streaming(false)");
+    CHECK(ds4_gpu_set_current_device(0) == 0, "back to tier 0");
+    CHECK(ds4_gpu_stream_expert_cache_current_count() == 0,
+          "tier 0 must be emptied by set_ssd_streaming(false), not just tier 1");
+
+    ds4_gpu_cleanup();
+    fprintf(stderr, "  test_teardown_frees_every_tier OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_seed_fewer_than_budget() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -875,6 +995,8 @@ int main(void) {
     if (test_trivial_noop_entries_callable() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_mode_off_seed_and_selected_are_noop_success() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_mode_off_prepare_selected_batch_fails() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_two_tiers_resident_cache_isolated() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_teardown_frees_every_tier() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_streaming OK\n");
     return 0;

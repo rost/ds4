@@ -159,9 +159,11 @@ void ds4_sycl_build_devices(const std::vector<sycl::device> &wanted,
 
 /* Defined in sycl/ds4_sycl_streaming.hpp, included at the end of this
  * file; forward-declared here so ds4_gpu_cleanup (below) can call it
- * while the queue every streaming cache slab and buffer was allocated
- * through is still alive, before g_devices.clear() destroys it. */
-static void sycl_stream_teardown_all(sycl::queue &q);
+ * while every tier's queue is still alive, before g_devices.clear()
+ * destroys them.  Takes no argument: it loops over every live tier and
+ * tears each one down through its own queue, not just whichever queue
+ * the caller happens to pass in. */
+static void sycl_stream_teardown_all(void);
 
 /* Multi-GPU plumbing globals declared extern by ds4_gpu_mgpu.h and read
  * directly by ds4.c.  Before ds4_gpu_init runs (or if it never runs) this
@@ -311,11 +313,12 @@ extern "C" void ds4_gpu_cleanup(void) {
                     "teardown: %s\n", e.what());
         }
     }
-    /* Frees every streaming cache slab and scratch buffer while their
-     * queue is still alive, matching ROCm's cuda_stream_selected_cache_release
-     * fan-out from ds4_gpu_cleanup (rocm/ds4_rocm_runtime.cuh:5873). Must
-     * run before g_devices.clear() below destroys the queue. */
-    if (!g_devices.empty()) sycl_stream_teardown_all(ds4_sycl_current_queue());
+    /* Frees every tier's streaming cache slabs and scratch buffers while
+     * their own queue is still alive, matching ROCm's
+     * cuda_stream_selected_cache_release fan-out from ds4_gpu_cleanup
+     * (rocm/ds4_rocm_runtime.cuh:5873). Must run before g_devices.clear()
+     * below destroys the queues. */
+    if (!g_devices.empty()) sycl_stream_teardown_all();
     g_devices.clear();
     g_n_gpus       = 0;
     g_current_tier = 0;
