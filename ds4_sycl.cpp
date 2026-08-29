@@ -2,8 +2,10 @@
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
+#include "sycl/ds4_sycl_common.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -157,6 +159,27 @@ void ds4_sycl_build_devices(const std::vector<sycl::device> &wanted,
 
 } /* namespace */
 
+/* Returns the first width in kRequiredSubGroupWidths that is absent from
+ * `supported` (an array of `n_supported` widths a device reports via
+ * sycl::info::device::sub_group_sizes), or 0 if every required width is
+ * present. Pure host-side comparison, no device access, so it is directly
+ * testable with a synthetic supported-widths array. 0 is never itself a
+ * valid sub-group width, so it unambiguously means "nothing missing" here;
+ * this is a local convention for this one helper, not a claim about the
+ * ABI-wide return-polarity convention documented in spec 3a, which does
+ * not apply to this internal (non-ABI) helper. */
+extern "C" uint32_t ds4_sycl_missing_required_subgroup_width(
+        const uint32_t *supported, int n_supported) {
+    for (uint32_t required : kRequiredSubGroupWidths) {
+        bool found = false;
+        for (int i = 0; i < n_supported; i++) {
+            if (supported[i] == required) { found = true; break; }
+        }
+        if (!found) return required;
+    }
+    return 0;
+}
+
 /* Defined in sycl/ds4_sycl_streaming.hpp, included at the end of this
  * file; forward-declared here so ds4_gpu_cleanup (below) can call it
  * while every tier's queue is still alive, before g_devices.clear()
@@ -272,6 +295,47 @@ extern "C" int ds4_gpu_init(void) {
                     "yet implemented in the SYCL backend; single-device use "
                     "is expected until the multi-GPU work lands\n",
                     g_n_gpus);
+        }
+
+        /* Per spec 6m, [[sycl::reqd_sub_group_size(N)]] is not enforced by
+         * the driver on this stack: a device that cannot honour N silently
+         * runs a different width instead of failing the kernel launch, and
+         * every kernel using that annotation then reduces over the wrong
+         * number of lanes for a plausible, wrong, answer with no error
+         * anywhere (see kRequiredSubGroupWidths, ds4_sycl_common.hpp).
+         * Checked against every device, not just tier 0, since the target
+         * hardware is many independent cards and any one of them can be the
+         * one missing a width. */
+        for (const ds4_sycl_device &d : g_devices) {
+            std::vector<size_t> raw = d.dev.get_info<sycl::info::device::sub_group_sizes>();
+            std::vector<uint32_t> widths;
+            widths.reserve(raw.size());
+            for (size_t w : raw) widths.push_back((uint32_t)w);
+
+            uint32_t missing = ds4_sycl_missing_required_subgroup_width(
+                    widths.data(), (int)widths.size());
+            if (missing != 0) {
+                std::string reported;
+                for (size_t i = 0; i < widths.size(); i++) {
+                    if (i) reported += ", ";
+                    reported += std::to_string(widths[i]);
+                }
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "device \"%s\" does not report required sub-group width "
+                        "%u (reports: %s); refusing to start. Per spec 6m, "
+                        "[[sycl::reqd_sub_group_size(%u)]] is not enforced by the "
+                        "driver on this stack, so continuing would not fail the "
+                        "kernel launch -- it would silently run a different "
+                        "hardware sub-group width and return wrong numbers with "
+                        "no error\n",
+                        d.dev.get_info<sycl::info::device::name>().c_str(), missing,
+                        reported.empty() ? "(none)" : reported.c_str(), missing);
+                g_devices.clear();
+                g_n_gpus       = 0;
+                g_current_tier = 0;
+                g_initialised  = false;
+                return 0;
+            }
         }
 
         g_current_tier = 0;

@@ -52,6 +52,32 @@ static inline int sycl_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c,
     return sycl_u64_mul_checked(a, b, &tmp) && sycl_u64_mul_checked(tmp, c, out);
 }
 
+/* Every [[sycl::reqd_sub_group_size(N)]] width this backend's kernels
+ * require, enumerated directly from sycl/*.hpp (2026-08-29): width 8
+ * appears 15 times (ds4_sycl_moe.hpp x12, ds4_sycl_attention.hpp x2,
+ * ds4_sycl_attention_output.hpp x1 via kGroupedQ8ASubgroupWidth), width 16
+ * appears 2 times (ds4_sycl_moe.hpp), width 32 appears 11 times
+ * (ds4_sycl_attention.hpp x4, ds4_sycl_moe.hpp x2,
+ * ds4_sycl_shared_expert.hpp x2, ds4_sycl_attention_output.hpp x1,
+ * ds4_sycl_indexer.hpp x1, ds4_sycl_router.hpp x1).
+ *
+ * Per spec 6m, [[sycl::reqd_sub_group_size(N)]] is NOT a hard requirement
+ * on this stack: a device that cannot honour N is not refused by the
+ * driver, which silently runs a hardware-feasible width instead. Every
+ * kernel carrying this annotation then performs a shuffle reduction whose
+ * tree depth is compiled in for width N (see sycl_attn_subgroup_sum<N> in
+ * ds4_sycl_attention.hpp and the matching shape in the MoE kernels), so a
+ * silent width mismatch reduces over the wrong set of lanes and returns a
+ * plausible, wrong, answer with no error anywhere. The device-discovery
+ * check in ds4_gpu_init (ds4_sycl.cpp) is this backend's only guard against
+ * that failure mode.
+ *
+ * IF YOU ADD A NEW reqd_sub_group_size(N) ANNOTATION AT A WIDTH NOT ALREADY
+ * LISTED HERE, ADD THE WIDTH HERE TOO, or ds4_gpu_init will not check for
+ * it and a device unable to honour it will silently corrupt that kernel's
+ * output. */
+static constexpr uint32_t kRequiredSubGroupWidths[] = {8u, 16u, 32u};
+
 static inline int sycl_tensor_has_bytes(const ds4_gpu_tensor *t, uint64_t bytes) {
     return t && t->ptr && t->bytes >= bytes;
 }
