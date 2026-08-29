@@ -21,7 +21,18 @@
  * A single call here exercises ds4_gpu_tensor_alloc_ptr_on dozens of times
  * across the per-tier scratch, per-tier decode/prefill state, and output
  * head allocation classes -- the exact call sites that were broken. If any
- * of them regress to a failing stub, this test fails. */
+ * of them regress to a failing stub, this test fails.
+ *
+ * ds4_test_graph_encode_smoke goes one level deeper still: allocation alone
+ * does not prove the engine can ENCODE anything into the graph it just
+ * built. That gap was real, not hypothetical, in the same way as the
+ * allocator gap above: ds4_gpu_begin_commands, _commands_active,
+ * _end_commands, _flush_commands, _flush_encoder and _synchronize were all
+ * stubbed to their own failure value, and metal_graph_eval_token_raw_swa --
+ * the real per-token decode path -- gates its entire encode step behind
+ * begin_commands succeeding and its result behind end_commands succeeding,
+ * with no backend gate. That stub combination failed every decode token on
+ * this backend before a single kernel ever ran. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -37,10 +48,11 @@
         }                                                                   \
     } while (0)
 
-/* DS4_TEST_HOOKS entry point defined in ds4.c; not declared in a shipped
+/* DS4_TEST_HOOKS entry points defined in ds4.c; not declared in a shipped
  * header, following the same pattern as ds4_test_session_read_logits and
  * ds4_test_engine_placement in tests/test_engine_mgpu_runtime.c. */
 int ds4_test_graph_alloc_smoke(void);
+int ds4_test_graph_encode_smoke(void);
 
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init returned zero");
@@ -49,6 +61,33 @@ int main(void) {
           "metal_graph_alloc_raw_cap failed on a synthetic single-tier "
           "shape; the engine's real session-creation path cannot allocate "
           "a graph on this backend");
+
+    /* One level deeper than the allocation-only check above: drives
+     * ds4_gpu_begin_commands -> a real kernel dispatch
+     * (ds4_gpu_embed_token_hc_tensor) -> ds4_gpu_end_commands ->
+     * ds4_gpu_synchronize, the exact sequence metal_graph_eval_token_raw_swa
+     * runs for every real decode token (ds4.c:30765-30792). All six
+     * ds4_gpu_begin_commands/_commands_active/_end_commands/_flush_commands/
+     * _flush_encoder/_synchronize entries were previously stubbed to their
+     * own failure value, which meant this exact call sequence -- and every
+     * real decode token -- failed before a single kernel ran. */
+    CHECK(ds4_test_graph_encode_smoke() != 0,
+          "begin_commands/embed_token_hc/end_commands/synchronize failed on "
+          "a synthetic single-layer graph; the engine's real decode path "
+          "cannot encode a token on this backend");
+
+    /* Direct ABI contract checks for the command-lifecycle entries
+     * themselves, independent of the engine call above: begin_commands and
+     * commands_active are trivial constants (this backend has no encoder
+     * object to track), matching both ROCm and CUDA exactly. */
+    CHECK(ds4_gpu_begin_commands() != 0, "begin_commands reported failure");
+    CHECK(ds4_gpu_commands_active() == 0,
+          "commands_active reported an outstanding batch this backend never "
+          "tracks");
+    CHECK(ds4_gpu_end_commands() != 0, "end_commands reported failure");
+    CHECK(ds4_gpu_flush_commands() != 0, "flush_commands reported failure");
+    CHECK(ds4_gpu_flush_encoder() != 0, "flush_encoder reported failure");
+    CHECK(ds4_gpu_synchronize() != 0, "synchronize reported failure");
 
     fprintf(stderr, "  test_sycl_session_smoke OK\n");
     /* ds4_engine_open calls these on every startup and ABORTS if any

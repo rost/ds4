@@ -57644,6 +57644,166 @@ int ds4_test_graph_alloc_smoke(void) {
     g_ds4_shape = saved_shape;
     return ok ? 1 : 0;
 }
+
+/* One level deeper than ds4_test_graph_alloc_smoke: that hook proves the
+ * engine's graph allocator can size and allocate every tensor a session
+ * needs; this one proves the engine can then actually ENCODE something into
+ * that graph, through the exact begin/end/synchronize gate every real
+ * decode token passes through.
+ *
+ * metal_graph_eval_token_raw_swa (the real per-token decode path reached
+ * from ds4_session_eval_internal) runs "bool ok = ds4_gpu_begin_commands()
+ * != 0; if (ok) ok = <encode the token>; if (ok) ok = ds4_gpu_end_commands()
+ * != 0;" with no backend gate. This hook reproduces that exact shape with
+ * ds4_gpu_embed_token_hc_tensor standing in for the full per-layer encode:
+ * it is the smallest already-landed real GPU compute entry that a real
+ * decode step dispatches between begin_commands and end_commands, so a
+ * regression in any of the three command-lifecycle entries (begin_commands,
+ * end_commands, synchronize) fails this test exactly as it would silently
+ * fail every real decode call.
+ *
+ * The embedding lookup only reads bytes out of the model map (spec 6l: no
+ * kernel here ever dereferences the host mmap itself, only the C++ wrapper
+ * does, staging the one row it needs to device), so a zero-filled buffer
+ * standing in for the real mmap'd weight file is sufficient: this test
+ * checks that the GPU dispatch and synchronization machinery works, not
+ * that the embedding table holds trained values. */
+int ds4_test_graph_encode_smoke(void) {
+    const ds4_shape saved_shape = g_ds4_shape;
+
+    g_ds4_shape = (ds4_shape){
+        .name = "test-tiny-encode",
+        .family = DS4_MODEL_FAMILY_DEEPSEEK4,
+        .variant = DS4_VARIANT_FLASH,
+        .n_layer = 1,
+        .n_embd = 64,
+        .n_vocab = 128,
+        .n_head = 2,
+        .n_head_kv = 1,
+        .n_head_dim = 16,
+        .n_value_dim = 16,
+        .n_rot = 8,
+        .n_out_group = 1,
+        .n_lora_q = 16,
+        .n_lora_o = 16,
+        .n_expert = 4,
+        .n_expert_used = 2,
+        .n_expert_shared = 1,
+        .n_ff_exp = 32,
+        .n_ff_dense = 32,
+        .n_hash_layer = 0,
+        .n_swa = 8,
+        .n_indexer_head = 2,
+        .n_indexer_head_dim = 8,
+        .n_indexer_top_k = 4,
+        .n_hc = 4,
+        .n_hc_sinkhorn_iter = 1,
+        .rms_eps = DS4_DEFAULT_RMS_EPS,
+        .hc_eps = DS4_DEFAULT_HC_EPS,
+        .expert_weight_scale = 1.0f,
+        .swiglu_clamp_exp = DS4_DEFAULT_SWIGLU_CLAMP_EXP,
+        .rope_freq_base = DS4_DEFAULT_ROPE_FREQ_BASE,
+        .rope_scale_factor = DS4_DEFAULT_ROPE_SCALE_FACTOR,
+        .rope_yarn_beta_fast = DS4_DEFAULT_ROPE_YARN_BETA_FAST,
+        .rope_yarn_beta_slow = DS4_DEFAULT_ROPE_YARN_BETA_SLOW,
+        .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
+        .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
+    };
+    memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+
+    ds4_tensor dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    dummy.ndim = 2;
+    dummy.dim[0] = 1;
+    dummy.dim[1] = 1;
+
+    ds4_tensor q_a = dummy;         q_a.dim[1] = 16;  /* q_rank */
+    ds4_tensor gate_shexp = dummy;  gate_shexp.dim[1] = 32;  /* shared_dim */
+    ds4_tensor gate_exps = dummy;   gate_exps.dim[1] = 32;   /* routed_mid_dim */
+    ds4_tensor output_t = dummy;    output_t.dim[1] = 128;   /* vocab_dim */
+
+    ds4_tensor token_embd = dummy;
+    token_embd.dim[0] = 64;   /* n_embd */
+    token_embd.dim[1] = 128;  /* n_vocab */
+    token_embd.abs_offset = 0;
+
+    /* Zero-filled stand-in for the mmap'd model file: one F16 (uint16_t)
+     * zero value per [n_vocab][n_embd] element, all embed_token_hc_tensor
+     * ever reads. */
+    const uint64_t encode_n_vocab = 128, encode_n_embd = 64;
+    const size_t model_bytes =
+        (size_t)encode_n_vocab * encode_n_embd * sizeof(uint16_t);
+    uint8_t *fake_model = (uint8_t *)calloc(1, model_bytes);
+    if (!fake_model) { g_ds4_shape = saved_shape; return 0; }
+
+    ds4_model model;
+    memset(&model, 0, sizeof(model));
+    model.map  = fake_model;
+    model.size = model_bytes;
+
+    ds4_weights weights;
+    memset(&weights, 0, sizeof(weights));
+    weights.output     = &output_t;
+    weights.token_embd = &token_embd;
+
+    ds4_layer_weights *l = &weights.layer[0];
+    l->hc_attn_fn = &dummy;
+    l->hc_attn_scale = &dummy;
+    l->hc_attn_base = &dummy;
+    l->attn_norm = &dummy;
+    l->attn_q_a = &q_a;
+    l->attn_q_a_norm = &dummy;
+    l->attn_q_b = &dummy;
+    l->attn_kv = &dummy;
+    l->attn_kv_a_norm = &dummy;
+    l->attn_sinks = &dummy;
+    l->attn_output_a = &dummy;
+    l->attn_output_b = &dummy;
+    l->hc_ffn_fn = &dummy;
+    l->hc_ffn_scale = &dummy;
+    l->hc_ffn_base = &dummy;
+    l->ffn_norm = &dummy;
+    l->ffn_gate_inp = &dummy;
+    l->ffn_gate_exps = &gate_exps;
+    l->ffn_up_exps = &dummy;
+    l->ffn_down_exps = &dummy;
+    l->ffn_gate_shexp = &gate_shexp;
+    l->ffn_up_shexp = &dummy;
+    l->ffn_down_shexp = &dummy;
+
+    ds4_gpu_graph g;
+    memset(&g, 0, sizeof(g));
+    bool ok = metal_graph_alloc_raw_cap(&g, &weights, l,
+                                        /*raw_cap=*/8, /*ctx_size=*/8,
+                                        /*prefill_cap=*/2,
+                                        /*enable_mtp=*/false,
+                                        /*placement=*/NULL,
+                                        /*cuda_tensor_parallel=*/false,
+                                        /*shared_prefill_workspace=*/NULL);
+
+    /* The exact call shape metal_graph_eval_token_raw_swa uses for every
+     * real decode token, with embed_token_hc_tensor in place of the full
+     * per-layer encode. */
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    if (ok) {
+        ok = ds4_gpu_embed_token_hc_tensor(
+                     metal_graph_cur_hc(&g),
+                     model.map,
+                     model.size,
+                     weights.token_embd->abs_offset,
+                     (uint32_t)weights.token_embd->dim[1],
+                     /*token=*/0,
+                     DS4_N_EMBD,
+                     DS4_N_HC) != 0;
+    }
+    if (ok) ok = ds4_gpu_end_commands() != 0;
+    if (ok) ok = ds4_gpu_synchronize() != 0;
+
+    metal_graph_free(&g);
+    free(fake_model);
+    g_ds4_shape = saved_shape;
+    return ok ? 1 : 0;
+}
 #endif /* DS4_TEST_HOOKS */
 
 static int engine_install_dspark_support_cache(ds4_engine *e);
