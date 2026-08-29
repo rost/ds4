@@ -786,6 +786,154 @@ static int test_rope_tail(void) {
     return 0;
 }
 
+/* ds4_gpu_rope_tail_decode_rows_tensor: the row-batched form of
+ * ds4_gpu_rope_tail_tensor above, used by metal_graph_encode_qkv_session_
+ * batch (ds4.c:64836 on the KV row, :64855 on the Q row) to RoPE-rotate
+ * several concurrent sessions' rows in one launch, each at its own
+ * absolute position.
+ *
+ * Primary check is DIFFERENTIAL, preferred here
+ * over an oracle alone: each row's output must match calling the already-
+ * landed single-row ds4_gpu_rope_tail_tensor once for that row alone, at
+ * that row's own position. Per design spec 6u a relational check like
+ * that cannot catch an error that moves every row identically (for
+ * instance, applying row 0's angle to every row disagrees with the
+ * single-row entry too, in fact, but a broken oracle comparison could
+ * still get lucky), so one specific row's tail is additionally checked
+ * against oracle_rope_tail_row directly, anchoring it to something
+ * outside the differential relation.
+ *
+ * N_ROWS = 5 is deliberately not a multiple of any power-of-two tile or
+ * work-group width this kernel touches (kRmsNormGroup = 256, or any
+ * smaller launch granularity), and the five positions are not an affine
+ * sequence (spec 6f/6n): {5, 130, 7, 999, 42} mixes small and large
+ * magnitudes with no shared arithmetic progression. */
+static int test_rope_tail_decode_rows(void) {
+    enum { N_ROWS = 5, N_HEAD = 3, HEAD_DIM = 32, N_ROT = 24,
+           N_NOPE = HEAD_DIM - N_ROT, ROW_ELEMS = N_HEAD * HEAD_DIM,
+           TOTAL = N_ROWS * ROW_ELEMS };
+    const uint32_t positions[N_ROWS] = {5u, 130u, 7u, 999u, 42u};
+    const uint32_t N_CTX_ORIG = 4096;
+    const float FREQ_BASE = 10000.0f;
+    const float BETA_FAST = 32.0f;
+    const float BETA_SLOW = 1.0f;
+    const float ATTN_FACTOR = 1.0f;
+    const double TOL_DIFFERENTIAL = 1e-6; /* same kernel math, same order */
+    const double TOL_ORACLE = 1e-4;       /* iterative vs direct-power angle */
+
+    struct { float freq_scale; float ext_factor; int inverse; } cases[] = {
+        {1.0f, 0.0f, 0},
+        {1.0f, 0.0f, 1},
+        {0.5f, 1.0f, 0},
+        {0.5f, 1.0f, 1},
+    };
+
+    for (size_t ci = 0; ci < sizeof(cases) / sizeof(cases[0]); ci++) {
+        float x[TOTAL];
+        for (int i = 0; i < TOTAL; i++) {
+            /* Non-affine: a linear term plus an interaction term, per
+             * spec 6f/6n, so no two elements are proportional. */
+            x[i] = ((float)(i % 13) - 6.0f) * 0.2f +
+                   (float)((i * 7) % 5) * 0.03f;
+        }
+
+        ds4_gpu_attention_decode_row rows[N_ROWS];
+        memset(rows, 0, sizeof(rows));
+        for (int r = 0; r < N_ROWS; r++) rows[r].pos = positions[r];
+
+        ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+        CHECK(tx != NULL, "rope_tail_decode_rows: allocation failed");
+        CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+              "rope_tail_decode_rows: write");
+
+        CHECK(ds4_gpu_rope_tail_decode_rows_tensor(
+                  tx, rows, N_ROWS, N_HEAD, HEAD_DIM, N_ROT, N_CTX_ORIG,
+                  cases[ci].inverse, FREQ_BASE, cases[ci].freq_scale,
+                  cases[ci].ext_factor, ATTN_FACTOR, BETA_FAST, BETA_SLOW) != 0,
+              "rope_tail_decode_rows: call");
+
+        float got[TOTAL];
+        CHECK(ds4_gpu_tensor_read(tx, 0, got, sizeof(got)) != 0,
+              "rope_tail_decode_rows: read");
+        ds4_gpu_tensor_free(tx);
+
+        for (int r = 0; r < N_ROWS; r++) {
+            /* Differential: the single-row entry, called alone with
+             * n_tok=1 and this row's own position, on a fresh copy of
+             * this row's untouched input. */
+            float row_x[ROW_ELEMS];
+            memcpy(row_x, &x[r * ROW_ELEMS], sizeof(row_x));
+            ds4_gpu_tensor *trow = ds4_gpu_tensor_alloc(sizeof(row_x));
+            CHECK(trow != NULL, "rope_tail_decode_rows: row allocation failed");
+            CHECK(ds4_gpu_tensor_write(trow, 0, row_x, sizeof(row_x)) != 0,
+                  "rope_tail_decode_rows: row write");
+            CHECK(ds4_gpu_rope_tail_tensor(
+                      trow, 1, N_HEAD, HEAD_DIM, N_ROT, positions[r],
+                      N_CTX_ORIG, cases[ci].inverse, FREQ_BASE,
+                      cases[ci].freq_scale, cases[ci].ext_factor, ATTN_FACTOR,
+                      BETA_FAST, BETA_SLOW) != 0,
+                  "rope_tail_decode_rows: single-row reference call");
+            float want_row[ROW_ELEMS];
+            CHECK(ds4_gpu_tensor_read(trow, 0, want_row, sizeof(want_row)) != 0,
+                  "rope_tail_decode_rows: single-row reference read");
+            ds4_gpu_tensor_free(trow);
+
+            const float *row_got = &got[r * ROW_ELEMS];
+            for (int c = 0; c < ROW_ELEMS; c++) {
+                CHECK_CLOSE(row_got[c], want_row[c], TOL_DIFFERENTIAL,
+                            "rope_tail_decode_rows: differs from single-row entry");
+            }
+        }
+
+        /* Anchor (spec 6u): row 2's tail checked against the oracle
+         * directly, independent of the differential relation above. */
+        {
+            const int anchor_row = 2;
+            float want_row[HEAD_DIM];
+            memcpy(want_row, &x[anchor_row * ROW_ELEMS + 0 * HEAD_DIM],
+                   sizeof(want_row));
+            oracle_rope_tail_row(want_row, HEAD_DIM, N_ROT, positions[anchor_row],
+                                 N_CTX_ORIG, FREQ_BASE, cases[ci].freq_scale,
+                                 cases[ci].ext_factor, ATTN_FACTOR, BETA_FAST,
+                                 BETA_SLOW, cases[ci].inverse);
+            const float *row_got = &got[anchor_row * ROW_ELEMS + 0 * HEAD_DIM];
+            for (int c = N_NOPE; c < HEAD_DIM; c++) {
+                CHECK_CLOSE(row_got[c], want_row[c], TOL_ORACLE,
+                            "rope_tail_decode_rows: anchor row disagrees with independent oracle");
+            }
+        }
+    }
+
+    /* n_rows == 0 must be rejected (matches ds4_cuda.cu's own launcher). */
+    {
+        ds4_gpu_tensor *t = ds4_gpu_tensor_alloc((uint64_t)ROW_ELEMS * sizeof(float));
+        CHECK(t != NULL, "rope_tail_decode_rows: n_rows=0 allocation failed");
+        CHECK(ds4_gpu_rope_tail_decode_rows_tensor(
+                  t, NULL, 0u, N_HEAD, HEAD_DIM, N_ROT, N_CTX_ORIG, false,
+                  FREQ_BASE, 1.0f, 0.0f, 1.0f, BETA_FAST, BETA_SLOW) == 0,
+              "rope_tail_decode_rows: n_rows=0 must be rejected");
+        ds4_gpu_tensor_free(t);
+    }
+
+    /* n_rows beyond DS4_GPU_ATTENTION_DECODE_BATCH_MAX must be rejected:
+     * the third ablation below targets exactly this bound. */
+    {
+        enum { OVER = DS4_GPU_ATTENTION_DECODE_BATCH_MAX + 1u };
+        ds4_gpu_attention_decode_row rows[OVER];
+        memset(rows, 0, sizeof(rows));
+        ds4_gpu_tensor *t = ds4_gpu_tensor_alloc((uint64_t)OVER * ROW_ELEMS * sizeof(float));
+        CHECK(t != NULL, "rope_tail_decode_rows: oversized allocation failed");
+        CHECK(ds4_gpu_rope_tail_decode_rows_tensor(
+                  t, rows, OVER, N_HEAD, HEAD_DIM, N_ROT, N_CTX_ORIG, false,
+                  FREQ_BASE, 1.0f, 0.0f, 1.0f, BETA_FAST, BETA_SLOW) == 0,
+              "rope_tail_decode_rows: n_rows over the batch cap must be rejected");
+        ds4_gpu_tensor_free(t);
+    }
+
+    fprintf(stderr, "  test_rope_tail_decode_rows OK\n");
+    return 0;
+}
+
 /* ds4_gpu_head_rms_norm_rope_tail_tensor: the fused, one-work-group-per-row
  * kernel.  Validated against the COMPOSED oracle: head RMS-norm first
  * (oracle_head_rms_norm_inplace with n_head=1, applied to one row at a
@@ -908,6 +1056,7 @@ int main(void) {
     if (test_dsv4_qkv_rms_norm_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dsv4_qkv_rms_norm_rows_kv_rope() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_rope_tail_decode_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_head_rms_norm_rope_tail() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_norm_rope OK\n");

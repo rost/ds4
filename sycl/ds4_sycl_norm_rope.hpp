@@ -842,3 +842,131 @@ extern "C" int ds4_gpu_rope_tail_tensor(
                                         freq_base, freq_scale, ext_factor,
                                         attn_factor, beta_fast, beta_slow);
 }
+
+/* ds4_gpu_rope_tail_decode_rows_tensor, ds4_cuda.cu:16311-16349
+ * (rope_tail_decode_rows_kernel, ds4_cuda.cu:6787-6844): the row-batched
+ * form of ds4_gpu_rope_tail_tensor above, generalising
+ * sycl_rope_tail_stride_tensor's per-pair kernel over an explicit row
+ * table instead of a single pos0 + t * pos_stride derivation. None of
+ * this exists in rocm/; CUDA is the only reference (a CUDA-only entry).
+ *
+ * Called at ds4.c:64836 (on the KV row, n_head = DS4_N_HEAD_KV == 1 for
+ * Flash) and ds4.c:64855 (on the Q row, n_head = DS4_N_HEAD), both inside
+ * metal_graph_encode_qkv_session_batch, which projects, RMS-normalises
+ * and RoPE-rotates several concurrent sessions' rows in one launch when
+ * ds4_sessions_eval_batch is called with count >= 3 (the QKV grouping
+ * path's own threshold, metal_graph_session_batch_qkv_supported).
+ *
+ * Only rows[i].pos is read; the row struct's KV-cache fields (raw_kv,
+ * comp_kv, topk, ...) are irrelevant to this entry, exactly as CUDA's own
+ * launcher copies just the row array's .pos field into its row table
+ * here. The row table is a host array (ds4_gpu_attention_decode_row has
+ * no device-resident form anywhere in this ABI), so per design spec 6l it
+ * cannot be dereferenced by a kernel directly: the per-row positions are
+ * staged to device scratch first, the same discipline as every other
+ * host-side table this backend stages before a launch. */
+extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
+        ds4_gpu_tensor                     *x,
+        const ds4_gpu_attention_decode_row *rows,
+        uint32_t                            n_rows,
+        uint32_t                            n_head,
+        uint32_t                            head_dim,
+        uint32_t                            n_rot,
+        uint32_t                            n_ctx_orig,
+        bool                                inverse,
+        float                               freq_base,
+        float                               freq_scale,
+        float                               ext_factor,
+        float                               attn_factor,
+        float                               beta_fast,
+        float                               beta_slow) {
+    if (!x || !rows || n_rows == 0u ||
+        n_rows > DS4_GPU_ATTENTION_DECODE_BATCH_MAX || n_head == 0u ||
+        n_rot == 0u || n_rot > head_dim || (n_rot & 1u) != 0u ||
+        !sycl_tensor_has_elems3(x, n_rows, n_head, head_dim, sizeof(float))) {
+        return 0;
+    }
+    const uint32_t pairs = n_rows * n_head * (n_rot / 2u);
+    if (pairs == 0u) return 1;
+    if (g_devices.empty()) return 0;
+
+    std::vector<uint32_t> row_pos((size_t)n_rows);
+    for (uint32_t i = 0; i < n_rows; i++) row_pos[i] = rows[i].pos;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(x->device_id);
+        sycl_device_scratch_guard pos_guard = sycl_stage_host_bytes(
+                q, row_pos.data(), (uint64_t)n_rows * sizeof(uint32_t));
+        if (!pos_guard.p) return 0;
+        const uint32_t *ppos  = (const uint32_t *)pos_guard.p;
+        float           *px   = (float *)x->ptr;
+        const size_t     group = kRmsNormGroup;
+        const size_t     grid  = ((size_t)pairs + group - 1) / group * group;
+
+        q.submit([&](sycl::handler &h) {
+            h.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>(grid),
+                                  sycl::range<1>(group)),
+                [=](sycl::nd_item<1> it) {
+                    const size_t gid = it.get_global_id(0);
+                    if (gid >= (size_t)pairs) return;
+
+                    const uint32_t half   = n_rot / 2u;
+                    const uint32_t pair   = (uint32_t)gid % half;
+                    const uint32_t tmp    = (uint32_t)gid / half;
+                    const uint32_t h      = tmp % n_head;
+                    const uint32_t row    = tmp / n_head;
+                    const uint32_t n_nope = head_dim - n_rot;
+                    const uint32_t i      = pair * 2u;
+
+                    float corr0 = 0.0f, corr1 = 0.0f;
+                    if (ext_factor != 0.0f) {
+                        const float denom = 2.0f * sycl::log(freq_base);
+                        corr0 = sycl::floor((float)n_rot *
+                                sycl::log((float)n_ctx_orig /
+                                          (beta_fast * 2.0f * (float)M_PI)) / denom);
+                        corr1 = sycl::ceil((float)n_rot *
+                                sycl::log((float)n_ctx_orig /
+                                          (beta_slow * 2.0f * (float)M_PI)) / denom);
+                        corr0 = sycl::fmax(0.0f, corr0);
+                        corr1 = sycl::fmin((float)(n_rot - 1), corr1);
+                    }
+
+                    const float theta_scale =
+                            sycl::pow(freq_base, -2.0f / (float)n_rot);
+                    /* Direct power, NOT iterative accumulation; see the
+                     * matching comment on the fused kernel above. Each
+                     * row's own absolute position, not a shared pos0. */
+                    const float theta_extrap =
+                            (float)ppos[row] * sycl::pow(theta_scale, (float)pair);
+                    const float theta_interp = freq_scale * theta_extrap;
+                    float theta  = theta_interp;
+                    float mscale = attn_factor;
+                    if (ext_factor != 0.0f) {
+                        const float ramp_mix =
+                                sycl_rope_yarn_ramp(corr0, corr1, (int)i) *
+                                ext_factor;
+                        theta = theta_interp * (1.0f - ramp_mix) +
+                                theta_extrap * ramp_mix;
+                        mscale *= 1.0f + 0.1f * sycl::log(1.0f / freq_scale);
+                    }
+                    float c = sycl::cos(theta) * mscale;
+                    float s = sycl::sin(theta) * mscale;
+                    if (inverse) s = -s;
+
+                    float *tail = px +
+                            ((uint64_t)row * n_head + h) * head_dim + n_nope;
+                    const float x0 = tail[i];
+                    const float x1 = tail[i + 1];
+                    tail[i]     = x0 * c - x1 * s;
+                    tail[i + 1] = x0 * s + x1 * c;
+                });
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "rope_tail_decode_rows failed: %s\n",
+                e.what());
+        return 0;
+    }
+    return 1;
+}
