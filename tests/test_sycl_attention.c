@@ -288,6 +288,178 @@ static int test_kv_fp8_store_raw(void) {
     return 0;
 }
 
+/* ds4_gpu_kv_fp8_store_raw_decode_rows_tensor: the row-batched form of
+ * ds4_gpu_kv_fp8_store_raw_tensor above, used by metal_graph_encode_qkv_
+ * session_batch (ds4.c:64872) to quantise and store several concurrent
+ * sessions' KV rows, each into its OWN private raw_cache, in one call.
+ *
+ * Primary check is differential against the single-row entry above,
+ * called once per row on a fresh copy of that row's data. N_ROWS = 5 is not a multiple of 64 (the FP8 quantiser's
+ * work-group width) or any other power-of-two tile this kernel touches.
+ * Per spec 6u, row 3 is additionally anchored against the same explicit
+ * oracle computation test_kv_fp8_store_raw uses above, independent of the
+ * differential relation: an error that moved every row's expected value
+ * the same way would not be caught by the row-vs-row comparison alone. */
+static int test_kv_fp8_store_raw_decode_rows(void) {
+    enum { N_ROWS = 5 };
+    const uint32_t n_rot = 0u; /* whole row quantised: n_nope == head_dim */
+    /* Deliberately uneven per-row cache shapes and start rows, not an
+     * affine sequence, so a bug that mixes up which row's table entry
+     * belongs to which row cannot hide behind uniform data. */
+    const uint32_t raw_caps[N_ROWS]  = {4u, 6u, 3u, 5u, 4u};
+    const uint32_t raw_rows[N_ROWS]  = {2u, 0u, 1u, 4u, 3u};
+
+    float kv[N_ROWS * HEAD_DIM_KV];
+    for (uint32_t r = 0; r < N_ROWS; r++) {
+        for (uint32_t d = 0; d < HEAD_DIM_KV; d++) {
+            kv[r * HEAD_DIM_KV + d] = test_prand(20u + r, d, 31u) * 5.0f;
+        }
+    }
+
+    ds4_gpu_tensor *tkv = ds4_gpu_tensor_alloc(sizeof(kv));
+    CHECK(tkv != NULL, "kv_fp8_store_raw_decode_rows: kv alloc failed");
+    CHECK(ds4_gpu_tensor_write(tkv, 0, kv, sizeof(kv)) != 0,
+          "kv_fp8_store_raw_decode_rows: kv write failed");
+
+    ds4_gpu_tensor *traw[N_ROWS];
+    for (uint32_t r = 0; r < N_ROWS; r++) {
+        traw[r] = ds4_gpu_tensor_alloc((uint64_t)raw_caps[r] * HEAD_DIM_KV * sizeof(float));
+        CHECK(traw[r] != NULL, "kv_fp8_store_raw_decode_rows: raw alloc failed");
+        float zeros[16u * HEAD_DIM_KV];
+        memset(zeros, 0, (size_t)raw_caps[r] * HEAD_DIM_KV * sizeof(float));
+        CHECK(ds4_gpu_tensor_write(traw[r], 0, zeros,
+                                   (uint64_t)raw_caps[r] * HEAD_DIM_KV * sizeof(float)) != 0,
+              "kv_fp8_store_raw_decode_rows: raw zero-init failed");
+    }
+
+    CHECK(ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
+              tkv, traw, raw_caps, raw_rows, N_ROWS, HEAD_DIM_KV, n_rot) != 0,
+          "kv_fp8_store_raw_decode_rows: launch failed");
+
+    for (uint32_t r = 0; r < N_ROWS; r++) {
+        /* Differential: the single-row entry, called alone on a fresh
+         * copy of this row's untouched input, into a same-shaped fresh
+         * cache. */
+        float row_kv[HEAD_DIM_KV];
+        memcpy(row_kv, &kv[r * HEAD_DIM_KV], sizeof(row_kv));
+        ds4_gpu_tensor *tkv_row = ds4_gpu_tensor_alloc(sizeof(row_kv));
+        ds4_gpu_tensor *traw_ref = ds4_gpu_tensor_alloc((uint64_t)raw_caps[r] * HEAD_DIM_KV * sizeof(float));
+        CHECK(tkv_row && traw_ref, "kv_fp8_store_raw_decode_rows: reference alloc failed");
+        float zeros[16u * HEAD_DIM_KV];
+        memset(zeros, 0, (size_t)raw_caps[r] * HEAD_DIM_KV * sizeof(float));
+        CHECK(ds4_gpu_tensor_write(traw_ref, 0, zeros,
+                                   (uint64_t)raw_caps[r] * HEAD_DIM_KV * sizeof(float)) != 0,
+              "kv_fp8_store_raw_decode_rows: reference zero-init failed");
+        CHECK(ds4_gpu_tensor_write(tkv_row, 0, row_kv, sizeof(row_kv)) != 0,
+              "kv_fp8_store_raw_decode_rows: reference kv write failed");
+        CHECK(ds4_gpu_kv_fp8_store_raw_tensor(
+                  tkv_row, traw_ref, raw_caps[r], raw_rows[r], HEAD_DIM_KV, n_rot) != 0,
+              "kv_fp8_store_raw_decode_rows: single-row reference call failed");
+
+        float got[16u * HEAD_DIM_KV], want[16u * HEAD_DIM_KV];
+        CHECK(ds4_gpu_tensor_read(traw[r], 0, got,
+                                  (uint64_t)raw_caps[r] * HEAD_DIM_KV * sizeof(float)) != 0,
+              "kv_fp8_store_raw_decode_rows: row read failed");
+        CHECK(ds4_gpu_tensor_read(traw_ref, 0, want,
+                                  (uint64_t)raw_caps[r] * HEAD_DIM_KV * sizeof(float)) != 0,
+              "kv_fp8_store_raw_decode_rows: reference read failed");
+        ds4_gpu_tensor_free(tkv_row);
+        ds4_gpu_tensor_free(traw_ref);
+
+        for (uint32_t i = 0; i < raw_caps[r] * HEAD_DIM_KV; i++) {
+            CHECK_CLOSE(got[i], want[i], 1e-6,
+                        "kv_fp8_store_raw_decode_rows: differs from single-row entry");
+        }
+    }
+
+    /* Anchor (spec 6u): row 3's stored values checked against the same
+     * explicit oracle test_kv_fp8_store_raw uses, independent of the
+     * row-vs-row differential above. */
+    {
+        const uint32_t r = 3;
+        const float *row_kv = &kv[r * HEAD_DIM_KV];
+        float row_max = 1.0e-4f;
+        for (uint32_t d = 0; d < HEAD_DIM_KV; d++) {
+            if (fabsf(row_kv[d]) > row_max) row_max = fabsf(row_kv[d]);
+        }
+        const float scale = exp2f(ceilf(log2f(row_max / 448.0f)));
+        float want[HEAD_DIM_KV];
+        for (uint32_t d = 0; d < HEAD_DIM_KV; d++) {
+            const float clamped = fminf(448.0f, fmaxf(-448.0f, row_kv[d] / scale));
+            want[d] = oracle_f16_round_trip(oracle_e4m3fn_dequant(clamped) * scale);
+        }
+        float got[16u * HEAD_DIM_KV];
+        CHECK(ds4_gpu_tensor_read(traw[r], 0, got,
+                                  (uint64_t)raw_caps[r] * HEAD_DIM_KV * sizeof(float)) != 0,
+              "kv_fp8_store_raw_decode_rows: anchor read failed");
+        for (uint32_t d = 0; d < HEAD_DIM_KV; d++) {
+            CHECK_CLOSE(got[raw_rows[r] * HEAD_DIM_KV + d], want[d], 1e-3,
+                        "kv_fp8_store_raw_decode_rows: anchor row disagrees with independent oracle");
+        }
+    }
+
+    ds4_gpu_tensor_free(tkv);
+    for (uint32_t r = 0; r < N_ROWS; r++) ds4_gpu_tensor_free(traw[r]);
+    fprintf(stderr, "  test_kv_fp8_store_raw_decode_rows OK\n");
+    return 0;
+}
+
+static int test_kv_fp8_store_raw_decode_rows_rejections(void) {
+    enum { N_ROWS = 2 };
+    const uint32_t raw_caps[N_ROWS] = {4u, 4u};
+    const uint32_t raw_rows[N_ROWS] = {0u, 0u};
+    float kv[N_ROWS * HEAD_DIM_KV];
+    memset(kv, 0, sizeof(kv));
+    ds4_gpu_tensor *tkv = ds4_gpu_tensor_alloc(sizeof(kv));
+    ds4_gpu_tensor *traw0 = ds4_gpu_tensor_alloc((uint64_t)4u * HEAD_DIM_KV * sizeof(float));
+    ds4_gpu_tensor *traw1 = ds4_gpu_tensor_alloc((uint64_t)4u * HEAD_DIM_KV * sizeof(float));
+    CHECK(tkv && traw0 && traw1, "kv_fp8_store_raw_decode_rows: rejection alloc failed");
+    ds4_gpu_tensor *raw_caches[N_ROWS] = {traw0, traw1};
+
+    CHECK(ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
+              tkv, raw_caches, raw_caps, raw_rows, 0u, HEAD_DIM_KV, 0u) == 0,
+          "kv_fp8_store_raw_decode_rows: n_rows=0 must be rejected");
+
+    {
+        /* A tkv sized for exactly OVER rows: the point of this case is
+         * the n_rows-vs-cap bound specifically, so kv must not ALSO be
+         * undersized, or an unrelated size check would reject the call
+         * for a different reason and this case would not discriminate
+         * (spec 6i). */
+        enum { OVER = DS4_GPU_ATTENTION_DECODE_BATCH_MAX + 1u };
+        ds4_gpu_tensor *over_caches[OVER];
+        uint32_t over_caps[OVER], over_rows[OVER];
+        for (uint32_t i = 0; i < OVER; i++) {
+            over_caches[i] = traw0;
+            over_caps[i] = 4u;
+            over_rows[i] = 0u;
+        }
+        float over_kv[OVER * HEAD_DIM_KV];
+        memset(over_kv, 0, sizeof(over_kv));
+        ds4_gpu_tensor *tkv_over = ds4_gpu_tensor_alloc(sizeof(over_kv));
+        CHECK(tkv_over != NULL, "kv_fp8_store_raw_decode_rows: over-sized kv alloc failed");
+        CHECK(ds4_gpu_tensor_write(tkv_over, 0, over_kv, sizeof(over_kv)) != 0,
+              "kv_fp8_store_raw_decode_rows: over-sized kv write failed");
+        CHECK(ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
+                  tkv_over, over_caches, over_caps, over_rows, OVER, HEAD_DIM_KV, 0u) == 0,
+              "kv_fp8_store_raw_decode_rows: n_rows over the batch cap must be rejected");
+        ds4_gpu_tensor_free(tkv_over);
+    }
+
+    {
+        const uint32_t bad_rows[N_ROWS] = {5u, 0u}; /* 5 >= raw_caps[0] == 4 */
+        CHECK(ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
+                  tkv, raw_caches, raw_caps, bad_rows, N_ROWS, HEAD_DIM_KV, 0u) == 0,
+              "kv_fp8_store_raw_decode_rows: raw_row >= raw_cap must be rejected");
+    }
+
+    ds4_gpu_tensor_free(tkv);
+    ds4_gpu_tensor_free(traw0);
+    ds4_gpu_tensor_free(traw1);
+    fprintf(stderr, "  test_kv_fp8_store_raw_decode_rows_rejections OK\n");
+    return 0;
+}
+
 #define DH_N_HEAD 4u
 #define DH_HEAD_DIM 16u
 #define DH_N_RAW 300u
@@ -1924,6 +2096,8 @@ int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_store_raw_kv() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_kv_fp8_store_raw() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_kv_fp8_store_raw_decode_rows() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_kv_fp8_store_raw_decode_rows_rejections() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_decode_heads_mixed_wraparound() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_decode_heads_raw_only() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_decode_heads_masked() != 0) { ds4_gpu_cleanup(); return 1; }

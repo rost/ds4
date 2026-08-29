@@ -319,3 +319,122 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache,
     }
     return 1;
 }
+
+/* ds4_gpu_kv_fp8_store_raw_decode_rows_tensor, ds4_cuda.cu:16366-16397
+ * (fp8_kv_quantize_store_rows_kernel, ds4_cuda.cu:6975-6992): the row-
+ * batched form of ds4_gpu_kv_fp8_store_raw_tensor (sycl/ds4_sycl_
+ * attention.hpp), called at ds4.c:64872 inside metal_graph_encode_qkv_
+ * session_batch to quantise and store several concurrent sessions' KV
+ * rows, each into its OWN private raw_cache, in one call. None of this
+ * exists in rocm/; CUDA is the only reference.
+ *
+ * Composed from two already-tested steps rather than one new fused
+ * kernel, the same choice ds4_gpu_kv_fp8_store_raw_tensor's own SYCL port
+ * already made for the single-row form: quantise every row in place
+ * first, by calling the already-landed ds4_gpu_dsv4_fp8_kv_quantize_
+ * tensor treating the n_rows rows as its n_tok, then store each now-
+ * quantised row into its own session's raw_cache below.
+ *
+ * CUDA instead fuses both into one <<<n_rows, 64>>> launch whose inner
+ * quantiser loop (fp8_kv_quantize_row) handles n_nope > 64 by looping
+ * chunk-by-chunk within that SAME 64-wide work-group, calling the shared
+ * max-reduction a second time against the same local scratch buffer
+ * before every lane has necessarily finished reading the first call's
+ * result: sycl_block_row_reduce's own trailing barrier guarantees every
+ * lane has ARRIVED at it, not that every lane's post-barrier read of
+ * local[0] has completed before another lane starts the next call's
+ * local[lid] = value write into the same slot. Reusing it twice per
+ * group with no intervening barrier is exactly the shape spec 6t warns
+ * about, one level down: ordering within a work-group is this code's job
+ * just as ordering between submits is. The two-step composition
+ * sidesteps it entirely: ds4_gpu_dsv4_fp8_kv_quantize_tensor's own
+ * multi-group grid already handles any n_nope correctly and is already
+ * tested on its own, and the per-row store step below has no reduction
+ * and needs no barrier at all, so there is nothing to reuse unsafely.
+ * The quantiser call's own trailing q.wait_and_throw() orders it ahead of
+ * the store submit below by construction (spec 6t), with no separate
+ * fence needed.
+ *
+ * Every raw_cache tensor must share kv's device: this backend already
+ * checks that on the single-row sibling (ds4_gpu_kv_fp8_store_raw_
+ * tensor's raw_cache->device_id != kv->device_id guard via ds4_gpu_
+ * store_raw_kv_tensor), a check CUDA's own unified-addressing launcher
+ * has no need for but this backend's Level Zero devices do (spec 6a).
+ *
+ * The per-row store step's target pointers are a host array of already
+ * device-resident raw_cache addresses (each ds4_gpu_tensor->ptr). Per
+ * spec 6l a kernel cannot read this table from the host, so it is staged
+ * to device scratch, alongside the per-row cap and start-row arrays,
+ * before the launch. */
+extern "C" int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
+        ds4_gpu_tensor        *kv,
+        ds4_gpu_tensor *const *raw_caches,
+        const uint32_t        *raw_caps,
+        const uint32_t        *raw_rows,
+        uint32_t               n_rows,
+        uint32_t               head_dim,
+        uint32_t               n_rot) {
+    if (!kv || !raw_caches || !raw_caps || !raw_rows || n_rows == 0u ||
+        n_rows > DS4_GPU_ATTENTION_DECODE_BATCH_MAX || n_rot > head_dim ||
+        !sycl_tensor_has_elems2(kv, n_rows, head_dim, sizeof(float))) {
+        return 0;
+    }
+
+    std::vector<float *>  row_raw_ptr((size_t)n_rows);
+    std::vector<uint32_t> row_raw_cap((size_t)n_rows);
+    std::vector<uint32_t> row_raw_start((size_t)n_rows);
+    for (uint32_t i = 0; i < n_rows; i++) {
+        ds4_gpu_tensor *raw = raw_caches[i];
+        if (!raw || raw_caps[i] == 0u || raw_rows[i] >= raw_caps[i] ||
+            raw->device_id != kv->device_id ||
+            !sycl_tensor_has_elems2(raw, raw_caps[i], head_dim, sizeof(float))) {
+            return 0;
+        }
+        row_raw_ptr[i]   = (float *)raw->ptr;
+        row_raw_cap[i]   = raw_caps[i];
+        row_raw_start[i] = raw_rows[i];
+    }
+    if (g_devices.empty()) return 0;
+
+    if (ds4_gpu_dsv4_fp8_kv_quantize_tensor(kv, n_rows, head_dim, n_rot) == 0) {
+        return 0;
+    }
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(kv->device_id);
+        sycl_device_scratch_guard ptr_guard = sycl_stage_host_bytes(
+                q, row_raw_ptr.data(), (uint64_t)n_rows * sizeof(float *));
+        sycl_device_scratch_guard cap_guard = sycl_stage_host_bytes(
+                q, row_raw_cap.data(), (uint64_t)n_rows * sizeof(uint32_t));
+        sycl_device_scratch_guard start_guard = sycl_stage_host_bytes(
+                q, row_raw_start.data(), (uint64_t)n_rows * sizeof(uint32_t));
+        if (!ptr_guard.p || !cap_guard.p || !start_guard.p) return 0;
+
+        float *const   *pptrs  = (float *const *)ptr_guard.p;
+        const uint32_t *pcaps  = (const uint32_t *)cap_guard.p;
+        const uint32_t *pstart = (const uint32_t *)start_guard.p;
+        const float     *pkv   = (const float *)kv->ptr;
+        const uint32_t   width = head_dim;
+        const uint64_t   n     = (uint64_t)n_rows * width;
+
+        q.submit([&](sycl::handler &h) {
+            h.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> gid_id) {
+                const uint64_t  gid = gid_id[0];
+                const uint32_t  d   = (uint32_t)(gid % width);
+                const uint32_t  row = (uint32_t)(gid / width);
+                float          *raw = pptrs[row];
+                const uint32_t  raw_row = pstart[row] % pcaps[row];
+                const uint16_t hb = sycl_f32_to_f16_bits_hip_round(
+                        pkv[(uint64_t)row * width + d]);
+                raw[(uint64_t)raw_row * width + d] =
+                        (float)sycl::bit_cast<sycl::half>(hb);
+            });
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "kv_fp8_store_raw_decode_rows failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
