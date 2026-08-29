@@ -245,6 +245,210 @@ static bool sycl_moe_build_sorted_pairs(sycl::queue &q, const int32_t *d_selecte
     return true;
 }
 
+/* ---- Q8_K activation quantiser -------------------------------------
+ *
+ * cuda_block_q8_K, ds4_rocm.cu:79-83: 256-value superblock, float scale,
+ * signed 8-bit codes, and 16 group sums of 16 codes each (bsums) used by
+ * the Q4_K/Q2_K/IQ2_XXS dot-product helpers to fold the min-value term
+ * without re-reading every code.  No half/f16 fields, unlike the weight
+ * block types, so no bit-cast conversion is needed here. */
+constexpr uint32_t kMoeQK = 256;  /* CUDA_QK_K, ds4_rocm.cu:47 */
+
+struct sycl_block_q8_K {
+    float   d;
+    int8_t  qs[kMoeQK];
+    int16_t bsums[kMoeQK / 16];
+};
+
+/* q8_K_quantize_kernel, moe.cuh:750-798.  Every launch site in
+ * moe_launch.cuh uses block dim 256 (== kMoeQK) exactly, so the CUDA
+ * kernel's "tid < CUDA_QK_K" guards are unconditionally true; this port
+ * omits them for that reason, not by aiming for a smaller work-group.
+ * Grid is (in_dim/256, n_rows): one work-group per (superblock, row).
+ * Every work-item writes its abs_part/val_part slot unconditionally
+ * before the barrier (spec section 6b): here that invariant holds
+ * trivially, since the work-group width equals the block width exactly
+ * and there is no strided remainder loop that could leave a work-item
+ * idle, unlike the norm_rope reductions spec 6c discusses. */
+static void sycl_moe_q8_k_quantize(sycl::queue &q, sycl_block_q8_K *out,
+                                   const float *x, uint32_t in_dim,
+                                   uint32_t n_rows) {
+    const uint32_t xq_blocks = in_dim / kMoeQK;
+    if (xq_blocks == 0u || n_rows == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         sycl::local_accessor<float, 1> abs_part(sycl::range<1>(kMoeQK), h);
+         sycl::local_accessor<float, 1> val_part(sycl::range<1>(kMoeQK), h);
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)xq_blocks * kMoeQK, n_rows),
+                               sycl::range<2>(kMoeQK, 1)),
+             [=](sycl::nd_item<2> it) {
+                 const uint32_t b = (uint32_t)it.get_group(0);
+                 const uint32_t row = (uint32_t)it.get_group(1);
+                 const uint32_t tid = (uint32_t)it.get_local_id(0);
+                 const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * kMoeQK;
+                 sycl_block_q8_K *yb = out + (uint64_t)row * xq_blocks + b;
+
+                 const float v = xr[tid];
+                 abs_part[tid] = sycl::fabs(v);
+                 val_part[tid] = v;
+                 it.barrier(sycl::access::fence_space::local_space);
+
+                 for (uint32_t stride = kMoeQK >> 1; stride > 0; stride >>= 1) {
+                     if (tid < stride && abs_part[tid + stride] > abs_part[tid]) {
+                         abs_part[tid] = abs_part[tid + stride];
+                         val_part[tid] = val_part[tid + stride];
+                     }
+                     it.barrier(sycl::access::fence_space::local_space);
+                 }
+
+                 const float amax = abs_part[0];
+                 if (amax == 0.0f) {
+                     if (tid == 0) yb->d = 0.0f;
+                     yb->qs[tid] = 0;
+                     if (tid < kMoeQK / 16u) yb->bsums[tid] = 0;
+                     return;
+                 }
+
+                 const float maxv = val_part[0];
+                 const float iscale = -127.0f / maxv;
+                 /* rint, not round: CUDA's lrintf (moe.cuh:783) rounds per
+                  * the current FPU mode (round-to-nearest-even by
+                  * default), which sycl::round's round-half-away-from-zero
+                  * does not match at exact .5 ties. */
+                 int qv = (int)sycl::rint(iscale * xr[tid]);
+                 if (qv > 127) qv = 127;
+                 if (qv < -128) qv = -128;
+                 yb->qs[tid] = (int8_t)qv;
+                 it.barrier(sycl::access::fence_space::global_and_local);
+
+                 if (tid < kMoeQK / 16u) {
+                     int sum = 0;
+                     for (int i = 0; i < 16; i++) sum += yb->qs[tid * 16 + i];
+                     yb->bsums[tid] = (int16_t)sum;
+                 }
+                 if (tid == 0) yb->d = 1.0f / iscale;
+             });
+     }).wait_and_throw();
+}
+
+/* ---- Sub-group reductions -------------------------------------------
+ *
+ * half_warp_sum_f32 (16-lane) and quarter_warp_sum_f32 (8-lane),
+ * moe.cuh:732-749.  CUDA implements these as a MASKED partition of one
+ * 32-wide warp (a shuffle with an explicit width parameter); Intel Arc
+ * supports real 8/16/32-wide sub-groups, so this port uses an actual
+ * reqd_sub_group_size(N) sub-group rather than emulating CUDA's masking
+ * scheme, per the plan.  Within a genuine N-wide sub-group, no mask is
+ * needed: sycl::sub_group's shuffle already scopes to the sub-group. */
+
+template <int N>
+static float sycl_moe_subgroup_sum(sycl::sub_group sg, float v) {
+    for (int offset = N >> 1; offset > 0; offset >>= 1) {
+        v += sycl::shift_group_left(sg, v, (uint32_t)offset);
+    }
+    return v;
+}
+
+/* ---- Sum / combine ---------------------------------------------------
+ *
+ * moe_sum_kernel / moe_sum_f16_kernel / moe_sum_f16x2_kernel,
+ * moe.cuh:3877-3918.  Weighted-sum-across-selected-experts into the
+ * final `out` tensor.  Accumulation order is `for e in 0..n_expert`,
+ * i.e. router-SLOT order, matching ds4.c's layer_routed_moe_one_prealloc
+ * (ds4.c:11075-11077) and NOT layer_routed_moe_batch's expert-id order
+ * (ds4.c:11156-11160); see ds4-sycl-moe-reference.md section 4(a). */
+static void sycl_moe_sum(sycl::queue &q, float *out, const float *down,
+                         uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (n == 0u) return;
+    q.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> id) {
+         uint64_t gid = id[0];
+         uint32_t tok = (uint32_t)(gid / out_dim);
+         uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim);
+         float acc = 0.0f;
+         for (uint32_t e = 0; e < n_expert; e++) {
+             acc += down[((uint64_t)tok * n_expert + e) * out_dim + row];
+         }
+         out[gid] = acc;
+     }).wait_and_throw();
+}
+
+static void sycl_moe_sum_f16(sycl::queue &q, float *out, const uint16_t *down_h,
+                             uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    const uint64_t n = (uint64_t)n_tokens * out_dim;
+    if (n == 0u) return;
+    q.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> id) {
+         uint64_t gid = id[0];
+         uint32_t tok = (uint32_t)(gid / out_dim);
+         uint32_t row = (uint32_t)(gid - (uint64_t)tok * out_dim);
+         float acc = 0.0f;
+         for (uint32_t e = 0; e < n_expert; e++) {
+             acc += sycl_moe_f16_to_f32(down_h[((uint64_t)tok * n_expert + e) * out_dim + row]);
+         }
+         out[gid] = acc;
+     }).wait_and_throw();
+}
+
+static void sycl_moe_sum_f16x2(sycl::queue &q, float *out, const uint16_t *down_h,
+                               uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens) {
+    const uint32_t out_dim2 = out_dim >> 1u;
+    const uint64_t n2 = (uint64_t)n_tokens * out_dim2;
+    if (n2 == 0u) return;
+    q.parallel_for(sycl::range<1>((size_t)n2), [=](sycl::id<1> id) {
+         uint64_t gid = id[0];
+         uint32_t tok = (uint32_t)(gid / out_dim2);
+         uint32_t row = (uint32_t)((gid - (uint64_t)tok * out_dim2) << 1u);
+         float acc0 = 0.0f, acc1 = 0.0f;
+         for (uint32_t e = 0; e < n_expert; e++) {
+             const uint64_t off = ((uint64_t)tok * n_expert + e) * out_dim + row;
+             acc0 += sycl_moe_f16_to_f32(down_h[off]);
+             acc1 += sycl_moe_f16_to_f32(down_h[off + 1u]);
+         }
+         const uint64_t out_off = (uint64_t)tok * out_dim + row;
+         out[out_off] = acc0;
+         out[out_off + 1u] = acc1;
+     }).wait_and_throw();
+}
+
+/* Test-only: exercises sycl_moe_subgroup_sum<N> as a real N-wide
+ * sub-group reduction (one sub-group per group of N input values, lane 0
+ * writes the result), so a test can drive the 8-lane and 16-lane shapes
+ * directly without needing a full Q4_K kernel launch.  Two separate
+ * kernels because reqd_sub_group_size must be a compile-time constant. */
+static void sycl_moe_test_subgroup_sum8(sycl::queue &q, const float *in,
+                                        uint32_t n_groups, float *out) {
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<1>(sycl::range<1>((size_t)n_groups * 8u),
+                               sycl::range<1>(8u)),
+             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(8)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t gid = (uint32_t)it.get_group(0);
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 float v = in[gid * 8u + lane];
+                 v = sycl_moe_subgroup_sum<8>(sg, v);
+                 if (lane == 0u) out[gid] = v;
+             });
+     }).wait_and_throw();
+}
+
+static void sycl_moe_test_subgroup_sum16(sycl::queue &q, const float *in,
+                                         uint32_t n_groups, float *out) {
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<1>(sycl::range<1>((size_t)n_groups * 16u),
+                               sycl::range<1>(16u)),
+             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t gid = (uint32_t)it.get_group(0);
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 float v = in[gid * 16u + lane];
+                 v = sycl_moe_subgroup_sum<16>(sg, v);
+                 if (lane == 0u) out[gid] = v;
+             });
+     }).wait_and_throw();
+}
+
 }  // namespace
 
 /* ---- Test-only side doors ------------------------------------------
@@ -307,6 +511,123 @@ extern "C" int ds4_sycl_moe_test_sort(const int32_t *selected, uint32_t pair_cou
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_sort failed: %s\n", e.what());
+        return 0;
+    }
+}
+
+/* Runs sycl_moe_q8_k_quantize and copies every output block back as raw
+ * bytes: 4 (d, float) + 256 (qs, int8) + 32 (bsums, int16) = 292 bytes
+ * per block, n_rows * (in_dim/256) blocks, matching sycl_block_q8_K's
+ * layout exactly (verified padding-free: qs starts at offset 4, ends at
+ * offset 260, which already satisfies bsums' 2-byte alignment). */
+extern "C" int ds4_sycl_moe_test_q8_k_quantize(const float *x, uint32_t in_dim,
+                                               uint32_t n_rows,
+                                               uint8_t *out_bytes) {
+    if (g_devices.empty() || !x || !out_bytes || in_dim == 0u || n_rows == 0u ||
+        in_dim % kMoeQK != 0u) {
+        return 0;
+    }
+    try {
+        sycl::queue &q = ds4_sycl_current_queue();
+        const uint32_t xq_blocks = in_dim / kMoeQK;
+        const uint64_t n_blocks = (uint64_t)n_rows * xq_blocks;
+        uint64_t x_bytes = 0, out_elem_bytes = 0;
+        if (!sycl_u64_mul3_checked(n_rows, in_dim, sizeof(float), &x_bytes) ||
+            !sycl_u64_mul_checked(n_blocks, sizeof(sycl_block_q8_K), &out_elem_bytes)) {
+            return 0;
+        }
+
+        float *d_x = (float *)sycl::malloc_device((size_t)x_bytes, q);
+        sycl_block_q8_K *d_out =
+                (sycl_block_q8_K *)sycl::malloc_device((size_t)out_elem_bytes, q);
+        if (!d_x || !d_out) {
+            if (d_x) sycl::free(d_x, q);
+            if (d_out) sycl::free(d_out, q);
+            return 0;
+        }
+        sycl_device_scratch_guard x_guard(q, d_x);
+        sycl_device_scratch_guard out_guard(q, d_out);
+
+        q.memcpy(d_x, x, (size_t)x_bytes).wait_and_throw();
+        sycl_moe_q8_k_quantize(q, d_out, d_x, in_dim, n_rows);
+        q.memcpy(out_bytes, d_out, (size_t)out_elem_bytes).wait_and_throw();
+        return 1;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_q8_k_quantize failed: %s\n",
+                e.what());
+        return 0;
+    }
+}
+
+extern "C" int ds4_sycl_moe_test_subgroup_sum(int width, const float *in,
+                                              uint32_t n_groups, float *out) {
+    if (g_devices.empty() || !in || !out || (width != 8 && width != 16)) return 0;
+    try {
+        sycl::queue &q = ds4_sycl_current_queue();
+        const uint64_t n_in = (uint64_t)n_groups * (uint32_t)width;
+        float *d_in = (float *)sycl::malloc_device(n_in * sizeof(float), q);
+        float *d_out = (float *)sycl::malloc_device((size_t)n_groups * sizeof(float), q);
+        if (!d_in || !d_out) {
+            if (d_in) sycl::free(d_in, q);
+            if (d_out) sycl::free(d_out, q);
+            return 0;
+        }
+        sycl_device_scratch_guard in_guard(q, d_in);
+        sycl_device_scratch_guard out_guard(q, d_out);
+        q.memcpy(d_in, in, n_in * sizeof(float)).wait_and_throw();
+        if (width == 8) {
+            sycl_moe_test_subgroup_sum8(q, d_in, n_groups, d_out);
+        } else {
+            sycl_moe_test_subgroup_sum16(q, d_in, n_groups, d_out);
+        }
+        q.memcpy(out, d_out, (size_t)n_groups * sizeof(float)).wait_and_throw();
+        return 1;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_subgroup_sum failed: %s\n",
+                e.what());
+        return 0;
+    }
+}
+
+/* mode: 0 = f32 (moe_sum_kernel), 1 = f16 (moe_sum_f16_kernel),
+ * 2 = f16x2 (moe_sum_f16x2_kernel).  down/down_h is n_tokens*n_expert*out_dim
+ * elements; out is n_tokens*out_dim floats. */
+extern "C" int ds4_sycl_moe_test_sum(int mode, const void *down, uint32_t out_dim,
+                                     uint32_t n_expert, uint32_t n_tokens,
+                                     float *out) {
+    if (g_devices.empty() || !down || !out || out_dim == 0u || n_expert == 0u ||
+        n_tokens == 0u) {
+        return 0;
+    }
+    if (mode == 2 && (out_dim & 1u)) return 0;
+    try {
+        sycl::queue &q = ds4_sycl_current_queue();
+        const uint64_t n_down = (uint64_t)n_tokens * n_expert * out_dim;
+        const uint64_t n_out = (uint64_t)n_tokens * out_dim;
+        const size_t elem_size = mode == 0 ? sizeof(float) : sizeof(uint16_t);
+        void *d_down = sycl::malloc_device(n_down * elem_size, q);
+        float *d_out = (float *)sycl::malloc_device(n_out * sizeof(float), q);
+        if (!d_down || !d_out) {
+            if (d_down) sycl::free(d_down, q);
+            if (d_out) sycl::free(d_out, q);
+            return 0;
+        }
+        sycl_device_scratch_guard down_guard(q, d_down);
+        sycl_device_scratch_guard out_guard(q, d_out);
+        q.memcpy(d_down, down, n_down * elem_size).wait_and_throw();
+        if (mode == 0) {
+            sycl_moe_sum(q, d_out, (const float *)d_down, out_dim, n_expert, n_tokens);
+        } else if (mode == 1) {
+            sycl_moe_sum_f16(q, d_out, (const uint16_t *)d_down, out_dim, n_expert,
+                             n_tokens);
+        } else {
+            sycl_moe_sum_f16x2(q, d_out, (const uint16_t *)d_down, out_dim, n_expert,
+                               n_tokens);
+        }
+        q.memcpy(out, d_out, n_out * sizeof(float)).wait_and_throw();
+        return 1;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_sum failed: %s\n", e.what());
         return 0;
     }
 }

@@ -42,6 +42,250 @@ enum { SENTINEL = 0xABABABABu };
  * Runs the full counting sort (rocm/ds4_rocm_moe.cuh:1255-1316) plus the
  * expert-tile build (moe.cuh:1327-1350) and reads every intermediate
  * array back to the host. */
+/* Q8_K activation quantiser, rocm/ds4_rocm_moe.cuh:750-798.  out_bytes
+ * must hold n_rows*(in_dim/256) blocks of 292 bytes each (float d, int8
+ * qs[256], int16 bsums[16], no padding between fields). */
+extern int ds4_sycl_moe_test_q8_k_quantize(const float *x, uint32_t in_dim,
+                                           uint32_t n_rows, uint8_t *out_bytes);
+
+/* Sub-group sum reduction, rocm/ds4_rocm_moe.cuh:732-749 (half_warp_sum_f32
+ * for width 16, quarter_warp_sum_f32 for width 8).  in holds
+ * n_groups*width values; out[g] is the sum of in[g*width .. g*width+width). */
+extern int ds4_sycl_moe_test_subgroup_sum(int width, const float *in,
+                                          uint32_t n_groups, float *out);
+
+/* Weighted-sum-across-experts combine, rocm/ds4_rocm_moe.cuh:3877-3918.
+ * mode 0 = moe_sum_kernel (f32 down), 1 = moe_sum_f16_kernel (down is raw
+ * f16 bit patterns), 2 = moe_sum_f16x2_kernel (same, vectorised path). */
+extern int ds4_sycl_moe_test_sum(int mode, const void *down, uint32_t out_dim,
+                                 uint32_t n_expert, uint32_t n_tokens, float *out);
+
+enum { Q8_K_BLOCK_BYTES = 292 };
+
+/* d (float, offset 0), qs (int8[256], offset 4), bsums (int16[16], offset 260). */
+static float q8k_read_d(const uint8_t *blk) {
+    float v;
+    memcpy(&v, blk, sizeof(v));
+    return v;
+}
+static int8_t q8k_read_qs(const uint8_t *blk, int i) { return (int8_t)blk[4 + i]; }
+static int16_t q8k_read_bsum(const uint8_t *blk, int i) {
+    int16_t v;
+    memcpy(&v, blk + 260 + i * 2, sizeof(v));
+    return v;
+}
+
+/* Minimal round-to-nearest-even IEEE754 binary16 encoder, sufficient for
+ * the finite, moderate-magnitude test values used below (no inf/NaN/
+ * subnormal handling needed). */
+static uint16_t f32_to_f16_bits(float f) {
+    uint32_t x;
+    memcpy(&x, &f, sizeof(x));
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = (int32_t)((x >> 23) & 0xffu) - 127 + 15;
+    uint32_t mant = x & 0x7fffffu;
+    if (exp <= 0) return (uint16_t)sign; /* flush to zero, not needed by tests */
+    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
+    uint16_t rounded_mant = (uint16_t)(mant >> 13);
+    if (mant & 0x1000u) rounded_mant++; /* round to nearest, ties up */
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | rounded_mant);
+}
+
+static int test_q8_k_quantize(void) {
+    /* Two superblocks (in_dim = 512), two rows.  Row 0 has a wide dynamic
+     * range (values spanning several orders of magnitude plus a mix of
+     * signs); row 1 is entirely zero, exercising the amax==0 branch. */
+    enum { IN_DIM = 512, N_ROWS = 2, N_BLOCKS = IN_DIM / 256 };
+    float x[N_ROWS * IN_DIM];
+    for (int i = 0; i < IN_DIM; i++) {
+        float v = ((float)((i * 37) % 251) - 125.0f) * ((i % 5 == 0) ? 100.0f : 0.01f);
+        if (i % 7 == 0) v = -v;
+        x[i] = v;
+    }
+    for (int i = 0; i < IN_DIM; i++) x[IN_DIM + i] = 0.0f;
+
+    uint8_t *out = malloc((size_t)N_ROWS * N_BLOCKS * Q8_K_BLOCK_BYTES);
+    CHECK(ds4_sycl_moe_test_q8_k_quantize(x, IN_DIM, N_ROWS, out) != 0,
+          "q8_k_quantize: call failed");
+
+    for (int row = 0; row < N_ROWS; row++) {
+        for (int b = 0; b < N_BLOCKS; b++) {
+            const float *xr = x + row * IN_DIM + b * 256;
+            const uint8_t *blk = out + ((size_t)row * N_BLOCKS + b) * Q8_K_BLOCK_BYTES;
+            float amax = 0.0f, maxv = 0.0f;
+            for (int i = 0; i < 256; i++) {
+                if (fabsf(xr[i]) > amax) { amax = fabsf(xr[i]); maxv = xr[i]; }
+            }
+            char msg[96];
+            if (amax == 0.0f) {
+                CHECK(q8k_read_d(blk) == 0.0f, "q8_k_quantize: zero block d must be 0");
+                for (int i = 0; i < 256; i++) {
+                    CHECK(q8k_read_qs(blk, i) == 0, "q8_k_quantize: zero block qs must be 0");
+                }
+                for (int i = 0; i < 16; i++) {
+                    CHECK(q8k_read_bsum(blk, i) == 0, "q8_k_quantize: zero block bsums must be 0");
+                }
+                continue;
+            }
+            const float iscale = -127.0f / maxv;
+            const float d = q8k_read_d(blk);
+            CHECK_CLOSE(d, 1.0f / iscale, fabsf(d) * 1e-5f + 1e-8f, "q8_k_quantize: d mismatch");
+            for (int i = 0; i < 256; i++) {
+                int qv = (int)lrintf(iscale * xr[i]);
+                if (qv > 127) qv = 127;
+                if (qv < -128) qv = -128;
+                snprintf(msg, sizeof(msg), "q8_k_quantize: qs[%d] mismatch (row %d block %d)", i, row, b);
+                CHECK(q8k_read_qs(blk, i) == (int8_t)qv, msg);
+            }
+            for (int g = 0; g < 16; g++) {
+                int sum = 0;
+                for (int i = 0; i < 16; i++) sum += q8k_read_qs(blk, g * 16 + i);
+                snprintf(msg, sizeof(msg), "q8_k_quantize: bsums[%d] mismatch (row %d block %d)", g, row, b);
+                CHECK(q8k_read_bsum(blk, g) == (int16_t)sum, msg);
+            }
+        }
+    }
+    free(out);
+    fprintf(stderr, "  test_q8_k_quantize OK\n");
+    return 0;
+}
+
+/* A row length that is not a multiple of 256 must be rejected (the
+ * quantiser has no defined behaviour for a partial superblock; the
+ * dispatcher's own validation, ported in a later task, rejects this
+ * shape before ever reaching the kernel). */
+static int test_q8_k_quantize_rejects_partial_row(void) {
+    float x[300];
+    for (int i = 0; i < 300; i++) x[i] = (float)i;
+    uint8_t out[2 * Q8_K_BLOCK_BYTES];
+    CHECK(ds4_sycl_moe_test_q8_k_quantize(x, 300, 1, out) == 0,
+          "q8_k_quantize: non-multiple-of-256 in_dim must be rejected");
+    fprintf(stderr, "  test_q8_k_quantize_rejects_partial_row OK\n");
+    return 0;
+}
+
+/* Both reduction widths, with values chosen so a reduction over the wrong
+ * lane count gives a different answer: group g's values are
+ * (g*100 + lane + 1), so summing 8 of them differs from summing 16 by a
+ * large, easily-distinguished amount (not just "some upper lanes happen
+ * to be zero"). */
+static int test_subgroup_sum(void) {
+    const int widths[2] = {8, 16};
+    for (int wi = 0; wi < 2; wi++) {
+        const int width = widths[wi];
+        enum { N_GROUPS = 6 };
+        float in[6 * 16];
+        float want[6];
+        for (int g = 0; g < N_GROUPS; g++) {
+            float sum = 0.0f;
+            for (int lane = 0; lane < width; lane++) {
+                float v = (float)(g * 100 + lane + 1);
+                in[g * width + lane] = v;
+                sum += v;
+            }
+            want[g] = sum;
+        }
+        float got[N_GROUPS];
+        char msg[64];
+        snprintf(msg, sizeof(msg), "subgroup_sum: width %d call failed", width);
+        CHECK(ds4_sycl_moe_test_subgroup_sum(width, in, N_GROUPS, got) != 0, msg);
+        for (int g = 0; g < N_GROUPS; g++) {
+            snprintf(msg, sizeof(msg), "subgroup_sum: width %d group %d mismatch", width, g);
+            CHECK_CLOSE(got[g], want[g], 1e-3, msg);
+        }
+    }
+    fprintf(stderr, "  test_subgroup_sum OK\n");
+    return 0;
+}
+
+/* moe_sum_kernel accumulates strictly in ascending slot order
+ * (e = 0..n_expert-1 over the pair index tok*n_expert+e).  Floating point
+ * addition is not associative, so a wrong accumulation order (as
+ * layer_routed_moe_batch's expert-id ordering would produce against this
+ * kernel's own down-tensor layout, see ds4-sycl-moe-reference.md section
+ * 4(a)) is only actually distinguishable from the correct order when the
+ * terms have a wide enough dynamic range for reordering to change
+ * rounding.  Each row's four values are {+1e8, -1e8, v1, v2}: summed in
+ * ascending order the two huge terms cancel to exactly 0.0 before the
+ * small terms are added (result v1+v2); summed in any order that adds a
+ * small term between the two huge ones, the small term is lost to
+ * rounding against the ~1e8-magnitude partial sum instead. */
+static int test_sum_slot_order(void) {
+    enum { OUT_DIM = 6, N_EXPERT = 4, N_TOKENS = 3 };
+    float down[N_TOKENS * N_EXPERT * OUT_DIM];
+    float want[N_TOKENS * OUT_DIM];
+    for (int t = 0; t < N_TOKENS; t++) {
+        for (int row = 0; row < OUT_DIM; row++) {
+            const float v1 = (float)((t + 1) * 10 + row + 1);
+            const float v2 = (float)((t + 1) * 7 + row + 3);
+            const float vals[N_EXPERT] = {1.0e8f, -1.0e8f, v1, v2};
+            float sum = 0.0f;
+            for (int e = 0; e < N_EXPERT; e++) {
+                down[(t * N_EXPERT + e) * OUT_DIM + row] = vals[e];
+                sum += vals[e];
+            }
+            want[t * OUT_DIM + row] = sum;
+        }
+    }
+    float got[N_TOKENS * OUT_DIM];
+    CHECK(ds4_sycl_moe_test_sum(0, down, OUT_DIM, N_EXPERT, N_TOKENS, got) != 0,
+          "sum_slot_order: f32 call failed");
+    for (int i = 0; i < N_TOKENS * OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-2, "sum_slot_order: f32 value mismatch");
+    }
+
+    /* f16 and f16x2 variants: half precision cannot represent 1e8 (max
+     * finite value ~65504), so these use their own moderate-magnitude
+     * data instead of the cancellation values above; the order-sensitive
+     * property was already exercised by the f32 case.  OUT_DIM is even,
+     * so f16x2 is exercised too. */
+    uint16_t down_h[N_TOKENS * N_EXPERT * OUT_DIM];
+    float want_h[N_TOKENS * OUT_DIM];
+    for (int t = 0; t < N_TOKENS; t++) {
+        for (int row = 0; row < OUT_DIM; row++) {
+            for (int e = 0; e < N_EXPERT; e++) {
+                float v = (float)((t + 1) * 12 - e * 5 + row);
+                down_h[(t * N_EXPERT + e) * OUT_DIM + row] = f32_to_f16_bits(v);
+            }
+        }
+    }
+    /* want_h is derived from the actual half-rounded values (decoded by
+     * hand below) so the oracle matches what the kernel reads, not full
+     * f32 precision. */
+    for (int t = 0; t < N_TOKENS; t++) {
+        for (int row = 0; row < OUT_DIM; row++) {
+            float sum = 0.0f;
+            for (int e = 0; e < N_EXPERT; e++) {
+                uint16_t bits = down_h[(t * N_EXPERT + e) * OUT_DIM + row];
+                float f;
+                /* Round-trip through the same bit-cast the kernel uses;
+                 * a plain host-side half decode via ldexp/mantissa. */
+                int sign = (bits & 0x8000) ? -1 : 1;
+                int exp = (bits >> 10) & 0x1f;
+                int mant = bits & 0x3ff;
+                if (exp == 0) f = sign * (float)mant * (float)ldexp(1.0, -24);
+                else f = sign * (float)(1024 + mant) * (float)ldexp(1.0, exp - 25);
+                sum += f;
+            }
+            want_h[t * OUT_DIM + row] = sum;
+        }
+    }
+    float got_h[N_TOKENS * OUT_DIM];
+    CHECK(ds4_sycl_moe_test_sum(1, down_h, OUT_DIM, N_EXPERT, N_TOKENS, got_h) != 0,
+          "sum_slot_order: f16 call failed");
+    for (int i = 0; i < N_TOKENS * OUT_DIM; i++) {
+        CHECK_CLOSE(got_h[i], want_h[i], 1e-2, "sum_slot_order: f16 value mismatch");
+    }
+    float got_h2[N_TOKENS * OUT_DIM];
+    CHECK(ds4_sycl_moe_test_sum(2, down_h, OUT_DIM, N_EXPERT, N_TOKENS, got_h2) != 0,
+          "sum_slot_order: f16x2 call failed");
+    for (int i = 0; i < N_TOKENS * OUT_DIM; i++) {
+        CHECK_CLOSE(got_h2[i], want_h[i], 1e-2, "sum_slot_order: f16x2 value mismatch");
+    }
+    fprintf(stderr, "  test_sum_slot_order OK\n");
+    return 0;
+}
+
 extern int ds4_sycl_moe_test_sort(const int32_t *selected, uint32_t pair_count,
                                   uint32_t n_total_expert, uint32_t block_m,
                                   uint32_t *counts_out, uint32_t *offsets_out,
@@ -233,6 +477,10 @@ static int test_sort_tile_sizes(void) {
 
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
+    if (test_q8_k_quantize() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q8_k_quantize_rejects_partial_row() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_subgroup_sum() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_sum_slot_order() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_sort_basic() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_sort_tile_sizes() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
