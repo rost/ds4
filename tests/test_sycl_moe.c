@@ -83,6 +83,13 @@ extern int ds4_sycl_moe_test_mxfp4_down_sum6(
         const void *down_model, uint64_t down_expert_bytes, uint64_t down_row_bytes,
         uint32_t n_total_expert, const float *mid, uint32_t mid_dim, uint32_t n_tokens,
         const int32_t *selected, uint32_t n_expert, uint32_t out_dim, float *out);
+/* Mirror of ds4_sycl_moe_test_q2k_down_direct above, for iq2_iq2_path's
+ * down projection (sycl_moe_iq2_down_direct, down_type == 16). */
+extern int ds4_sycl_moe_test_iq2_down_direct(
+        const uint8_t *down_bytes, const uint8_t *midq_bytes, const int32_t *selected,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t midq_blocks,
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t n_total_expert,
+        float *out);
 
 enum { Q8_K_BLOCK_BYTES = 292 };
 
@@ -3010,6 +3017,78 @@ out:
     return rc;
 }
 
+/* Mirror of test_q2k_down_slot_order above, for sycl_moe_iq2_down_direct
+ * (down_type == 16, iq2_iq2_path's down projection): the identical gap a
+ * review found -- every ABI-level test that exercises this function
+ * (test_iq2iq2_decode, test_iq2iq2_batch) uses RM_N_EXPERT == 2, which is
+ * exactly commutative under float addition and so can never discriminate
+ * slot-order summation from any other order, the same blind spot
+ * test_q2k_down_slot_order exists to close for its sibling function.
+ *
+ * oracle_iq2_dot_block's output is exactly linear in the weight block's d
+ * (0.125f * xd * y->d * bsum, with no dmin term the way Q2_K's dot has),
+ * so the same three-slot construction works with no extra zeroing: every
+ * expert's down block shares one grid/sign/ls-nibble template (grid index
+ * 0, no sign flips, the maximum ls nibble, so every term is the same sign
+ * and magnitude rather than partially cancelling), and only d differs
+ * across the three slots that matter -- +60000, its exact bit-negation,
+ * and 0.001, the same ratio test_q2k_down_slot_order uses to guarantee
+ * the two extremes round away completely under any order that does not
+ * place them adjacently. */
+static int test_iq2_down_slot_order(void) {
+    enum { N_EXPERT = 3, N_TOTAL_EXPERT = 6 };
+    uint16_t qs[32];
+    for (uint32_t g = 0; g < 8u; g++) {
+        oracle_iq2_pack_ib32(&qs[g * 4u], 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 15u);
+    }
+
+    const uint16_t d_pos_bits = f32_to_f16_bits(60000.0f);
+    const uint16_t d_neg_bits = (uint16_t)(d_pos_bits ^ 0x8000u); /* exact negation */
+    const uint16_t d_small_bits = f32_to_f16_bits(0.001f);
+
+    uint8_t down[N_TOTAL_EXPERT][RM_IQ2_BLOCK_BYTES];
+    for (int e = 0; e < N_TOTAL_EXPERT; e++) oracle_iq2_pack_block(down[e], 1.0f, qs);
+    memcpy(down[0], &d_pos_bits, 2);   /* expert 0: +big */
+    memcpy(down[5], &d_neg_bits, 2);   /* expert 5: -big, exact negation */
+    memcpy(down[2], &d_small_bits, 2); /* expert 2: small */
+
+    float x[256];
+    for (int i = 0; i < 256; i++) x[i] = 10.0f; /* constant: no cross-element cancellation */
+    oracle_q8k_block xq;
+    oracle_q8k_quantize_block(x, &xq);
+
+    uint8_t midq_bytes[3 * Q8_K_BLOCK_BYTES];
+    for (int s = 0; s < N_EXPERT; s++) {
+        memcpy(midq_bytes + s * Q8_K_BLOCK_BYTES, &xq.d, 4);
+        memcpy(midq_bytes + s * Q8_K_BLOCK_BYTES + 4, xq.qs, 256);
+        memcpy(midq_bytes + s * Q8_K_BLOCK_BYTES + 260, xq.bsums, 32);
+    }
+
+    uint8_t down_flat[N_TOTAL_EXPERT * RM_IQ2_BLOCK_BYTES];
+    for (int e = 0; e < N_TOTAL_EXPERT; e++) {
+        memcpy(down_flat + e * RM_IQ2_BLOCK_BYTES, down[e], RM_IQ2_BLOCK_BYTES);
+    }
+
+    /* Slot order: expert 0 (+big), expert 5 (-big), expert 2 (small). */
+    int32_t sel[N_EXPERT] = {0, 5, 2};
+    float got = 0.0f;
+    CHECK(ds4_sycl_moe_test_iq2_down_direct(down_flat, midq_bytes, sel,
+                                            /*down_expert_bytes=*/RM_IQ2_BLOCK_BYTES,
+                                            /*down_row_bytes=*/RM_IQ2_BLOCK_BYTES, /*midq_blocks=*/1u,
+                                            /*out_dim=*/1u, N_EXPERT, /*n_tokens=*/1u,
+                                            N_TOTAL_EXPERT, &got) != 0,
+          "iq2_down_slot_order: call failed");
+
+    float want = oracle_iq2_dot_block(down[2], &xq);
+    CHECK(fabsf(want) > 1.0f, "iq2_down_slot_order: test data too weak (small term near zero)");
+    CHECK_CLOSE(got, want, fabs(want) * 1e-3 + 1e-4,
+               "iq2_down_slot_order: slot-order sum must equal the small term exactly, "
+               "not be swallowed by the two cancelling extremes");
+    fprintf(stderr, "  test_iq2_down_slot_order OK (got %.6g, want %.6g)\n", (double)got,
+            (double)want);
+    return 0;
+}
+
 int main(void) {
     /* MXFP4 format-oracle tests need no GPU; run them before ds4_gpu_init
      * so a failure here is never confused with a device-side problem. */
@@ -3083,6 +3162,7 @@ int main(void) {
         if (!mx_ok) { ds4_gpu_cleanup(); return 1; }
     }
 
+    if (test_iq2_down_slot_order() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_moe OK\n");
     return 0;

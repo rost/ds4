@@ -2245,6 +2245,21 @@ extern "C" int ds4_sycl_moe_test_mxfp4_down_sum6(
         const int32_t *selected, uint32_t n_expert, uint32_t out_dim, float *out) {
     if (g_devices.empty() || !down_model || !mid || !selected || !out || mid_dim == 0u ||
         mid_dim % kMoeQK != 0u || out_dim == 0u || n_tokens == 0u || n_expert == 0u ||
+/* Mirror of ds4_sycl_moe_test_q2k_down_direct above, for iq2_iq2_path's
+ * down projection (down_type == 16, sycl_moe_iq2_down_direct): the same
+ * "n_expert >= 2 in every ABI test cannot discriminate slot order"
+ * argument applies identically here, since sycl_moe_iq2_down_direct has
+ * the same `for slot in 0..n_expert: total += acc` accumulation shape.
+ * down_bytes holds n_total_expert rows of down_expert_bytes of
+ * sycl_block_iq2_xxs data (not Q2_K); everything else matches the Q2_K
+ * hook's addressing exactly. */
+extern "C" int ds4_sycl_moe_test_iq2_down_direct(
+        const uint8_t *down_bytes, const uint8_t *midq_bytes, const int32_t *selected,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t midq_blocks,
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t n_total_expert,
+        float *out) {
+    if (g_devices.empty() || !down_bytes || !midq_bytes || !selected || !out ||
+        out_dim == 0u || n_expert == 0u || n_tokens == 0u || midq_blocks == 0u ||
         n_total_expert == 0u) {
         return 0;
     }
@@ -2290,6 +2305,39 @@ extern "C" int ds4_sycl_moe_test_mxfp4_down_sum6(
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_mxfp4_down_sum6 failed: %s\n", e.what());
+        const uint64_t down_bytes_total = (uint64_t)n_total_expert * down_expert_bytes;
+        const uint64_t midq_count = (uint64_t)n_tokens * n_expert * midq_blocks;
+        const uint64_t midq_bytes_total = midq_count * sizeof(sycl_block_q8_K);
+        const uint64_t sel_bytes = (uint64_t)n_tokens * n_expert * sizeof(int32_t);
+        const uint64_t out_bytes = (uint64_t)n_tokens * out_dim * sizeof(float);
+
+        void *d_down = sycl::malloc_device((size_t)down_bytes_total, q);
+        void *d_midq = sycl::malloc_device((size_t)midq_bytes_total, q);
+        int32_t *d_sel = (int32_t *)sycl::malloc_device((size_t)sel_bytes, q);
+        float *d_out = (float *)sycl::malloc_device((size_t)out_bytes, q);
+        if (!d_down || !d_midq || !d_sel || !d_out) {
+            if (d_down) sycl::free(d_down, q);
+            if (d_midq) sycl::free(d_midq, q);
+            if (d_sel) sycl::free(d_sel, q);
+            if (d_out) sycl::free(d_out, q);
+            return 0;
+        }
+        sycl_device_scratch_guard down_guard(q, d_down);
+        sycl_device_scratch_guard midq_guard(q, d_midq);
+        sycl_device_scratch_guard sel_guard(q, d_sel);
+        sycl_device_scratch_guard out_guard(q, d_out);
+        q.memcpy(d_down, down_bytes, (size_t)down_bytes_total);
+        q.memcpy(d_midq, midq_bytes, (size_t)midq_bytes_total);
+        q.memcpy(d_sel, selected, (size_t)sel_bytes);
+        q.wait_and_throw();
+
+        sycl_moe_iq2_down_direct(q, d_out, (const char *)d_down, (const sycl_block_q8_K *)d_midq,
+                                 d_sel, down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
+                                 n_expert, n_tokens);
+        q.memcpy(out, d_out, (size_t)out_bytes).wait_and_throw();
+        return 1;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_iq2_down_direct failed: %s\n", e.what());
         return 0;
     }
 }
