@@ -16,11 +16,15 @@
  * tier 0 with g_n_gpus == 1) remain the model for return-value polarity
  * and argument validation, which do generalise. */
 
+#include "ds4_gpu_args.h"
 #include "ds4_sycl_common.hpp"
 
 /* ds4_gpu_config, ds4_gpu_ctx, DS4_MAX_GPUS, g_gpu, g_n_gpus and
  * g_gpu_peer_ok all come from ds4_gpu_mgpu.h, included by ds4_sycl.cpp
- * before this header. */
+ * before this header. ds4_gpu_args.h is included so the compiler checks
+ * ds4_gpu_args_probe_auto_cuda's definition below against its one
+ * canonical declaration rather than relying on extern "C" name matching
+ * alone. */
 
 /* The peer-access validation protocol, ported whole from
  * ds4_cuda.cu:2630-2760, not just its capability-query steps: the comment
@@ -221,6 +225,13 @@ static bool sycl_validate_peer_pair(int i, int j) {
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     if (g_initialised) ds4_gpu_cleanup();
+
+    /* See the identical call in ds4_gpu_init (ds4_sycl.cpp): must run
+     * before the first Level Zero enumeration, which ds4_sycl_enumerate_gpus
+     * immediately below performs. This entry point is a distinct process
+     * startup path from ds4_gpu_init, so it needs its own call rather than
+     * relying on that one having already run. */
+    setenv("ZES_ENABLE_SYSMAN", "1", 0);
 
     try {
         const std::vector<sycl::device> all = ds4_sycl_enumerate_gpus();
@@ -524,4 +535,106 @@ extern "C" int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier)
 
 extern "C" int ds4_gpu_tensor_wait_xdev_default(const ds4_gpu_tensor *src, int dst_tier) {
     return ds4_gpu_tensor_wait_xdev(src, dst_tier);
+}
+
+/* --gpu-vram auto CLI probe. Zero means success, nonzero on failure with
+ * errbuf populated (ds4_gpu_args.h:63, confirmed against ROCm's real
+ * implementation, ds4_rocm_compat.cu:144-186, which returns 1 on every one
+ * of its seven failure paths and 0 only at the very end). CUDA's own
+ * implementation (ds4_cuda.cu:25923-26018) is the structural reference for
+ * this entry specifically rather than ROCm's, because CUDA genuinely
+ * probes every visible device (or an explicit filter) while ROCm refuses
+ * more than one; this backend's init_multi now supports real multi-device
+ * use (above), so the CLI probe should not artificially restrict
+ * `auto` to one device the way ROCm's single-GPU backend must. */
+extern "C" int ds4_gpu_args_probe_auto_cuda(const int *device_filter, int filter_len,
+                                            ds4_gpu_config *out,
+                                            size_t safety_margin_bytes, char *errbuf,
+                                            size_t errbuflen) {
+    /* See the identical call and comment in ds4_gpu_init (ds4_sycl.cpp):
+     * must run before ds4_sycl_enumerate_gpus below performs the first
+     * Level Zero platform/device enumeration. CLI argument parsing runs
+     * before engine setup, so this is very often the actual first call
+     * into this backend, and ds4_gpu_init's own call is too late for it. */
+    setenv("ZES_ENABLE_SYSMAN", "1", 0);
+
+    if (!out) {
+        if (errbuf && errbuflen) snprintf(errbuf, errbuflen, "internal: NULL out");
+        return 1;
+    }
+    const std::vector<sycl::device> all = ds4_sycl_enumerate_gpus();
+    if (all.empty()) {
+        if (errbuf && errbuflen) snprintf(errbuf, errbuflen, "no SYCL GPU device found");
+        return 1;
+    }
+
+    int devs[DS4_MAX_GPUS];
+    int n_dev = 0;
+    if (device_filter && filter_len > 0) {
+        if (filter_len > DS4_MAX_GPUS) {
+            if (errbuf && errbuflen) {
+                snprintf(errbuf, errbuflen, "--gpu-devices filter has %d entries (max %d)",
+                         filter_len, DS4_MAX_GPUS);
+            }
+            return 1;
+        }
+        for (int i = 0; i < filter_len; i++) {
+            const int d = device_filter[i];
+            if (d < 0 || (size_t)d >= all.size()) {
+                if (errbuf && errbuflen) {
+                    snprintf(errbuf, errbuflen, "--gpu-devices: device %d not in 0..%zu",
+                             d, all.size() - 1);
+                }
+                return 1;
+            }
+            devs[n_dev++] = d;
+        }
+    } else {
+        const int cap = (int)(all.size() < (size_t)DS4_MAX_GPUS ? all.size()
+                                                                : (size_t)DS4_MAX_GPUS);
+        for (int i = 0; i < cap; i++) devs[n_dev++] = i;
+    }
+
+    memset(out, 0, sizeof(*out));
+    out->n_gpus = n_dev;
+    out->safety_margin_bytes = safety_margin_bytes;
+    for (int i = 0; i < n_dev; i++) {
+        uint64_t free_bytes = 0;
+        if (!sycl_zes_free_bytes(all[(size_t)devs[i]], &free_bytes)) {
+            if (errbuf && errbuflen) {
+                snprintf(errbuf, errbuflen,
+                         "Level Zero Sysman free-memory query failed on device %d; "
+                         "pass explicit --gpu-vram budgets instead",
+                         devs[i]);
+            }
+            return 1;
+        }
+        /* Reserve = max(2 GiB, 5% of free), matching CUDA's own auto-probe
+         * reserve exactly (ds4_cuda.cu:26009-26012): a fixed floor for
+         * small cards where 5% is under a GiB, scaling up on larger ones.
+         * Explicit --gpu-vram budgets do not go through this probe and are
+         * unaffected. */
+        const uint64_t reserve_floor = 2ull * 1024 * 1024 * 1024;
+        const uint64_t reserve_pct   = free_bytes / 20u;
+        const uint64_t reserve       = reserve_floor > reserve_pct ? reserve_floor
+                                                                    : reserve_pct;
+        out->device_indices[i] = devs[i];
+        out->vram_bytes[i]     = free_bytes > reserve ? (size_t)(free_bytes - reserve) : 0;
+    }
+    return 0;
+}
+
+/* Test-only: exposes the exact same Sysman free-memory reading the probe
+ * itself uses, so a test can verify the reserve subtraction (probe's
+ * `free_bytes - reserve`) actually ran, on the same accounting basis the
+ * probe uses. Sysman's own total (zes_mem_state_t::size) was found not to
+ * agree with sycl::info::device::global_mem_size on this hardware (see the
+ * report), so comparing against the SYCL device query is the wrong ground
+ * truth; this hook avoids that mismatch entirely by reusing the identical
+ * query. Not part of the ABI. */
+extern "C" uint64_t ds4_sycl_test_zes_free_bytes(int tier) {
+    if (tier < 0 || (size_t)tier >= g_devices.size()) return 0;
+    uint64_t free_bytes = 0;
+    if (!sycl_zes_free_bytes(g_devices[(size_t)tier].dev, &free_bytes)) return 0;
+    return free_bytes;
 }

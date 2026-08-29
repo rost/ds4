@@ -11,8 +11,14 @@
 
 #include "ds4_gpu_mgpu.h"
 
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+
+#include <level_zero/zes_api.h>
+
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <vector>
 
 static inline int sycl_u64_mul_checked(uint64_t a, uint64_t b, uint64_t *out) {
     if (!out) return 0;
@@ -189,6 +195,60 @@ static inline sycl_device_scratch_guard sycl_stage_host_bytes(
     sycl_device_scratch_guard guard(q, dptr);
     q.memcpy(dptr, host_ptr, (size_t)bytes).wait_and_throw();
     return guard;
+}
+
+/* Live free-VRAM query via Level Zero Sysman. Shared by
+ * ds4_gpu_args_probe_auto_cuda (sycl/ds4_sycl_mgpu.hpp, the --gpu-vram
+ * auto CLI path) and, as future work, sycl_stream_vram_ceiling's live
+ * upgrade (sycl/ds4_sycl_streaming.hpp): that function today substitutes a
+ * static ceiling (total device memory minus a fixed reserve) because this
+ * capability did not exist yet, per its own header comment.  Not rewired
+ * here: only the CLI path uses the helper here; wiring the streaming
+ * cache to it is future work.
+ *
+ * Requires ZES_ENABLE_SYSMAN to have been armed before the Level Zero
+ * loader's first platform/device enumeration (see the setenv calls in
+ * ds4_gpu_init and ds4_gpu_args_probe_auto_cuda); if Sysman was never
+ * armed, or the device is not on the Level Zero backend, every zes* call
+ * below fails and this returns false -- "no data available", not a
+ * fabricated zero, which a caller could otherwise mistake for a genuinely
+ * full device.  Sums every memory module Sysman reports rather than
+ * assuming exactly one, since the API is written for zero-or-more. */
+static inline bool sycl_zes_free_bytes(const sycl::device &d, uint64_t *out_free_bytes) {
+    if (!out_free_bytes) return false;
+    if (d.get_backend() != sycl::backend::ext_oneapi_level_zero) return false;
+    try {
+        const ze_device_handle_t ze_dev =
+            sycl::get_native<sycl::backend::ext_oneapi_level_zero>(d);
+        const zes_device_handle_t zes_dev = (zes_device_handle_t)ze_dev;
+
+        uint32_t count = 0;
+        if (zesDeviceEnumMemoryModules(zes_dev, &count, nullptr) != ZE_RESULT_SUCCESS ||
+            count == 0) {
+            return false;
+        }
+        std::vector<zes_mem_handle_t> mods(count);
+        if (zesDeviceEnumMemoryModules(zes_dev, &count, mods.data()) != ZE_RESULT_SUCCESS) {
+            return false;
+        }
+
+        uint64_t total_free = 0;
+        bool any = false;
+        for (uint32_t i = 0; i < count; i++) {
+            zes_mem_state_t st;
+            memset(&st, 0, sizeof(st));
+            st.stype = ZES_STRUCTURE_TYPE_MEM_STATE;
+            if (zesMemoryGetState(mods[i], &st) == ZE_RESULT_SUCCESS) {
+                total_free += st.free;
+                any = true;
+            }
+        }
+        if (!any) return false;
+        *out_free_bytes = total_free;
+        return true;
+    } catch (const sycl::exception &) {
+        return false;
+    }
 }
 
 /* Work-group tree reduction over one row: every lane in the group passes

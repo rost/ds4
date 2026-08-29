@@ -61,7 +61,10 @@ ICPX ?= $(shell command -v icpx 2>/dev/null || echo /opt/intel/oneapi/compiler/2
 SYCL_SRCS := $(wildcard sycl/*.hpp)
 SYCL_HOST_CFLAGS ?= -fPIC
 SYCL_CFLAGS ?= -fsycl -O3 -g -ffast-math -fno-finite-math-only -pthread -Wall -Wextra
-SYCL_LDLIBS ?= -fsycl -lm -pthread
+# -lze_loader resolves the Level Zero Sysman calls (zesDeviceEnumMemoryModules,
+# zesMemoryGetState) in sycl/ds4_sycl_common.hpp's free-VRAM helper, pulled
+# into every binary and test through ds4_sycl.o.
+SYCL_LDLIBS ?= -fsycl -lm -pthread -lze_loader
 DS4_LINK ?= $(NVCC) $(NVCCFLAGS)
 DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)

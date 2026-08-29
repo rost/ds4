@@ -5,7 +5,7 @@
  *
  * ds4's GPU ABI is NOT uniform on success polarity: most entries return
  * nonzero for success and 0 for failure, but a minority (notably
- * ds4_gpu_set_current_device[_fenced] and ds4_gpu_args_probe_auto_cuda)
+ * ds4_gpu_device_cache_tensors and _support_tensors, still stubbed below)
  * return 0 for success and nonzero for failure.  An "unavailable" stub
  * must always return ITS OWN entry's failure value, never a bare 0 or 1
  * picked without checking, or it silently reports success.  The two int
@@ -74,10 +74,6 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_suspend_expert_sharding)
 /* int returns. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add_xdev_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_argmax_tensor)
-/* ds4_gpu_args_probe_auto_cuda: 0 on success, nonzero on failure (see
- * ds4_gpu_args.h and ds4_rocm_compat.cu:146).  Failing loud here means
- * --gpu-vram auto gets a clean refusal instead of a zeroed config. */
-SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_args_probe_auto_cuda)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_decode_heads_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_decode_mixed_batch_heads_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_decode_raw_batch_heads_tensor)

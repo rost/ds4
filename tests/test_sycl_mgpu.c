@@ -14,6 +14,7 @@
  * file. */
 
 #include "ds4_gpu.h"
+#include "ds4_gpu_args.h"
 #include "ds4_gpu_mgpu.h"
 
 #include <stdio.h>
@@ -453,6 +454,100 @@ static int test_peer_bytecheck_pattern_variation_matters(void) {
     return 0;
 }
 
+/* ---- ds4_gpu_args_probe_auto_cuda (--gpu-vram auto) -------------------- */
+
+static int test_probe_auto_success(void) {
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    char errbuf[256];
+    errbuf[0] = '\0';
+
+    CHECK(ds4_gpu_args_probe_auto_cuda(NULL, 0, &cfg, 12345, errbuf,
+                                       sizeof(errbuf)) == 0,
+          "probe_auto success (0 = success)");
+    CHECK(cfg.n_gpus == 1, "probe_auto n_gpus on a one-device box");
+    CHECK(cfg.device_indices[0] == 0, "probe_auto device_indices[0]");
+    CHECK(cfg.vram_bytes[0] > 0, "probe_auto vram_bytes[0] positive");
+    CHECK(cfg.safety_margin_bytes == 12345, "probe_auto safety_margin_bytes passthrough");
+    return 0;
+}
+
+static int test_probe_auto_null_out(void) {
+    char errbuf[256];
+    errbuf[0] = '\0';
+    CHECK(ds4_gpu_args_probe_auto_cuda(NULL, 0, NULL, 0, errbuf, sizeof(errbuf)) != 0,
+          "probe_auto NULL out must fail");
+    CHECK(errbuf[0] != '\0', "probe_auto NULL out must populate errbuf");
+    return 0;
+}
+
+static int test_probe_auto_bad_filter(void) {
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    char errbuf[256];
+
+    int too_many[DS4_MAX_GPUS + 1];
+    memset(too_many, 0, sizeof(too_many));
+    CHECK(ds4_gpu_args_probe_auto_cuda(too_many, DS4_MAX_GPUS + 1, &cfg, 0, errbuf,
+                                       sizeof(errbuf)) != 0,
+          "probe_auto filter longer than DS4_MAX_GPUS must fail");
+
+    int out_of_range[1] = {99};
+    CHECK(ds4_gpu_args_probe_auto_cuda(out_of_range, 1, &cfg, 0, errbuf,
+                                       sizeof(errbuf)) != 0,
+          "probe_auto out-of-range filtered device must fail");
+
+    int valid[1] = {0};
+    CHECK(ds4_gpu_args_probe_auto_cuda(valid, 1, &cfg, 0, errbuf, sizeof(errbuf)) == 0,
+          "probe_auto valid single-device filter must succeed");
+    CHECK(cfg.n_gpus == 1 && cfg.device_indices[0] == 0,
+          "probe_auto valid filter populates the requested device");
+    return 0;
+}
+
+/* ds4_sycl_test_zes_free_bytes is a test-only hook (see
+ * sycl/ds4_sycl_mgpu.hpp) that runs the identical Sysman free-memory query
+ * the probe itself uses, so this test can confirm the reserve subtraction
+ * actually ran, compared on the SAME accounting basis the probe uses.
+ * Comparing against sycl::info::device::global_mem_size instead was tried
+ * and found unreliable: Sysman's own total (zes_mem_state_t::size, 17.08
+ * GB) does not agree with the SYCL device query (16.23 GB) on this
+ * hardware, an environment-specific discrepancy reported separately.
+ *
+ * Separately, a direct experiment (see the report) found Sysman's `free`
+ * reading does not respond to real allocation pressure on this A770 and
+ * driver combination at all: a held 2 GiB USM allocation left it
+ * completely unchanged. A before/after-allocation comparison (the more
+ * direct test that the probe reads free rather than total) would not
+ * discriminate anything on this box and is not attempted here. */
+extern uint64_t ds4_sycl_test_zes_free_bytes(int tier);
+
+static int test_probe_auto_reserve_applied(void) {
+    /* ds4_sycl_test_zes_free_bytes reads g_devices, which needs an init
+     * call first; ds4_gpu_args_probe_auto_cuda itself does not, since it
+     * enumerates independently. */
+    CHECK(ds4_gpu_init(), "ds4_gpu_init for reserve check");
+
+    const uint64_t free_bytes = ds4_sycl_test_zes_free_bytes(0);
+    CHECK(free_bytes > 0, "Sysman free-memory query must answer");
+
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    char errbuf[256];
+    CHECK(ds4_gpu_args_probe_auto_cuda(NULL, 0, &cfg, 0, errbuf, sizeof(errbuf)) == 0,
+          "probe_auto for reserve check");
+
+    CHECK(cfg.vram_bytes[0] < free_bytes,
+          "probe_auto budget must be below free device memory (a reserve was applied)");
+    const uint64_t reserve = free_bytes - cfg.vram_bytes[0];
+    const uint64_t two_gib = 2ull * 1024 * 1024 * 1024;
+    CHECK(reserve >= two_gib - (two_gib / 100),
+          "probe_auto reserve must be at least approximately the 2 GiB floor");
+
+    ds4_gpu_cleanup();
+    return 0;
+}
+
 int main(void) {
     if (test_init_multi_n1()) return 1;
     if (test_init_multi_rejects_bad_cfg()) return 1;
@@ -467,6 +562,10 @@ int main(void) {
     if (test_peer_bytecheck_baseline()) return 1;
     if (test_peer_bytecheck_corrupt_is_caught()) return 1;
     if (test_peer_bytecheck_pattern_variation_matters()) return 1;
+    if (test_probe_auto_success()) return 1;
+    if (test_probe_auto_null_out()) return 1;
+    if (test_probe_auto_bad_filter()) return 1;
+    if (test_probe_auto_reserve_applied()) return 1;
     fprintf(stderr, "test_sycl_mgpu: all tests passed\n");
     return 0;
 }

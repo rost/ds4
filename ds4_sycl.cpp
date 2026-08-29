@@ -214,6 +214,16 @@ sycl::queue &ds4_sycl_current_queue(void) {
 extern "C" int ds4_gpu_init(void) {
     if (g_initialised) return 1;
 
+    /* Must run before the first Level Zero platform/device enumeration
+     * (ds4_sycl_enumerate_gpus, immediately below): Sysman cannot be armed
+     * retroactively on an already-initialised Level Zero loader. Overwrite
+     * is 0 so an operator's own exported value is respected; harmless when
+     * Sysman is never queried (sycl_zes_free_bytes, ds4_sycl_common.hpp).
+     * ds4_gpu_args_probe_auto_cuda (sycl/ds4_sycl_mgpu.hpp) sets the same
+     * variable for the case where CLI argument parsing runs first and
+     * reaches Sysman before this function ever does. */
+    setenv("ZES_ENABLE_SYSMAN", "1", 0);
+
     try {
         std::vector<sycl::device> chosen = ds4_sycl_enumerate_gpus();
 
