@@ -449,6 +449,381 @@ static void sycl_moe_test_subgroup_sum16(sycl::queue &q, const float *in,
      }).wait_and_throw();
 }
 
+/* ---- Q4_K ------------------------------------------------------------
+ *
+ * cuda_block_q4_K, ds4_rocm.cu:72-77: 256-value superblock, half scale
+ * and min, 12 bytes of sub-block scale/min codes, 128 bytes of packed
+ * 4-bit codes.  Of the 9 Q4_K kernels and 4 device helpers inventoried
+ * by ds4-sycl-moe-reference.md, this header ports 5 kernels and 3 helpers;
+ * the other 4 are dead code
+ * (two kernels gated by a compile-time-constant expert_tile_m that is
+ * always 8, never taking their "else" branch; two more whose only
+ * possible caller condition -- a sorted-pairs allocation that succeeds
+ * while its co-allocated tile arrays fail -- is unreachable because both
+ * come from the same single allocation). */
+
+struct sycl_block_q4_K {
+    uint16_t d;
+    uint16_t dmin;
+    uint8_t  scales[12];
+    uint8_t  qs[128];
+};
+
+/* dev_q4_K_get_scale_min, moe.cuh:250-262. */
+static inline void sycl_dev_q4_k_get_scale_min(uint32_t j, const uint8_t *scales,
+                                               uint8_t *d_out, uint8_t *m_out) {
+    if (j < 4u) {
+        *d_out = scales[j] & 63u;
+        *m_out = scales[j + 4u] & 63u;
+    } else {
+        *d_out = (scales[j + 4u] & 0x0fu) | ((scales[j - 4u] >> 6u) << 4u);
+        *m_out = (scales[j + 4u] >> 4u) | ((scales[j] >> 6u) << 4u);
+    }
+}
+
+/* dev_dot_q4_32, moe.cuh:264-271: dots 32 packed 4-bit codes (shifted by
+ * `shift` out of their byte) against 32 signed Q8_K codes.  ROCm's form
+ * packs 4 bytes at a time through __dp4a; this is the unpacked
+ * equivalent, which is exact-integer arithmetic throughout so there is
+ * no associativity concern in grouping it differently. */
+static inline int32_t sycl_dev_dot_q4_32(const uint8_t *qs, const int8_t *q8, int shift) {
+    int32_t sum = 0;
+    for (uint32_t i = 0; i < 32u; i++) {
+        sum += (int32_t)((qs[i] >> shift) & 0x0f) * (int32_t)q8[i];
+    }
+    return sum;
+}
+
+/* dev_dot_q4_K_q8_K_block, moe.cuh:274-287: one Q4_K weight block dotted
+ * against one Q8_K activation block. */
+static inline float sycl_dev_dot_q4_k_q8_k_block(const sycl_block_q4_K *x,
+                                                 const sycl_block_q8_K *y) {
+    const float xd = sycl_moe_f16_to_f32(x->d);
+    const float xmin = sycl_moe_f16_to_f32(x->dmin);
+    int32_t isum = 0, summs = 0;
+    for (uint32_t j = 0; j < 8u; j++) {
+        uint8_t sc, m;
+        sycl_dev_q4_k_get_scale_min(j, x->scales, &sc, &m);
+        summs += (int32_t)m * (int32_t)(y->bsums[2u * j] + y->bsums[2u * j + 1u]);
+        const uint32_t byte_off = (j >> 1u) * 32u;
+        const int shift = (j & 1u) ? 4 : 0;
+        isum += (int32_t)sc * sycl_dev_dot_q4_32(x->qs + byte_off, y->qs + j * 32u, shift);
+    }
+    return y->d * xd * (float)isum - y->d * xmin * (float)summs;
+}
+
+/* dev_dot_q4_K_q8_K_block8, moe.cuh:588-617: the same dot product against
+ * up to 8 activation blocks at once, accumulating into acc[8], used by
+ * the expert-tile kernels which process 8 (token,slot) pairs per tile. */
+static inline void sycl_dev_dot_q4_k_q8_k_block8(
+        const sycl_block_q4_K *x, const sycl_block_q8_K *const ys[8],
+        uint32_t n, float acc[8]) {
+    const float xd = sycl_moe_f16_to_f32(x->d);
+    const float xmin = sycl_moe_f16_to_f32(x->dmin);
+    int32_t isum[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32_t summs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (uint32_t j = 0; j < 8u; j++) {
+        uint8_t sc, m;
+        sycl_dev_q4_k_get_scale_min(j, x->scales, &sc, &m);
+        const uint32_t byte_off = (j >> 1u) * 32u;
+        const int shift = (j & 1u) ? 4 : 0;
+        for (uint32_t p = 0; p < n; p++) {
+            if (!ys[p]) continue;
+            summs[p] += (int32_t)m * (int32_t)(ys[p]->bsums[2u * j] + ys[p]->bsums[2u * j + 1u]);
+            isum[p] += (int32_t)sc * sycl_dev_dot_q4_32(x->qs + byte_off, ys[p]->qs + j * 32u, shift);
+        }
+    }
+    for (uint32_t p = 0; p < n; p++) {
+        if (ys[p]) acc[p] += ys[p]->d * xd * (float)isum[p] - ys[p]->d * xmin * (float)summs[p];
+    }
+}
+
+/* moe_gate_up_mid_decode_q4K_qwarp32_kernel, moe.cuh:2713-2764.  Despite
+ * its "decode" name, ROCm reaches this for every n_tokens < 32 call
+ * (both true single-token decode and small untiled batches), not just
+ * n_tokens == 1: it is the "else" of "sorted_pairs" in the gate/up
+ * dispatch (moe_launch.cuh:1470-1488), and sorted_pairs is only built
+ * when n_tokens >= 32 for q4k_path (moe_launch.cuh:757).  8-lane
+ * sub-groups: 32 groups per 256-work-item work-group, 4 row-groups of 32
+ * rows each per pair. */
+static void sycl_moe_q4k_gate_up_mid_decode(
+        sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
+        const sycl_block_q8_K *xq, const int32_t *selected, const float *weights,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint32_t xq_blocks,
+        uint32_t expert_mid_dim, uint32_t n_expert, uint32_t pair_count, float clamp) {
+    const uint32_t row_blocks = (expert_mid_dim + 127u) / 128u;
+    if (row_blocks == 0u || pair_count == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, pair_count),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row_lane = (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t row_block = (uint32_t)it.get_group(0);
+                 const uint32_t pair = (uint32_t)it.get_group(1);
+                 const uint32_t tok = pair / n_expert;
+                 const uint32_t slot = pair - tok * n_expert;
+                 int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+                 if (expert_i < 0) expert_i = 0;
+                 const uint32_t expert = (uint32_t)expert_i;
+                 const sycl_block_q8_K *xqb = xq + (uint64_t)tok * xq_blocks;
+                 for (uint32_t rr = 0; rr < 4u; rr++) {
+                     const uint32_t row = row_block * 128u + row_lane + rr * 32u;
+                     if (row >= expert_mid_dim) continue;
+                     const sycl_block_q4_K *gr = (const sycl_block_q4_K *)
+                             (gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                     const sycl_block_q4_K *ur = (const sycl_block_q4_K *)
+                             (up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                     float gate = 0.0f, up = 0.0f;
+                     for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+                         gate += sycl_dev_dot_q4_k_q8_k_block(gr + b, xqb + b);
+                         up += sycl_dev_dot_q4_k_q8_k_block(ur + b, xqb + b);
+                     }
+                     gate = sycl_moe_subgroup_sum<8>(sg, gate);
+                     up = sycl_moe_subgroup_sum<8>(sg, up);
+                     if (lane == 0u) {
+                         if (clamp > 1.0e-6f) {
+                             if (gate > clamp) gate = clamp;
+                             if (up > clamp) up = clamp;
+                             if (up < -clamp) up = -clamp;
+                         }
+                         const uint64_t off = (uint64_t)pair * expert_mid_dim + row;
+                         mid_out[off] = (gate / (1.0f + sycl::exp(-gate))) * up *
+                                        weights[(uint64_t)tok * n_expert + slot];
+                     }
+                 }
+             });
+     }).wait_and_throw();
+}
+
+/* moe_gate_up_mid_q4K_expert_tile8_row32_kernel, moe.cuh:2021-2098:
+ * n_tokens >= 32 tiled batched path, block_m = 8 pairs per tile, 8-lane
+ * sub-groups.  Staging Q8_K activation blocks into local memory when
+ * xq_blocks <= 16 (matching ROCm's __shared__ sxq[8][16] cap) is what
+ * every kernel using this cluster's sort output does; this is the only
+ * one of the two tile kernels ported here (see the file header's
+ * dead-code note for why the tile4 sibling is not). */
+static void sycl_moe_q4k_gate_up_mid_tile8(
+        sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
+        const sycl_block_q8_K *xq, const uint32_t *sorted_pairs, const uint32_t *offsets,
+        const uint32_t *counts, const uint32_t *tile_total, const uint32_t *tile_experts,
+        const uint32_t *tile_starts, const float *weights, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint32_t xq_blocks, uint32_t expert_mid_dim,
+        uint32_t n_expert, uint32_t tile_capacity, float clamp) {
+    const uint32_t row_blocks = (expert_mid_dim + 31u) / 32u;
+    if (row_blocks == 0u || tile_capacity == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         sycl::local_accessor<sycl_block_q8_K, 2> sxq(sycl::range<2>(8, 16), h);
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, tile_capacity),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 const uint32_t tile = (uint32_t)it.get_group(1);
+                 if (tile >= *tile_total) return;
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u + (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t expert = tile_experts[tile];
+                 const uint32_t count = counts[expert];
+                 const uint32_t local_start = tile_starts[tile];
+
+                 uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 uint32_t tok[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 uint32_t slot[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 const sycl_block_q8_K *xqb[8] = {nullptr, nullptr, nullptr, nullptr,
+                                                  nullptr, nullptr, nullptr, nullptr};
+                 uint32_t np = 0;
+                 for (; np < 8u; np++) {
+                     const uint32_t local_pair = local_start + np;
+                     if (local_pair >= count) break;
+                     pair[np] = sorted_pairs[offsets[expert] + local_pair];
+                     tok[np] = pair[np] / n_expert;
+                     slot[np] = pair[np] - tok[np] * n_expert;
+                     xqb[np] = xq + (uint64_t)tok[np] * xq_blocks;
+                 }
+                 if (xq_blocks <= 16u) {
+                     const uint32_t lid = (uint32_t)it.get_local_id(0);
+                     for (uint32_t i = lid; i < np * xq_blocks; i += 256u) {
+                         const uint32_t p = i / xq_blocks;
+                         const uint32_t b = i - p * xq_blocks;
+                         sxq[p][b] = xqb[p][b];
+                     }
+                     it.barrier(sycl::access::fence_space::local_space);
+                     for (uint32_t p = 0; p < np; p++) xqb[p] = &sxq[p][0];
+                 }
+                 if (row >= expert_mid_dim) return;
+                 const sycl_block_q4_K *gr = (const sycl_block_q4_K *)
+                         (gate_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                 const sycl_block_q4_K *ur = (const sycl_block_q4_K *)
+                         (up_base + (uint64_t)expert * gate_expert_bytes + (uint64_t)row * gate_row_bytes);
+                 float gate[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 float up[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+                     sycl_dev_dot_q4_k_q8_k_block8(gr + b, xqb, np, gate);
+                     sycl_dev_dot_q4_k_q8_k_block8(ur + b, xqb, np, up);
+                 }
+                 for (uint32_t p = 0; p < np; p++) {
+                     gate[p] = sycl_moe_subgroup_sum<8>(sg, gate[p]);
+                     up[p] = sycl_moe_subgroup_sum<8>(sg, up[p]);
+                     if (lane == 0u) {
+                         float g = gate[p], u = up[p];
+                         if (clamp > 1.0e-6f) {
+                             if (g > clamp) g = clamp;
+                             if (u > clamp) u = clamp;
+                             if (u < -clamp) u = -clamp;
+                         }
+                         const uint64_t off = (uint64_t)pair[p] * expert_mid_dim + row;
+                         mid_out[off] = (g / (1.0f + sycl::exp(-g))) * u *
+                                        weights[(uint64_t)tok[p] * n_expert + slot[p]];
+                     }
+                 }
+             });
+     }).wait_and_throw();
+}
+
+/* moe_down_q4K_sum6_qwarp32_kernel, moe.cuh:3075-3099: n_tokens == 1
+ * only, writes the final combined output row directly (no separate
+ * moe_sum_kernel combine pass; this is the "direct_down_sum6" fast path,
+ * so called because it sums over up to DS4_ROCM_N_EXPERT_USED=6 slots in
+ * one kernel instead of writing per-slot rows for a later reduction). */
+static void sycl_moe_q4k_down_sum6(
+        sycl::queue &q, float *out, const char *down_base, const sycl_block_q8_K *midq,
+        const int32_t *selected, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t midq_blocks, uint32_t out_dim, uint32_t n_expert) {
+    const uint32_t row_blocks = (out_dim + 31u) / 32u;
+    if (row_blocks == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<1>(sycl::range<1>((size_t)row_blocks * 256u),
+                               sycl::range<1>(256u)),
+             [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(8)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u + (uint32_t)(it.get_local_id(0) >> 3);
+                 if (row >= out_dim) return;
+                 float total = 0.0f;
+                 for (uint32_t slot = 0; slot < 8u /* DS4_ROCM_N_EXPERT_USED */; slot++) {
+                     if (slot >= n_expert) continue;
+                     int32_t expert_i = selected[slot];
+                     if (expert_i < 0) expert_i = 0;
+                     const sycl_block_q4_K *wr = (const sycl_block_q4_K *)
+                             (down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+                     const sycl_block_q8_K *xqb = midq + (uint64_t)slot * midq_blocks;
+                     float acc = 0.0f;
+                     for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+                         acc += sycl_dev_dot_q4_k_q8_k_block(wr + b, xqb + b);
+                     }
+                     acc = sycl_moe_subgroup_sum<8>(sg, acc);
+                     if (lane == 0u) total += acc;
+                 }
+                 if (lane == 0u) out[row] = total;
+             });
+     }).wait_and_throw();
+}
+
+/* moe_down_q4K_qwarp32_kernel, moe.cuh:3162-3187: 1 < n_tokens < 32,
+ * untiled, one (token,slot) pair per blockIdx.y; writes per-pair rows
+ * into the down scratch tensor for a later moe_sum_kernel combine. */
+static void sycl_moe_q4k_down_untiled(
+        sycl::queue &q, float *down_out, const char *down_base, const sycl_block_q8_K *midq,
+        const int32_t *selected, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t midq_blocks, uint32_t out_dim, uint32_t n_expert, uint32_t pair_count) {
+    const uint32_t row_blocks = (out_dim + 31u) / 32u;
+    if (row_blocks == 0u || pair_count == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, pair_count),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u + (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t pair = (uint32_t)it.get_group(1);
+                 if (row >= out_dim) return;
+                 const uint32_t tok = pair / n_expert;
+                 const uint32_t slot = pair - tok * n_expert;
+                 int32_t expert_i = selected[(uint64_t)tok * n_expert + slot];
+                 if (expert_i < 0) expert_i = 0;
+                 const sycl_block_q4_K *wr = (const sycl_block_q4_K *)
+                         (down_base + (uint64_t)(uint32_t)expert_i * down_expert_bytes + (uint64_t)row * down_row_bytes);
+                 const sycl_block_q8_K *xqb = midq + (uint64_t)pair * midq_blocks;
+                 float acc = 0.0f;
+                 for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+                     acc += sycl_dev_dot_q4_k_q8_k_block(wr + b, xqb + b);
+                 }
+                 acc = sycl_moe_subgroup_sum<8>(sg, acc);
+                 if (lane == 0u) down_out[(uint64_t)pair * out_dim + row] = acc;
+             });
+     }).wait_and_throw();
+}
+
+/* moe_down_q4K_expert_tile8_row32_kernel, moe.cuh:3276-3330: n_tokens >=
+ * 32 tiled path.  ROCm's atomic_out flag (accumulate straight into `out`
+ * for very large batches, n_tokens >= 128) is deliberately not ported:
+ * it is a bitwise-nondeterministic performance optimisation (concurrent
+ * atomic float adds have no fixed order), not a distinct algorithm, and
+ * this port always writes per-pair rows into the down scratch tensor
+ * for a moe_sum_kernel combine instead -- a strict correctness superset
+ * at the cost of one extra kernel launch on batches this large. */
+static void sycl_moe_q4k_down_tile8(
+        sycl::queue &q, float *down_out, const char *down_base, const sycl_block_q8_K *midq,
+        const uint32_t *sorted_pairs, const uint32_t *offsets, const uint32_t *counts,
+        const uint32_t *tile_total, const uint32_t *tile_experts, const uint32_t *tile_starts,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t midq_blocks,
+        uint32_t out_dim, uint32_t tile_capacity) {
+    const uint32_t row_blocks = (out_dim + 31u) / 32u;
+    if (row_blocks == 0u || tile_capacity == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         sycl::local_accessor<sycl_block_q8_K, 2> sxq(sycl::range<2>(8, 8), h);
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, tile_capacity),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 const uint32_t tile = (uint32_t)it.get_group(1);
+                 if (tile >= *tile_total) return;
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u + (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t expert = tile_experts[tile];
+                 const uint32_t local_start = tile_starts[tile];
+
+                 uint32_t pair[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 const sycl_block_q8_K *xqb[8] = {nullptr, nullptr, nullptr, nullptr,
+                                                  nullptr, nullptr, nullptr, nullptr};
+                 uint32_t np = 0;
+                 for (; np < 8u; np++) {
+                     const uint32_t local_pair = local_start + np;
+                     if (local_pair >= counts[expert]) break;
+                     pair[np] = sorted_pairs[offsets[expert] + local_pair];
+                     xqb[np] = midq + (uint64_t)pair[np] * midq_blocks;
+                 }
+                 if (midq_blocks <= 8u) {
+                     const uint32_t lid = (uint32_t)it.get_local_id(0);
+                     for (uint32_t i = lid; i < np * midq_blocks; i += 256u) {
+                         const uint32_t p = i / midq_blocks;
+                         const uint32_t b = i - p * midq_blocks;
+                         sxq[p][b] = xqb[p][b];
+                     }
+                     it.barrier(sycl::access::fence_space::local_space);
+                     for (uint32_t p = 0; p < np; p++) xqb[p] = &sxq[p][0];
+                 }
+                 if (row >= out_dim) return;
+                 const sycl_block_q4_K *wr = (const sycl_block_q4_K *)
+                         (down_base + (uint64_t)expert * down_expert_bytes + (uint64_t)row * down_row_bytes);
+                 float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+                 for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+                     sycl_dev_dot_q4_k_q8_k_block8(wr + b, xqb, np, acc);
+                 }
+                 for (uint32_t p = 0; p < np; p++) {
+                     acc[p] = sycl_moe_subgroup_sum<8>(sg, acc[p]);
+                     if (lane == 0u) down_out[(uint64_t)pair[p] * out_dim + row] = acc[p];
+                 }
+             });
+     }).wait_and_throw();
+}
+
 }  // namespace
 
 /* ---- Test-only side doors ------------------------------------------

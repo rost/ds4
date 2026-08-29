@@ -127,6 +127,94 @@ static bool sycl_stream_selected_apply_lookup() { return false; }
  * are unreachable from any format implemented here regardless. */
 static bool sycl_routed_moe_full_table_is_cached() { return false; }
 
+/* ---- Q4_K format block -------------------------------------------
+ *
+ * Dispatch thresholds mirror moe_launch.cuh:750-777 restricted to the
+ * q4k_path-reachable branches (`use_sorted_pairs = n_tokens > 1u &&
+ * (!q4k_path || n_tokens >= 32u)`, which for q4k_path collapses to
+ * `n_tokens >= 32u`; `use_direct_down_sum6 = n_tokens == 1u` once
+ * `use_mxfp4_tiny_batch` is excluded and `n_expert <=
+ * DS4_ROCM_N_EXPERT_USED` is already guaranteed by build_plan). Three
+ * regimes:
+ *   n_tokens == 1:        decode gate/up, sum6 direct-to-out down.
+ *   1 < n_tokens < 32:    decode gate/up (same kernel, larger pair grid),
+ *                         untiled down into scratch, then moe_sum combine.
+ *   n_tokens >= 32:       sorted-pairs tile8 gate/up and down into
+ *                         scratch, then moe_sum combine. */
+static int sycl_routed_moe_q4k_dispatch(
+        sycl::queue &q, ds4_gpu_tensor *out, ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down, sycl_block_q8_K *xq, sycl_block_q8_K *midq,
+        const char *gate_w, const char *up_w, const char *down_w,
+        const ds4_gpu_tensor *weights, const ds4_gpu_tensor *selected,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t xq_blocks,
+        uint32_t midq_blocks, uint32_t expert_mid_dim, uint32_t out_dim,
+        uint32_t n_total_expert, uint32_t n_expert, uint32_t n_tokens,
+        uint32_t pair_count, float clamp) {
+    const int32_t *sel = (const int32_t *)selected->ptr;
+    const float *w = (const float *)weights->ptr;
+    float *out_ptr = (float *)out->ptr;
+    float *mid_ptr = (float *)mid->ptr;
+    float *down_ptr = (float *)down->ptr;
+
+    /* Gate/up, writing SwiGLU intermediates into the real `mid` tensor
+     * (moe_launch.cuh:1479-1495 for n_tokens < 32, :1256-1279 for
+     * n_tokens >= 32): the "decode" kernel handles every n_tokens < 32
+     * call, true decode included, since sorted_pairs (and therefore the
+     * tile8 kernel) is only built once n_tokens >= 32 for q4k_path. */
+    void *tile_scratch = nullptr;
+    sycl_moe_sorted_pairs sp;
+    const bool use_sorted_pairs = n_tokens >= 32u;
+    if (use_sorted_pairs) {
+        if (!sycl_moe_build_sorted_pairs(q, sel, pair_count, n_total_expert, 8u,
+                                         &tile_scratch, &sp)) {
+            return 0;
+        }
+    }
+    sycl_device_scratch_guard tile_guard(q, tile_scratch);
+
+    if (use_sorted_pairs) {
+        sycl_moe_q4k_gate_up_mid_tile8(q, mid_ptr, gate_w, up_w, xq, sp.sorted_pairs,
+                                       sp.offsets, sp.counts, sp.tile_total,
+                                       sp.tile_experts, sp.tile_starts, w,
+                                       gate_expert_bytes, gate_row_bytes, xq_blocks,
+                                       expert_mid_dim, n_expert, sp.tile_capacity,
+                                       clamp);
+    } else {
+        sycl_moe_q4k_gate_up_mid_decode(q, mid_ptr, gate_w, up_w, xq, sel, w,
+                                        gate_expert_bytes, gate_row_bytes,
+                                        xq_blocks, expert_mid_dim, n_expert,
+                                        pair_count, clamp);
+    }
+
+    /* Quantise the freshly computed mid activations, moe_launch.cuh:1630-1634
+     * (`q8_K_quantize_kernel<<<midq_grid,256>>>(midq, mid->ptr, expert_mid_dim,
+     * pair_count)`), unconditionally, before any down kernel runs.  Common
+     * to every n_tokens regime: gate/up always writes pair_count rows into
+     * `mid` regardless of which kernel above produced them. */
+    sycl_moe_q8_k_quantize(q, midq, mid_ptr, expert_mid_dim, pair_count);
+
+    if (n_tokens == 1u) {
+        /* Direct-to-out combine: no separate moe_sum_kernel pass. */
+        sycl_moe_q4k_down_sum6(q, out_ptr, down_w, midq, sel, down_expert_bytes,
+                               down_row_bytes, midq_blocks, out_dim, n_expert);
+        return 1;
+    }
+    if (use_sorted_pairs) {
+        sycl_moe_q4k_down_tile8(q, down_ptr, down_w, midq, sp.sorted_pairs,
+                                sp.offsets, sp.counts, sp.tile_total,
+                                sp.tile_experts, sp.tile_starts, down_expert_bytes,
+                                down_row_bytes, midq_blocks, out_dim,
+                                sp.tile_capacity);
+    } else {
+        sycl_moe_q4k_down_untiled(q, down_ptr, down_w, midq, sel, down_expert_bytes,
+                                  down_row_bytes, midq_blocks, out_dim, n_expert,
+                                  pair_count);
+    }
+    sycl_moe_sum(q, out_ptr, down_ptr, out_dim, n_expert, n_tokens);
+    return 1;
+}
+
 /* ---- The shared launcher ---------------------------------------------
  *
  * Mirrors routed_moe_launch (moe_launch.cuh:523-745 for the preamble
@@ -233,10 +321,48 @@ static int sycl_routed_moe_launch(
         sycl_moe_q8_k_quantize(q, xq, (const float *)x->ptr, expert_in_dim, n_tokens);
 
         if (plan.q4k_path) {
-            /* Q4_K's kernels land later in this same plan; until then this
-             * block fails cleanly rather than computing wrong output. */
-            (void)pair_count;
-            return 0;
+            /* gate_w/up_w/down_w point into model_map, ordinary host
+             * memory (or a plain host-backed test fixture): a SYCL
+             * kernel cannot dereference an arbitrary host pointer the
+             * way a CUDA/HIP kernel can under unified virtual
+             * addressing (spec section 6a's "known gap" is the general
+             * case of this; ROCm's own routed_moe_launch reads gate_w/
+             * up_w/down_w directly inside its kernels and gets away with
+             * it for exactly this reason).  Every other SYCL kernel in
+             * this backend that reads a model-mapped weight range copies
+             * it to device memory first (ds4_sycl_embedding.hpp's
+             * per-token row copy, ds4_sycl_compressor.hpp's APE-table
+             * staging); this is that same pattern applied to the whole
+             * per-layer gate/up/down table, since MoE does not know
+             * which experts `selected` names until the device has
+             * already computed it.  Real zero-copy residency is
+             * ds4_gpu_register_model_map_no_copy's job, still a stub in
+             * this backend; this is a correctness-first placeholder that
+             * costs a full-table copy on every call until that (or the
+             * resident streaming expert cache) is wired in here. */
+            void *gate_dev = sycl::malloc_device((size_t)plan.gate_bytes, q);
+            void *up_dev = sycl::malloc_device((size_t)plan.gate_bytes, q);
+            void *down_dev = sycl::malloc_device((size_t)plan.down_bytes, q);
+            if (!gate_dev || !up_dev || !down_dev) {
+                if (gate_dev) sycl::free(gate_dev, q);
+                if (up_dev) sycl::free(up_dev, q);
+                if (down_dev) sycl::free(down_dev, q);
+                return 0;
+            }
+            sycl_device_scratch_guard gate_guard(q, gate_dev);
+            sycl_device_scratch_guard up_guard(q, up_dev);
+            sycl_device_scratch_guard down_guard(q, down_dev);
+            q.memcpy(gate_dev, gate_w, (size_t)plan.gate_bytes);
+            q.memcpy(up_dev, up_w, (size_t)plan.gate_bytes);
+            q.memcpy(down_dev, down_w, (size_t)plan.down_bytes);
+            q.wait_and_throw();
+
+            return sycl_routed_moe_q4k_dispatch(
+                    q, out, mid, down, xq, midq, (const char *)gate_dev,
+                    (const char *)up_dev, (const char *)down_dev, weights,
+                    selected, gate_expert_bytes, gate_row_bytes, down_expert_bytes,
+                    down_row_bytes, xq_blocks, midq_blocks, expert_mid_dim, out_dim,
+                    n_total_expert, n_expert, n_tokens, pair_count, clamp);
         }
         if (plan.iq2_path || plan.iq2_iq2_path) {
             /* IQ2_XXS gate/up (+ Q2_K down for iq2_path); not yet implemented. */

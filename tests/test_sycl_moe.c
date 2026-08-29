@@ -92,6 +92,16 @@ static uint16_t f32_to_f16_bits(float f) {
     return (uint16_t)(sign | ((uint32_t)exp << 10) | rounded_mant);
 }
 
+/* Inverse of f32_to_f16_bits, matching the sycl::bit_cast<sycl::half>
+ * decode every SYCL-side f16 field in this subsystem uses. */
+static float f16_bits_to_f32(uint16_t bits) {
+    const int sign = (bits & 0x8000) ? -1 : 1;
+    const int exp = (bits >> 10) & 0x1f;
+    const int mant = bits & 0x3ff;
+    if (exp == 0) return (float)sign * (float)mant * (float)ldexp(1.0, -24);
+    return (float)sign * (float)(1024 + mant) * (float)ldexp(1.0, exp - 25);
+}
+
 static int test_q8_k_quantize(void) {
     /* Two superblocks (in_dim = 512), two rows.  Row 0 has a wide dynamic
      * range (values spanning several orders of magnitude plus a mix of
@@ -250,23 +260,15 @@ static int test_sum_slot_order(void) {
             }
         }
     }
-    /* want_h is derived from the actual half-rounded values (decoded by
-     * hand below) so the oracle matches what the kernel reads, not full
-     * f32 precision. */
+    /* want_h is derived from the actual half-rounded values (decoded via
+     * f16_bits_to_f32) so the oracle matches what the kernel reads, not
+     * full f32 precision. */
     for (int t = 0; t < N_TOKENS; t++) {
         for (int row = 0; row < OUT_DIM; row++) {
             float sum = 0.0f;
             for (int e = 0; e < N_EXPERT; e++) {
                 uint16_t bits = down_h[(t * N_EXPERT + e) * OUT_DIM + row];
-                float f;
-                /* Round-trip through the same bit-cast the kernel uses;
-                 * a plain host-side half decode via ldexp/mantissa. */
-                int sign = (bits & 0x8000) ? -1 : 1;
-                int exp = (bits >> 10) & 0x1f;
-                int mant = bits & 0x3ff;
-                if (exp == 0) f = sign * (float)mant * (float)ldexp(1.0, -24);
-                else f = sign * (float)(1024 + mant) * (float)ldexp(1.0, exp - 25);
-                sum += f;
+                sum += f16_bits_to_f32(bits);
             }
             want_h[t * OUT_DIM + row] = sum;
         }
@@ -633,13 +635,25 @@ static int test_dispatcher_mxfp4_not_yet_implemented(void) {
     return 0;
 }
 
+/* Uses a fully well-formed q4k_path call (the only format this test
+ * model's byte layout can actually complete successfully) so the add_in check is proven to fire
+ * before a call that would otherwise succeed, not merely alongside other
+ * validation failures that would return 0 anyway. */
 static int test_dispatcher_add_in_rejected(void) {
+    rm_model m = rm_build_model();
+    rm_tensors t = rm_build_tensors();
     ds4_gpu_tensor *dummy = ds4_gpu_tensor_alloc(64);
     CHECK(ds4_gpu_routed_moe_one_tensor(
-              NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-              0, 0, 0, NULL, NULL, 0, 0, 0.0f, NULL, dummy, 0, false) == 0,
+              t.out, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t.x,
+              dummy, 0u, false) == 0,
           "dispatcher: non-null add_in must fail on the decode entry");
     ds4_gpu_tensor_free(dummy);
+    rm_free_tensors(&t);
+    free(m.model);
     fprintf(stderr, "  test_dispatcher_add_in_rejected OK\n");
     return 0;
 }
@@ -710,6 +724,487 @@ static int test_dispatcher_build_plan_validation(void) {
     return 0;
 }
 
+/* ---- Q4_K: full decode/batch path against a scalar CPU oracle --------
+ *
+ * The oracle below reimplements ds4.c's layer_routed_moe_one_prealloc
+ * (ds4.c:10984-11092) for the Q4_K case: matvec_q4_k_experts_mid_prequant
+ * (ds4.c:8970-9014, via matvec_q4_k_mid_worker at :8946-8965) for gate/up,
+ * ds4_quantize_row_q8_K (ds4.c:3336-3370) to requantize the mid
+ * activations, and matvec_q4_k_experts_accum_prequant (ds4.c:9042-9078,
+ * via matvec_q4_k_accum_worker at :9024-9036) for the down projection,
+ * which sums over slots in ascending order inside one worker call -- the
+ * same order ds4-sycl-moe-reference.md section 4(a) attributes to a
+ * "for i in 0..n_expert_used" loop that this reading of ds4.c did not
+ * find; the loop shape differs from the research document's description
+ * but the property that matters (ascending slot-order summation,
+ * matching moe_sum_kernel) is the same either way, re-confirmed directly
+ * against ds4.c rather than trusted from the document.
+ *
+ * ds4.c's own scalar routines (ds4_vec_dot_q4_K_q8_K, ds4_quantize_row_q8_K)
+ * cannot be linked (static, and ds4.c is not part of this build), so
+ * every scalar helper below is an independent reimplementation, matching
+ * the precedent in tests/test_mxfp4_rocm.c and every oracle earlier in
+ * this file. */
+
+/* q4_k_get_scale_min, ds4.c:3514-3521 (and dev_q4_K_get_scale_min,
+ * moe.cuh:250-262): unpacks one of 8 6-bit (scale, min) pairs from a
+ * Q4_K block's 12-byte scales array. */
+static void oracle_q4k_get_scale_min(int j, const uint8_t *q, uint8_t *sc, uint8_t *m) {
+    if (j < 4) {
+        *sc = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *sc = (uint8_t)((q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    }
+}
+
+/* Inverse packing: given 8 (scale, min) pairs (each 0-63), produce the
+ * 12-byte scales array a real Q4_K block would carry.  Derived by
+ * inverting oracle_q4k_get_scale_min's two branches; self-checked by
+ * test_q4k_scale_pack_roundtrip below before being trusted for anything
+ * else. */
+static void oracle_q4k_pack_scales(uint8_t q[12], const uint8_t sc[8], const uint8_t m[8]) {
+    for (int i = 0; i < 4; i++) {
+        q[i]     = (uint8_t)((sc[i] & 0x3Fu) | ((uint32_t)(sc[i + 4] >> 4) << 6));
+        q[i + 4] = (uint8_t)((m[i] & 0x3Fu) | ((uint32_t)(m[i + 4] >> 4) << 6));
+        q[i + 8] = (uint8_t)((sc[i + 4] & 0x0Fu) | ((uint32_t)(m[i + 4] & 0x0Fu) << 4));
+    }
+}
+
+static int test_q4k_scale_pack_roundtrip(void) {
+    uint8_t sc[8], m[8], q[12];
+    for (int seed = 0; seed < 5; seed++) {
+        for (int j = 0; j < 8; j++) {
+            sc[j] = (uint8_t)((seed * 17 + j * 23) % 64);
+            m[j] = (uint8_t)((seed * 29 + j * 11) % 64);
+        }
+        oracle_q4k_pack_scales(q, sc, m);
+        for (int j = 0; j < 8; j++) {
+            uint8_t got_sc, got_m;
+            oracle_q4k_get_scale_min(j, q, &got_sc, &got_m);
+            char msg[80];
+            snprintf(msg, sizeof(msg), "scale_pack_roundtrip: seed %d j %d sc mismatch", seed, j);
+            CHECK(got_sc == sc[j], msg);
+            snprintf(msg, sizeof(msg), "scale_pack_roundtrip: seed %d j %d m mismatch", seed, j);
+            CHECK(got_m == m[j], msg);
+        }
+    }
+    fprintf(stderr, "  test_q4k_scale_pack_roundtrip OK\n");
+    return 0;
+}
+
+/* Packs one 144-byte cuda_block_q4_K (ds4_rocm.cu:72-77): d and dmin as
+ * f16 bits, 12 bytes of packed scale/min, 128 bytes of packed 4-bit
+ * codes (two sub-blocks share each 32-byte qs region, low nibble for the
+ * even sub-block, high nibble for the odd one, per moe.cuh:274-287's
+ * byte_off/shift math). */
+static void oracle_q4k_pack_block(uint8_t out[144], float d, float dmin,
+                                  const uint8_t sc[8], const uint8_t m[8],
+                                  const uint8_t nib[256]) {
+    uint16_t dh = f32_to_f16_bits(d);
+    uint16_t dminh = f32_to_f16_bits(dmin);
+    memcpy(out, &dh, 2);
+    memcpy(out + 2, &dminh, 2);
+    oracle_q4k_pack_scales(out + 4, sc, m);
+    uint8_t qs[128];
+    memset(qs, 0, sizeof(qs));
+    for (int j = 0; j < 8; j++) {
+        const int byte_off = (j >> 1) * 32;
+        const int shift = (j & 1) ? 4 : 0;
+        for (int k = 0; k < 32; k++) {
+            uint8_t v = nib[j * 32 + k] & 0x0Fu;
+            if (shift == 0) qs[byte_off + k] = (uint8_t)((qs[byte_off + k] & 0xF0u) | v);
+            else qs[byte_off + k] = (uint8_t)((qs[byte_off + k] & 0x0Fu) | (v << 4));
+        }
+    }
+    memcpy(out + 16, qs, 128);
+}
+
+typedef struct {
+    int8_t  qs[256];
+    int16_t bsums[16];
+    float   d;
+} oracle_q8k_block;
+
+/* ds4_quantize_row_q8_K / q8_K_quantize_kernel, both cited above
+ * test_q8_k_quantize: identical amax scan, iscale = -127/max, round to
+ * nearest, clamp to [-128,127], and 16-wide block sums. */
+static void oracle_q8k_quantize_block(const float *xr, oracle_q8k_block *out) {
+    float amax = 0.0f, maxv = 0.0f;
+    for (int i = 0; i < 256; i++) {
+        float ax = fabsf(xr[i]);
+        if (ax > amax) { amax = ax; maxv = xr[i]; }
+    }
+    if (amax == 0.0f) {
+        out->d = 0.0f;
+        memset(out->qs, 0, sizeof(out->qs));
+        memset(out->bsums, 0, sizeof(out->bsums));
+        return;
+    }
+    const float iscale = -127.0f / maxv;
+    for (int i = 0; i < 256; i++) {
+        int v = (int)lrintf(iscale * xr[i]);
+        if (v > 127) v = 127;
+        if (v < -128) v = -128;
+        out->qs[i] = (int8_t)v;
+    }
+    for (int g = 0; g < 16; g++) {
+        int sum = 0;
+        for (int i = 0; i < 16; i++) sum += out->qs[g * 16 + i];
+        out->bsums[g] = (int16_t)sum;
+    }
+    out->d = 1.0f / iscale;
+}
+
+/* dev_dot_q4_K_q8_K_block / ds4_vec_dot_q4_K_q8_K, single 256-value block. */
+static float oracle_q4k_dot_block(const uint8_t blk[144], const oracle_q8k_block *y) {
+    uint16_t dbits, dminbits;
+    memcpy(&dbits, blk, 2);
+    memcpy(&dminbits, blk + 2, 2);
+    const float xd = f16_bits_to_f32(dbits);
+    const float xmin = f16_bits_to_f32(dminbits);
+    const uint8_t *scales = blk + 4;
+    const uint8_t *qs = blk + 16;
+    int32_t isum = 0, summs = 0;
+    for (int j = 0; j < 8; j++) {
+        uint8_t sc, m;
+        oracle_q4k_get_scale_min(j, scales, &sc, &m);
+        summs += (int32_t)m * (int32_t)(y->bsums[2 * j] + y->bsums[2 * j + 1]);
+        const int byte_off = (j >> 1) * 32;
+        const int shift = (j & 1) ? 4 : 0;
+        int32_t block_sum = 0;
+        for (int i = 0; i < 32; i++) {
+            block_sum += (int32_t)((qs[byte_off + i] >> shift) & 0x0F) * (int32_t)y->qs[j * 32 + i];
+        }
+        isum += (int32_t)sc * block_sum;
+    }
+    return y->d * xd * (float)isum - y->d * xmin * (float)summs;
+}
+
+static float oracle_silu(float x) { return x / (1.0f + expf(-x)); }
+
+/* Deterministic per-(expert,row) weight-block generator with a
+ * non-linear interaction term (spec 6f: pure affine test data makes
+ * every element mutually proportional and hides scale-only bugs). */
+static void q4k_fill_row(uint8_t out[144], uint32_t phase, uint32_t expert, uint32_t row) {
+    uint8_t sc[8], m[8], nib[256];
+    for (int j = 0; j < 8; j++) {
+        sc[j] = (uint8_t)(1u + (phase * 5u + expert * 7u + row * 3u + (uint32_t)j * 5u) % 40u);
+        m[j] = (uint8_t)((phase * 3u + expert * 11u + row * 2u + (uint32_t)j * 13u) % 20u);
+    }
+    for (int k = 0; k < 256; k++) {
+        nib[k] = (uint8_t)((phase * 19u + expert * 13u + row * 17u + (uint32_t)k +
+                            (expert * row) % 5u + ((uint32_t)k * row) % 7u) % 16u);
+    }
+    const float d = 0.01f + 0.001f * (float)((phase + expert + row) % 7u);
+    const float dmin = 0.001f * (float)((phase + expert * 2u + row) % 5u);
+    oracle_q4k_pack_block(out, d, dmin, sc, m, nib);
+}
+
+static void q4k_fill_x_row(float *x, uint32_t in_dim, uint32_t tok) {
+    for (uint32_t k = 0; k < in_dim; k++) {
+        x[k] = 0.01f * (float)((int)((tok * 37u + k * 11u + (tok * k) % 13u + 5u) % 200u) - 100);
+    }
+}
+
+enum { Q4K_PHASE_GATE = 0, Q4K_PHASE_UP = 100, Q4K_PHASE_DOWN = 200 };
+
+/* Fills an rm_model's gate/up/down sections with q4k_fill_row blocks,
+ * one block per row (in_dim == 256 for gate/up, mid_dim == 256 for down,
+ * so xq_blocks == midq_blocks == 1 for every test in this section). */
+static void q4k_fill_model(rm_model *m, uint32_t n_total_expert, uint32_t mid_dim,
+                           uint32_t out_dim) {
+    for (uint32_t e = 0; e < n_total_expert; e++) {
+        for (uint32_t row = 0; row < mid_dim; row++) {
+            uint8_t blk[144];
+            q4k_fill_row(blk, Q4K_PHASE_GATE, e, row);
+            memcpy(m->model + m->gate_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
+                   blk, sizeof(blk));
+            q4k_fill_row(blk, Q4K_PHASE_UP, e, row);
+            memcpy(m->model + m->up_offset + e * m->gate_expert_bytes + (uint64_t)row * m->gate_row_bytes,
+                   blk, sizeof(blk));
+        }
+        for (uint32_t row = 0; row < out_dim; row++) {
+            uint8_t blk[144];
+            q4k_fill_row(blk, Q4K_PHASE_DOWN, e, row);
+            memcpy(m->model + m->down_offset + e * m->down_expert_bytes + (uint64_t)row * m->down_row_bytes,
+                   blk, sizeof(blk));
+        }
+    }
+}
+
+/* layer_routed_moe_one_prealloc for the Q4_K case, one token at a time. */
+static void oracle_q4k_one_token(const rm_model *m, uint32_t in_dim, uint32_t mid_dim,
+                                 uint32_t out_dim, uint32_t n_expert,
+                                 const int32_t *sel, const float *w, const float *x,
+                                 float clamp, float *out) {
+    (void)in_dim; /* == 256 assumed throughout (single Q8_K block per row) */
+    oracle_q8k_block xq;
+    oracle_q8k_quantize_block(x, &xq);
+
+    float *mid = malloc((size_t)n_expert * mid_dim * sizeof(float));
+    for (uint32_t s = 0; s < n_expert; s++) {
+        const uint32_t expert = (uint32_t)sel[s];
+        for (uint32_t row = 0; row < mid_dim; row++) {
+            const uint8_t *gate_blk = m->model + m->gate_offset + (uint64_t)expert * m->gate_expert_bytes +
+                                      (uint64_t)row * m->gate_row_bytes;
+            const uint8_t *up_blk = m->model + m->up_offset + (uint64_t)expert * m->gate_expert_bytes +
+                                    (uint64_t)row * m->gate_row_bytes;
+            float gate = oracle_q4k_dot_block(gate_blk, &xq);
+            float up = oracle_q4k_dot_block(up_blk, &xq);
+            if (clamp > 1.0e-6f) {
+                if (gate > clamp) gate = clamp;
+                if (up > clamp) up = clamp;
+                if (up < -clamp) up = -clamp;
+            }
+            mid[(size_t)s * mid_dim + row] = oracle_silu(gate) * up * w[s];
+        }
+    }
+
+    oracle_q8k_block *midq = malloc((size_t)n_expert * sizeof(oracle_q8k_block));
+    for (uint32_t s = 0; s < n_expert; s++) {
+        oracle_q8k_quantize_block(mid + (size_t)s * mid_dim, &midq[s]); /* mid_dim == 256 */
+    }
+
+    for (uint32_t row = 0; row < out_dim; row++) {
+        float acc = 0.0f;
+        for (uint32_t s = 0; s < n_expert; s++) { /* ascending slot order */
+            const uint32_t expert = (uint32_t)sel[s];
+            const uint8_t *down_blk = m->model + m->down_offset + (uint64_t)expert * m->down_expert_bytes +
+                                      (uint64_t)row * m->down_row_bytes;
+            acc += oracle_q4k_dot_block(down_blk, &midq[s]);
+        }
+        out[row] = acc;
+    }
+    free(mid);
+    free(midq);
+}
+
+static void q4k_fill_selected(int32_t *sel, float *w, uint32_t tok, uint32_t n_expert,
+                              uint32_t n_total_expert) {
+    for (uint32_t s = 0; s < n_expert; s++) {
+        sel[s] = (int32_t)((tok * 3u + s * 2u + 1u) % n_total_expert);
+        w[s] = 0.5f + 0.25f * (float)((tok + s) % 3u);
+    }
+}
+
+/* n_tokens == 1 (decode) against the per-token oracle, at tight tolerance. */
+static int test_q4k_decode(void) {
+    rm_model m = rm_build_model();
+    q4k_fill_model(&m, RM_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+    rm_tensors t = rm_build_tensors();
+
+    int32_t sel[RM_N_EXPERT];
+    float w[RM_N_EXPERT];
+    float x[RM_EXPERT_IN_DIM];
+    q4k_fill_selected(sel, w, /*tok=*/0, RM_N_EXPERT, RM_N_TOTAL_EXPERT);
+    q4k_fill_x_row(x, RM_EXPERT_IN_DIM, /*tok=*/0);
+    ds4_gpu_tensor_write(t.selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(t.weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(t.x, 0, x, sizeof(x));
+
+    CHECK(ds4_gpu_routed_moe_one_tensor(
+              t.out, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t.x,
+              /*add_in=*/NULL, /*layer_index=*/0u, /*force_resident=*/false) != 0,
+          "q4k_decode: call failed");
+
+    float want[RM_OUT_DIM];
+    oracle_q4k_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT,
+                         sel, w, x, 0.0f, want);
+    float got[RM_OUT_DIM];
+    ds4_gpu_tensor_read(t.out, 0, got, sizeof(got));
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], fabs(want[i]) * 1e-3 + 1e-4, "q4k_decode: value mismatch");
+    }
+
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_q4k_decode OK\n");
+    return 0;
+}
+
+/* Batched path against N ordered per-token oracle calls, for an n_tokens
+ * both below and at/above the sorted-pairs threshold (32), so both the
+ * untiled and tiled routes are exercised. */
+static int test_q4k_batch(uint32_t n_tokens) {
+    rm_model m = rm_build_model();
+    q4k_fill_model(&m, RM_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tokens * RM_EXPERT_IN_DIM * sizeof(float));
+
+    int32_t *sel = malloc((size_t)n_tokens * RM_N_EXPERT * sizeof(int32_t));
+    float *w = malloc((size_t)n_tokens * RM_N_EXPERT * sizeof(float));
+    float *xv = malloc((size_t)n_tokens * RM_EXPERT_IN_DIM * sizeof(float));
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        q4k_fill_selected(sel + (size_t)t * RM_N_EXPERT, w + (size_t)t * RM_N_EXPERT, t,
+                          RM_N_EXPERT, RM_N_TOTAL_EXPERT);
+        q4k_fill_x_row(xv + (size_t)t * RM_EXPERT_IN_DIM, RM_EXPERT_IN_DIM, t);
+    }
+    ds4_gpu_tensor_write(selected, 0, sel, (uint64_t)n_tokens * RM_N_EXPERT * sizeof(int32_t));
+    ds4_gpu_tensor_write(weights, 0, w, (uint64_t)n_tokens * RM_N_EXPERT * sizeof(float));
+    ds4_gpu_tensor_write(x, 0, xv, (uint64_t)n_tokens * RM_EXPERT_IN_DIM * sizeof(float));
+
+    bool mid_is_f16 = true;
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              out, gate, up, mid, down, m.model, m.model_size, m.gate_offset,
+              m.up_offset, m.down_offset, 12u, 12u, m.gate_expert_bytes,
+              m.gate_row_bytes, m.down_expert_bytes, m.down_row_bytes,
+              RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, selected, weights,
+              RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, x, /*layer_index=*/0u, n_tokens,
+              &mid_is_f16, /*force_resident=*/false) != 0,
+          "q4k_batch: call failed");
+    CHECK(mid_is_f16 == false, "q4k_batch: mid_is_f16 must be written false");
+
+    float *got = malloc((size_t)n_tokens * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor_read(out, 0, got, (uint64_t)n_tokens * RM_OUT_DIM * sizeof(float));
+
+    float want_row[RM_OUT_DIM];
+    for (uint32_t t = 0; t < n_tokens; t++) {
+        oracle_q4k_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_N_EXPERT,
+                             sel + (size_t)t * RM_N_EXPERT, w + (size_t)t * RM_N_EXPERT,
+                             xv + (size_t)t * RM_EXPERT_IN_DIM, 0.0f, want_row);
+        for (int i = 0; i < RM_OUT_DIM; i++) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "q4k_batch(n=%u): token %u value mismatch", n_tokens, t);
+            CHECK_CLOSE(got[(size_t)t * RM_OUT_DIM + i], want_row[i],
+                       fabs(want_row[i]) * 1e-3 + 1e-4, msg);
+        }
+    }
+
+    free(sel);
+    free(w);
+    free(xv);
+    free(got);
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(x);
+    free(m.model);
+    fprintf(stderr, "  test_q4k_batch(n_tokens=%u) OK\n", n_tokens);
+    return 0;
+}
+
+/* Differential check between the decode path (ds4_gpu_routed_moe_one_tensor,
+ * always n_tokens == 1) and the batch path (ds4_gpu_routed_moe_batch_tensor
+ * called with n_tokens == 1u): both dispatch to the same "decode" gate/up
+ * kernel and the same sum6 down kernel, so they must produce identical
+ * output on identical input.  This substitutes for a differential test
+ * against the F32 fallback path: that fallback turned out to hardcode
+ * IQ2_XXS/Q2_K weight-block casts, so it cannot validate
+ * Q4_K at all; comparing decode against batch on identical input is the
+ * cheapest available cross-check between two independently dispatched
+ * real code paths instead. */
+static int test_q4k_decode_matches_batch_of_one(void) {
+    rm_model m = rm_build_model();
+    q4k_fill_model(&m, RM_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+    rm_tensors t1 = rm_build_tensors();
+    rm_tensors t2 = rm_build_tensors();
+
+    int32_t sel[RM_N_EXPERT];
+    float w[RM_N_EXPERT];
+    float x[RM_EXPERT_IN_DIM];
+    q4k_fill_selected(sel, w, /*tok=*/2, RM_N_EXPERT, RM_N_TOTAL_EXPERT);
+    q4k_fill_x_row(x, RM_EXPERT_IN_DIM, /*tok=*/2);
+    ds4_gpu_tensor_write(t1.selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(t1.weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(t1.x, 0, x, sizeof(x));
+    ds4_gpu_tensor_write(t2.selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(t2.weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(t2.x, 0, x, sizeof(x));
+
+    CHECK(ds4_gpu_routed_moe_one_tensor(
+              t1.out, t1.gate, t1.up, t1.mid, t1.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t1.selected, t1.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t1.x,
+              NULL, 0u, false) != 0,
+          "decode_matches_batch: decode call failed");
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              t2.out, t2.gate, t2.up, t2.mid, t2.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t2.selected, t2.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t2.x,
+              0u, /*n_tokens=*/1u, NULL, false) != 0,
+          "decode_matches_batch: batch(n=1) call failed");
+
+    float got1[RM_OUT_DIM], got2[RM_OUT_DIM];
+    ds4_gpu_tensor_read(t1.out, 0, got1, sizeof(got1));
+    ds4_gpu_tensor_read(t2.out, 0, got2, sizeof(got2));
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        CHECK_CLOSE(got1[i], got2[i], fabs(got1[i]) * 1e-4 + 1e-5,
+                   "decode_matches_batch: decode vs batch(n=1) mismatch");
+    }
+
+    rm_free_tensors(&t1);
+    rm_free_tensors(&t2);
+    free(m.model);
+    fprintf(stderr, "  test_q4k_decode_matches_batch_of_one OK\n");
+    return 0;
+}
+
+/* The scratch-buffer-reuse precondition (moe_launch.cuh:746) failing must
+ * be a clean failure for Q4_K: ROCm's own
+ * fallback for this case cannot be reused (it hardcodes IQ2_XXS/Q2_K
+ * weight-block casts, wrong for Q4_K bytes). */
+static int test_q4k_scratch_precondition_failure(void) {
+    rm_model m = rm_build_model();
+    q4k_fill_model(&m, RM_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+
+    /* gate/down sized only for their literal F32 role, too small to also
+     * hold the Q8_K quantisation scratch this path needs. */
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(4);
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(4);
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_EXPERT_IN_DIM * sizeof(float));
+    int32_t sel[RM_N_TOKENS * RM_N_EXPERT] = {0, 1, 2, 3};
+    float w[RM_N_TOKENS * RM_N_EXPERT] = {1, 1, 1, 1};
+    ds4_gpu_tensor_write(selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(weights, 0, w, sizeof(w));
+
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              out, gate, up, mid, down, m.model, m.model_size, m.gate_offset,
+              m.up_offset, m.down_offset, 12u, 12u, m.gate_expert_bytes,
+              m.gate_row_bytes, m.down_expert_bytes, m.down_row_bytes,
+              RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, selected, weights,
+              RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, x, 0u, RM_N_TOKENS, NULL,
+              false) == 0,
+          "q4k_scratch_precondition: undersized gate/down must fail cleanly");
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(x);
+    free(m.model);
+    fprintf(stderr, "  test_q4k_scratch_precondition_failure OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_q8_k_quantize() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -726,6 +1221,12 @@ int main(void) {
     if (test_dispatcher_add_in_rejected() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_mid_is_f16_written_false() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_dispatcher_build_plan_validation() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_scale_pack_roundtrip() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_decode() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_batch(8u) != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_batch(40u) != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_decode_matches_batch_of_one() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_scratch_precondition_failure() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_moe OK\n");
     return 0;
