@@ -410,13 +410,19 @@ static bool ds4_backend_supports_ssd_streaming(ds4_backend backend) {
 
 static bool ds4_backend_supports_streaming_auto_cache(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
-#ifdef DS4_ROCM_BUILD
+#if defined(DS4_ROCM_BUILD) || defined(DS4_SYCL_BUILD)
     if (backend == DS4_BACKEND_CUDA) return true;
 #else
     (void)backend;
 #endif
     return false;
 }
+
+#ifdef DS4_TEST_HOOKS
+int ds4_test_backend_supports_streaming_auto_cache(int backend) {
+    return ds4_backend_supports_streaming_auto_cache((ds4_backend)backend) ? 1 : 0;
+}
+#endif
 
 static bool ds4_backend_supports_glm_streaming_full_layers(ds4_backend backend) {
     if (backend == DS4_BACKEND_METAL) return true;
@@ -55577,6 +55583,49 @@ static bool ds4_engine_configure_streaming_auto_cache(ds4_engine *e) {
         fprintf(stderr,
                 "ds4:   note: non-routed weights already fill the 80%% target; keeping a one-expert cache\n");
     }
+#ifdef DS4_SYCL_BUILD
+    /* Multi-tier: size and apply every device's OWN cache here, since the
+     * legacy single-tier call site (ds4_engine_create's "Single-tier path"
+     * branch, which applies e->ssd_streaming_cache_experts via
+     * ds4_gpu_set_streaming_expert_cache_budget) is never reached from the
+     * multi-tier engine-creation branch. Each tier gets its own plan from
+     * its own recommended working set (ds4_gpu_recommended_working_set_size_on),
+     * subtracting the same non-routed/per-expert/max-experts figures
+     * computed once above: those figures come from the model's weights,
+     * not from any one device, so they do not vary per tier the way the
+     * working-set recommendation does. e->ssd_streaming_cache_experts and
+     * _bytes above already hold tier 0's own plan (computed identically,
+     * from the same "recommended" this function measured at its top); this
+     * loop applies it to every tier's real cache, tier 0 included. */
+    if (e->gpu_cfg.n_gpus > 1) {
+        for (int t = 0; t < e->gpu_cfg.n_gpus; t++) {
+            const uint64_t tier_recommended =
+                    ds4_gpu_recommended_working_set_size_on(t);
+            if (tier_recommended == 0) {
+                fprintf(stderr,
+                        "ds4:   tier %d working set unavailable; leaving its "
+                        "expert cache unconfigured\n", t);
+                continue;
+            }
+            ds4_ssd_cache_plan tier_plan;
+            if (!ds4_ssd_auto_cache_plan(tier_recommended, non_routed_bytes,
+                                         per_expert_bytes, max_model_experts,
+                                         &tier_plan)) {
+                fprintf(stderr,
+                        "ds4:   tier %d could not compute a valid cache "
+                        "budget; leaving it unconfigured\n", t);
+                continue;
+            }
+            ds4_gpu_set_streaming_expert_cache_budget_on(t, tier_plan.cache_experts);
+            fprintf(stderr,
+                    "ds4:   tier %d: %.2f GiB working set -> %u experts "
+                    "(%.2f GiB)\n",
+                    t, (double)tier_recommended / 1073741824.0,
+                    tier_plan.cache_experts,
+                    (double)tier_plan.effective_cache_bytes / 1073741824.0);
+        }
+    }
+#endif
     return true;
 #endif
 }
@@ -56668,6 +56717,51 @@ static int engine_classify_multi_tier(ds4_engine *e, const ds4_gpu_config *cfg) 
     return 0;
 }
 
+/* Whether SSD streaming combined with multi-tier GPU placement must be
+ * refused. The combination is dangerous in general: every backend before
+ * this one kept a single global streaming expert cache (spec section 5),
+ * so seeding an expert while tier 1 is current and then reading it back
+ * while tier 0 is current would silently read the wrong device's memory
+ * (or, if the cache is not device-addressed at all, a stale value from
+ * whichever tier last wrote it). Two things narrow that down:
+ *
+ * 1. Only SYCL gives every tier its own resident cache. Metal,
+ *    plain CUDA and ROCm still keep one global cache, so for them the
+ *    combination remains unconditionally unsafe and stays refused exactly
+ *    as it did before SYCL's per-tier cache existed.
+ * 2. Even on SYCL, a placement that spills any layer to the CPU tier has
+ *    no streaming path for CPU-resident weights: streaming addresses
+ *    GPU-resident experts only. That part of the original refusal is
+ *    still real and stays refused; only the GPU-only case is admitted. */
+static bool engine_ssd_streaming_multi_tier_blocked(const ds4_engine *e) {
+#ifdef DS4_SYCL_BUILD
+    for (int i = 0; i < e->n_placement_entries; i++) {
+        if (e->placement[i] == DS4_LAYER_PACK_CPU) return true;
+    }
+    return false;
+#else
+    (void)e;
+    return true;
+#endif
+}
+
+#ifdef DS4_TEST_HOOKS
+/* Exercises engine_ssd_streaming_multi_tier_blocked directly against a
+ * hand-supplied placement, without needing a real packer run or GPU
+ * config: the predicate only ever reads e->n_placement_entries and
+ * e->placement[]. */
+int ds4_test_ssd_streaming_multi_tier_blocked(const int *placement,
+                                              int        n_placement_entries) {
+    ds4_engine eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.n_placement_entries = n_placement_entries;
+    for (int i = 0; i < n_placement_entries && i < (int)(DS4_MAX_LAYER + 2); i++) {
+        eng.placement[i] = placement[i];
+    }
+    return engine_ssd_streaming_multi_tier_blocked(&eng) ? 1 : 0;
+}
+#endif
+
 #ifndef DS4_NO_GPU
 static int engine_append_device_cache_span(
         ds4_tensor_range **per_dev_ranges,
@@ -57266,6 +57360,49 @@ int ds4_test_classify_multi_tier_with_ctx_cuda_tp(
             tensors, n_tensors, cfg, placement_ctx_hint, true, placement_out,
             out_multi_tier, out_n_entries);
 }
+
+#ifndef DS4_NO_GPU
+/* Exercises ds4_engine_configure_streaming_auto_cache's per-tier loop
+ * directly, bypassing engine_classify_multi_tier and the real packer
+ * entirely: the loop only reads e->gpu_cfg.n_gpus, e->weights and
+ * e->ssd_streaming*, none of which the packer computes. The caller is
+ * responsible for a real ds4_gpu_init_multi(n_gpus) call beforehand (the
+ * loop calls ds4_gpu_recommended_working_set_size_on, which needs live
+ * devices) and for reading each tier's applied budget back through
+ * ds4_gpu_stream_expert_cache_configured_count_on afterward -- this hook
+ * only runs the configure step and reports whether it succeeded. Builds
+ * one routed-expert layer (layer 0) with valid, non-degenerate Q8_0 dims
+ * so ds4_streaming_routed_expert_bytes and
+ * ds4_streaming_cacheable_expert_count both succeed, plus a tiny
+ * attn_norm tensor: weights_streaming_non_routed_bytes fails outright on
+ * a layer with routed-expert tensors and nothing else (a real model never
+ * has that shape), so at least one non-routed, non-uniform-gated field
+ * has to be present too. */
+int ds4_test_configure_streaming_auto_cache_multi_tier(int n_gpus) {
+    ds4_engine eng;
+    memset(&eng, 0, sizeof(eng));
+    eng.backend = DS4_BACKEND_CUDA;
+    eng.ssd_streaming = true;
+    eng.gpu_cfg.n_gpus = n_gpus;
+
+    ds4_tensor gate, up, down, attn_norm;
+    memset(&gate, 0, sizeof(gate));
+    memset(&up, 0, sizeof(up));
+    memset(&down, 0, sizeof(down));
+    memset(&attn_norm, 0, sizeof(attn_norm));
+    gate.type = up.type = down.type = DS4_TENSOR_Q8_0;
+    gate.ndim = up.ndim = down.ndim = 2;
+    gate.dim[0] = up.dim[0] = down.dim[0] = 32;
+    gate.dim[1] = up.dim[1] = down.dim[1] = 8;
+    attn_norm.bytes = 4096;
+    eng.weights.layer[0].ffn_gate_exps = &gate;
+    eng.weights.layer[0].ffn_up_exps = &up;
+    eng.weights.layer[0].ffn_down_exps = &down;
+    eng.weights.layer[0].attn_norm = &attn_norm;
+
+    return ds4_engine_configure_streaming_auto_cache(&eng) ? 1 : 0;
+}
+#endif
 
 void ds4_test_seed_compress_ratios(void) {
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
@@ -57867,7 +58004,8 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    if (e->ssd_streaming && e->multi_tier) {
+    if (e->ssd_streaming && e->multi_tier &&
+        engine_ssd_streaming_multi_tier_blocked(e)) {
         fprintf(stderr,
                 "ds4: --ssd-streaming is not compatible with multi-GPU placement\n");
         ds4_engine_close(e);
@@ -58070,6 +58208,50 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 *out = NULL;
                 return 1;
             }
+#ifdef DS4_SYCL_BUILD
+            /* SSD streaming + multi-tier GPU-only placement: the refusal
+             * above only narrows for SYCL when no layer spills to CPU, so
+             * e->ssd_streaming can genuinely be true by this point. Metal,
+             * plain CUDA and ROCm never reach this line with
+             * e->ssd_streaming true (their refusal stays unconditional),
+             * so this whole block is unreachable dead code for them; kept
+             * behind the same build guard as every other SYCL-only
+             * addition in this function regardless, for the same reason
+             * the refusal narrowing itself is guarded. */
+            if (e->ssd_streaming) {
+                ds4_gpu_set_ssd_streaming(e->ssd_streaming);
+                const bool manual_budget_given =
+                    e->ssd_streaming_cache_experts != 0 ||
+                    e->ssd_streaming_cache_bytes != 0;
+                if (!ds4_engine_configure_streaming_auto_cache(e)) {
+                    ds4_engine_close(e);
+                    *out = NULL;
+                    return 1;
+                }
+                if (manual_budget_given) {
+                    /* Manual budgets (--ssd-streaming-cache-experts) apply
+                     * the same configured value to every tier uniformly:
+                     * per-tier manual tuning is not implemented here
+                     * (spec section 5 only asks for the auto-cache loop).
+                     * Auto mode already sized and applied every tier's own
+                     * budget inside ds4_engine_configure_streaming_auto_cache
+                     * above; manual_budget_given was captured before that
+                     * call so this branch cannot also fire for auto mode. */
+                    for (int t = 0; t < e->gpu_cfg.n_gpus; t++) {
+                        ds4_gpu_set_streaming_expert_cache_budget_on(
+                                t, e->ssd_streaming_cache_experts);
+                    }
+                }
+                uint64_t slab_expert_bytes = 0;
+                if (ds4_streaming_routed_expert_bytes(&e->weights,
+                                                      &slab_expert_bytes)) {
+                    for (int t = 0; t < e->gpu_cfg.n_gpus; t++) {
+                        ds4_gpu_set_streaming_expert_cache_expert_bytes_on(
+                                t, slab_expert_bytes);
+                    }
+                }
+            }
+#endif
             /* GPU-only multi-tier execution is now wired up
              * (B2-B6: per-tier graph allocation, dispatch loops, boundary
              * copies). CPU-spill placements were rejected by
