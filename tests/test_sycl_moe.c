@@ -61,6 +61,16 @@ extern int ds4_sycl_moe_test_subgroup_sum(int width, const float *in,
 extern int ds4_sycl_moe_test_sum(int mode, const void *down, uint32_t out_dim,
                                  uint32_t n_expert, uint32_t n_tokens, float *out);
 
+/* Drives sycl_moe_q2k_down_direct (the untagged-family Q2_K down kernel,
+ * rocm/ds4_rocm_moe.cuh:2909-2936, generalised over n_tokens) directly,
+ * for the slot-order regression test below; every ABI-level test in this
+ * file uses n_expert == 2, which cannot discriminate summation order. */
+extern int ds4_sycl_moe_test_q2k_down_direct(
+        const uint8_t *down_bytes, const uint8_t *midq_bytes, const int32_t *selected,
+        uint64_t down_expert_bytes, uint64_t down_row_bytes, uint32_t midq_blocks,
+        uint32_t out_dim, uint32_t n_expert, uint32_t n_tokens, uint32_t n_total_expert,
+        float *out);
+
 enum { Q8_K_BLOCK_BYTES = 292 };
 
 /* d (float, offset 0), qs (int8[256], offset 4), bsums (int16[16], offset 260). */
@@ -1883,6 +1893,89 @@ static int test_q2k_decode_matches_batch_of_one(void) {
  * them deliberately, so they are alike by design here, not by an
  * ablation that failed to discriminate. */
 
+/* The down projection's central property, tested directly rather than through the ABI:
+ * the down projection sums in ascending SLOT order, matching
+ * moe_sum_kernel and layer_routed_moe_one_prealloc, not ascending
+ * expert-id order (ds4-sycl-moe-reference.md section 4(a)). Every ABI
+ * test above uses RM_N_EXPERT == 2, and IEEE754 addition of exactly two
+ * values is exactly commutative (a+b bit-equals b+a always), so no
+ * 2-term test can ever catch an order bug. This test uses 3 slots
+ * engineered so two extreme, exactly-opposite-sign values cancel to
+ * precisely 0.0 only when summed adjacently, and a third, ~6e8 times
+ * smaller value survives only when it is not the first term combined
+ * with either extreme -- summing in slot order [big+, big-, small]
+ * gives exactly `small`; any other order that separates the two extremes
+ * gives exactly 0.0 (verified by hand: float addition of two bit-exact
+ * negations is exact regardless of what else is in flight, and 6e8 is
+ * far past float32's ~1.19e-7 relative precision, so adding `small` to
+ * either extreme first always rounds it away). */
+static int test_q2k_down_slot_order(void) {
+    enum { N_EXPERT = 3, N_TOTAL_EXPERT = 6 };
+    uint8_t scales[16], nib[256];
+    for (int g = 0; g < 16; g++) scales[g] = 15u; /* scale=15, min=0 */
+    /* Constant code (not alternating): x below is also constant, so the
+     * per-element products all share one sign and accumulate rather than
+     * partially cancelling, which a symmetric-around-zero x would do. */
+    for (int k = 0; k < 256; k++) nib[k] = 1u;
+
+    const uint16_t d_pos_bits = f32_to_f16_bits(60000.0f);
+    const uint16_t d_neg_bits = (uint16_t)(d_pos_bits ^ 0x8000u); /* exact negation */
+    const uint16_t d_small_bits = f32_to_f16_bits(0.001f);
+    const uint16_t zero16 = 0;
+
+    uint8_t down[N_TOTAL_EXPERT][84];
+    for (int e = 0; e < N_TOTAL_EXPERT; e++) {
+        memset(down[e], 0, sizeof(down[e]));
+        memcpy(down[e], scales, 16);
+        for (uint32_t idx = 0; idx < 256u; idx++) {
+            uint32_t group = idx / 16u;
+            uint32_t l = idx - group * 16u;
+            uint32_t q_base = 32u * (group / 8u) + 16u * (group & 1u);
+            uint32_t shift = ((group / 2u) & 3u) * 2u;
+            down[e][16u + q_base + l] =
+                (uint8_t)(down[e][16u + q_base + l] | ((nib[idx] & 3u) << shift));
+        }
+        memcpy(down[e] + 82, &zero16, 2); /* dmin = 0 for every expert */
+    }
+    memcpy(down[0] + 80, &d_pos_bits, 2);   /* expert 0: +big */
+    memcpy(down[5] + 80, &d_neg_bits, 2);   /* expert 5: -big, exact negation */
+    memcpy(down[2] + 80, &d_small_bits, 2); /* expert 2: small */
+
+    float x[256];
+    for (int i = 0; i < 256; i++) x[i] = 10.0f; /* constant: no cross-element cancellation */
+    oracle_q8k_block xq;
+    oracle_q8k_quantize_block(x, &xq);
+
+    uint8_t midq_bytes[3 * Q8_K_BLOCK_BYTES];
+    for (int s = 0; s < N_EXPERT; s++) {
+        memcpy(midq_bytes + s * Q8_K_BLOCK_BYTES, &xq.d, 4);
+        memcpy(midq_bytes + s * Q8_K_BLOCK_BYTES + 4, xq.qs, 256);
+        memcpy(midq_bytes + s * Q8_K_BLOCK_BYTES + 260, xq.bsums, 32);
+    }
+
+    uint8_t down_flat[N_TOTAL_EXPERT * 84];
+    for (int e = 0; e < N_TOTAL_EXPERT; e++) memcpy(down_flat + e * 84, down[e], 84);
+
+    /* Slot order: expert 0 (+big), expert 5 (-big), expert 2 (small). */
+    int32_t sel[N_EXPERT] = {0, 5, 2};
+    float got = 0.0f;
+    CHECK(ds4_sycl_moe_test_q2k_down_direct(down_flat, midq_bytes, sel,
+                                            /*down_expert_bytes=*/84u,
+                                            /*down_row_bytes=*/84u, /*midq_blocks=*/1u,
+                                            /*out_dim=*/1u, N_EXPERT, /*n_tokens=*/1u,
+                                            N_TOTAL_EXPERT, &got) != 0,
+          "q2k_down_slot_order: call failed");
+
+    float want = oracle_q2k_dot_block(down[2], &xq);
+    CHECK(fabsf(want) > 1.0f, "q2k_down_slot_order: test data too weak (small term near zero)");
+    CHECK_CLOSE(got, want, fabs(want) * 1e-3 + 1e-4,
+               "q2k_down_slot_order: slot-order sum must equal the small term exactly, "
+               "not be swallowed by the two cancelling extremes");
+    fprintf(stderr, "  test_q2k_down_slot_order OK (got %.6g, want %.6g)\n", (double)got,
+            (double)want);
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_q8_k_quantize() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1917,6 +2010,7 @@ int main(void) {
     if (test_q2k_batch_small() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q2k_batch_large() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q2k_decode_matches_batch_of_one() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q2k_down_slot_order() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_moe OK\n");
     return 0;
