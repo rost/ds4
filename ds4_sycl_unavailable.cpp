@@ -73,7 +73,6 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_suspend_expert_sharding)
 
 /* int returns. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add_xdev_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_decode_rows_rope_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_noncausal_raw_batch_heads_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_output_low_q8_rows_exact_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_prefill_raw_heads_range_tensor)

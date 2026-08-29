@@ -1626,6 +1626,266 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
 
 namespace {
 
+/* ds4_gpu_attention_decode_rows_rope_tensor, ds4_cuda.cu:17175-17311:
+ * multi-session decode attention, one work-group per (row, head), each
+ * row carrying its OWN raw_kv/comp_kv/topk device state (a session's
+ * private KV cache) rather than one KV table shared across a token
+ * dimension. Called at ds4.c:65088 (metal_graph_encode_attention_session_
+ * batch, count >= 2 concurrent sessions). None of this exists in rocm/;
+ * CUDA is the only reference.
+ *
+ * NOT a port of CUDA's actual kernel body. CUDA's version is a
+ * substantially different algorithm: for head_dim == 512 with a specific
+ * set of internal feature flags all at their default (off) state, it
+ * scores with a separate tiled kernel (attention_decode_score_split_
+ * scores_tile512_rows_kernel) into a DEVICE-global scratch buffer sized
+ * n_rows * n_head * max_dense_score, opts a func attribute in for extra
+ * dynamic shared memory, finalises with a second kernel, and then --
+ * regardless of whether the tiled path or the indexed path ran --
+ * unconditionally applies rope_tail_decode_rows_kernel with inverse=1 to
+ * its OWN output. That final inverse rotation is not a general
+ * requirement of row-batched decode attention: it exists because CUDA's
+ * tiled scoring kernel scores against a representation that defers
+ * rope's positional rotation into the score computation itself (the
+ * "fuse_inv_rope" naming), leaving the raw weighted-KV sum needing a
+ * trailing correction that only THAT scoring shortcut created. This port
+ * takes the plain, already-established route instead: by the time ds4.c
+ * reaches this entry, Q was already RoPE-rotated by ds4_gpu_rope_tail_
+ * decode_rows_tensor earlier in the SAME session-batch step (ds4.c:64855
+ * on Q, :64836 on KV, both inside metal_graph_encode_qkv_session_batch,
+ * which always runs before metal_graph_encode_attention_session_batch --
+ * see ds4.c:66253/:66300 and :66662/:66692 for the fixed call order), and
+ * every stored raw_kv/comp_kv row was RoPE-rotated at write time the same
+ * way single-session decode already does. So a straightforward dot-
+ * product softmax over the data exactly as given needs no rotation step
+ * of its own, on either end: this generalises the already-landed single-
+ * row oldhip kernels above (sycl_attention_decode_mixed_one_fast_oldhip_
+ * kernel for a dense row, sycl_attention_decode_indexed_mixed_one_fast_
+ * oldhip_kernel for an indexed one) over an explicit per-row table
+ * instead of one shared KV tensor, branching per work-group on that row's
+ * own .indexed flag (uniform across every work-item in the group, since
+ * every lane reads the same row's descriptor, so the barrier inside the
+ * indexed branch is reached uniformly). n_rot and the other RoPE
+ * parameters are still validated for shape (matching ds4_cuda.cu's own
+ * bounds exactly), just never used to rotate anything, since this port's
+ * algorithm has nothing left for them to do.
+ *
+ * The row table (ds4_gpu_attention_decode_row, a host array whose raw_kv/
+ * comp_kv/topk fields already hold this session's own DEVICE addresses as
+ * plain uint64_t values, ds4_gpu.h) is staged to device scratch wholesale
+ * via sycl_stage_host_bytes and read back on-device by reinterpreting
+ * those integers as pointers into the SAME device's address space, per
+ * spec 6l (the row array itself lives on the host and cannot be
+ * dereferenced by a kernel) and matching spec 6a's documented gap: this
+ * ABI provides no device_id for a row's raw_kv/comp_kv addresses, so
+ * unlike ds4_gpu_kv_fp8_store_raw_decode_rows_tensor's raw_cache tensors
+ * above, there is no metadata here to cross-device-check against, the
+ * same gap ROCm's own row-based entries carry. */
+static void sycl_attention_decode_rows_kernel(
+        sycl::nd_item<2> it,
+        sycl::local_accessor<float, 1> scores,
+        sycl::local_accessor<float, 1> reduce_scratch,
+        sycl::local_accessor<uint32_t, 1> comp_rows,
+        sycl::local_accessor<uint32_t, 1> comp_meta,
+        float *heads,
+        const float *sinks,
+        const float *q,
+        const ds4_gpu_attention_decode_row *rows,
+        uint32_t n_head,
+        uint32_t head_dim,
+        uint32_t use_vec4) {
+    const uint32_t row_idx = (uint32_t)it.get_group(0);
+    const uint32_t h       = (uint32_t)it.get_group(1);
+    if (h >= n_head) return;
+    const uint32_t tid   = (uint32_t)it.get_local_id(0);
+    const uint32_t block = (uint32_t)it.get_local_range(0);
+
+    const ds4_gpu_attention_decode_row r = rows[row_idx];
+    const float   *raw_kv = (const float *)(uintptr_t)r.raw_kv;
+    const float   *comp_kv = r.comp_kv ? (const float *)(uintptr_t)r.comp_kv : nullptr;
+    const int32_t *topk    = r.topk ? (const int32_t *)(uintptr_t)r.topk : nullptr;
+    const float   *qh = q + ((uint64_t)row_idx * n_head + h) * head_dim;
+    float         *oh = heads + ((uint64_t)row_idx * n_head + h) * head_dim;
+    const float    scale = sycl::rsqrt((float)head_dim);
+
+    uint32_t comp_count;
+    if (r.indexed) {
+        /* Mirrors sycl_attention_decode_indexed_mixed_one_fast_oldhip_
+         * kernel's topk compaction exactly, using this row's own pos and
+         * ratio to derive visible_comp. */
+        uint32_t visible_comp = r.n_comp;
+        if (r.ratio != 0u) {
+            visible_comp = (r.pos + 1u) / r.ratio;
+            if (visible_comp > r.n_comp) visible_comp = r.n_comp;
+        }
+        if (tid == 0u) {
+            uint32_t count = 0u;
+            for (uint32_t i = 0; i < r.top_k && count < comp_rows.size(); i++) {
+                const int32_t ci = topk[i];
+                if (ci < 0) continue;
+                const uint32_t c = (uint32_t)ci;
+                if (c < r.n_comp && c < visible_comp) comp_rows[count++] = c;
+            }
+            comp_meta[0] = count;
+        }
+        it.barrier(sycl::access::fence_space::local_space);
+        comp_count = comp_meta[0];
+    } else {
+        comp_count = r.n_comp;
+    }
+
+    float local_max = sinks[h];
+    for (uint32_t rr = tid; rr < r.n_raw; rr += block) {
+        const uint32_t row = r.raw_cap ? ((r.raw_start + rr) % r.raw_cap) : rr;
+        const float *kv = raw_kv + (uint64_t)row * head_dim;
+        const float s = sycl_attn_dot(qh, kv, head_dim, use_vec4) * scale;
+        scores[rr] = s;
+        local_max = sycl::fmax(local_max, s);
+    }
+    for (uint32_t c = tid; c < comp_count; c += block) {
+        const uint32_t crow = r.indexed ? comp_rows[c] : c;
+        const float *kv = comp_kv + (uint64_t)crow * head_dim;
+        const float dot = sycl_attn_dot(qh, kv, head_dim, use_vec4);
+        const float s = dot * scale;
+        scores[r.n_raw + c] = s;
+        local_max = sycl::fmax(local_max, s);
+    }
+    const float max_score = sycl_block_row_reduce(
+            it, reduce_scratch, local_max,
+            [](float a, float b) { return sycl::fmax(a, b); });
+
+    const uint32_t n_score = r.n_raw + comp_count;
+    float local_sum = 0.0f;
+    for (uint32_t i = tid; i < n_score; i += block) {
+        const float w = sycl::exp(scores[i] - max_score);
+        scores[i] = w;
+        local_sum += w;
+    }
+    if (tid == 0u) local_sum += sycl::exp(sinks[h] - max_score);
+    const float denom = sycl_block_row_reduce(
+            it, reduce_scratch, local_sum,
+            [](float a, float b) { return a + b; });
+    const float inv_denom = 1.0f / denom;
+
+    for (uint32_t d = tid; d < head_dim; d += block) {
+        float acc = 0.0f;
+        for (uint32_t rr = 0; rr < r.n_raw; rr++) {
+            const uint32_t row = r.raw_cap ? ((r.raw_start + rr) % r.raw_cap) : rr;
+            acc += scores[rr] * raw_kv[(uint64_t)row * head_dim + d];
+        }
+        for (uint32_t c = 0; c < comp_count; c++) {
+            const uint32_t crow = r.indexed ? comp_rows[c] : c;
+            acc += scores[r.n_raw + c] * comp_kv[(uint64_t)crow * head_dim + d];
+        }
+        oh[d] = acc * inv_denom;
+    }
+}
+
+}  // namespace
+
+extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
+        ds4_gpu_tensor                     *heads,
+        const void                         *model_map,
+        uint64_t                            model_size,
+        uint64_t                            sinks_offset,
+        const ds4_gpu_tensor               *q,
+        const ds4_gpu_attention_decode_row *rows,
+        uint32_t                            n_rows,
+        uint32_t                            n_head,
+        uint32_t                            head_dim,
+        uint32_t                            n_rot,
+        uint32_t                            n_ctx_orig,
+        float                               freq_base,
+        float                               freq_scale,
+        float                               ext_factor,
+        float                               attn_factor,
+        float                               beta_fast,
+        float                               beta_slow) {
+    /* Validated for shape only, matching ds4_cuda.cu's own bounds, then
+     * unused: see this entry's kernel comment above for why this port's
+     * algorithm needs no rotation step of its own. */
+    (void)n_ctx_orig; (void)freq_base; (void)freq_scale; (void)ext_factor;
+    (void)attn_factor; (void)beta_fast; (void)beta_slow;
+    constexpr uint32_t kIndexedTopkCap = 512u; /* ds4_cuda.cu's own row-batched cap, tighter than the single-row entry's 1024 */
+    if (!heads || !q || !rows || !model_map || n_rows < 2u ||
+        n_rows > DS4_GPU_ATTENTION_DECODE_BATCH_MAX || n_head == 0u ||
+        head_dim != 512u || n_rot == 0u || n_rot > head_dim || (n_rot & 1u) != 0u ||
+        !sycl_model_range_fits(model_size, sinks_offset, (uint64_t)n_head * sizeof(float)) ||
+        !sycl_tensor_has_elems3(heads, n_rows, n_head, head_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems3(q, n_rows, n_head, head_dim, sizeof(float))) {
+        return 0;
+    }
+
+    uint32_t max_score_width = 1u;
+    for (uint32_t i = 0; i < n_rows; i++) {
+        const ds4_gpu_attention_decode_row &r = rows[i];
+        if (r.raw_kv == 0u || r.n_raw == 0u || r.raw_cap < r.n_raw ||
+            r.raw_start >= r.raw_cap || (r.n_comp != 0u && r.comp_kv == 0u)) {
+            return 0;
+        }
+        uint32_t score_width;
+        if (r.indexed) {
+            if (r.comp_kv == 0u || r.topk == 0u || r.n_comp == 0u ||
+                r.top_k == 0u || r.top_k > kIndexedTopkCap || r.ratio == 0u) {
+                return 0;
+            }
+            const uint32_t comp_bound = r.top_k < r.n_comp ? r.top_k : r.n_comp;
+            score_width = r.n_raw + comp_bound;
+        } else {
+            score_width = r.n_raw + r.n_comp;
+        }
+        if (score_width > max_score_width) max_score_width = score_width;
+    }
+    if (n_head == 0u || head_dim == 0u) return 1;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &dq = ds4_sycl_queue(heads->device_id);
+        const char *sinks_host = sycl_model_range_ptr(
+                model_map, sinks_offset, (uint64_t)n_head * sizeof(float), model_size,
+                "attn_sinks_rows");
+        if (!sinks_host) return 0;
+        sycl_device_scratch_guard sinks_guard = sycl_stage_host_bytes(
+                dq, sinks_host, (uint64_t)n_head * sizeof(float));
+        if (!sinks_guard.p) return 0;
+        const float *psinks = (const float *)sinks_guard.p;
+
+        sycl_device_scratch_guard rows_guard = sycl_stage_host_bytes(
+                dq, rows, (uint64_t)n_rows * sizeof(ds4_gpu_attention_decode_row));
+        if (!rows_guard.p) return 0;
+        const ds4_gpu_attention_decode_row *prows =
+                (const ds4_gpu_attention_decode_row *)rows_guard.p;
+
+        float          *pheads = (float *)heads->ptr;
+        const float    *pq     = (const float *)q->ptr;
+        const uint32_t  use_vec4 = (head_dim & 3u) == 0u ? 1u : 0u;
+        constexpr uint32_t kBlock = 256u;
+
+        dq.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> scores(sycl::range<1>(max_score_width), h);
+            sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(kBlock), h);
+            sycl::local_accessor<uint32_t, 1> comp_rows(sycl::range<1>(kIndexedTopkCap), h);
+            sycl::local_accessor<uint32_t, 1> comp_meta(sycl::range<1>(1), h);
+            h.parallel_for(
+                    sycl::nd_range<2>(sycl::range<2>((size_t)n_rows * kBlock, n_head),
+                                      sycl::range<2>(kBlock, 1)),
+                    [=](sycl::nd_item<2> it) {
+                        sycl_attention_decode_rows_kernel(
+                                it, scores, reduce_scratch, comp_rows, comp_meta, pheads,
+                                psinks, pq, prows, n_head, head_dim, use_vec4);
+                    });
+        });
+        dq.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode rows launch failed: %s\n",
+                e.what());
+        return 0;
+    }
+    return 1;
+}
+
+namespace {
+
 /* attention_prefill_raw_softmax_kernel, attention.cuh:222-266: normalises
  * one (token, head) row of the score GEMM's output in place, applying the
  * causal/window mask and the sink logit bias. Consumes the score GEMM's

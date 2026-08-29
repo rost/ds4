@@ -1090,6 +1090,285 @@ static int test_decode_batch_validation(void) {
     return 0;
 }
 
+/* ---- ds4_gpu_attention_decode_rows_rope_tensor --------------------------
+ *
+ * Multi-session decode: several sessions' single-token attention in one
+ * launch, each session with its OWN private raw_kv/comp_kv/topk state, a
+ * mix of dense (non-indexed) and hash-indexed rows in the same call,
+ * exactly the shape metal_graph_encode_attention_session_batch
+ * (ds4.c:65088) builds.
+ *
+ * head_dim must be 512 (this entry's own hard requirement, matching
+ * ds4_cuda.cu's row-batched launcher exactly); Flash's real head_dim is
+ * always 512, so this is never a real restriction, only a validated
+ * contract. n_rot/n_ctx_orig/freq_base/freq_scale/ext_factor/attn_factor/
+ * beta_fast/beta_slow are validated for shape but not used to rotate
+ * anything: by the time ds4.c reaches this entry, Q and every stored KV
+ * row already carry RoPE applied by the earlier ds4_gpu_rope_tail_decode_
+ * rows_tensor call in the same session-batch step (ds4.c:64855, :64836),
+ * so this port computes plain dot-product attention over the data as
+ * given, deliberately NOT replicating CUDA's internal "exact score split
+ * fuse inv rope" tiled kernel (see this entry's own comment in
+ * sycl/ds4_sycl_attention.hpp for the full reasoning): that CUDA path
+ * scores against an intentionally un-rotated representation and corrects
+ * the output with a trailing inverse RoPE pass as an artefact of ITS OWN
+ * scoring shortcut, an artefact this port's straightforward per-row
+ * generalisation of the already-landed oldhip kernels never introduces in
+ * the first place, so there is nothing to correct.
+ *
+ * Primary check is differential against the single-row entries:
+ * row 0 and row 2 (dense) against ds4_gpu_attention_
+ * decode_heads_tensor, row 1 (indexed) against ds4_gpu_attention_indexed_
+ * mixed_batch_heads_tensor with n_tokens=1 (its own comment states n_tokens
+ * == 1 always takes the oldhip fast kernel). The three rows deliberately
+ * have different n_raw/raw_cap/raw_start/n_comp shapes and a mix of
+ * indexed and dense rows, so a bug that mixes up which row's state belongs
+ * to which row cannot hide behind uniform data, and N_ROWS = 3 is not a
+ * multiple of any power-of-two tile this kernel touches.
+ *
+ * Per spec 6u, row 0 is additionally anchored against oracle_attention_
+ * decode_heads directly, independent of the differential relation: an
+ * error that moved every row's expected value the same way would not be
+ * caught by the row-vs-single-row comparison alone. */
+#define DR_N_HEAD 2u
+#define DR_HEAD_DIM 512u
+#define DR_N_ROT 64u
+#define DR_N_ROWS 3u
+
+static int test_decode_rows_mixed(void) {
+    float sinks[DR_N_HEAD];
+    for (uint32_t h = 0; h < DR_N_HEAD; h++) sinks[h] = test_prand(h, 777u, 5u) * 2.0f;
+    dh_model model = dh_model_build(sinks, DR_N_HEAD);
+
+    /* Row shapes, deliberately uneven and including a dense row with no
+     * compressed rows at all (row 2). */
+    const uint32_t n_raw[DR_N_ROWS]    = {5u, 3u, 7u};
+    const uint32_t raw_cap[DR_N_ROWS]  = {8u, 6u, 7u};
+    const uint32_t raw_start[DR_N_ROWS] = {3u, 2u, 0u};
+    const uint32_t n_comp[DR_N_ROWS]   = {4u, 10u, 0u};
+    const int      is_indexed[DR_N_ROWS] = {0, 1, 0};
+    const uint32_t ratio = 4u;
+    const uint32_t pos1 = 39u; /* visible_comp = (39+1)/4 = 10 == n_comp[1] */
+    const uint32_t top_k = 6u;
+    const int32_t topk1[6] = {0, 2, 4, 6, 8, 9}; /* distinct, all < n_comp[1] */
+
+    float q[DR_N_ROWS * DR_N_HEAD * DR_HEAD_DIM];
+    for (uint32_t i = 0; i < DR_N_ROWS * DR_N_HEAD * DR_HEAD_DIM; i++) {
+        q[i] = test_prand(1000u + i, i * 3u, 41u);
+    }
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(sizeof(q));
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(sizeof(q));
+    CHECK(tq && theads, "decode_rows_mixed: q/heads alloc failed");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, sizeof(q)) != 0, "decode_rows_mixed: q write failed");
+
+    ds4_gpu_tensor *traw[DR_N_ROWS];
+    ds4_gpu_tensor *tcomp[DR_N_ROWS];
+    ds4_gpu_tensor *ttopk[DR_N_ROWS];
+    memset(tcomp, 0, sizeof(tcomp));
+    memset(ttopk, 0, sizeof(ttopk));
+    ds4_gpu_attention_decode_row rows[DR_N_ROWS];
+    memset(rows, 0, sizeof(rows));
+
+    for (uint32_t r = 0; r < DR_N_ROWS; r++) {
+        float *raw_buf = (float *)malloc((size_t)raw_cap[r] * DR_HEAD_DIM * sizeof(float));
+        for (uint32_t i = 0; i < raw_cap[r] * DR_HEAD_DIM; i++) {
+            raw_buf[i] = test_prand(2000u + r, i, 53u);
+        }
+        traw[r] = ds4_gpu_tensor_alloc((uint64_t)raw_cap[r] * DR_HEAD_DIM * sizeof(float));
+        CHECK(traw[r] != NULL, "decode_rows_mixed: raw alloc failed");
+        CHECK(ds4_gpu_tensor_write(traw[r], 0, raw_buf,
+                                   (uint64_t)raw_cap[r] * DR_HEAD_DIM * sizeof(float)) != 0,
+              "decode_rows_mixed: raw write failed");
+        free(raw_buf);
+
+        if (n_comp[r] != 0u) {
+            float *comp_buf = (float *)malloc((size_t)n_comp[r] * DR_HEAD_DIM * sizeof(float));
+            for (uint32_t i = 0; i < n_comp[r] * DR_HEAD_DIM; i++) {
+                comp_buf[i] = test_prand(3000u + r, i, 59u);
+            }
+            tcomp[r] = ds4_gpu_tensor_alloc((uint64_t)n_comp[r] * DR_HEAD_DIM * sizeof(float));
+            CHECK(tcomp[r] != NULL, "decode_rows_mixed: comp alloc failed");
+            CHECK(ds4_gpu_tensor_write(tcomp[r], 0, comp_buf,
+                                       (uint64_t)n_comp[r] * DR_HEAD_DIM * sizeof(float)) != 0,
+                  "decode_rows_mixed: comp write failed");
+            free(comp_buf);
+        }
+
+        if (is_indexed[r]) {
+            ttopk[r] = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(int32_t));
+            CHECK(ttopk[r] != NULL, "decode_rows_mixed: topk alloc failed");
+            CHECK(ds4_gpu_tensor_write(ttopk[r], 0, topk1, sizeof(topk1)) != 0,
+                  "decode_rows_mixed: topk write failed");
+        }
+
+        rows[r].raw_kv   = (uint64_t)(uintptr_t)traw[r]->ptr;
+        rows[r].comp_kv  = n_comp[r] ? (uint64_t)(uintptr_t)tcomp[r]->ptr : 0u;
+        rows[r].topk     = is_indexed[r] ? (uint64_t)(uintptr_t)ttopk[r]->ptr : 0u;
+        rows[r].pos      = is_indexed[r] ? pos1 : 0u;
+        rows[r].n_raw    = n_raw[r];
+        rows[r].raw_cap  = raw_cap[r];
+        rows[r].raw_start = raw_start[r];
+        rows[r].n_comp   = n_comp[r];
+        rows[r].top_k    = is_indexed[r] ? top_k : 0u;
+        rows[r].window   = 0u;
+        rows[r].ratio    = is_indexed[r] ? ratio : 0u;
+        rows[r].indexed  = is_indexed[r] ? 1u : 0u;
+    }
+
+    CHECK(ds4_gpu_attention_decode_rows_rope_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, rows, DR_N_ROWS,
+              DR_N_HEAD, DR_HEAD_DIM, DR_N_ROT, /*n_ctx_orig=*/4096u, /*freq_base=*/10000.0f,
+              /*freq_scale=*/1.0f, /*ext_factor=*/0.0f, /*attn_factor=*/1.0f,
+              /*beta_fast=*/32.0f, /*beta_slow=*/1.0f) != 0,
+          "decode_rows_mixed: launch failed");
+
+    float got[DR_N_ROWS * DR_N_HEAD * DR_HEAD_DIM];
+    CHECK(ds4_gpu_tensor_read(theads, 0, got, sizeof(got)) != 0,
+          "decode_rows_mixed: read failed");
+
+    const uint32_t row_elems = DR_N_HEAD * DR_HEAD_DIM;
+    for (uint32_t r = 0; r < DR_N_ROWS; r++) {
+        ds4_gpu_tensor *tq_row = ds4_gpu_tensor_alloc((uint64_t)row_elems * sizeof(float));
+        ds4_gpu_tensor *theads_ref = ds4_gpu_tensor_alloc((uint64_t)row_elems * sizeof(float));
+        CHECK(tq_row && theads_ref, "decode_rows_mixed: reference alloc failed");
+        CHECK(ds4_gpu_tensor_write(tq_row, 0, &q[r * row_elems], (uint64_t)row_elems * sizeof(float)) != 0,
+              "decode_rows_mixed: reference q write failed");
+
+        if (is_indexed[r]) {
+            CHECK(ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
+                      theads_ref, model.bytes, model.size, model.sinks_offset, tq_row,
+                      traw[r], tcomp[r], /*comp_kv_f16=*/0u, ttopk[r], /*n_tokens=*/1u, pos1,
+                      n_raw[r], raw_cap[r], raw_start[r], n_comp[r], top_k, /*window=*/0u,
+                      ratio, DR_N_HEAD, DR_HEAD_DIM) != 0,
+                  "decode_rows_mixed: indexed reference call failed");
+        } else {
+            CHECK(ds4_gpu_attention_decode_heads_tensor(
+                      theads_ref, model.bytes, model.size, model.sinks_offset, tq_row,
+                      traw[r], n_raw[r], raw_cap[r], raw_start[r], tcomp[r],
+                      /*comp_kv_f16=*/0u, n_comp[r], /*comp_mask=*/NULL, /*use_mask=*/0u,
+                      DR_N_HEAD, DR_HEAD_DIM) != 0,
+                  "decode_rows_mixed: dense reference call failed");
+        }
+
+        float want_row[DR_N_HEAD * DR_HEAD_DIM];
+        CHECK(ds4_gpu_tensor_read(theads_ref, 0, want_row, sizeof(want_row)) != 0,
+              "decode_rows_mixed: reference read failed");
+        ds4_gpu_tensor_free(tq_row);
+        ds4_gpu_tensor_free(theads_ref);
+
+        for (uint32_t i = 0; i < row_elems; i++) {
+            CHECK_CLOSE(got[r * row_elems + i], want_row[i], 1e-4,
+                        "decode_rows_mixed: differs from single-row entry");
+        }
+    }
+
+    /* Anchor (spec 6u): row 0's output checked against the independent
+     * oracle_attention_decode_heads, not merely against the single-row
+     * ABI entry used above. */
+    {
+        float raw0[8u * DR_HEAD_DIM], comp0[4u * DR_HEAD_DIM];
+        CHECK(ds4_gpu_tensor_read(traw[0], 0, raw0, sizeof(raw0)) != 0,
+              "decode_rows_mixed: anchor raw read failed");
+        CHECK(ds4_gpu_tensor_read(tcomp[0], 0, comp0, sizeof(comp0)) != 0,
+              "decode_rows_mixed: anchor comp read failed");
+        float want0[DR_N_HEAD * DR_HEAD_DIM];
+        oracle_attention_decode_heads(want0, sinks, &q[0], raw0, n_raw[0], raw_cap[0],
+                                      raw_start[0], comp0, n_comp[0], NULL, 0, DR_N_HEAD,
+                                      DR_HEAD_DIM);
+        for (uint32_t i = 0; i < row_elems; i++) {
+            CHECK_CLOSE(got[i], want0[i], 1e-3,
+                        "decode_rows_mixed: anchor row disagrees with independent oracle");
+        }
+    }
+
+    ds4_gpu_tensor_free(tq);
+    ds4_gpu_tensor_free(theads);
+    for (uint32_t r = 0; r < DR_N_ROWS; r++) {
+        ds4_gpu_tensor_free(traw[r]);
+        if (tcomp[r]) ds4_gpu_tensor_free(tcomp[r]);
+        if (ttopk[r]) ds4_gpu_tensor_free(ttopk[r]);
+    }
+    free(model.bytes);
+    fprintf(stderr, "  test_decode_rows_mixed OK\n");
+    return 0;
+}
+
+static int test_decode_rows_validation(void) {
+    float sinks[DR_N_HEAD] = {0};
+    dh_model model = dh_model_build(sinks, DR_N_HEAD);
+    const uint32_t row_elems = DR_N_HEAD * DR_HEAD_DIM;
+
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc((uint64_t)2u * row_elems * sizeof(float));
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc((uint64_t)2u * row_elems * sizeof(float));
+    ds4_gpu_tensor *traw = ds4_gpu_tensor_alloc((uint64_t)8u * DR_HEAD_DIM * sizeof(float));
+    CHECK(tq && theads && traw, "decode_rows_validation: alloc failed");
+
+    ds4_gpu_attention_decode_row one_row[1];
+    memset(one_row, 0, sizeof(one_row));
+    one_row[0].raw_kv = (uint64_t)(uintptr_t)traw->ptr;
+    one_row[0].n_raw = 5u;
+    one_row[0].raw_cap = 8u;
+    one_row[0].raw_start = 0u;
+    CHECK(ds4_gpu_attention_decode_rows_rope_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, one_row, 1u,
+              DR_N_HEAD, DR_HEAD_DIM, DR_N_ROT, 4096u, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f,
+              1.0f) == 0,
+          "decode_rows_validation: n_rows < 2 must be rejected");
+
+    ds4_gpu_attention_decode_row two_rows[2];
+    memset(two_rows, 0, sizeof(two_rows));
+    for (int i = 0; i < 2; i++) {
+        two_rows[i].raw_kv = (uint64_t)(uintptr_t)traw->ptr;
+        two_rows[i].n_raw = 5u;
+        two_rows[i].raw_cap = 8u;
+        two_rows[i].raw_start = 0u;
+    }
+    CHECK(ds4_gpu_attention_decode_rows_rope_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, two_rows, 2u,
+              DR_N_HEAD, /*head_dim=*/128u, DR_N_ROT, 4096u, 10000.0f, 1.0f, 0.0f, 1.0f,
+              32.0f, 1.0f) == 0,
+          "decode_rows_validation: head_dim != 512 must be rejected");
+
+    two_rows[1].raw_kv = 0u;
+    CHECK(ds4_gpu_attention_decode_rows_rope_tensor(
+              theads, model.bytes, model.size, model.sinks_offset, tq, two_rows, 2u,
+              DR_N_HEAD, DR_HEAD_DIM, DR_N_ROT, 4096u, 10000.0f, 1.0f, 0.0f, 1.0f, 32.0f,
+              1.0f) == 0,
+          "decode_rows_validation: a row with raw_kv == 0 must be rejected");
+
+    {
+        /* q/heads sized for exactly OVER rows: the point of this case is
+         * the n_rows-vs-cap bound specifically, so an unrelated size
+         * check must not also reject the call (spec 6i). */
+        enum { OVER = DS4_GPU_ATTENTION_DECODE_BATCH_MAX + 1u };
+        ds4_gpu_attention_decode_row over_rows[OVER];
+        memset(over_rows, 0, sizeof(over_rows));
+        for (uint32_t i = 0; i < OVER; i++) {
+            over_rows[i].raw_kv = (uint64_t)(uintptr_t)traw->ptr;
+            over_rows[i].n_raw = 5u;
+            over_rows[i].raw_cap = 8u;
+            over_rows[i].raw_start = 0u;
+        }
+        ds4_gpu_tensor *tq_over = ds4_gpu_tensor_alloc((uint64_t)OVER * row_elems * sizeof(float));
+        ds4_gpu_tensor *theads_over = ds4_gpu_tensor_alloc((uint64_t)OVER * row_elems * sizeof(float));
+        CHECK(tq_over && theads_over, "decode_rows_validation: over-sized alloc failed");
+        CHECK(ds4_gpu_attention_decode_rows_rope_tensor(
+                  theads_over, model.bytes, model.size, model.sinks_offset, tq_over,
+                  over_rows, OVER, DR_N_HEAD, DR_HEAD_DIM, DR_N_ROT, 4096u, 10000.0f, 1.0f,
+                  0.0f, 1.0f, 32.0f, 1.0f) == 0,
+              "decode_rows_validation: n_rows over the batch cap must be rejected");
+        ds4_gpu_tensor_free(tq_over);
+        ds4_gpu_tensor_free(theads_over);
+    }
+
+    ds4_gpu_tensor_free(tq);
+    ds4_gpu_tensor_free(theads);
+    ds4_gpu_tensor_free(traw);
+    free(model.bytes);
+    fprintf(stderr, "  test_decode_rows_validation OK\n");
+    return 0;
+}
+
 /* ---- Indexed decode and small-window static prefill --------------------
  *
  * Oracle: ds4_gpu_attention_indexed_mixed_batch_heads_tensor's per-(t,h)
@@ -2107,6 +2386,8 @@ int main(void) {
     if (test_decode_mixed_batch_online_vs_general() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_decode_mixed_batch_online_running_max() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_decode_batch_validation() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_decode_rows_mixed() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_decode_rows_validation() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_indexed_mixed_general() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_indexed_mixed_online(64u) != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_indexed_mixed_online(512u) != 0) { ds4_gpu_cleanup(); return 1; }
