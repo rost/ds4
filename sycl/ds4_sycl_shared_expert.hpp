@@ -246,3 +246,71 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
            ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_dim, clamp,
                                  1.0f);
 }
+
+/* ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor.  ROCm's own
+ * definition (rocm/ds4_rocm_shared_expert.cuh:69-86) voids every argument
+ * and unconditionally returns 0: a real stub in that reference, not an
+ * oversight.  This backend deliberately DOES NOT port that stub: Metal
+ * implements this entry for real (ds4_metal.m:19368, kernel
+ * "kernel_dsv4_shared_gate_up_swiglu_q8_0"), ds4_gpu.h declares it as an
+ * ordinary primitive with no "optional" framing, and it has a
+ * Flash-reachable call site (ds4.c:62246,
+ * metal_graph_encode_native_session_batch_shared, the generic non-GLM
+ * batched-session path). ROCm being the structural reference exists to
+ * keep semantics aligned, not to reproduce ROCm's own incomplete backend
+ * coverage on an entry another real backend implements; the SYCL port of
+ * ds4_gpu_matmul_q8_0_rows_scalar_tensor (sycl/ds4_sycl_matmul.hpp) made
+ * the identical judgement call for the structurally analogous dense-matmul
+ * entry. Do not "fix" this back to a stub for ROCm-consistency.
+ *
+ * n_tok == 1 delegates to the core entry above, matching Metal's own
+ * implementation.  For n_tok > 1: unlike ROCm's fused batch kernel
+ * (rocm/ds4_rocm_q8.cuh:524-586, reached from
+ * ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor below), which takes no
+ * clamp parameter at all and is why that entry refuses clamp > 1e-6f
+ * rather than route through it, Metal's real
+ * kernel_dsv4_shared_gate_up_swiglu_q8_0 DOES accept and apply clamp for
+ * n_tok > 1.  This implementation matches Metal's capability, not ROCm's
+ * limitation: ds4_gpu_matmul_q8_0_pair_tensor and ds4_gpu_swiglu_tensor
+ * already accept an arbitrary token/element count in one launch, and
+ * swiglu's clamp is applied elementwise regardless of how the flat buffer
+ * divides into per-token rows, so generalising the general path above
+ * over n_tok needs no new kernel and no clamp restriction. */
+extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+        ds4_gpu_tensor       *gate,
+        ds4_gpu_tensor       *up,
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok,
+        float                   clamp) {
+    if (n_tok == 1u) {
+        return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+                gate, up, mid, model_map, model_size, gate_offset, up_offset,
+                in_dim, out_dim, x, clamp);
+    }
+    if (!gate || !up || !mid || !model_map || !x || n_tok == 0u ||
+        in_dim == 0u || out_dim == 0u || in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX || n_tok > UINT32_MAX) {
+        return 0;
+    }
+    uint64_t out_elems = 0;
+    if (!sycl_u64_mul_checked(out_dim, n_tok, &out_elems) ||
+        out_elems > UINT32_MAX) {
+        return 0;
+    }
+
+    /* The short-circuit && matters here for the same reason as the core
+     * entry above: a failed pair matmul must skip the SwiGLU rather than
+     * run it over stale gate/up and report success. */
+    return ds4_gpu_matmul_q8_0_pair_tensor(gate, up, model_map, model_size,
+                                           gate_offset, up_offset, in_dim,
+                                           out_dim, out_dim, x, n_tok) &&
+           ds4_gpu_swiglu_tensor(mid, gate, up, (uint32_t)out_elems, clamp,
+                                 1.0f);
+}

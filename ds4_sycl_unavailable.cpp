@@ -224,11 +224,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_add_q8_0_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_q8_0_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor)
-/* Deliberately left stubbed, matching ROCm: rocm/ds4_rocm_shared_expert.cuh:69-86
- * voids every argument and unconditionally `return 0;`.  This is a real
- * stub in the reference implementation, not an oversight to correct, so
- * the faithful port is a stub here too. */
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor)
 /* Deliberately left stubbed: implemented ONLY in ds4_cuda.cu (CUDA-only;
  * rocm/ has no definition at all, so ROCm itself hits its own unavailable

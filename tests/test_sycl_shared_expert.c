@@ -665,6 +665,290 @@ static int test_shared_gate_up_swiglu_fast_vs_general_differential(void) {
     return 0;
 }
 
+/* ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor.  ROCm's own
+ * definition (rocm/ds4_rocm_shared_expert.cuh:69-86) voids every argument
+ * and unconditionally returns 0: a real stub, not an oversight, in that
+ * reference.  This backend deliberately diverges from that stub: Metal
+ * implements this entry for real (ds4_metal.m:19368, kernel
+ * "kernel_dsv4_shared_gate_up_swiglu_q8_0"), it is declared in ds4_gpu.h
+ * as an ordinary primitive with no "optional" framing, and it has a
+ * Flash-reachable call site at ds4.c:62246
+ * (metal_graph_encode_native_session_batch_shared, the generic non-GLM
+ * batched-session path; the other call site, ds4.c:43369, is
+ * glm_graph_-prefixed and out of scope).  ROCm being the structural
+ * reference exists to keep semantics aligned, not to reproduce ROCm's own
+ * incomplete backend coverage on an entry Metal already implements; the
+ * SYCL port of ds4_gpu_matmul_q8_0_rows_scalar_tensor
+ * (sycl/ds4_sycl_matmul.hpp) made the identical judgement call for the
+ * structurally analogous dense-matmul entry.
+ *
+ * n_tok == 1 delegates to the core entry, matching Metal's own
+ * ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor.  For n_tok > 1,
+ * unlike ROCm's fused batch kernel (rocm/ds4_rocm_q8.cuh:524-586,
+ * reachable here through ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor),
+ * which has no clamp parameter at all and is why _rows_tensor refuses
+ * clamp > 1e-6f rather than route through it, Metal's real
+ * kernel_dsv4_shared_gate_up_swiglu_q8_0 DOES accept and apply clamp for
+ * n_tok > 1.  This SYCL implementation matches Metal's capability rather
+ * than ROCm's limitation: it generalises the already-implemented,
+ * already-ablated general path
+ * (ds4_gpu_matmul_q8_0_pair_tensor + ds4_gpu_swiglu_tensor) over n_tok
+ * rather than refusing a nonzero clamp, since both primitives already
+ * accept an arbitrary token/element count in one launch and swiglu's
+ * clamp is applied elementwise regardless of how the flat buffer is
+ * divided into per-token rows.  Test data below deliberately drives clamp
+ * so at least one token actually clamps, proving this multi-token clamp
+ * support rather than merely not crashing with clamp == 0. */
+static int test_shared_gate_up_swiglu_rows_scalar_n_tok_1(void) {
+    enum { IN_DIM = 37, OUT_DIM = 9 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const float clamp = 3.0f;
+
+    unsigned char wg[OUT_DIM * 68];
+    unsigned char wu[OUT_DIM * 68];
+    float x[IN_DIM];
+    float want_gate[OUT_DIM], want_up[OUT_DIM], want_mid[OUT_DIM];
+    float got_gate[OUT_DIM], got_up[OUT_DIM], got_mid[OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 7);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 77);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) {
+        x[k] = (float)(((k + 3) * 5) % 13) - 6.0f;
+    }
+    oracle_shared_gate_up_swiglu(want_gate, want_up, want_mid, x, wg, wu,
+                                 IN_DIM, OUT_DIM, row_bytes, clamp);
+
+    unsigned char combined[sizeof(wg) + sizeof(wu)];
+    memcpy(combined, wg, sizeof(wg));
+    memcpy(combined + sizeof(wg), wu, sizeof(wu));
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = sizeof(wg);
+    const uint64_t model_size = sizeof(combined);
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tgate = ds4_gpu_tensor_alloc(sizeof(got_gate));
+    ds4_gpu_tensor *tup = ds4_gpu_tensor_alloc(sizeof(got_up));
+    ds4_gpu_tensor *tmid = ds4_gpu_tensor_alloc(sizeof(got_mid));
+    CHECK(tx && tgate && tup && tmid,
+          "shared_gate_up_swiglu_rows_scalar_n_tok_1: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "shared_gate_up_swiglu_rows_scalar_n_tok_1: write x");
+
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, tx, 1, clamp) != 0,
+          "shared_gate_up_swiglu_rows_scalar_n_tok_1: call");
+    CHECK(ds4_gpu_tensor_read(tgate, 0, got_gate, sizeof(got_gate)) != 0 &&
+          ds4_gpu_tensor_read(tup, 0, got_up, sizeof(got_up)) != 0 &&
+          ds4_gpu_tensor_read(tmid, 0, got_mid, sizeof(got_mid)) != 0,
+          "shared_gate_up_swiglu_rows_scalar_n_tok_1: readback failed");
+
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got_gate[i], want_gate[i], 1e-2,
+                    "shared_gate_up_swiglu_rows_scalar_n_tok_1: gate mismatch");
+        CHECK_CLOSE(got_up[i], want_up[i], 1e-2,
+                    "shared_gate_up_swiglu_rows_scalar_n_tok_1: up mismatch");
+        CHECK_CLOSE(got_mid[i], want_mid[i], 1e-2,
+                    "shared_gate_up_swiglu_rows_scalar_n_tok_1: mid mismatch");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgate);
+    ds4_gpu_tensor_free(tup);
+    ds4_gpu_tensor_free(tmid);
+    fprintf(stderr, "  test_shared_gate_up_swiglu_rows_scalar_n_tok_1 OK\n");
+    return 0;
+}
+
+/* n_tok > 1, checked against a PER-TOKEN oracle (every token, not only the
+ * first), with a clamp that actually bites for at least one token so this
+ * entry's multi-token clamp support (see the block comment above) is
+ * genuinely exercised rather than merely tolerated. */
+static int test_shared_gate_up_swiglu_rows_scalar_multi_token(void) {
+    enum { IN_DIM = 32, OUT_DIM = 6, N_TOK = 4 };
+    const uint64_t row_bytes = 34; /* one block, IN_DIM == 32 */
+    const float clamp = 1.5f;
+
+    unsigned char wg[OUT_DIM * 34];
+    unsigned char wu[OUT_DIM * 34];
+    float x[N_TOK * IN_DIM];
+    float want_gate[N_TOK * OUT_DIM], want_up[N_TOK * OUT_DIM],
+            want_mid[N_TOK * OUT_DIM];
+    float got_gate[N_TOK * OUT_DIM], got_up[N_TOK * OUT_DIM],
+            got_mid[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 1);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 51);
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            /* (t * k) interaction term, per spec 6f: a purely affine
+             * a*i + b pattern would make every token's row proportional
+             * to every other, hiding a bug that mixes up which token's
+             * slice a row belongs to. */
+            x[t * IN_DIM + k] =
+                    (float)(((t + 1) * (k + 2)) % 11) - 5.0f +
+                    0.3f * (float)((t * k) % 7);
+        }
+        oracle_shared_gate_up_swiglu(want_gate + t * OUT_DIM,
+                                     want_up + t * OUT_DIM,
+                                     want_mid + t * OUT_DIM, x + t * IN_DIM,
+                                     wg, wu, IN_DIM, OUT_DIM, row_bytes,
+                                     clamp);
+    }
+
+    /* Sanity: confirm the oracle itself actually drives at least one
+     * token's clamp, or this test could not tell "clamp applied" from
+     * "clamp ignored". */
+    int saw_clamped = 0;
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        if (want_gate[i] > clamp || want_up[i] > clamp || want_up[i] < -clamp) {
+            saw_clamped = 1;
+        }
+    }
+    CHECK(saw_clamped,
+          "shared_gate_up_swiglu_rows_scalar_multi_token: test data does "
+          "not drive clamp for any token");
+
+    unsigned char combined[sizeof(wg) + sizeof(wu)];
+    memcpy(combined, wg, sizeof(wg));
+    memcpy(combined + sizeof(wg), wu, sizeof(wu));
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = sizeof(wg);
+    const uint64_t model_size = sizeof(combined);
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tgate = ds4_gpu_tensor_alloc(sizeof(got_gate));
+    ds4_gpu_tensor *tup = ds4_gpu_tensor_alloc(sizeof(got_up));
+    ds4_gpu_tensor *tmid = ds4_gpu_tensor_alloc(sizeof(got_mid));
+    CHECK(tx && tgate && tup && tmid,
+          "shared_gate_up_swiglu_rows_scalar_multi_token: allocation "
+          "failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "shared_gate_up_swiglu_rows_scalar_multi_token: write x");
+
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, tx, N_TOK, clamp) != 0,
+          "shared_gate_up_swiglu_rows_scalar_multi_token: call");
+    CHECK(ds4_gpu_tensor_read(tgate, 0, got_gate, sizeof(got_gate)) != 0 &&
+          ds4_gpu_tensor_read(tup, 0, got_up, sizeof(got_up)) != 0 &&
+          ds4_gpu_tensor_read(tmid, 0, got_mid, sizeof(got_mid)) != 0,
+          "shared_gate_up_swiglu_rows_scalar_multi_token: readback failed");
+
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got_gate[i], want_gate[i], 1e-2,
+                    "shared_gate_up_swiglu_rows_scalar_multi_token: gate "
+                    "mismatch");
+        CHECK_CLOSE(got_up[i], want_up[i], 1e-2,
+                    "shared_gate_up_swiglu_rows_scalar_multi_token: up "
+                    "mismatch");
+        CHECK_CLOSE(got_mid[i], want_mid[i], 1e-2,
+                    "shared_gate_up_swiglu_rows_scalar_multi_token: mid "
+                    "mismatch");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgate);
+    ds4_gpu_tensor_free(tup);
+    ds4_gpu_tensor_free(tmid);
+    fprintf(stderr,
+            "  test_shared_gate_up_swiglu_rows_scalar_multi_token OK\n");
+    return 0;
+}
+
+static int test_shared_gate_up_swiglu_rows_scalar_rejections(void) {
+    enum { IN_DIM = 32, OUT_DIM = 4, N_TOK = 3 };
+    const uint64_t row_bytes = 34;
+    unsigned char wg[OUT_DIM * 34];
+    unsigned char wu[OUT_DIM * 34];
+    float x[N_TOK * IN_DIM];
+    float gate[N_TOK * OUT_DIM], up[N_TOK * OUT_DIM], mid[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 2);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 42);
+    }
+    for (uint32_t k = 0; k < N_TOK * IN_DIM; k++) x[k] = (float)k;
+
+    unsigned char combined[sizeof(wg) + sizeof(wu)];
+    memcpy(combined, wg, sizeof(wg));
+    memcpy(combined + sizeof(wg), wu, sizeof(wu));
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = sizeof(wg);
+    const uint64_t model_size = sizeof(combined);
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tgate = ds4_gpu_tensor_alloc(sizeof(gate));
+    ds4_gpu_tensor *tup = ds4_gpu_tensor_alloc(sizeof(up));
+    ds4_gpu_tensor *tmid = ds4_gpu_tensor_alloc(sizeof(mid));
+    ds4_gpu_tensor *tsmall = ds4_gpu_tensor_alloc(sizeof(float));
+    CHECK(tx && tgate && tup && tmid && tsmall,
+          "shared_gate_up_swiglu_rows_scalar_rejections: allocation "
+          "failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: write x");
+
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  NULL, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, tx, N_TOK, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: null gate must be "
+          "rejected");
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tgate, tup, tmid, NULL, model_size, gate_offset, up_offset,
+                  IN_DIM, OUT_DIM, tx, N_TOK, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: null model_map "
+          "must be rejected");
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, NULL, N_TOK, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: null x must be "
+          "rejected");
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, tx, 0, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: zero n_tok must "
+          "be rejected");
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, 0, OUT_DIM, tx, N_TOK, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: zero in_dim must "
+          "be rejected");
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, 0, tx, N_TOK, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: zero out_dim must "
+          "be rejected");
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tsmall, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, tx, N_TOK, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: undersized gate "
+          "must be rejected");
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, tsmall, N_TOK, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: undersized x must "
+          "be rejected");
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_scalar_tensor(
+                  tgate, tup, tmid, combined, model_size, model_size,
+                  up_offset, IN_DIM, OUT_DIM, tx, N_TOK, 0.0f) == 0,
+          "shared_gate_up_swiglu_rows_scalar_rejections: out-of-range "
+          "gate_offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgate);
+    ds4_gpu_tensor_free(tup);
+    ds4_gpu_tensor_free(tmid);
+    ds4_gpu_tensor_free(tsmall);
+    fprintf(stderr,
+            "  test_shared_gate_up_swiglu_rows_scalar_rejections OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_shared_gate_up_swiglu_general() != 0) {
@@ -684,6 +968,18 @@ int main(void) {
         return 1;
     }
     if (test_shared_gate_up_swiglu_fast_vs_general_differential() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_gate_up_swiglu_rows_scalar_n_tok_1() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_gate_up_swiglu_rows_scalar_multi_token() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_gate_up_swiglu_rows_scalar_rejections() != 0) {
         ds4_gpu_cleanup();
         return 1;
     }
