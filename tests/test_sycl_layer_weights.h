@@ -1,22 +1,27 @@
-/* Synthetic ds4_weights / ds4_layer_weights scaffolding for one DeepSeek V4
- * Flash decoder layer, at a small shape sized to drive
- * metal_graph_encode_decode_layer_phase (ds4.c:21856), the real per-token
- * decode path, with no model file.  Pure C, no SYCL or C++-only includes:
- * this is included both from a plain C test file and, under
- * DS4_TEST_HOOKS, from ds4.c itself, which every GPU backend compiles with
- * a plain C compiler.
+/* Synthetic ds4_weights / ds4_layer_weights scaffolding for a multi-layer
+ * DeepSeek V4 Flash decoder, at a small shape sized to drive
+ * metal_graph_encode_decode_layer_phase (ds4.c:21856) and the output head
+ * (metal_graph_encode_output_head, ds4.c:25147), the real per-token decode
+ * path, with no model file.  Pure C, no SYCL or C++-only includes: this is
+ * included both from plain C test files and, under DS4_TEST_HOOKS, from
+ * ds4.c itself, which every GPU backend compiles with a plain C compiler.
  *
- * Nothing calls this header yet.  A later DS4_TEST_HOOKS hook builds a
- * ds4_weights and ds4_layer_weights by pointing ds4_tensor fields at the
- * abs_offset/dim/type values this header fills in, exactly as
- * ds4_test_graph_alloc_smoke and ds4_test_graph_encode_smoke (ds4.c:57544,
- * ds4.c:57671) already do by hand for their own smaller synthetic tensors.
+ * Two DS4_TEST_HOOKS hooks build a ds4_weights and ds4_layer_weights[] by
+ * pointing ds4_tensor fields at the abs_offset/dim/type values this header
+ * fills in, exactly as ds4_test_graph_alloc_smoke and
+ * ds4_test_graph_encode_smoke (ds4.c:57544, ds4.c:57671) already do by hand
+ * for their own smaller synthetic tensors: ds4_test_graph_full_layer_encode
+ * drives one layer directly, ds4_test_graph_full_token_encode drives every
+ * layer plus the output head through metal_graph_eval_token_raw_swa.
  *
  * The quantisation combination matches Flash as shipped: dense weights
  * (attn_q_a, attn_q_b, attn_kv, attn_output_a, attn_output_b,
- * ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp) are Q8_0; the router
- * (ffn_gate_inp) is F16; routed experts are IQ2_XXS gate/up and Q2_K down;
- * norms, hyper-connection (HC) scale/base, and attn_sinks are F32.
+ * ffn_gate_shexp, ffn_up_shexp, ffn_down_shexp, output) are Q8_0; the
+ * router (ffn_gate_inp) is F16; routed experts are IQ2_XXS gate/up and
+ * Q2_K down; the hash routing table (ffn_gate_tid2eid, layers below
+ * DS4_TW_N_HASH_LAYER only) is I32; norms, hyper-connection (HC)
+ * scale/base, attn_sinks and the output head's HC/norm tensors are F32
+ * (output_hc_fn is F16, matching a real model's output_hc_fn.weight).
  *
  * The IQ2_XXS block packer, the Q2_K block packer, the Q8_0 row encoder,
  * and the non-affine float filler below are ports of already-existing,
@@ -69,12 +74,19 @@
  *
  * A caller building the matching ds4_shape (only ds4.c can, ds4_shape is
  * private to that translation unit) should use these same values for
- * every field below, plus n_ff_dense=32, n_hash_layer=0, n_swa=8, small
- * n_indexer_* values, and the DS4_DEFAULT_* constants for everything else
- * -- the same pattern ds4_test_graph_alloc_smoke (ds4.c:57544) uses -- so
- * the shape fed to the engine and the tensors this header builds never
- * drift apart. */
-#define DS4_TW_N_LAYER              1u
+ * every field below, plus n_ff_dense=32, n_hash_layer=DS4_TW_N_HASH_LAYER,
+ * n_swa=8, small n_indexer_* values, and the DS4_DEFAULT_* constants for
+ * everything else -- the same pattern ds4_test_graph_alloc_smoke
+ * (ds4.c:57544) uses -- so the shape fed to the engine and the tensors this
+ * header builds never drift apart.
+ *
+ * DS4_TW_N_LAYER is 4 and DS4_TW_N_HASH_LAYER is 3, matching Flash's own
+ * n_hash_layer (ds4.c:566): layers 0-2 route by hash and require an
+ * ffn_gate_tid2eid table (ds4.c:4910, ds4.c:5948), layer 3 routes by top-k.
+ * A single layer can never exercise the layer-to-layer hyper-connection
+ * carry or the hash-routing path at all, so a full-token test needs both. */
+#define DS4_TW_N_LAYER              4u
+#define DS4_TW_N_HASH_LAYER         3u
 #define DS4_TW_N_EMBD                256u
 #define DS4_TW_N_VOCAB               128u
 #define DS4_TW_N_HEAD                2u
@@ -112,8 +124,9 @@
 #define DS4_TW_TYPE_Q8_0     8u
 #define DS4_TW_TYPE_Q2_K     10u
 #define DS4_TW_TYPE_IQ2_XXS  16u
+#define DS4_TW_TYPE_I32      26u
 
-/* elements-per-block/bytes-per-block for exactly the five types above,
+/* elements-per-block/bytes-per-block for exactly the six types above,
  * mirroring the relevant entries of ds4.c's gguf_types table (ds4.c:2028-
  * 2054) and its tensor_nbytes formula (ds4.c:2182-2188): bytes =
  * ceil(elements/block_elems) * block_bytes.  Every tensor built below has
@@ -127,6 +140,7 @@ static inline uint64_t ds4_tw_tensor_bytes(uint32_t type, uint64_t elements) {
         case DS4_TW_TYPE_Q8_0:    block_elems = 32;  block_bytes = 34; break;
         case DS4_TW_TYPE_Q2_K:    block_elems = 256; block_bytes = 84; break;
         case DS4_TW_TYPE_IQ2_XXS: block_elems = 256; block_bytes = 66; break;
+        case DS4_TW_TYPE_I32:     block_elems = 1;   block_bytes = 4;  break;
         default: return 0;
     }
     const uint64_t blocks = (elements + block_elems - 1u) / block_elems;
@@ -312,6 +326,26 @@ static inline void ds4_tw_fill_f16(uint16_t *dst, uint64_t n, uint32_t salt, flo
     for (uint64_t i = 0; i < n; i++) dst[i] = f32_to_f16_bits(center + scale * fill_val((uint32_t)i, salt));
 }
 
+/* Fills a hash routing table (ffn_gate_tid2eid): int32, dim = [n_expert_used,
+ * n_vocab], physically laid out token-major (n_vocab rows of n_expert_used
+ * ids each) per layer_hash_selected_experts (ds4.c:10699, "table +
+ * token * DS4_N_EXPERT_USED"). Every id is in [0, n_expert) and, within one
+ * token's row, all n_expert_used ids are pairwise distinct: 41 is odd and
+ * therefore coprime with any power of two, so `i * 41 mod n_expert` visits
+ * n_expert_used distinct residues for the small n_expert_used this header
+ * uses. `layer_salt` keeps different hash-routed layers from picking
+ * identical experts for the same token. */
+static inline void ds4_tw_fill_hash_tid2eid(int32_t *dst, uint32_t n_vocab,
+                                            uint32_t n_expert_used, uint32_t n_expert,
+                                            uint32_t layer_salt) {
+    for (uint32_t tok = 0; tok < n_vocab; tok++) {
+        const uint32_t base = (layer_salt * 29u + tok * 97u) % n_expert;
+        for (uint32_t i = 0; i < n_expert_used; i++) {
+            dst[(uint64_t)tok * n_expert_used + i] = (int32_t)((base + i * 41u) % n_expert);
+        }
+    }
+}
+
 /* ---- Tensor descriptors ---------------------------------------------------
  *
  * Carries exactly the ds4_tensor fields metal_graph_encode_decode_layer_phase
@@ -356,13 +390,22 @@ typedef struct {
     ds4_tw_tensor ffn_gate_shexp;
     ds4_tw_tensor ffn_up_shexp;
     ds4_tw_tensor ffn_down_shexp;
+    /* Only reserved and filled for layers below DS4_TW_N_HASH_LAYER; left
+     * zeroed (abs_offset/bytes/elements all 0) for top-k layers, exactly
+     * like a real ds4_layer_weights leaves the pointer NULL. */
+    ds4_tw_tensor ffn_gate_tid2eid;
 } ds4_tw_layer;
 
 typedef struct {
     uint8_t     *buf;
     uint64_t     buf_size;
     ds4_tw_tensor token_embd;
-    ds4_tw_layer  layer;
+    ds4_tw_tensor output_hc_base;
+    ds4_tw_tensor output_hc_fn;
+    ds4_tw_tensor output_hc_scale;
+    ds4_tw_tensor output_norm;
+    ds4_tw_tensor output;
+    ds4_tw_layer  layer[DS4_TW_N_LAYER];
 } ds4_tw_flash_weights;
 
 /* Rounds x up to the next multiple of align (align a power of two). */
@@ -458,12 +501,16 @@ enum {
 };
 
 /* Allocates and fills a host byte buffer standing in for model.map, holding
- * every tensor a compress-ratio-0 Flash decoder layer's full per-token
- * phase (metal_graph_encode_decode_layer_phase, ds4.c:21856) and the
- * token-embedding lookup that precedes it read, at the shape defined
- * above.  All tensors are filled with real, non-zero, deterministic
- * values (not zeroed), so a caller checking "the layer's output is not
- * all zero" is checking something meaningful.
+ * every tensor a compress-ratio-0 Flash decoder's full per-token phase
+ * (metal_graph_encode_decode_layer_phase, ds4.c:21856), the token-embedding
+ * lookup that precedes it, and the output head (metal_graph_encode_output_head,
+ * ds4.c:25147) read, at the shape defined above, for all DS4_TW_N_LAYER
+ * layers: layers below DS4_TW_N_HASH_LAYER additionally get a real
+ * ffn_gate_tid2eid hash routing table.  Every layer's tensors are filled
+ * with distinct salts (offset by the layer index) so no two layers end up
+ * with identical weights by coincidence.  All tensors are filled with real,
+ * non-zero, deterministic values (not zeroed), so a caller checking "the
+ * output is not all zero" is checking something meaningful.
  *
  * Returns 1 on success (out->buf allocated and every field populated), 0
  * on failure (out of memory); on failure *out is left zeroed and there is
@@ -473,35 +520,46 @@ static inline int ds4_test_build_flash_layer_weights(ds4_tw_flash_weights *out) 
     uint64_t cursor = 0;
 
     ds4_tw_reserve(&out->token_embd, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_N_EMBD, DS4_TW_N_VOCAB, 0);
+    ds4_tw_reserve(&out->output_hc_base, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_HC, 0, 0);
+    ds4_tw_reserve(&out->output_hc_fn, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_HC_DIM, DS4_TW_N_HC, 0);
+    ds4_tw_reserve(&out->output_hc_scale, &cursor, DS4_TW_TYPE_F32, 1, 1, 0, 0);
+    ds4_tw_reserve(&out->output_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_EMBD, 0, 0);
+    ds4_tw_reserve(&out->output, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_EMBD, DS4_TW_N_VOCAB, 0);
 
-    ds4_tw_layer *l = &out->layer;
-    ds4_tw_reserve(&l->hc_attn_fn, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_HC_DIM, DS4_TW_HC_MIX_DIM, 0);
-    ds4_tw_reserve(&l->hc_attn_scale, &cursor, DS4_TW_TYPE_F32, 1, 3, 0, 0);
-    ds4_tw_reserve(&l->hc_attn_base, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_HC_MIX_DIM, 0, 0);
-    ds4_tw_reserve(&l->attn_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_EMBD, 0, 0);
-    ds4_tw_reserve(&l->attn_q_a, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_EMBD, DS4_TW_N_LORA_Q, 0);
-    ds4_tw_reserve(&l->attn_q_a_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_LORA_Q, 0, 0);
-    ds4_tw_reserve(&l->attn_q_b, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_LORA_Q, DS4_TW_Q_DIM, 0);
-    ds4_tw_reserve(&l->attn_kv, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_EMBD, DS4_TW_N_HEAD_DIM, 0);
-    ds4_tw_reserve(&l->attn_kv_a_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_HEAD_DIM, 0, 0);
-    ds4_tw_reserve(&l->attn_sinks, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_HEAD, 0, 0);
-    ds4_tw_reserve(&l->attn_output_a, &cursor, DS4_TW_TYPE_Q8_0, 2,
-                   DS4_TW_N_HEAD_DIM * (DS4_TW_N_HEAD / DS4_TW_N_OUT_GROUP), DS4_TW_OUT_LOW_DIM, 0);
-    ds4_tw_reserve(&l->attn_output_b, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_OUT_LOW_DIM, DS4_TW_N_EMBD, 0);
-    ds4_tw_reserve(&l->hc_ffn_fn, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_HC_DIM, DS4_TW_HC_MIX_DIM, 0);
-    ds4_tw_reserve(&l->hc_ffn_scale, &cursor, DS4_TW_TYPE_F32, 1, 3, 0, 0);
-    ds4_tw_reserve(&l->hc_ffn_base, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_HC_MIX_DIM, 0, 0);
-    ds4_tw_reserve(&l->ffn_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_EMBD, 0, 0);
-    ds4_tw_reserve(&l->ffn_gate_inp, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_N_EMBD, DS4_TW_N_EXPERT, 0);
-    ds4_tw_reserve(&l->ffn_gate_exps, &cursor, DS4_TW_TYPE_IQ2_XXS, 3,
-                   DS4_TW_N_EMBD, DS4_TW_N_FF_EXP, DS4_TW_N_EXPERT);
-    ds4_tw_reserve(&l->ffn_up_exps, &cursor, DS4_TW_TYPE_IQ2_XXS, 3,
-                   DS4_TW_N_EMBD, DS4_TW_N_FF_EXP, DS4_TW_N_EXPERT);
-    ds4_tw_reserve(&l->ffn_down_exps, &cursor, DS4_TW_TYPE_Q2_K, 3,
-                   DS4_TW_N_FF_EXP, DS4_TW_N_EMBD, DS4_TW_N_EXPERT);
-    ds4_tw_reserve(&l->ffn_gate_shexp, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_EMBD, DS4_TW_N_FF_EXP, 0);
-    ds4_tw_reserve(&l->ffn_up_shexp, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_EMBD, DS4_TW_N_FF_EXP, 0);
-    ds4_tw_reserve(&l->ffn_down_shexp, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_FF_EXP, DS4_TW_N_EMBD, 0);
+    for (uint32_t il = 0; il < DS4_TW_N_LAYER; il++) {
+        ds4_tw_layer *l = &out->layer[il];
+        ds4_tw_reserve(&l->hc_attn_fn, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_HC_DIM, DS4_TW_HC_MIX_DIM, 0);
+        ds4_tw_reserve(&l->hc_attn_scale, &cursor, DS4_TW_TYPE_F32, 1, 3, 0, 0);
+        ds4_tw_reserve(&l->hc_attn_base, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_HC_MIX_DIM, 0, 0);
+        ds4_tw_reserve(&l->attn_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_EMBD, 0, 0);
+        ds4_tw_reserve(&l->attn_q_a, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_EMBD, DS4_TW_N_LORA_Q, 0);
+        ds4_tw_reserve(&l->attn_q_a_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_LORA_Q, 0, 0);
+        ds4_tw_reserve(&l->attn_q_b, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_LORA_Q, DS4_TW_Q_DIM, 0);
+        ds4_tw_reserve(&l->attn_kv, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_EMBD, DS4_TW_N_HEAD_DIM, 0);
+        ds4_tw_reserve(&l->attn_kv_a_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_HEAD_DIM, 0, 0);
+        ds4_tw_reserve(&l->attn_sinks, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_HEAD, 0, 0);
+        ds4_tw_reserve(&l->attn_output_a, &cursor, DS4_TW_TYPE_Q8_0, 2,
+                       DS4_TW_N_HEAD_DIM * (DS4_TW_N_HEAD / DS4_TW_N_OUT_GROUP), DS4_TW_OUT_LOW_DIM, 0);
+        ds4_tw_reserve(&l->attn_output_b, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_OUT_LOW_DIM, DS4_TW_N_EMBD, 0);
+        ds4_tw_reserve(&l->hc_ffn_fn, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_HC_DIM, DS4_TW_HC_MIX_DIM, 0);
+        ds4_tw_reserve(&l->hc_ffn_scale, &cursor, DS4_TW_TYPE_F32, 1, 3, 0, 0);
+        ds4_tw_reserve(&l->hc_ffn_base, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_HC_MIX_DIM, 0, 0);
+        ds4_tw_reserve(&l->ffn_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_EMBD, 0, 0);
+        ds4_tw_reserve(&l->ffn_gate_inp, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_N_EMBD, DS4_TW_N_EXPERT, 0);
+        ds4_tw_reserve(&l->ffn_gate_exps, &cursor, DS4_TW_TYPE_IQ2_XXS, 3,
+                       DS4_TW_N_EMBD, DS4_TW_N_FF_EXP, DS4_TW_N_EXPERT);
+        ds4_tw_reserve(&l->ffn_up_exps, &cursor, DS4_TW_TYPE_IQ2_XXS, 3,
+                       DS4_TW_N_EMBD, DS4_TW_N_FF_EXP, DS4_TW_N_EXPERT);
+        ds4_tw_reserve(&l->ffn_down_exps, &cursor, DS4_TW_TYPE_Q2_K, 3,
+                       DS4_TW_N_FF_EXP, DS4_TW_N_EMBD, DS4_TW_N_EXPERT);
+        ds4_tw_reserve(&l->ffn_gate_shexp, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_EMBD, DS4_TW_N_FF_EXP, 0);
+        ds4_tw_reserve(&l->ffn_up_shexp, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_EMBD, DS4_TW_N_FF_EXP, 0);
+        ds4_tw_reserve(&l->ffn_down_shexp, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_N_FF_EXP, DS4_TW_N_EMBD, 0);
+        if (il < DS4_TW_N_HASH_LAYER) {
+            ds4_tw_reserve(&l->ffn_gate_tid2eid, &cursor, DS4_TW_TYPE_I32, 2,
+                           DS4_TW_N_EXPERT_USED, DS4_TW_N_VOCAB, 0);
+        }
+    }
 
     out->buf_size = cursor;
     out->buf = (uint8_t *)calloc(1, (size_t)cursor);
@@ -512,42 +570,62 @@ static inline int ds4_test_build_flash_layer_weights(ds4_tw_flash_weights *out) 
 
     ds4_tw_fill_f16((uint16_t *)(out->buf + out->token_embd.abs_offset), out->token_embd.elements,
                     /*salt=*/1u, 0.0f, 0.2f);
+    ds4_tw_fill_f32((float *)(out->buf + out->output_hc_base.abs_offset), out->output_hc_base.elements,
+                    /*salt=*/14u, 0.0f, 0.1f);
+    ds4_tw_fill_f16((uint16_t *)(out->buf + out->output_hc_fn.abs_offset), out->output_hc_fn.elements,
+                    /*salt=*/15u, 0.0f, 0.1f);
+    ds4_tw_fill_f32((float *)(out->buf + out->output_hc_scale.abs_offset), out->output_hc_scale.elements,
+                    /*salt=*/16u, 0.5f, 0.2f);
+    ds4_tw_fill_f32((float *)(out->buf + out->output_norm.abs_offset), out->output_norm.elements,
+                    /*salt=*/17u, 1.0f, 0.1f);
+    ds4_tw_fill_q8_0_dense(out->buf, &out->output, /*salt_base=*/8000u);
 
-    ds4_tw_fill_f16((uint16_t *)(out->buf + l->hc_attn_fn.abs_offset), l->hc_attn_fn.elements,
-                    /*salt=*/2u, 0.0f, 0.1f);
-    ds4_tw_fill_f32((float *)(out->buf + l->hc_attn_scale.abs_offset), l->hc_attn_scale.elements,
-                    /*salt=*/3u, 0.5f, 0.2f);
-    ds4_tw_fill_f32((float *)(out->buf + l->hc_attn_base.abs_offset), l->hc_attn_base.elements,
-                    /*salt=*/4u, 0.0f, 0.1f);
-    ds4_tw_fill_f32((float *)(out->buf + l->attn_norm.abs_offset), l->attn_norm.elements,
-                    /*salt=*/5u, 1.0f, 0.1f);
-    ds4_tw_fill_q8_0_dense(out->buf, &l->attn_q_a, /*salt_base=*/0u);
-    ds4_tw_fill_f32((float *)(out->buf + l->attn_q_a_norm.abs_offset), l->attn_q_a_norm.elements,
-                    /*salt=*/6u, 1.0f, 0.1f);
-    ds4_tw_fill_q8_0_dense(out->buf, &l->attn_q_b, /*salt_base=*/1000u);
-    ds4_tw_fill_q8_0_dense(out->buf, &l->attn_kv, /*salt_base=*/2000u);
-    ds4_tw_fill_f32((float *)(out->buf + l->attn_kv_a_norm.abs_offset), l->attn_kv_a_norm.elements,
-                    /*salt=*/7u, 1.0f, 0.1f);
-    ds4_tw_fill_f32((float *)(out->buf + l->attn_sinks.abs_offset), l->attn_sinks.elements,
-                    /*salt=*/8u, 0.0f, 0.2f);
-    ds4_tw_fill_q8_0_dense(out->buf, &l->attn_output_a, /*salt_base=*/3000u);
-    ds4_tw_fill_q8_0_dense(out->buf, &l->attn_output_b, /*salt_base=*/4000u);
-    ds4_tw_fill_f16((uint16_t *)(out->buf + l->hc_ffn_fn.abs_offset), l->hc_ffn_fn.elements,
-                    /*salt=*/9u, 0.0f, 0.1f);
-    ds4_tw_fill_f32((float *)(out->buf + l->hc_ffn_scale.abs_offset), l->hc_ffn_scale.elements,
-                    /*salt=*/10u, 0.5f, 0.2f);
-    ds4_tw_fill_f32((float *)(out->buf + l->hc_ffn_base.abs_offset), l->hc_ffn_base.elements,
-                    /*salt=*/11u, 0.0f, 0.1f);
-    ds4_tw_fill_f32((float *)(out->buf + l->ffn_norm.abs_offset), l->ffn_norm.elements,
-                    /*salt=*/12u, 1.0f, 0.1f);
-    ds4_tw_fill_f16((uint16_t *)(out->buf + l->ffn_gate_inp.abs_offset), l->ffn_gate_inp.elements,
-                    /*salt=*/13u, 0.0f, 0.2f);
-    ds4_tw_fill_iq2_routed(out->buf, &l->ffn_gate_exps, DS4_TW_PHASE_GATE);
-    ds4_tw_fill_iq2_routed(out->buf, &l->ffn_up_exps, DS4_TW_PHASE_UP);
-    ds4_tw_fill_q2k_routed(out->buf, &l->ffn_down_exps, DS4_TW_PHASE_DOWN);
-    ds4_tw_fill_q8_0_dense(out->buf, &l->ffn_gate_shexp, /*salt_base=*/5000u);
-    ds4_tw_fill_q8_0_dense(out->buf, &l->ffn_up_shexp, /*salt_base=*/6000u);
-    ds4_tw_fill_q8_0_dense(out->buf, &l->ffn_down_shexp, /*salt_base=*/7000u);
+    for (uint32_t il = 0; il < DS4_TW_N_LAYER; il++) {
+        ds4_tw_layer *l = &out->layer[il];
+        const uint32_t s = il * 100u;
+        const uint32_t sb = il * 10000u;
+
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->hc_attn_fn.abs_offset), l->hc_attn_fn.elements,
+                        /*salt=*/2u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f32((float *)(out->buf + l->hc_attn_scale.abs_offset), l->hc_attn_scale.elements,
+                        /*salt=*/3u + s, 0.5f, 0.2f);
+        ds4_tw_fill_f32((float *)(out->buf + l->hc_attn_base.abs_offset), l->hc_attn_base.elements,
+                        /*salt=*/4u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f32((float *)(out->buf + l->attn_norm.abs_offset), l->attn_norm.elements,
+                        /*salt=*/5u + s, 1.0f, 0.1f);
+        ds4_tw_fill_q8_0_dense(out->buf, &l->attn_q_a, /*salt_base=*/0u + sb);
+        ds4_tw_fill_f32((float *)(out->buf + l->attn_q_a_norm.abs_offset), l->attn_q_a_norm.elements,
+                        /*salt=*/6u + s, 1.0f, 0.1f);
+        ds4_tw_fill_q8_0_dense(out->buf, &l->attn_q_b, /*salt_base=*/1000u + sb);
+        ds4_tw_fill_q8_0_dense(out->buf, &l->attn_kv, /*salt_base=*/2000u + sb);
+        ds4_tw_fill_f32((float *)(out->buf + l->attn_kv_a_norm.abs_offset), l->attn_kv_a_norm.elements,
+                        /*salt=*/7u + s, 1.0f, 0.1f);
+        ds4_tw_fill_f32((float *)(out->buf + l->attn_sinks.abs_offset), l->attn_sinks.elements,
+                        /*salt=*/8u + s, 0.0f, 0.2f);
+        ds4_tw_fill_q8_0_dense(out->buf, &l->attn_output_a, /*salt_base=*/3000u + sb);
+        ds4_tw_fill_q8_0_dense(out->buf, &l->attn_output_b, /*salt_base=*/4000u + sb);
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->hc_ffn_fn.abs_offset), l->hc_ffn_fn.elements,
+                        /*salt=*/9u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f32((float *)(out->buf + l->hc_ffn_scale.abs_offset), l->hc_ffn_scale.elements,
+                        /*salt=*/10u + s, 0.5f, 0.2f);
+        ds4_tw_fill_f32((float *)(out->buf + l->hc_ffn_base.abs_offset), l->hc_ffn_base.elements,
+                        /*salt=*/11u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f32((float *)(out->buf + l->ffn_norm.abs_offset), l->ffn_norm.elements,
+                        /*salt=*/12u + s, 1.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->ffn_gate_inp.abs_offset), l->ffn_gate_inp.elements,
+                        /*salt=*/13u + s, 0.0f, 0.2f);
+        ds4_tw_fill_iq2_routed(out->buf, &l->ffn_gate_exps, DS4_TW_PHASE_GATE + il * 3u);
+        ds4_tw_fill_iq2_routed(out->buf, &l->ffn_up_exps, DS4_TW_PHASE_UP + il * 3u);
+        ds4_tw_fill_q2k_routed(out->buf, &l->ffn_down_exps, DS4_TW_PHASE_DOWN + il * 3u);
+        ds4_tw_fill_q8_0_dense(out->buf, &l->ffn_gate_shexp, /*salt_base=*/5000u + sb);
+        ds4_tw_fill_q8_0_dense(out->buf, &l->ffn_up_shexp, /*salt_base=*/6000u + sb);
+        ds4_tw_fill_q8_0_dense(out->buf, &l->ffn_down_shexp, /*salt_base=*/7000u + sb);
+        if (il < DS4_TW_N_HASH_LAYER) {
+            ds4_tw_fill_hash_tid2eid((int32_t *)(out->buf + l->ffn_gate_tid2eid.abs_offset),
+                                     DS4_TW_N_VOCAB, DS4_TW_N_EXPERT_USED, DS4_TW_N_EXPERT,
+                                     /*layer_salt=*/il + 1u);
+        }
+    }
 
     return 1;
 }
