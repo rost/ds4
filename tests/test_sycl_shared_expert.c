@@ -22,7 +22,15 @@
 #include "test_sycl_harness.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* Test-only diagnostic (sycl/ds4_sycl_shared_expert.hpp), the same
+ * hit-counter technique used by ds4_sycl_stream_test_hit_miss: a
+ * correctness assertion on gate/up/mid cannot tell "the fused kernel ran"
+ * apart from "the general path computed the same dot product", so tests
+ * that must confirm which branch actually executed read this counter. */
+extern uint64_t ds4_sycl_shared_expert_test_fast_path_hits(void);
 
 /* Half-precision encode, plain truncation (not round-to-nearest); safe
  * here because the decode side (sycl_q8_0_dequant, via the kernel under
@@ -155,10 +163,22 @@ static int test_shared_gate_up_swiglu_general(void) {
     CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
           "shared_gate_up_swiglu_general: write x");
 
+    /* IN_DIM != 4096, so this must take the general path: the fast-path
+     * hit counter must not move.  This is the test that would catch a
+     * port that takes the fused kernel unconditionally regardless of
+     * shape, since IN_DIM is also not a multiple of 32, so the fused
+     * kernel's unguarded `x[b*32+lane]` read would run past the end of
+     * the IN_DIM-sized x buffer for the remainder block, corrupting the
+     * result (see the fast_path_correctness test's own header comment for
+     * why a multiple-of-32-but-not-4096 shape could not catch this). */
+    const uint64_t fast_hits_before = ds4_sycl_shared_expert_test_fast_path_hits();
     CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                   tgate, tup, tmid, combined, model_size, gate_offset,
                   up_offset, IN_DIM, OUT_DIM, tx, clamp) != 0,
           "shared_gate_up_swiglu_general: call");
+    CHECK(ds4_sycl_shared_expert_test_fast_path_hits() == fast_hits_before,
+          "shared_gate_up_swiglu_general: must not take the fused fast "
+          "path for IN_DIM != 4096");
     CHECK(ds4_gpu_tensor_read(tgate, 0, got_gate, sizeof(got_gate)) != 0,
           "shared_gate_up_swiglu_general: read gate");
     CHECK(ds4_gpu_tensor_read(tup, 0, got_up, sizeof(got_up)) != 0,
@@ -394,6 +414,257 @@ static int test_shared_gate_up_swiglu_rejections(void) {
     return 0;
 }
 
+/* Fused fast path: in_dim == 4096 triggers
+ * shared_gate_up_swiglu_q8_0_rows_w32_kernel (rocm/ds4_rocm_q8.cuh:948-1046)
+ * instead of the general path.  out_dim deliberately not a multiple of 32
+ * (the fast kernel's row-block size), so the final work-group's partial
+ * row-block guard (`if (row >= out_dim) return;`) is exercised: with
+ * rows_per_block == 32 and OUT_DIM == 50, the second work-group covers
+ * rows 32..63 but only 32..49 are valid.  gate/up/mid are allocated with
+ * PADDED_DIM == 64 capacity (one full row-block beyond the last one that
+ * matters) and pre-filled with a canary pattern the entry is never told
+ * about (out_dim is passed as 50, not 64): dropping the guard would write
+ * computed values into rows 50..63 too, which the OUT_DIM-only read in an
+ * earlier version of this test could not see, since it only read back the
+ * 50 rows it asked for. Reading and checking the full padded range is
+ * what makes that ablation observable; a first version of this test
+ * allocated exactly OUT_DIM-sized buffers and the guard-drop ablation
+ * passed anyway, corrupting memory just past the tensors' ends without
+ * moving any value this test inspected.  Heap-allocated: IN_DIM == 4096
+ * makes the per-row weight tables and activation too large for a
+ * comfortable stack frame. */
+static int test_shared_gate_up_swiglu_fast_path_correctness(void) {
+    enum { IN_DIM = 4096, OUT_DIM = 50, PADDED_DIM = 64 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const float clamp = 4.0f;
+    const float canary = -123456.0f;
+
+    unsigned char *wg = (unsigned char *)malloc((size_t)OUT_DIM * row_bytes);
+    unsigned char *wu = (unsigned char *)malloc((size_t)OUT_DIM * row_bytes);
+    float *x = (float *)malloc((size_t)IN_DIM * sizeof(float));
+    float *want_gate = (float *)malloc((size_t)OUT_DIM * sizeof(float));
+    float *want_up = (float *)malloc((size_t)OUT_DIM * sizeof(float));
+    float *want_mid = (float *)malloc((size_t)OUT_DIM * sizeof(float));
+    float *got_gate = (float *)malloc((size_t)PADDED_DIM * sizeof(float));
+    float *got_up = (float *)malloc((size_t)PADDED_DIM * sizeof(float));
+    float *got_mid = (float *)malloc((size_t)PADDED_DIM * sizeof(float));
+    float *padded_canary = (float *)malloc((size_t)PADDED_DIM * sizeof(float));
+    unsigned char *combined =
+            (unsigned char *)malloc((size_t)2 * OUT_DIM * row_bytes);
+    CHECK(wg && wu && x && want_gate && want_up && want_mid && got_gate &&
+          got_up && got_mid && padded_canary && combined,
+          "shared_gate_up_swiglu_fast_path: allocation failed");
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 0);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 100);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) {
+        x[k] = (float)(((k + 1) * 11) % 17) - 8.0f + 0.01f * (float)(k % 7);
+    }
+    for (int i = 0; i < PADDED_DIM; i++) padded_canary[i] = canary;
+    oracle_shared_gate_up_swiglu(want_gate, want_up, want_mid, x, wg, wu,
+                                 IN_DIM, OUT_DIM, row_bytes, clamp);
+
+    memcpy(combined, wg, (size_t)OUT_DIM * row_bytes);
+    memcpy(combined + (size_t)OUT_DIM * row_bytes, wu,
+           (size_t)OUT_DIM * row_bytes);
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = (uint64_t)OUT_DIM * row_bytes;
+    const uint64_t model_size = 2ull * OUT_DIM * row_bytes;
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc((size_t)IN_DIM * sizeof(float));
+    ds4_gpu_tensor *tgate =
+            ds4_gpu_tensor_alloc((size_t)PADDED_DIM * sizeof(float));
+    ds4_gpu_tensor *tup =
+            ds4_gpu_tensor_alloc((size_t)PADDED_DIM * sizeof(float));
+    ds4_gpu_tensor *tmid =
+            ds4_gpu_tensor_alloc((size_t)PADDED_DIM * sizeof(float));
+    CHECK(tx && tgate && tup && tmid,
+          "shared_gate_up_swiglu_fast_path: tensor allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, (size_t)IN_DIM * sizeof(float)) != 0,
+          "shared_gate_up_swiglu_fast_path: write x");
+    CHECK(ds4_gpu_tensor_write(tgate, 0, padded_canary,
+                               (size_t)PADDED_DIM * sizeof(float)) != 0 &&
+          ds4_gpu_tensor_write(tup, 0, padded_canary,
+                               (size_t)PADDED_DIM * sizeof(float)) != 0 &&
+          ds4_gpu_tensor_write(tmid, 0, padded_canary,
+                               (size_t)PADDED_DIM * sizeof(float)) != 0,
+          "shared_gate_up_swiglu_fast_path: write canary");
+
+    const uint64_t fast_hits_before = ds4_sycl_shared_expert_test_fast_path_hits();
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, tx, clamp) != 0,
+          "shared_gate_up_swiglu_fast_path: call");
+    CHECK(ds4_sycl_shared_expert_test_fast_path_hits() == fast_hits_before + 1,
+          "shared_gate_up_swiglu_fast_path: must take the fused fast path "
+          "for IN_DIM == 4096");
+    CHECK(ds4_gpu_tensor_read(tgate, 0, got_gate,
+                              (size_t)PADDED_DIM * sizeof(float)) != 0,
+          "shared_gate_up_swiglu_fast_path: read gate");
+    CHECK(ds4_gpu_tensor_read(tup, 0, got_up,
+                              (size_t)PADDED_DIM * sizeof(float)) != 0,
+          "shared_gate_up_swiglu_fast_path: read up");
+    CHECK(ds4_gpu_tensor_read(tmid, 0, got_mid,
+                              (size_t)PADDED_DIM * sizeof(float)) != 0,
+          "shared_gate_up_swiglu_fast_path: read mid");
+
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got_gate[i], want_gate[i], 1e-1,
+                    "shared_gate_up_swiglu_fast_path: gate mismatch");
+        CHECK_CLOSE(got_up[i], want_up[i], 1e-1,
+                    "shared_gate_up_swiglu_fast_path: up mismatch");
+        CHECK_CLOSE(got_mid[i], want_mid[i], 1e-1,
+                    "shared_gate_up_swiglu_fast_path: mid mismatch");
+    }
+    for (int i = OUT_DIM; i < PADDED_DIM; i++) {
+        CHECK(got_gate[i] == canary,
+              "shared_gate_up_swiglu_fast_path: gate canary past out_dim "
+              "was overwritten");
+        CHECK(got_up[i] == canary,
+              "shared_gate_up_swiglu_fast_path: up canary past out_dim was "
+              "overwritten");
+        CHECK(got_mid[i] == canary,
+              "shared_gate_up_swiglu_fast_path: mid canary past out_dim "
+              "was overwritten");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgate);
+    ds4_gpu_tensor_free(tup);
+    ds4_gpu_tensor_free(tmid);
+    free(wg);
+    free(wu);
+    free(x);
+    free(padded_canary);
+    free(want_gate);
+    free(want_up);
+    free(want_mid);
+    free(got_gate);
+    free(got_up);
+    free(got_mid);
+    free(combined);
+    fprintf(stderr, "  test_shared_gate_up_swiglu_fast_path_correctness OK\n");
+    return 0;
+}
+
+/* Differential test: for the SAME in_dim == 4096 shape, the public entry
+ * always takes the fused fast path (there is no way to force it through
+ * the general path via the public ABI once the shape qualifies), so the
+ * "general path" side of this comparison is built by calling the two
+ * primitives the general path itself calls,
+ * ds4_gpu_matmul_q8_0_pair_tensor and ds4_gpu_swiglu_tensor, directly.
+ * gate, up AND mid must all agree: gate/up equality catches a fused
+ * kernel that has drifted from the pair matmul's dequant/accumulate, and
+ * mid equality additionally exercises the fused kernel's own inline SwiGLU
+ * against the already-validated ds4_gpu_swiglu_tensor. */
+static int test_shared_gate_up_swiglu_fast_vs_general_differential(void) {
+    enum { IN_DIM = 4096, OUT_DIM = 20 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const float clamp = 2.5f;
+
+    unsigned char *wg = (unsigned char *)malloc((size_t)OUT_DIM * row_bytes);
+    unsigned char *wu = (unsigned char *)malloc((size_t)OUT_DIM * row_bytes);
+    float *x = (float *)malloc((size_t)IN_DIM * sizeof(float));
+    unsigned char *combined =
+            (unsigned char *)malloc((size_t)2 * OUT_DIM * row_bytes);
+    CHECK(wg && wu && x && combined,
+          "shared_gate_up_swiglu_fast_vs_general: allocation failed");
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 3);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 200);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) {
+        x[k] = (float)(((k + 2) * 13) % 19) - 9.0f + 0.02f * (float)(k % 5);
+    }
+    memcpy(combined, wg, (size_t)OUT_DIM * row_bytes);
+    memcpy(combined + (size_t)OUT_DIM * row_bytes, wu,
+           (size_t)OUT_DIM * row_bytes);
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = (uint64_t)OUT_DIM * row_bytes;
+    const uint64_t model_size = 2ull * OUT_DIM * row_bytes;
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc((size_t)IN_DIM * sizeof(float));
+    ds4_gpu_tensor *tgen_gate =
+            ds4_gpu_tensor_alloc((size_t)OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tgen_up =
+            ds4_gpu_tensor_alloc((size_t)OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tgen_mid =
+            ds4_gpu_tensor_alloc((size_t)OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tfused_gate =
+            ds4_gpu_tensor_alloc((size_t)OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tfused_up =
+            ds4_gpu_tensor_alloc((size_t)OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tfused_mid =
+            ds4_gpu_tensor_alloc((size_t)OUT_DIM * sizeof(float));
+    CHECK(tx && tgen_gate && tgen_up && tgen_mid && tfused_gate &&
+          tfused_up && tfused_mid,
+          "shared_gate_up_swiglu_fast_vs_general: tensor allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, (size_t)IN_DIM * sizeof(float)) != 0,
+          "shared_gate_up_swiglu_fast_vs_general: write x");
+
+    CHECK(ds4_gpu_matmul_q8_0_pair_tensor(tgen_gate, tgen_up, combined,
+                                          model_size, gate_offset, up_offset,
+                                          IN_DIM, OUT_DIM, OUT_DIM, tx,
+                                          1) != 0,
+          "shared_gate_up_swiglu_fast_vs_general: general pair matmul call");
+    CHECK(ds4_gpu_swiglu_tensor(tgen_mid, tgen_gate, tgen_up, OUT_DIM, clamp,
+                                1.0f) != 0,
+          "shared_gate_up_swiglu_fast_vs_general: general swiglu call");
+
+    /* Confirms the "general" side above genuinely bypassed the fused
+     * kernel (it calls the primitives directly, not the dispatching
+     * entry, so it must not move the counter at all), and that the fused
+     * call below is what actually exercises the fast path being compared
+     * against. */
+    const uint64_t fast_hits_before = ds4_sycl_shared_expert_test_fast_path_hits();
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
+                  tfused_gate, tfused_up, tfused_mid, combined, model_size,
+                  gate_offset, up_offset, IN_DIM, OUT_DIM, tx, clamp) != 0,
+          "shared_gate_up_swiglu_fast_vs_general: fused call");
+    CHECK(ds4_sycl_shared_expert_test_fast_path_hits() == fast_hits_before + 1,
+          "shared_gate_up_swiglu_fast_vs_general: fused call must take the "
+          "fast path exactly once");
+
+    float gen_g[OUT_DIM], gen_u[OUT_DIM], gen_m[OUT_DIM];
+    float fus_g[OUT_DIM], fus_u[OUT_DIM], fus_m[OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(tgen_gate, 0, gen_g, sizeof(gen_g)) != 0 &&
+          ds4_gpu_tensor_read(tgen_up, 0, gen_u, sizeof(gen_u)) != 0 &&
+          ds4_gpu_tensor_read(tgen_mid, 0, gen_m, sizeof(gen_m)) != 0 &&
+          ds4_gpu_tensor_read(tfused_gate, 0, fus_g, sizeof(fus_g)) != 0 &&
+          ds4_gpu_tensor_read(tfused_up, 0, fus_u, sizeof(fus_u)) != 0 &&
+          ds4_gpu_tensor_read(tfused_mid, 0, fus_m, sizeof(fus_m)) != 0,
+          "shared_gate_up_swiglu_fast_vs_general: readback failed");
+
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(fus_g[i], gen_g[i], 1e-1,
+                    "shared_gate_up_swiglu_fast_vs_general: gate mismatch");
+        CHECK_CLOSE(fus_u[i], gen_u[i], 1e-1,
+                    "shared_gate_up_swiglu_fast_vs_general: up mismatch");
+        CHECK_CLOSE(fus_m[i], gen_m[i], 1e-1,
+                    "shared_gate_up_swiglu_fast_vs_general: mid mismatch");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgen_gate);
+    ds4_gpu_tensor_free(tgen_up);
+    ds4_gpu_tensor_free(tgen_mid);
+    ds4_gpu_tensor_free(tfused_gate);
+    ds4_gpu_tensor_free(tfused_up);
+    ds4_gpu_tensor_free(tfused_mid);
+    free(wg);
+    free(wu);
+    free(x);
+    free(combined);
+    fprintf(stderr,
+            "  test_shared_gate_up_swiglu_fast_vs_general_differential OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_shared_gate_up_swiglu_general() != 0) {
@@ -405,6 +676,14 @@ int main(void) {
         return 1;
     }
     if (test_shared_gate_up_swiglu_rejections() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_gate_up_swiglu_fast_path_correctness() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_gate_up_swiglu_fast_vs_general_differential() != 0) {
         ds4_gpu_cleanup();
         return 1;
     }
