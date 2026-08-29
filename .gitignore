@@ -39,10 +39,14 @@
 /tests/test_sycl_norm_rope
 /tests/test_sycl_compressor
 /tests/test_sycl_matmul
+<<<<<<< HEAD
 /tests/test_sycl_router
 =======
 /tests/test_sycl_fp8_kv
 >>>>>>> 0923295 (feat(sycl): add e4m3 value table and nearest rounding)
+=======
+/tests/test_sycl_shared_expert
+>>>>>>> 98bc717 (feat(sycl): implement shared expert gate up swiglu)
 *.o
 *.dSYM/
 __pycache__/

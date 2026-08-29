@@ -501,3 +501,9 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
 #include "sycl/ds4_sycl_router.hpp"
 /* Same scoping reason as the includes above. */
 #include "sycl/ds4_sycl_fp8_kv.hpp"
+
+/* Same scoping reason as the includes above: the shared expert's fused
+ * fast-path kernel references g_devices and ds4_sycl_queue, and its
+ * general path calls ds4_gpu_matmul_q8_0_pair_tensor and
+ * ds4_gpu_swiglu_tensor above, both of which must already be defined. */
+#include "sycl/ds4_sycl_shared_expert.hpp"
