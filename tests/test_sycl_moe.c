@@ -112,6 +112,243 @@ static float f16_bits_to_f32(uint16_t bits) {
     return (float)sign * (float)(1024 + mant) * (float)ldexp(1.0, exp - 25);
 }
 
+/* ---- MXFP4: independent format oracle, no GPU involved -----------------
+ *
+ * Every MXFP4 kernel this port will add ultimately reduces to one 17-byte
+ * block layout (ds4.c:807-819, block_mxfp4: uint8_t e; uint8_t qs[16]) and
+ * two conversions: the E8M0 shared exponent (ds4.c:3732-3737) and the
+ * 16-value E2M1 element table (ds4.c:3739-3742).  ds4-sycl-mxfp4-
+ * validation.md's central risk is that a test oracle and a kernel derive
+ * both from the same misreading of that format and quietly agree while
+ * both being wrong.  This section carries two INDEPENDENTLY derived
+ * computations of the same sixteen dequantized values, cross-checked
+ * against each other on random data instead of one being tested against
+ * a copy of itself:
+ *
+ *   - oracle_mxfp4_code_value_ocp: the OCP MX E2M1 bit fields (sign, a
+ *     2-bit exponent with bias 1, a 1-bit mantissa) combined via ldexp,
+ *     derived from the format definition, not from ds4_mxfp4_values or
+ *     any existing test file's table.
+ *   - oracle_mxfp4_code_twice: a doubled-integer bit manipulation in the
+ *     SHAPE of dev_mxfp4_unpack4's portable branch
+ *     (rocm/ds4_rocm_moe.cuh:301-326), independently re-derived here
+ *     rather than copied, used only as the cross-check.
+ *
+ * No kernel exists yet at this point in the plan; this is deliberately
+ * the one place in the project where a test legitimately passes before
+ * any device code exists, because what it is testing is the oracle
+ * itself. */
+
+enum { MXFP4_QK = 32 };
+
+typedef struct {
+    uint8_t e;
+    uint8_t qs[MXFP4_QK / 2];
+} oracle_mxfp4_block;
+
+/* ds4_e8m0_to_f32, ds4.c:3732-3737: bits = e==0 ? 0x00400000 : (e<<23),
+ * i.e. the raw byte placed directly into a float's 8-bit exponent field.
+ * Derived here via ldexpf rather than the bit-cast ds4.c and the SYCL
+ * kernel both use, so a wrong exponent bias would have to be wrong the
+ * same way in two unrelated code shapes to go unnoticed. */
+static float oracle_mxfp4_e8m0_scale(uint8_t e) {
+    return e == 0u ? ldexpf(1.0f, -127) : ldexpf(1.0f, (int)e - 127);
+}
+
+/* Independent derivation 1: OCP MX E2M1 bit fields.  Bit 3 is sign, bits
+ * 2:1 are a 2-bit exponent field with bias 1, bit 0 is a 1-bit mantissa.
+ * Exponent field 0 is the subnormal case (leading significand bit 0
+ * instead of 1).  Arithmetic on the field values, not a lookup table. */
+static float oracle_mxfp4_code_value_ocp(uint8_t code) {
+    const int sign = (code & 8u) ? -1 : 1;
+    const int exp_field = (code >> 1) & 3;
+    const int mantissa_bit = code & 1;
+    const double leading = exp_field == 0 ? 0.0 : 1.0;
+    const double significand = leading + (double)mantissa_bit * 0.5;
+    const double scale = exp_field == 0 ? ldexp(1.0, 0) : ldexp(1.0, exp_field - 1);
+    return (float)((double)sign * significand * scale);
+}
+
+/* Independent derivation 2: doubled-integer bit manipulation, matching
+ * the shape of dev_mxfp4_unpack4's portable branch: base walks 0..7, the
+ * two "missing mantissa step" codes (5 and 6) get bumped past the gap,
+ * and code 7 gets a further +2 to reach 12 (6.0 doubled) instead of the
+ * naive 7+3=10.  Every value is exact in integer doubled form. */
+static int oracle_mxfp4_code_twice(uint8_t code) {
+    const uint32_t base = code & 7u;
+    int32_t value = (int32_t)(base + (base > 4u ? base - 4u : 0u) + (base == 7u ? 2u : 0u));
+    if (code & 8u) value = -value;
+    return value;
+}
+
+static float oracle_mxfp4_dot(const oracle_mxfp4_block *blocks, int n_blocks, const float *y) {
+    float sum = 0.0f;
+    for (int ib = 0; ib < n_blocks; ib++) {
+        const float scale = oracle_mxfp4_e8m0_scale(blocks[ib].e);
+        for (int j = 0; j < MXFP4_QK / 2; j++) {
+            const uint8_t byte = blocks[ib].qs[j];
+            sum += scale * oracle_mxfp4_code_value_ocp(byte & 0x0f) * y[ib * MXFP4_QK + j];
+            sum += scale * oracle_mxfp4_code_value_ocp(byte >> 4) * y[ib * MXFP4_QK + j + MXFP4_QK / 2];
+        }
+    }
+    return sum;
+}
+
+static int test_mxfp4_block_layout(void) {
+    CHECK(sizeof(oracle_mxfp4_block) == 17, "mxfp4: block size must be 17 bytes");
+    fprintf(stderr, "  test_mxfp4_block_layout OK\n");
+    return 0;
+}
+
+static int test_mxfp4_e8m0_boundary(void) {
+    /* e == 0 is 2^-127, a small subnormal-magnitude float, NOT zero: a
+     * plausible-looking but wrong simplification is to treat a
+     * zero-exponent block as an all-zero block. */
+    CHECK(oracle_mxfp4_e8m0_scale(0) == ldexpf(1.0f, -127),
+          "mxfp4: e=0 scale must be 2^-127, not 0");
+    CHECK(oracle_mxfp4_e8m0_scale(0) != 0.0f, "mxfp4: e=0 scale must not be zero");
+    CHECK(oracle_mxfp4_e8m0_scale(1) == ldexpf(1.0f, -126), "mxfp4: e=1 scale mismatch");
+    CHECK(oracle_mxfp4_e8m0_scale(127) == 1.0f, "mxfp4: e=127 scale must be 1.0");
+    fprintf(stderr, "  test_mxfp4_e8m0_boundary OK\n");
+    return 0;
+}
+
+/* Pinned, not resolved: e==255 places an all-ones exponent field with a
+ * zero mantissa into a float, which IEEE754 defines as +infinity, not a
+ * finite 2^128 -- 2^(255-127) = 2^128 overflows any finite float either
+ * way, so a bit-cast and an ldexpf-based scale necessarily agree here.
+ * The OCP MX spec reserves e==255 for NaN; this project's format does not
+ * implement that.  This test pins the actual (diverging) behaviour rather
+ * than adjudicating whether the divergence matters. */
+static int test_mxfp4_e255_pinned(void) {
+    const float scale = oracle_mxfp4_e8m0_scale(255);
+    CHECK(isinf(scale) && scale > 0.0f,
+          "mxfp4: e=255 must be +infinity, not a finite value or NaN");
+    fprintf(stderr, "  test_mxfp4_e255_pinned OK\n");
+    return 0;
+}
+
+static int test_mxfp4_e2m1_codes(void) {
+    static const float expect[16] = {
+        0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+        0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+    };
+    for (int code = 0; code < 16; code++) {
+        const float got_ocp = oracle_mxfp4_code_value_ocp((uint8_t)code);
+        const float got_twice = 0.5f * (float)oracle_mxfp4_code_twice((uint8_t)code);
+        CHECK(got_ocp == expect[code], "mxfp4: OCP-derived code value mismatch");
+        CHECK(got_twice == expect[code], "mxfp4: twice-integer code value mismatch");
+    }
+    fprintf(stderr, "  test_mxfp4_e2m1_codes OK\n");
+    return 0;
+}
+
+static int test_mxfp4_exponent_scaling(void) {
+    /* Exact power-of-two ratio between adjacent nonzero exponents, bit
+     * exact (every value here is a small power-of-two multiple, exactly
+     * representable in float). */
+    for (int e = 1; e < 250; e++) {
+        const float lo = oracle_mxfp4_e8m0_scale((uint8_t)e);
+        const float hi = oracle_mxfp4_e8m0_scale((uint8_t)(e + 1));
+        CHECK(hi == 2.0f * lo, "mxfp4: adjacent exponents must scale by exactly 2x");
+    }
+    for (int code = 1; code < 8; code++) {
+        const float v_e1 = oracle_mxfp4_code_value_ocp((uint8_t)code) * oracle_mxfp4_e8m0_scale(10);
+        const float v_e2 = oracle_mxfp4_code_value_ocp((uint8_t)code) * oracle_mxfp4_e8m0_scale(11);
+        CHECK(v_e2 == 2.0f * v_e1, "mxfp4: dequantized value must double with exponent+1");
+    }
+    fprintf(stderr, "  test_mxfp4_exponent_scaling OK\n");
+    return 0;
+}
+
+static int test_mxfp4_monotonicity(void) {
+    for (int code = 0; code < 7; code++) {
+        CHECK(oracle_mxfp4_code_value_ocp((uint8_t)code) <
+                  oracle_mxfp4_code_value_ocp((uint8_t)(code + 1)),
+              "mxfp4: non-negative codes must be strictly increasing");
+    }
+    for (int code = 0; code < 8; code++) {
+        CHECK(oracle_mxfp4_code_value_ocp((uint8_t)(code + 8)) ==
+                  -oracle_mxfp4_code_value_ocp((uint8_t)code),
+              "mxfp4: sign bit must exactly negate the magnitude code");
+    }
+    fprintf(stderr, "  test_mxfp4_monotonicity OK\n");
+    return 0;
+}
+
+static int test_mxfp4_nibble_order(void) {
+    /* y is zero on the block's second half, so only the low-nibble
+     * contribution (elements 0..15) survives the dot.  A uniform y
+     * (every element 1.0) sums both halves regardless of which nibble
+     * feeds which half and cannot tell nibble order from a value-table
+     * bug at all; that degenerate form of this test was tried first and
+     * an ablation swapping the nibble order did not fail it, only
+     * test_mxfp4_random_dot caught it (spec 6i: the test data, not just
+     * the property under test, decides whether an ablation discriminates).
+     * Low nibble 0x6 -> code 6 -> value 4.0; high nibble 0xf -> code 15
+     * -> value -6.0. */
+    oracle_mxfp4_block block;
+    float y[MXFP4_QK];
+    block.e = 127;
+    memset(block.qs, 0xf6, sizeof(block.qs));
+    for (int i = 0; i < MXFP4_QK / 2; i++) y[i] = 1.0f;
+    for (int i = MXFP4_QK / 2; i < MXFP4_QK; i++) y[i] = 0.0f;
+    const float got = oracle_mxfp4_dot(&block, 1, y);
+    CHECK(got == 16.0f * 4.0f, "mxfp4: nibble order mismatch");
+    fprintf(stderr, "  test_mxfp4_nibble_order OK\n");
+    return 0;
+}
+
+static int test_mxfp4_random_dot(void) {
+    enum { N_BLOCK = 5, N = N_BLOCK * MXFP4_QK };
+    oracle_mxfp4_block blocks[N_BLOCK];
+    float y[N];
+    uint32_t state = 0xC0FFEEu;
+    for (int trial = 0; trial < 200; trial++) {
+        for (int ib = 0; ib < N_BLOCK; ib++) {
+            state = state * 1664525u + 1013904223u;
+            blocks[ib].e = (uint8_t)(100u + state % 55u);
+            for (int j = 0; j < MXFP4_QK / 2; j++) {
+                state = state * 1664525u + 1013904223u;
+                blocks[ib].qs[j] = (uint8_t)(state >> 24);
+            }
+        }
+        for (int i = 0; i < N; i++) {
+            state = state * 1664525u + 1013904223u;
+            y[i] = (float)(int16_t)(state >> 16) / 4096.0f;
+        }
+
+        const float got = oracle_mxfp4_dot(blocks, N_BLOCK, y);
+        float expected = 0.0f;
+        float abs_sum = 0.0f;
+        for (int ib = 0; ib < N_BLOCK; ib++) {
+            const float scale = oracle_mxfp4_e8m0_scale(blocks[ib].e);
+            for (int j = 0; j < MXFP4_QK / 2; j++) {
+                const uint8_t byte = blocks[ib].qs[j];
+                const float t0 = scale * 0.5f * (float)oracle_mxfp4_code_twice(byte & 0x0f) *
+                                 y[ib * MXFP4_QK + j];
+                const float t1 = scale * 0.5f * (float)oracle_mxfp4_code_twice(byte >> 4) *
+                                 y[ib * MXFP4_QK + j + MXFP4_QK / 2];
+                expected += t0;
+                expected += t1;
+                abs_sum += fabsf(t0) + fabsf(t1);
+            }
+        }
+        /* Tolerance floors on the sum of term magnitudes, not the (possibly
+         * heavily cancelled) final expected value: random signed terms at
+         * widely varying per-block scales can sum to something much
+         * smaller than any individual term, and a relative tolerance on
+         * that near-zero total would fail on ordinary float rounding, not
+         * on a real defect (spec 6f's cancellation hazard, applied to plain
+         * summation rather than a normalisation). */
+        const float tolerance = 2.0e-5f * fmaxf(1.0f, abs_sum);
+        CHECK(fabsf(got - expected) <= tolerance,
+              "mxfp4: dot vs independently-derived reference mismatch");
+    }
+    fprintf(stderr, "  test_mxfp4_random_dot OK\n");
+    return 0;
+}
+
 static int test_q8_k_quantize(void) {
     /* Two superblocks (in_dim = 512), two rows.  Row 0 has a wide dynamic
      * range (values spanning several orders of magnitude plus a mix of
@@ -2077,6 +2314,18 @@ static int test_q2k_down_slot_order(void) {
 }
 
 int main(void) {
+    /* MXFP4 format-oracle tests need no GPU; run
+     * them before ds4_gpu_init so a failure here is never confused with a
+     * device-side problem. */
+    if (test_mxfp4_block_layout() != 0) return 1;
+    if (test_mxfp4_e8m0_boundary() != 0) return 1;
+    if (test_mxfp4_e255_pinned() != 0) return 1;
+    if (test_mxfp4_e2m1_codes() != 0) return 1;
+    if (test_mxfp4_exponent_scaling() != 0) return 1;
+    if (test_mxfp4_monotonicity() != 0) return 1;
+    if (test_mxfp4_nibble_order() != 0) return 1;
+    if (test_mxfp4_random_dot() != 0) return 1;
+
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_q8_k_quantize() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q8_k_quantize_rejects_partial_row() != 0) { ds4_gpu_cleanup(); return 1; }
