@@ -183,44 +183,14 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x,
 
 namespace {
 
-/* Ported literally from f32_to_f16_bits_hip_round
- * (rocm/ds4_rocm_common.cuh:372-390): a hand-rolled F32-to-F16 bit encoder
- * that rounds up whenever the single highest discarded bit is set, with
- * no sticky-bit check of the remaining discarded bits.  This means it
- * rounds an EXACT tie up unconditionally ("round half up"), never to the
- * even neighbour.
+/* sycl_f32_to_f16_bits_hip_round now lives in ds4_sycl_common.hpp: this
+ * file's F16 store direction needs the same exact-tie rounding rule as
+ * ds4_sycl_attention_output.hpp's F16 output entry (spec 6k), so it is
+ * shared rather than ported a second time. See that header for the full
+ * derivation comment (measured against sycl::half on an Arc A770 in
+ * tests/test_sycl_fp8_kv.c).
  *
- * sycl::half's own device-side float-to-half conversion was measured
- * directly against this oracle on an Intel Arc A770 (Level Zero, oneAPI
- * 2025.3), via tests/test_sycl_fp8_kv.c's
- * test_f16_sycl_half_matches_device_on_non_tie_values and
- * test_f16_exact_tie_sycl_half_diverges_from_oracle: the two agree at
- * every non-tie input tried (subnormal, near-maximum, overflow-to-infinity,
- * mantissa-carry-into-next-exponent), and disagree at a deliberately
- * constructed exact tie, where sycl::half rounds to the even neighbour and
- * this function rounds up.  Using sycl::half for this direction would
- * silently change ring-buffer store results at exact ties relative to the
- * ROCm backend, so this function is ported bit-for-bit instead. */
-static inline uint16_t sycl_f32_to_f16_bits_hip_round(float f) {
-    const uint32_t u = sycl::bit_cast<uint32_t>(f);
-    const uint32_t sign = (u >> 16) & 0x8000u;
-    int32_t exp = (int32_t)((u >> 23) & 0xffu) - 127 + 15;
-    uint32_t mant = u & 0x7fffffu;
-    if (exp <= 0) {
-        if (exp < -10) return (uint16_t)sign;
-        mant |= 0x800000u;
-        const uint32_t shift = (uint32_t)(14 - exp);
-        uint32_t half_mant = mant >> shift;
-        if ((mant >> (shift - 1)) & 1u) half_mant++;
-        return (uint16_t)(sign | half_mant);
-    }
-    if (exp >= 31) return (uint16_t)(sign | 0x7c00u);
-    uint32_t half = sign | ((uint32_t)exp << 10) | (mant >> 13);
-    if (mant & 0x1000u) half++;
-    return (uint16_t)half;
-}
-
-/* store_raw_kv_batch_kernel, ported from rocm/ds4_rocm_fp8_kv.cuh:31-40:
+ * store_raw_kv_batch_kernel, ported from rocm/ds4_rocm_fp8_kv.cuh:31-40:
  * flattens (token, dim) into one linear range and, for each element,
  * encodes the KV value to F16 with the rounding rule above then
  * immediately widens it back to F32 before storing it in the ring
