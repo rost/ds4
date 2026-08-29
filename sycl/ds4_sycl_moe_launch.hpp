@@ -22,6 +22,8 @@
 
 #include "ds4_sycl_moe.hpp"
 
+#include <cstdlib>
+
 namespace {
 
 /* ---- routed_moe_build_plan, moe_launch.cuh:451-509 ------------------
@@ -265,7 +267,37 @@ static int sycl_routed_moe_iq2_dispatch(
  *                   decode kernel writes the final token row").
  *   n_tokens >= 5:  sorted-pairs tile8 gate/up and down into scratch,
  *                   then moe_sum combine, identical structure to q4k's
- *                   n_tokens >= 32 regime. */
+ *                   n_tokens >= 32 regime.
+ *
+ * Explicitly NOT ported: the four env-gated occupancy variants of the
+ * gate/up tile8 kernel (TILE4, ROW64, LDSB, TILE32,
+ * rocm/ds4_rocm_moe.cuh:2246-2229 and 2381-2637).  Each is documented in
+ * ROCm as bit-exact against the canonical tile8 kernel (same dot helper,
+ * same reduction, only tile/thread geometry differs), off by default, and
+ * exists purely to trade staging footprint against resident-warp count on
+ * AMDGCN hardware.  Porting them costs four more kernels' worth of A/B
+ * tests and zero oracle-backed correctness surface (this trade is
+ * explicitly optional); skipping them costs a tuning pass this
+ * project defers until real occupancy data from the B60
+ * target exists to tune against.  The row-group parameter below is
+ * different in kind (a parameter on the one kernel actually shipped here,
+ * not a fifth kernel body) and is ported for real. */
+/* DS4_ROCM_MXFP4_DOWN_RGROUP, rocm/ds4_rocm_moe_launch.cuh:801-807: a
+ * row-group count parameter on the canonical down tile8 kernel, not a
+ * distinct kernel body, so it is A/B-tested byte-exact against the
+ * default (1) rather than needing its own oracle (see
+ * the MXFP4 port's scope note).  Same env var name and
+ * validation range as ROCm (1..8), defaulting to 1 when unset, empty, or
+ * out of range. */
+static uint32_t sycl_mxfp4_down_row_groups_from_env() {
+    const char *v = getenv("DS4_ROCM_MXFP4_DOWN_RGROUP");
+    if (v && v[0]) {
+        const long rv = strtol(v, nullptr, 10);
+        if (rv >= 1 && rv <= 8) return (uint32_t)rv;
+    }
+    return 1u;
+}
+
 static int sycl_routed_moe_mxfp4_dispatch(
         sycl::queue &q, ds4_gpu_tensor *out, ds4_gpu_tensor *mid, ds4_gpu_tensor *down,
         sycl_block_q8_K *xq, sycl_block_q8_K *midq, const char *gate_w, const char *up_w,
@@ -599,7 +631,7 @@ static int sycl_routed_moe_launch(
                     (const char *)down_dev, weights, selected, gate_expert_bytes, gate_row_bytes,
                     down_expert_bytes, down_row_bytes, xq_blocks, midq_blocks, expert_mid_dim,
                     out_dim, n_total_expert, n_expert, n_tokens, pair_count, clamp,
-                    /*down_row_groups=*/1u);
+                    sycl_mxfp4_down_row_groups_from_env());
         }
         return 0; /* unreachable: build_plan already required exactly one path. */
     } catch (const sycl::exception &e) {

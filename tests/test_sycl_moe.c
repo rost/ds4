@@ -2640,6 +2640,112 @@ out:
     return rc;
 }
 
+/* Runs one routed_moe_batch_tensor call with the four-pattern-cycled
+ * routing already established above and returns the `out` tensor read
+ * back into a caller-supplied buffer (n_tokens*MX_OUT_DIM floats).
+ * Shared by test_mxfp4_batch's own oracle check and
+ * test_mxfp4_down_rgroup_byte_exact's A/B comparison, which needs the
+ * identical routing run twice under different environment settings. */
+static int mx_run_batch_out(const mx_model *m, uint32_t n_tokens, float *out_buf) {
+    int32_t sel_pat[MX_N_PATTERN][MX_N_EXPERT];
+    float w_pat[MX_N_PATTERN][MX_N_EXPERT];
+    float x_pat[MX_N_PATTERN][MX_IN_DIM];
+    for (uint32_t p = 0; p < MX_N_PATTERN; p++) mx_build_pattern(p, sel_pat[p], w_pat[p], x_pat[p]);
+
+    const uint64_t route_count = (uint64_t)n_tokens * MX_N_EXPERT;
+    int32_t *sel_all = malloc((size_t)(route_count * sizeof(int32_t)));
+    float *w_all = malloc((size_t)(route_count * sizeof(float)));
+    float *x_all = malloc((size_t)((uint64_t)n_tokens * MX_IN_DIM * sizeof(float)));
+    for (uint32_t tok = 0; tok < n_tokens; tok++) {
+        const uint32_t p = tok % MX_N_PATTERN;
+        memcpy(sel_all + (size_t)tok * MX_N_EXPERT, sel_pat[p], sizeof(sel_pat[p]));
+        memcpy(w_all + (size_t)tok * MX_N_EXPERT, w_pat[p], sizeof(w_pat[p]));
+        memcpy(x_all + (size_t)tok * MX_IN_DIM, x_pat[p], sizeof(x_pat[p]));
+    }
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)n_tokens * MX_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate = ds4_gpu_tensor_alloc(route_count * MX_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *up = ds4_gpu_tensor_alloc(route_count * MX_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc(route_count * MX_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *down = ds4_gpu_tensor_alloc(route_count * MX_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(route_count * sizeof(int32_t));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(route_count * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tokens * MX_IN_DIM * sizeof(float));
+    int ok = sel_all && w_all && x_all && out && gate && up && mid && down && selected &&
+             weights && x;
+
+    ok = ok && ds4_gpu_tensor_write(selected, 0, sel_all, route_count * sizeof(int32_t));
+    ok = ok && ds4_gpu_tensor_write(weights, 0, w_all, route_count * sizeof(float));
+    ok = ok && ds4_gpu_tensor_write(x, 0, x_all, (uint64_t)n_tokens * MX_IN_DIM * sizeof(float));
+    ok = ok && ds4_gpu_routed_moe_batch_tensor(
+                       out, gate, up, mid, down, m->model, m->model_size, m->gate_offset,
+                       m->up_offset, m->down_offset, 39u, 39u, m->gate_expert_bytes,
+                       m->gate_row_bytes, m->down_expert_bytes, m->down_row_bytes, MX_IN_DIM,
+                       MX_MID_DIM, MX_OUT_DIM, selected, weights, MX_N_TOTAL_EXPERT, MX_N_EXPERT,
+                       MX_CLAMP, x, 0u, n_tokens, NULL, false) != 0;
+    ok = ok && ds4_gpu_tensor_read(out, 0, out_buf,
+                                   (uint64_t)n_tokens * MX_OUT_DIM * sizeof(float)) != 0;
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(down);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(x);
+    free(sel_all);
+    free(w_all);
+    free(x_all);
+    return ok;
+}
+
+/* DS4_ROCM_MXFP4_DOWN_RGROUP parameterises the canonical down tile8
+ * kernel's row grouping; it is not a distinct kernel body, so per the
+ * plan it is checked byte-exact against the default (row_groups=1)
+ * rather than needing its own oracle.  Token counts and the shared
+ * four-pattern routing already exercise uneven occupancy, an empty
+ * expert (most of the 32 experts are never selected by any pattern) and
+ * a tail tile (pair counts per expert are not multiples of 8) without
+ * further setup. */
+static int test_mxfp4_down_rgroup_byte_exact(const mx_model *m) {
+    static const uint32_t token_cases[] = {5u, 32u, 128u, 512u};
+    for (size_t i = 0; i < sizeof(token_cases) / sizeof(token_cases[0]); i++) {
+        const uint32_t n_tokens = token_cases[i];
+        float *out_default = malloc((size_t)((uint64_t)n_tokens * MX_OUT_DIM * sizeof(float)));
+        float *out_rgroup4 = malloc((size_t)((uint64_t)n_tokens * MX_OUT_DIM * sizeof(float)));
+        int ok = out_default && out_rgroup4;
+
+        unsetenv("DS4_ROCM_MXFP4_DOWN_RGROUP");
+        ok = ok && mx_run_batch_out(m, n_tokens, out_default);
+        setenv("DS4_ROCM_MXFP4_DOWN_RGROUP", "4", 1);
+        ok = ok && mx_run_batch_out(m, n_tokens, out_rgroup4);
+        unsetenv("DS4_ROCM_MXFP4_DOWN_RGROUP");
+
+        if (!ok) {
+            fprintf(stderr, "FAIL: mxfp4_down_rgroup_byte_exact(%u): a batch call failed\n",
+                    n_tokens);
+            free(out_default);
+            free(out_rgroup4);
+            return 1;
+        }
+        if (memcmp(out_default, out_rgroup4, (size_t)((uint64_t)n_tokens * MX_OUT_DIM *
+                                                       sizeof(float))) != 0) {
+            fprintf(stderr,
+                    "FAIL: mxfp4_down_rgroup_byte_exact(%u): DOWN_RGROUP=4 not bitwise "
+                    "identical to the default path\n",
+                    n_tokens);
+            free(out_default);
+            free(out_rgroup4);
+            return 1;
+        }
+        free(out_default);
+        free(out_rgroup4);
+    }
+    fprintf(stderr, "  test_mxfp4_down_rgroup_byte_exact OK\n");
+    return 0;
+}
+
 /* Covers every n_tokens through the real public entries
  * (ds4_gpu_routed_moe_batch_tensor), straddling the launcher's own
  * mxfp4_path threshold (n_tokens >= 5 takes the sorted-pairs tile8 path;
@@ -2847,6 +2953,7 @@ int main(void) {
          * before real work-group contention exposed it.  Runs in under
          * two seconds end to end, cheap enough to keep permanently. */
         mx_ok = mx_ok && test_mxfp4_batch(&mxm, 16384u) == 0;
+        mx_ok = mx_ok && test_mxfp4_down_rgroup_byte_exact(&mxm) == 0;
         mx_free_model(&mxm);
         if (!mx_ok) { ds4_gpu_cleanup(); return 1; }
     }
