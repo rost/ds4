@@ -572,6 +572,162 @@ static int test_mask_rejections(void) {
     return 0;
 }
 
+/* ---- Top-k tests -------------------------------------------------------
+ *
+ * Oracle mirrors indexer_allowed_decode_one's own selection loop
+ * (ds4.c:12977-12986: scan ascending, replace only on a STRICT `>`, so an
+ * exact tie keeps the earlier/lower index) and topk_score_better's
+ * ascending-index tie-break (rocm/ds4_rocm_indexer.cuh:308-310):
+ * repeatedly picks the best remaining candidate in the same order the
+ * bitonic network's descending sort would produce it. */
+static void oracle_topk(uint32_t *out, const float *scores, uint32_t n_comp, uint32_t top_k) {
+    int *used = (int *)calloc(n_comp, sizeof(int));
+    for (uint32_t k = 0; k < top_k; k++) {
+        uint32_t best = 0;
+        float best_v = -INFINITY;
+        int found = 0;
+        for (uint32_t c = 0; c < n_comp; c++) {
+            if (used[c]) continue;
+            if (!found || scores[c] > best_v) {
+                best = c;
+                best_v = scores[c];
+                found = 1;
+            }
+        }
+        used[best] = 1;
+        out[k] = best;
+    }
+    free(used);
+}
+
+static void fill_topk_scores(float *scores, uint32_t n_comp, uint32_t seed) {
+    for (uint32_t c = 0; c < n_comp; c++) {
+        uint32_t h = (c * 2654435761u + seed * 97531u) ^ (c << 6);
+        scores[c] = (float)((int32_t)(h % 200001) - 100000) * 0.0001f;
+    }
+}
+
+/* Runs ds4_gpu_indexer_topk_tensor for one token against oracle_topk and
+ * asserts an exact index-for-index match (order matters: the kernel's
+ * descending bitonic sort and the oracle's repeated-best-pick produce the
+ * same order given the same tie-break), plus that no padding index
+ * (>= n_comp) ever appears in the output (spec 6o: padding must never
+ * win a comparison against real data). */
+static int run_topk_case(const char *name, uint32_t n_comp, uint32_t top_k, uint32_t seed,
+                         int n_ties, const uint32_t *tie_a, const uint32_t *tie_b,
+                         const float *tie_val) {
+    float *scores = (float *)malloc((size_t)n_comp * sizeof(float));
+    CHECK(scores != NULL, "topk: host alloc");
+    fill_topk_scores(scores, n_comp, seed);
+    for (int i = 0; i < n_ties; i++) {
+        scores[tie_a[i]] = tie_val[i];
+        scores[tie_b[i]] = tie_val[i];
+    }
+
+    uint32_t *want = (uint32_t *)malloc((size_t)top_k * sizeof(uint32_t));
+    oracle_topk(want, scores, n_comp, top_k);
+
+    ds4_gpu_tensor *tscores = ds4_gpu_tensor_alloc((uint64_t)n_comp * sizeof(float));
+    ds4_gpu_tensor *tsel = ds4_gpu_tensor_alloc((uint64_t)top_k * sizeof(uint32_t));
+    CHECK(tscores && tsel, "topk: alloc");
+    CHECK(ds4_gpu_tensor_write(tscores, 0, scores, (uint64_t)n_comp * sizeof(float)) != 0,
+          "topk: write");
+    CHECK(ds4_gpu_indexer_topk_tensor(tsel, tscores, n_comp, 1, top_k) != 0, "topk: call");
+
+    uint32_t *got = (uint32_t *)malloc((size_t)top_k * sizeof(uint32_t));
+    CHECK(ds4_gpu_tensor_read(tsel, 0, got, (uint64_t)top_k * sizeof(uint32_t)) != 0,
+          "topk: read");
+
+    int fail = 0;
+    for (uint32_t k = 0; k < top_k; k++) {
+        if (got[k] >= n_comp) {
+            fprintf(stderr, "FAIL: %s: padding index %u won slot %u\n", name, got[k], k);
+            fail = 1;
+        } else if (got[k] != want[k]) {
+            fprintf(stderr, "FAIL: %s: slot %u got %u want %u\n", name, k, got[k], want[k]);
+            fail = 1;
+        }
+    }
+    ds4_gpu_tensor_free(tscores);
+    ds4_gpu_tensor_free(tsel);
+    free(scores);
+    free(want);
+    free(got);
+    if (fail) return 1;
+    fprintf(stderr, "  %s OK\n", name);
+    return 0;
+}
+
+/* Adversarial tie indices per spec 6i: one small-XOR pair and one
+ * large-XOR pair, both real (not padding) indices within n_comp, spread
+ * so neither collapses into the other's bitonic pairing by chance. */
+static int run_topk_tie_case(const char *name, uint32_t n_comp, uint32_t top_k, uint32_t seed,
+                             uint32_t small_a, uint32_t small_b, uint32_t large_a,
+                             uint32_t large_b) {
+    uint32_t tie_a[2] = {small_a, large_a};
+    uint32_t tie_b[2] = {small_b, large_b};
+    float tie_val[2] = {777.0f, 777.0f};
+    return run_topk_case(name, n_comp, top_k, seed, 2, tie_a, tie_b, tie_val);
+}
+
+/* SORT_N == 1024 (indexer_topk_1024_kernel's shape, served here by
+ * sycl_indexer_topk_pow2_kernel<1024>; see this file's header comment on
+ * why those are the same kernel). */
+static int test_topk_width_1024(void) {
+    int failures = 0;
+    failures += run_topk_case("test_topk_width_1024_padded", 777, 512, 101, 0, NULL, NULL, NULL);
+    failures += run_topk_case("test_topk_width_1024_exact", 1024, 512, 103, 0, NULL, NULL, NULL);
+    failures += run_topk_tie_case("test_topk_width_1024_ties", 1024, 512, 107, 5, 4, 600, 33);
+    return failures;
+}
+
+static int test_topk_width_2048(void) {
+    int failures = 0;
+    failures += run_topk_case("test_topk_width_2048_padded", 1500, 512, 211, 0, NULL, NULL, NULL);
+    failures += run_topk_case("test_topk_width_2048_exact", 2048, 512, 213, 0, NULL, NULL, NULL);
+    failures += run_topk_tie_case("test_topk_width_2048_ties", 2048, 512, 217, 9, 8, 1500, 17);
+    return failures;
+}
+
+static int test_topk_width_4096(void) {
+    int failures = 0;
+    failures += run_topk_case("test_topk_width_4096_padded", 3000, 512, 311, 0, NULL, NULL, NULL);
+    failures += run_topk_case("test_topk_width_4096_exact", 4096, 512, 313, 0, NULL, NULL, NULL);
+    failures += run_topk_tie_case("test_topk_width_4096_ties", 4096, 512, 317, 13, 12, 3000, 45);
+    return failures;
+}
+
+static int test_topk_width_8192_u16(void) {
+    int failures = 0;
+    failures += run_topk_case("test_topk_width_8192_padded", 5000, 512, 411, 0, NULL, NULL, NULL);
+    failures += run_topk_case("test_topk_width_8192_exact", 8192, 512, 413, 0, NULL, NULL, NULL);
+    failures += run_topk_tie_case("test_topk_width_8192_ties", 8192, 512, 417, 21, 20, 6000, 77);
+    return failures;
+}
+
+/* Fallback brute-force kernel: any top_k outside {512, 1024, 2048}. */
+static int test_topk_fallback_kernel(void) {
+    int failures = 0;
+    failures += run_topk_case("test_topk_fallback_small", 50, 7, 511, 0, NULL, NULL, NULL);
+    failures += run_topk_tie_case("test_topk_fallback_ties", 50, 7, 513, 3, 2, 40, 5);
+    return failures;
+}
+
+static int test_topk_rejections(void) {
+    ds4_gpu_tensor *tscores = ds4_gpu_tensor_alloc(64 * sizeof(float));
+    ds4_gpu_tensor *tsel = ds4_gpu_tensor_alloc(64 * sizeof(uint32_t));
+    CHECK(tscores && tsel, "topk_rejections: alloc");
+    CHECK(ds4_gpu_indexer_topk_tensor(tsel, tscores, 0, 1, 4) == 0, "topk_rejections: zero n_comp");
+    CHECK(ds4_gpu_indexer_topk_tensor(tsel, tscores, 4, 1, 0) == 0, "topk_rejections: zero top_k");
+    CHECK(ds4_gpu_indexer_topk_tensor(tsel, tscores, 4, 1, 5) == 0,
+          "topk_rejections: top_k > n_comp");
+    CHECK(ds4_gpu_indexer_topk_tensor(NULL, tscores, 4, 1, 4) == 0, "topk_rejections: null selected");
+    ds4_gpu_tensor_free(tscores);
+    ds4_gpu_tensor_free(tsel);
+    fprintf(stderr, "  test_topk_rejections OK\n");
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
 
@@ -596,6 +752,13 @@ int main(void) {
 
     failures += test_mask_matches_selected_and_rejects_out_of_range();
     failures += test_mask_rejections();
+
+    failures += test_topk_width_1024();
+    failures += test_topk_width_2048();
+    failures += test_topk_width_4096();
+    failures += test_topk_width_8192_u16();
+    failures += test_topk_fallback_kernel();
+    failures += test_topk_rejections();
 
     ds4_gpu_cleanup();
 
