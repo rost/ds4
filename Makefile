@@ -455,7 +455,7 @@ tests/test_sycl_matmul: tests/test_sycl_matmul.o ds4_sycl.o ds4_sycl_unavailable
 test-sycl-matmul: tests/test_sycl_matmul
 	./tests/test_sycl_matmul
 
-test-sycl: test-sycl-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl-matmul test-sycl-streaming test-sycl-router test-sycl-fp8-kv
+test-sycl: test-sycl-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl-matmul test-sycl-streaming test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert
 tests/test_sycl_shared_expert.o: tests/test_sycl_shared_expert.c ds4_gpu.h ds4_gpu_mgpu.h tests/test_sycl_harness.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
 
@@ -465,7 +465,6 @@ tests/test_sycl_shared_expert: tests/test_sycl_shared_expert.o ds4_sycl.o ds4_sy
 test-sycl-shared-expert: tests/test_sycl_shared_expert
 	./tests/test_sycl_shared_expert
 
-test-sycl: test-sycl-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl-matmul test-sycl-shared-expert test-sycl-streaming
 
 tests/test_sycl_streaming.o: tests/test_sycl_streaming.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
