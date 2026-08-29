@@ -97,6 +97,116 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     return 1;
 }
 
+/* Submits (without waiting) out[t][o] = sum_k x[t][k] * dequant(w[o][k])
+ * for one Q8_0-quantised weight table, row-major out_dim rows of row_bytes
+ * bytes each (blocks of 32 values, 34 bytes per block; see
+ * sycl_q8_0_dequant in ds4_sycl_common.hpp).  One work-item per
+ * (token, out_row) pair, covering every n_tok with no shape gating. */
+static void sycl_q8_0_matmul_launch(sycl::queue &q, float *out,
+                                    const unsigned char *w, const float *x,
+                                    uint32_t in_dim, uint32_t out_dim,
+                                    uint32_t n_tok, uint64_t row_bytes) {
+    const uint64_t n = (uint64_t)n_tok * out_dim;
+    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+        const uint32_t o  = (uint32_t)(gid % out_dim);
+        const uint32_t t  = (uint32_t)(gid / out_dim);
+        const float         *xr = x + (uint64_t)t * in_dim;
+        const unsigned char *wr = w + (uint64_t)o * row_bytes;
+        float sum = 0.0f;
+        for (uint32_t k = 0; k < in_dim; k++) {
+            sum += xr[k] * sycl_q8_0_dequant(wr, k);
+        }
+        out[gid] = sum;
+    });
+}
+
+/* Core Q8_0 dense matmul: out[t][o] = sum_k x[t][k] * dequant(w[o][k]) for
+ * one weight table.  Validation and shared kernel selection ported from
+ * ROCm's cuda_matmul_q8_0_tensor_labeled (rocm/ds4_rocm_matmul.cuh:311-524),
+ * which every entry taking a plain Q8_0 weight table delegates to; this
+ * helper plays the same role here for ds4_gpu_matmul_q8_0_tensor below and
+ * for the later Q8_0 matmul entries in this file.
+ *
+ * Two things ROCm does are intentionally not ported:
+ *
+ * - The cuBLAS/GEMM fast path (rocm/ds4_rocm_matmul.cuh:325-330 and the
+ *   f16-expansion-cache retry further down) is a perf path requiring a
+ *   GEMM library; this backend has no oneMKL wiring yet, so it is skipped
+ *   entirely and every call goes through the native kernel below.
+ * - ROCm then branches on n_tok and on in_dim's shape to pick among
+ *   several tiled/vendor kernels (the sharedx warp-row kernels gated on
+ *   `in_dim & 31 == 0`, an AMD-only wmma kernel, and a prequantized-to-int8
+ *   dp4a path) before falling through to a shape-ungated kernel
+ *   (matmul_q8_0_f32_warp8_kernel for n_tok == 1, :380-387;
+ *   matmul_q8_0_f32_batch_warp8_kernel for n_tok > 1, :425-434) that does
+ *   the same per-(token, out_row) dequant-and-accumulate as every other
+ *   branch, just with different tiling.  Those branches are ROCm/CUDA
+ *   vendor performance tuning with no correctness difference from the
+ *   general path; the dp4a branch additionally assumes an NVIDIA/AMD
+ *   dot-product-of-4-int8 instruction with no direct SYCL equivalent worth
+ *   chasing for a first port.  This helper always uses the shape-ungated
+ *   kernel form (sycl_q8_0_matmul_launch above), for every n_tok. */
+static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
+                                    uint64_t model_size, uint64_t weight_offset,
+                                    uint64_t in_dim, uint64_t out_dim,
+                                    const ds4_gpu_tensor *x, uint64_t n_tok) {
+    if (!out || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        n_tok == 0u || in_dim > UINT32_MAX || out_dim > UINT32_MAX ||
+        n_tok > UINT32_MAX) {
+        return 0;
+    }
+
+    uint64_t row_bytes = 0, weight_bytes = 0;
+    if (!sycl_q8_0_row_bytes_checked(in_dim, &row_bytes) ||
+        !sycl_u64_mul_checked(out_dim, row_bytes, &weight_bytes) ||
+        !sycl_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !sycl_tensor_has_elems2(x, n_tok, in_dim, sizeof(float)) ||
+        !sycl_tensor_has_elems2(out, n_tok, out_dim, sizeof(float))) {
+        return 0;
+    }
+    const char *wptr = sycl_model_range_ptr(model_map, weight_offset,
+                                            weight_bytes, model_size, "q8_0");
+    if (!wptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out->device_id);
+
+        unsigned char *dw = sycl::malloc_device<unsigned char>(
+                (size_t)weight_bytes, q);
+        if (!dw) return 0;
+        sycl_device_scratch_guard dw_guard(q, dw);
+        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
+
+        sycl_q8_0_matmul_launch(q, (float *)out->ptr, dw, (const float *)x->ptr,
+                                (uint32_t)in_dim, (uint32_t)out_dim,
+                                (uint32_t)n_tok, row_bytes);
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0 failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* Core Q8_0 dense matmul entry point.  ROCm's own entry
+ * (rocm/ds4_rocm_matmul.cuh:526-529) is a two-line wrapper over
+ * cuda_matmul_q8_0_tensor_labeled with label "q8_0"; the label is
+ * diagnostic-only here (it only otherwise selects the omitted GEMM cache
+ * path), so sycl_q8_0_matmul_general above needs no label parameter. */
+extern "C" int ds4_gpu_matmul_q8_0_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    return sycl_q8_0_matmul_general(out, model_map, model_size, weight_offset,
+                                    in_dim, out_dim, x, n_tok);
+}
+
 /* Optional Metal decode fusion (paired projection plus recurrent
  * compressor-state store).  This backend has no such fused path; ROCm's
  * own implementation (rocm/ds4_rocm_matmul.cuh:933-965) is `(void)` on

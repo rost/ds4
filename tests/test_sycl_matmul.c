@@ -4,9 +4,10 @@
  * with the ROCm source line numbers cited (ROCm, not ds4.c, is the port
  * source for the dense matmul entries covered here).  Needs no model file.
  *
- * This file covers the F16 pair matmul entries: the paired dense
+ * This file covers the F16 pair matmul entries (the paired dense
  * projection and the Metal-only fused compressor-store optimisation,
- * which this backend declines on every call. */
+ * which this backend declines on every call) and the core Q8_0 dense
+ * matmul entry. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -185,10 +186,128 @@ static int test_matmul_f16_pair_compressor_store(void) {
     return 0;
 }
 
+/* Q8_0 row layout, cited to rocm/ds4_rocm_common.cuh:19-63: blocks of 32
+ * values, 34 bytes per block, a little-endian F16 scale in bytes 0-1
+ * followed by 32 signed int8 values.  Encodes one out_dim row so the
+ * per-column dequantised value is scale(k/32) * (float)q8[k], matching
+ * sycl_q8_0_dequant in sycl/ds4_sycl_common.hpp.  The int8 payload carries
+ * an (o, k) product interaction term (not a plain a*i + b), so a kernel
+ * that mixed up rows or dropped the block stride would produce a visibly
+ * wrong result rather than a coincidentally matching one. */
+static void test_encode_q8_0_row(unsigned char *row, uint32_t in_dim, uint32_t o) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        unsigned char *bp = row + (size_t)blk * 34u;
+        const uint16_t braw = test_float_to_half(0.05f * (float)(o + blk + 1u));
+        bp[0] = (unsigned char)(braw & 0xFFu);
+        bp[1] = (unsigned char)((braw >> 8) & 0xFFu);
+        for (uint32_t idx = 0; idx < 32u; idx++) {
+            const uint32_t k = blk * 32u + idx;
+            const int qv = (k < in_dim)
+                    ? (int)(((o + 1u) * (k + 3u)) % 13u) - 6
+                    : 0;
+            bp[2 + idx] = (unsigned char)(signed char)qv;
+        }
+    }
+}
+
+/* Oracle: out[t][o] = sum_k x[t][k] * scale(k/32) * (float)q8[o][k], cited
+ * to rocm/ds4_rocm_matmul.cuh:306-525 (matmul_q8_0_f32_warp8_kernel and
+ * matmul_q8_0_f32_batch_warp8_kernel, which agree on this formula and
+ * differ only in tiling). */
+static void oracle_matmul_q8_0(float *out, const float *x,
+                               const unsigned char *w, uint32_t in_dim,
+                               uint32_t out_dim, uint32_t n_tok,
+                               uint64_t row_bytes) {
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < out_dim; o++) {
+            const unsigned char *row = w + (size_t)o * row_bytes;
+            double sum = 0.0;
+            for (uint32_t k = 0; k < in_dim; k++) {
+                const uint32_t blk = k / 32u;
+                const uint32_t idx = k % 32u;
+                const unsigned char *bp = row + (size_t)blk * 34u;
+                const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+                const float scale = oracle_half_to_float(raw);
+                const signed char qv = (signed char)bp[2 + idx];
+                sum += (double)x[t * in_dim + k] * (double)scale * (double)qv;
+            }
+            out[t * out_dim + o] = (float)sum;
+        }
+    }
+}
+
+/* in_dim deliberately not a multiple of 32 so the last Q8_0 block is only
+ * partially used, exercising the remainder.  n_tok > 1 exercises the
+ * per-token row stride over x. */
+static int test_matmul_q8_0(void) {
+    enum { IN_DIM = 37, OUT_DIM = 5, N_TOK = 3 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+
+    unsigned char weights[OUT_DIM * 68]; /* row_bytes <= 2*34 = 68 here */
+    float          x[N_TOK * IN_DIM];
+    float          want[N_TOK * OUT_DIM];
+    float          got[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(weights + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+    oracle_matmul_q8_0(want, x, weights, IN_DIM, OUT_DIM, N_TOK, row_bytes);
+
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * row_bytes;
+
+    ds4_gpu_tensor *tx  = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tx != NULL && tout != NULL, "matmul_q8_0: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "matmul_q8_0: write x");
+
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tout, weights, weight_bytes, 0,
+                                     IN_DIM, OUT_DIM, tx, N_TOK) != 0,
+          "matmul_q8_0: call");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got, sizeof(got)) != 0,
+          "matmul_q8_0: read out");
+
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-2, "matmul_q8_0: out mismatch");
+    }
+
+    /* Validation ported from rocm/ds4_rocm_matmul.cuh:312-323. */
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tout, weights, weight_bytes, 0,
+                                     0, OUT_DIM, tx, N_TOK) == 0,
+          "matmul_q8_0: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tout, weights, weight_bytes, 0,
+                                     IN_DIM, 0, tx, N_TOK) == 0,
+          "matmul_q8_0: zero out_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tout, weights, weight_bytes, 0,
+                                     IN_DIM, OUT_DIM, tx, 0) == 0,
+          "matmul_q8_0: zero n_tok must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tout, weights, weight_bytes, 0,
+                                     (uint64_t)UINT32_MAX + 1u, OUT_DIM,
+                                     tx, N_TOK) == 0,
+          "matmul_q8_0: oversized in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tout, weights, weight_bytes,
+                                     weight_bytes, IN_DIM, OUT_DIM, tx,
+                                     N_TOK) == 0,
+          "matmul_q8_0: out-of-range weight offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_matmul_q8_0 OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_matmul_f16_pair() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_f16_pair_compressor_store() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_matmul OK\n");
     return 0;
