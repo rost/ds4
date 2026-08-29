@@ -408,22 +408,29 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
  * element of shx is written unconditionally (a real value or 0.0f for a
  * position past n_blocks/n_tok) before the barrier that follows it, with
  * a second barrier after the row/token accumulation loop before the next
- * tile's staging pass reuses the same local memory. CONFIRMED by ablation:
- * dropping either barrier, or both together, produced no test failure
- * across five repeated runs, including after the test data was
- * specifically rebuilt so every staged value is bounded away from zero
- * (ruling out the "torn read returns zero, indistinguishable from a
- * small correct value" explanation spec 6b itself describes). With
- * IN_DIM == 64 (n_blocks == 2, less than BLOCKS_TILE == 16) this kernel's
- * outer loop runs exactly one iteration, so there is only one
- * write-then-read hazard to observe, not the reuse-across-iterations
- * hazard the second barrier guards; this hardware or driver evidently
- * still does not expose it. This is a FOURTH ablation that fails to fail
- * on this hardware, joining spec sections 6b, 6f and 6g: it is evidence
- * about the test environment, never evidence that the barriers are
- * unnecessary. Both barriers are correct by construction and by direct
- * comparison with the ROCm source's __syncthreads placement, and must not
- * be removed on the strength of a passing test suite. */
+ * tile's staging pass reuses the same local memory.
+ *
+ * An early ablation at small scale (IN_DIM == 64, one staging/consume
+ * iteration, 4 work-groups total) dropped either barrier, or both, with no
+ * test failure across five repeated runs, even after the test data was
+ * rebuilt so every staged value is bounded away from zero (ruling out
+ * spec 6b's "torn read returns zero" explanation). That was recorded as a
+ * fourth ablation that fails to fail, per spec section 6j the wrong
+ * conclusion to stop at: too few work-groups were resident at once for the
+ * cross-wave race either barrier guards to have contention to act on.
+ * tests/test_sycl_shared_expert.c's
+ * test_shared_gate_up_swiglu_rows_batch_barrier_stress scales the same
+ * kernel to IN_DIM == 1024 (two full staging/consume iterations, so the
+ * second barrier's reuse-across-iterations hazard has an iteration
+ * boundary to expose) and OUT_DIM == 512 by N_TOK == 4096 (4096
+ * work-groups, about 4.19 million work-items, launched at once). At that
+ * scale, dropping the first barrier alone corrupted roughly 13-15 percent
+ * of output elements, and dropping both corrupted roughly 60 percent,
+ * reliably across five repeated runs each, while the small-scale
+ * correctness test in the same binary kept passing throughout. Both
+ * barriers are correct by construction, by direct comparison with the
+ * ROCm source's __syncthreads placement, and now by an ablation that
+ * actually discriminates; do not remove either. */
 static int sycl_shared_gate_up_swiglu_q8_0_batch(
         ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
         const void *model_map, uint64_t model_size, uint64_t gate_offset,

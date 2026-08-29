@@ -1457,6 +1457,199 @@ static int test_shared_gate_up_swiglu_rows_batch_in_dim_rejection(void) {
     return 0;
 }
 
+/* Contention stress case for the two work-group barriers in
+ * sycl_shared_gate_up_swiglu_q8_0_batch (spec section 6j).  The small
+ * shapes in test_shared_gate_up_swiglu_rows_batch_correctness above (4
+ * work-groups total, one staging/consume iteration) cannot exercise a
+ * race that needs many work-groups genuinely resident at once, the same
+ * lesson the FP8 reduction's test_reduction_barrier_stress
+ * (tests/test_sycl_fp8_kv.c) drew from an identical-looking ablation that
+ * did not fail at small scale and did fail once scaled to run many
+ * work-groups concurrently.
+ *
+ * IN_DIM == 1024 gives n_blocks == 32, two full passes of the kBlocksTile
+ * == 16 outer loop, so the second barrier's reuse-across-iterations
+ * hazard (the next pass restaging shx while a slow lane is still reading
+ * the previous pass's tile) has an iteration boundary to expose, unlike
+ * the small correctness test's IN_DIM == 64, which never leaves the
+ * first iteration.  OUT_DIM == 512 and N_TOK == 4096 both divide evenly
+ * by kRowsPerBlock == 32 and kTokTile == 16, giving grid_x == 16 and
+ * grid_y == 256, so 4096 work-groups of 1024 work-items launch at once:
+ * about 4.19 million work-items, the same order of magnitude as the FP8
+ * stress case's 4.096 million.
+ *
+ * Every x element is kept well clear of zero, for the same reason as
+ * test_shared_gate_up_swiglu_rows_batch_correctness: this hardware reads
+ * uninitialised local memory as zero (spec 6b), so a torn read of shx
+ * would be indistinguishable from a correct near-zero value unless every
+ * staged value is bounded away from zero.  The comparison below uses a
+ * relative tolerance rather than the fixed 1e-1 CHECK_CLOSE uses
+ * elsewhere: test_encode_q8_0_row's scale grows with o + blk, and at
+ * OUT_DIM == 512 and 32 blocks the largest rows' raw dot products reach
+ * magnitudes where a fixed absolute tolerance would either be meaninglessly
+ * loose for small rows or fail on ordinary fp32-accumulation-order noise
+ * for large ones. */
+static int test_shared_gate_up_swiglu_rows_batch_barrier_stress(void) {
+    enum { IN_DIM = 1024, OUT_DIM = 512, N_TOK = 4096 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u; /* == 32 */
+    const uint64_t row_bytes = blocks * 34u;
+    const float clamp = 0.0f;
+
+    unsigned char *wg = (unsigned char *)malloc((size_t)OUT_DIM * row_bytes);
+    unsigned char *wu = (unsigned char *)malloc((size_t)OUT_DIM * row_bytes);
+    float *x = (float *)malloc((size_t)N_TOK * IN_DIM * sizeof(float));
+    float *dqg = (float *)malloc((size_t)OUT_DIM * IN_DIM * sizeof(float));
+    float *dqu = (float *)malloc((size_t)OUT_DIM * IN_DIM * sizeof(float));
+    float *want_gate =
+            (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    float *want_up = (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    float *want_mid =
+            (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    float *got_gate = (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    float *got_up = (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    float *got_mid = (float *)malloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    unsigned char *combined =
+            (unsigned char *)malloc((size_t)2 * OUT_DIM * row_bytes);
+    CHECK(wg && wu && x && dqg && dqu && want_gate && want_up && want_mid &&
+          got_gate && got_up && got_mid && combined,
+          "shared_gate_up_swiglu_rows_batch_barrier_stress: allocation "
+          "failed");
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 4);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 40);
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            dqg[(size_t)o * IN_DIM + k] =
+                    oracle_dequant(wg + (size_t)o * row_bytes, k);
+            dqu[(size_t)o * IN_DIM + k] =
+                    oracle_dequant(wu + (size_t)o * row_bytes, k);
+        }
+    }
+    /* Moduli 97 and 89 (coprime, LCM 8633) rather than the small
+     * correctness test's 17 and 11: at N_TOK == 4096, a short period in t
+     * would make many tiles compute the exact same dot product, which is
+     * harmless for correctness but pointless for a contention stress case
+     * that wants every work-group's input to be genuinely distinct. */
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[(size_t)t * IN_DIM + k] =
+                    ((float)(((t + 2) * (k + 3)) % 97) + 5.0f +
+                     0.02f * (float)((t * k) % 89)) *
+                    0.02f;
+        }
+    }
+    /* Precomputed dequant tables turn the oracle's inner loop into a
+     * plain multiply-accumulate (no per-element bit unpack), which is
+     * the only way T * R * D work at this scale finishes quickly on the
+     * host. */
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        const float *xt = x + (size_t)t * IN_DIM;
+        for (uint32_t o = 0; o < OUT_DIM; o++) {
+            const float *rg = dqg + (size_t)o * IN_DIM;
+            const float *ru = dqu + (size_t)o * IN_DIM;
+            double sg = 0.0, su = 0.0;
+            for (uint32_t k = 0; k < IN_DIM; k++) {
+                sg += (double)xt[k] * (double)rg[k];
+                su += (double)xt[k] * (double)ru[k];
+            }
+            const float g = (float)sg;
+            const float u = (float)su;
+            const size_t off = (size_t)t * OUT_DIM + o;
+            want_gate[off] = g;
+            want_up[off] = u;
+            want_mid[off] = oracle_silu(g) * u;
+        }
+    }
+
+    memcpy(combined, wg, (size_t)OUT_DIM * row_bytes);
+    memcpy(combined + (size_t)OUT_DIM * row_bytes, wu,
+           (size_t)OUT_DIM * row_bytes);
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = (uint64_t)OUT_DIM * row_bytes;
+    const uint64_t model_size = 2ull * OUT_DIM * row_bytes;
+
+    ds4_gpu_tensor *tx =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * IN_DIM * sizeof(float));
+    ds4_gpu_tensor *tgate =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tup =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *tmid =
+            ds4_gpu_tensor_alloc((size_t)N_TOK * OUT_DIM * sizeof(float));
+    CHECK(tx && tgate && tup && tmid,
+          "shared_gate_up_swiglu_rows_batch_barrier_stress: tensor "
+          "allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x,
+                               (size_t)N_TOK * IN_DIM * sizeof(float)) != 0,
+          "shared_gate_up_swiglu_rows_batch_barrier_stress: write x");
+
+    CHECK(ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor(
+                  tgate, tup, tmid, combined, model_size, gate_offset,
+                  up_offset, IN_DIM, OUT_DIM, tx, N_TOK, clamp) != 0,
+          "shared_gate_up_swiglu_rows_batch_barrier_stress: call");
+    CHECK(ds4_gpu_tensor_read(tgate, 0, got_gate,
+                              (size_t)N_TOK * OUT_DIM * sizeof(float)) != 0 &&
+          ds4_gpu_tensor_read(tup, 0, got_up,
+                              (size_t)N_TOK * OUT_DIM * sizeof(float)) != 0 &&
+          ds4_gpu_tensor_read(tmid, 0, got_mid,
+                              (size_t)N_TOK * OUT_DIM * sizeof(float)) != 0,
+          "shared_gate_up_swiglu_rows_batch_barrier_stress: readback "
+          "failed");
+
+    /* Gate and up get a tight relative tolerance (1%, floor 2e-2): the
+     * kernel's tree reduction and the oracle's double accumulation only
+     * differ by summation order over IN_DIM == 1024 terms, which is far
+     * below this bound.  Mid needs a looser one (8%, floor 8e-2): it is
+     * SiLU(gate) * up, so gate's and up's own sub-percent errors compound
+     * multiplicatively, and SiLU's nonlinearity adds further leverage;
+     * measured empirically against the unmodified kernel across repeated
+     * runs, whose worst mid deviation was under 5%. A genuine dropped or
+     * torn tile is expected to miss by much more than either bound, since
+     * it drops or duplicates a whole 32-wide block's contribution rather
+     * than perturbing the summation order. */
+    long mismatches = 0;
+    for (long i = 0; i < (long)N_TOK * OUT_DIM; i++) {
+        const double wg_ = (double)want_gate[i], wu_ = (double)want_up[i];
+        const double wm_ = (double)want_mid[i];
+        const double tolg =
+                fmax(2.0e-2, 1.0e-2 * fmax(fabs(wg_), fabs((double)got_gate[i])));
+        const double tolu =
+                fmax(2.0e-2, 1.0e-2 * fmax(fabs(wu_), fabs((double)got_up[i])));
+        const double tolm =
+                fmax(8.0e-2, 8.0e-2 * fmax(fabs(wm_), fabs((double)got_mid[i])));
+        if (fabs((double)got_gate[i] - wg_) > tolg) mismatches++;
+        if (fabs((double)got_up[i] - wu_) > tolu) mismatches++;
+        if (fabs((double)got_mid[i] - wm_) > tolm) mismatches++;
+    }
+    if (mismatches != 0) {
+        fprintf(stderr,
+                "FAIL: shared_gate_up_swiglu_rows_batch_barrier_stress: "
+                "%ld/%ld elements mismatched\n",
+                mismatches, (long)N_TOK * OUT_DIM * 3);
+        return 1;
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tgate);
+    ds4_gpu_tensor_free(tup);
+    ds4_gpu_tensor_free(tmid);
+    free(wg);
+    free(wu);
+    free(x);
+    free(dqg);
+    free(dqu);
+    free(want_gate);
+    free(want_up);
+    free(want_mid);
+    free(got_gate);
+    free(got_up);
+    free(got_mid);
+    free(combined);
+    fprintf(stderr,
+            "  test_shared_gate_up_swiglu_rows_batch_barrier_stress OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_shared_gate_up_swiglu_general() != 0) {
@@ -1512,6 +1705,10 @@ int main(void) {
         return 1;
     }
     if (test_shared_gate_up_swiglu_rows_batch_in_dim_rejection() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_gate_up_swiglu_rows_batch_barrier_stress() != 0) {
         ds4_gpu_cleanup();
         return 1;
     }
