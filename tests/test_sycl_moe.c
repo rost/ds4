@@ -10,6 +10,7 @@
 #include "ds4_gpu_mgpu.h"
 
 #include <math.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -475,6 +476,240 @@ static int test_sort_tile_sizes(void) {
     return 0;
 }
 
+/* ---- Dispatcher skeleton and the two entry points --------------------
+ *
+ * Shapes small enough that the scratch-buffer-reuse precondition
+ * (gate/down tensors doubling as Q8_K quantisation scratch) is always
+ * satisfied by construction: gate holds n_tokens*n_expert*expert_mid_dim
+ * floats, which for these sizes is comfortably larger than the Q8_K
+ * scratch it would need to double as. */
+enum {
+    RM_EXPERT_IN_DIM  = 256,
+    RM_EXPERT_MID_DIM = 256,
+    RM_OUT_DIM        = 64,
+    RM_N_EXPERT       = 2,
+    RM_N_TOKENS       = 2,
+    RM_N_TOTAL_EXPERT = 4,
+    RM_Q4K_BLOCK_BYTES = 144, /* cuda_block_q4_K, ds4_rocm.cu:72-77 */
+};
+
+typedef struct {
+    unsigned char *model;
+    uint64_t       model_size;
+    uint64_t       gate_offset, up_offset, down_offset;
+    uint64_t       gate_expert_bytes, gate_row_bytes;
+    uint64_t       down_expert_bytes, down_row_bytes;
+} rm_model;
+
+/* type: 12 = Q4_K (used for gate_row_bytes sizing regardless of the
+ * gate_type/down_type the caller then passes; only the byte layout
+ * needs to be self-consistent for the model-range bounds checks to
+ * pass, and every format the dispatcher can currently reach
+ * (implemented or stubbed) uses 256-wide superblocks). */
+static rm_model rm_build_model(void) {
+    rm_model m;
+    m.gate_row_bytes = (RM_EXPERT_IN_DIM / 256u) * RM_Q4K_BLOCK_BYTES;
+    m.gate_expert_bytes = (uint64_t)RM_EXPERT_MID_DIM * m.gate_row_bytes;
+    m.down_row_bytes = (RM_EXPERT_MID_DIM / 256u) * RM_Q4K_BLOCK_BYTES;
+    m.down_expert_bytes = (uint64_t)RM_OUT_DIM * m.down_row_bytes;
+    m.gate_offset = 0;
+    m.up_offset = m.gate_expert_bytes * RM_N_TOTAL_EXPERT;
+    m.down_offset = m.up_offset + m.gate_expert_bytes * RM_N_TOTAL_EXPERT;
+    m.model_size = m.down_offset + m.down_expert_bytes * RM_N_TOTAL_EXPERT;
+    m.model = calloc(1, (size_t)m.model_size);
+    return m;
+}
+
+typedef struct {
+    ds4_gpu_tensor *out, *gate, *up, *mid, *down, *selected, *weights, *x;
+} rm_tensors;
+
+static rm_tensors rm_build_tensors(void) {
+    rm_tensors t;
+    t.out = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_OUT_DIM * sizeof(float));
+    t.gate = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    t.up = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    t.mid = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * RM_EXPERT_MID_DIM * sizeof(float));
+    t.down = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * RM_OUT_DIM * sizeof(float));
+    t.selected = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * sizeof(int32_t));
+    t.weights = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_N_EXPERT * sizeof(float));
+    t.x = ds4_gpu_tensor_alloc((uint64_t)RM_N_TOKENS * RM_EXPERT_IN_DIM * sizeof(float));
+
+    int32_t sel[RM_N_TOKENS * RM_N_EXPERT];
+    float w[RM_N_TOKENS * RM_N_EXPERT];
+    for (int i = 0; i < RM_N_TOKENS * RM_N_EXPERT; i++) {
+        sel[i] = i % RM_N_TOTAL_EXPERT;
+        w[i] = 1.0f;
+    }
+    ds4_gpu_tensor_write(t.selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(t.weights, 0, w, sizeof(w));
+    float xv[RM_N_TOKENS * RM_EXPERT_IN_DIM];
+    for (int i = 0; i < RM_N_TOKENS * RM_EXPERT_IN_DIM; i++) xv[i] = 0.01f * (float)i;
+    ds4_gpu_tensor_write(t.x, 0, xv, sizeof(xv));
+    return t;
+}
+
+static void rm_free_tensors(rm_tensors *t) {
+    ds4_gpu_tensor_free(t->out);
+    ds4_gpu_tensor_free(t->gate);
+    ds4_gpu_tensor_free(t->up);
+    ds4_gpu_tensor_free(t->mid);
+    ds4_gpu_tensor_free(t->down);
+    ds4_gpu_tensor_free(t->selected);
+    ds4_gpu_tensor_free(t->weights);
+    ds4_gpu_tensor_free(t->x);
+}
+
+static int rm_call_batch(rm_model *m, rm_tensors *t, uint32_t gate_type,
+                         uint32_t down_type, uint32_t n_tokens, bool *mid_is_f16) {
+    return ds4_gpu_routed_moe_batch_tensor(
+            t->out, t->gate, t->up, t->mid, t->down, m->model, m->model_size,
+            m->gate_offset, m->up_offset, m->down_offset, gate_type, down_type,
+            m->gate_expert_bytes, m->gate_row_bytes, m->down_expert_bytes,
+            m->down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+            t->selected, t->weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t->x,
+            /*layer_index=*/0u, n_tokens, mid_is_f16, /*force_resident=*/false);
+}
+
+/* n_tokens == 0 is a FAILURE (routed_moe_build_plan, moe_launch.cuh:479),
+ * unlike several other entries ported earlier in this project where
+ * zero-work is a free success. */
+static int test_dispatcher_zero_tokens_fails(void) {
+    rm_model m = rm_build_model();
+    rm_tensors t = rm_build_tensors();
+    CHECK(rm_call_batch(&m, &t, 12u, 12u, 0u, NULL) == 0,
+          "dispatcher: n_tokens == 0 must fail, not succeed");
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_dispatcher_zero_tokens_fails OK\n");
+    return 0;
+}
+
+static int test_dispatcher_unrecognised_format_fails(void) {
+    rm_model m = rm_build_model();
+    rm_tensors t = rm_build_tensors();
+    CHECK(rm_call_batch(&m, &t, 99u, 99u, RM_N_TOKENS, NULL) == 0,
+          "dispatcher: unrecognised gate/down type pair must fail");
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_dispatcher_unrecognised_format_fails OK\n");
+    return 0;
+}
+
+/* Each of the three formats not yet implemented here must fail
+ * cleanly with a well-formed call (reaching its own delimited dispatcher
+ * block, not failing on validation), and each of these three tests is
+ * exactly the test that must flip when that format is implemented. */
+static int test_dispatcher_iq2_not_yet_implemented(void) {
+    rm_model m = rm_build_model();
+    rm_tensors t = rm_build_tensors();
+    CHECK(rm_call_batch(&m, &t, 16u, 10u, RM_N_TOKENS, NULL) == 0,
+          "dispatcher: iq2_path must fail until it is implemented");
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_dispatcher_iq2_not_yet_implemented OK\n");
+    return 0;
+}
+
+static int test_dispatcher_q2k_not_yet_implemented(void) {
+    rm_model m = rm_build_model();
+    rm_tensors t = rm_build_tensors();
+    CHECK(rm_call_batch(&m, &t, 10u, 10u, RM_N_TOKENS, NULL) == 0,
+          "dispatcher: q2k_path must fail until it is implemented");
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_dispatcher_q2k_not_yet_implemented OK\n");
+    return 0;
+}
+
+static int test_dispatcher_mxfp4_not_yet_implemented(void) {
+    rm_model m = rm_build_model();
+    rm_tensors t = rm_build_tensors();
+    CHECK(rm_call_batch(&m, &t, 39u, 39u, RM_N_TOKENS, NULL) == 0,
+          "dispatcher: mxfp4_path must fail until it is implemented");
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_dispatcher_mxfp4_not_yet_implemented OK\n");
+    return 0;
+}
+
+static int test_dispatcher_add_in_rejected(void) {
+    ds4_gpu_tensor *dummy = ds4_gpu_tensor_alloc(64);
+    CHECK(ds4_gpu_routed_moe_one_tensor(
+              NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+              0, 0, 0, NULL, NULL, 0, 0, 0.0f, NULL, dummy, 0, false) == 0,
+          "dispatcher: non-null add_in must fail on the decode entry");
+    ds4_gpu_tensor_free(dummy);
+    fprintf(stderr, "  test_dispatcher_add_in_rejected OK\n");
+    return 0;
+}
+
+static int test_dispatcher_mid_is_f16_written_false(void) {
+    rm_model m = rm_build_model();
+    rm_tensors t = rm_build_tensors();
+    bool mid_is_f16 = true;
+    /* The call itself fails (mxfp4 not implemented yet), but mid_is_f16
+     * must still be written, unconditionally, before that failure. */
+    rm_call_batch(&m, &t, 39u, 39u, RM_N_TOKENS, &mid_is_f16);
+    CHECK(mid_is_f16 == false,
+          "dispatcher: mid_is_f16 must be written false regardless of outcome");
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_dispatcher_mid_is_f16_written_false OK\n");
+    return 0;
+}
+
+/* A representative sample of routed_moe_build_plan's own validation
+ * rejections (moe_launch.cuh:479-509), each independent of format. */
+static int test_dispatcher_build_plan_validation(void) {
+    rm_model m = rm_build_model();
+    rm_tensors t = rm_build_tensors();
+
+    /* expert_in_dim not a multiple of 256: reuse the batch call but with
+     * an ad hoc direct call so expert_in_dim can be perturbed. */
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              t.out, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, /*expert_in_dim=*/255u, RM_EXPERT_MID_DIM,
+              RM_OUT_DIM, t.selected, t.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT,
+              0.0f, t.x, 0u, RM_N_TOKENS, NULL, false) == 0,
+          "build_plan: expert_in_dim not a multiple of 256 must fail");
+
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              t.out, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_N_TOTAL_EXPERT, /*n_expert=*/9u, 0.0f,
+              t.x, 0u, RM_N_TOKENS, NULL, false) == 0,
+          "build_plan: n_expert above DS4_ROCM_N_EXPERT_USED must fail");
+
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              NULL, t.gate, t.up, t.mid, t.down, m.model, m.model_size,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t.x,
+              0u, RM_N_TOKENS, NULL, false) == 0,
+          "build_plan: null out tensor must fail");
+
+    CHECK(ds4_gpu_routed_moe_batch_tensor(
+              t.out, t.gate, t.up, t.mid, t.down, m.model,
+              /*model_size=*/1u /* too small for gate/up/down ranges */,
+              m.gate_offset, m.up_offset, m.down_offset, 12u, 12u,
+              m.gate_expert_bytes, m.gate_row_bytes, m.down_expert_bytes,
+              m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+              t.selected, t.weights, RM_N_TOTAL_EXPERT, RM_N_EXPERT, 0.0f, t.x,
+              0u, RM_N_TOKENS, NULL, false) == 0,
+          "build_plan: model range exceeding model_size must fail");
+
+    rm_free_tensors(&t);
+    free(m.model);
+    fprintf(stderr, "  test_dispatcher_build_plan_validation OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_q8_k_quantize() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -483,6 +718,14 @@ int main(void) {
     if (test_sum_slot_order() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_sort_basic() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_sort_tile_sizes() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_zero_tokens_fails() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_unrecognised_format_fails() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_iq2_not_yet_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_q2k_not_yet_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_mxfp4_not_yet_implemented() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_add_in_rejected() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_mid_is_f16_written_false() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_dispatcher_build_plan_validation() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_moe OK\n");
     return 0;

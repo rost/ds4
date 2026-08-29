@@ -67,11 +67,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-<<<<<<< HEAD
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl test-sycl-streaming test-sycl-matmul test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert
-=======
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-kernels test-sycl-streaming test-sycl-moe
->>>>>>> f3faaa8 (feat(sycl): add moe counting sort for token expert pairs)
+.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl test-sycl-streaming test-sycl-matmul test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-kernels test-sycl-moe
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
@@ -479,7 +475,6 @@ tests/test_sycl_streaming: tests/test_sycl_streaming.o ds4_sycl.o ds4_sycl_unava
 test-sycl-streaming: tests/test_sycl_streaming
 	./tests/test_sycl_streaming
 
-<<<<<<< HEAD
 tests/test_sycl_router.o: tests/test_sycl_router.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
 
@@ -497,7 +492,6 @@ tests/test_sycl_fp8_kv: tests/test_sycl_fp8_kv.o ds4_sycl.o ds4_sycl_unavailable
 
 test-sycl-fp8-kv: tests/test_sycl_fp8_kv
 	./tests/test_sycl_fp8_kv
-=======
 tests/test_sycl_moe.o: tests/test_sycl_moe.c ds4_gpu.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
 
@@ -506,7 +500,6 @@ tests/test_sycl_moe: tests/test_sycl_moe.o ds4_sycl.o ds4_sycl_unavailable.o
 
 test-sycl-moe: tests/test_sycl_moe
 	./tests/test_sycl_moe
->>>>>>> f3faaa8 (feat(sycl): add moe counting sort for token expert pairs)
 
 tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
@@ -657,8 +650,4 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 	./tests/test_mxfp4_dot
 
 clean:
-<<<<<<< HEAD
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_sycl_smoke tests/test_sycl_output tests/test_sycl_embedding tests/test_sycl_norm_rope tests/test_sycl_compressor tests/test_sycl_streaming tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_sycl_matmul tests/test_sycl_router tests/test_sycl_fp8_kv tests/test_sycl_shared_expert
-=======
-	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_sycl_smoke tests/test_sycl_kernels tests/test_sycl_streaming tests/test_sycl_moe tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o
->>>>>>> f3faaa8 (feat(sycl): add moe counting sort for token expert pairs)
+	rm -f ds4 ds4-server ds4-bench ds4-eval ds4-agent ds4_cpu ds4_native ds4_server_test ds4_test ds4_agent_test gguf-tools/quality-testing/score_official gguf-tools/quality-testing/score_official.o speed-bench/metal_decode_schedule_bench speed-bench/metal_prefill_variant_bench speed-bench/*.o tests/test_q4k_dot tests/test_mxfp4_dot tests/test_mxfp4_metal tests/test_mxfp4_rocm tests/test_mxfp4_cuda tests/test_metal_session_batch tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict tests/test_engine_mgpu_refusal tests/test_engine_mgpu_runtime tests/test_engine_correctness tests/test_sampling tests/test_cuda_session_batch tests/test_cuda_mixed_batch tests/test_sycl_smoke tests/test_sycl_output tests/test_sycl_embedding tests/test_sycl_norm_rope tests/test_sycl_compressor tests/test_sycl_streaming tests/*.o *.o tests/cuda_long_context_smoke tests/cuda_long_context_smoke.o tests/test_sycl_matmul tests/test_sycl_router tests/test_sycl_fp8_kv tests/test_sycl_shared_expert tests/test_sycl_kernels tests/test_sycl_moe
