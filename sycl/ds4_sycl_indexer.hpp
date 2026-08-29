@@ -212,13 +212,17 @@ static void sycl_indexer_scores_kernel(
         const float *kh = index_comp + (uint64_t)c * head_dim;
         float dot = 0.0f;
         for (uint32_t d = tid; d < head_dim; d += block_dim) dot += qh[d] * kh[d];
-        partial[tid] = dot;
-        it.barrier(sycl::access::fence_space::local_space);
-        for (uint32_t s = block_dim >> 1; s > 0; s >>= 1) {
-            if (tid < s) partial[tid] += partial[tid + s];
-            it.barrier(sycl::access::fence_space::local_space);
-        }
-        total += sycl::fmax(partial[0], 0.0f) * weights[(uint64_t)t * n_head + h];
+        /* dot is initialised for every lane, including lanes with no work
+         * when head_dim < block_dim, so each contributes the sum identity.
+         * That unconditional write is the invariant spec 6b requires and
+         * that sycl_block_row_reduce documents: uninitialised local memory
+         * reads as zero on this hardware, so no test here can catch a lane
+         * skipping it. */
+        const float head_dot =
+                sycl_block_row_reduce(it, partial, dot, [](float a, float b) { return a + b; });
+        total += sycl::fmax(head_dot, 0.0f) * weights[(uint64_t)t * n_head + h];
+        /* The next head reuses `partial`; every lane must be done reading
+         * slot 0 before any lane overwrites its own slot. */
         it.barrier(sycl::access::fence_space::local_space);
     }
     if (tid == 0u) scores[(uint64_t)t * n_comp + c] = total * scale;
