@@ -18,27 +18,38 @@
  * (ffn_gate_inp) is F16; routed experts are IQ2_XXS gate/up and Q2_K down;
  * norms, hyper-connection (HC) scale/base, and attn_sinks are F32.
  *
- * The IQ2_XXS block packer, the Q2_K block packer, and the Q8_0 row
- * encoder below are ports of already-existing, already-exercised block
- * encoders, not new byte layouts: they reproduce, line for line,
- * tests/test_sycl_moe.c's f32_to_f16_bits (:113), oracle_iq2_pack_ib32
- * (:1693), oracle_iq2_pack_block (:1707), iq2_fill_row (:1715),
- * oracle_q2k_pack_block (:1770), q2k_fill_row (:1813), and
+ * The IQ2_XXS block packer, the Q2_K block packer, the Q8_0 row encoder,
+ * and the non-affine float filler below are ports of already-existing,
+ * already-exercised test helpers, not new byte layouts or a new fill
+ * strategy: they reproduce, line for line, tests/test_sycl_moe.c's
+ * f32_to_f16_bits (:113), oracle_iq2_pack_ib32 (:1693),
+ * oracle_iq2_pack_block (:1707), iq2_fill_row (:1715),
+ * oracle_q2k_pack_block (:1770), q2k_fill_row (:1813);
  * tests/test_sycl_matmul.c's test_encode_q8_0_row (:220, adapted to call
  * this header's f32_to_f16_bits instead of that file's test_float_to_half
  * -- the two are not the same conversion, see the note above
- * f32_to_f16_bits below).  They are reproduced here rather than shared by
- * extraction because test_sycl_moe.c documents itself as deliberately
- * self-contained ("no tests/test_sycl_harness.h on this branch's base
- * commit") and every SYCL test file in this suite follows the same
- * precedent of a cited, local reimplementation rather than a cross-file
- * header dependency (test_sycl_moe.c's own top comment cites
- * test_sycl_kernels.c for this), so this header follows that established
- * convention instead of retrofitting either file. */
+ * f32_to_f16_bits below); and tests/test_sycl_hc.c's fill_val (:147),
+ * whose non-affine shape (spec 6f/6n) is exactly what this header's own
+ * float filler needs and so replaces the header's original ad hoc hash.
+ * They are reproduced here rather than shared by extraction because
+ * test_sycl_moe.c documents itself as deliberately self-contained ("no
+ * tests/test_sycl_harness.h on this branch's base commit") and every SYCL
+ * test file in this suite follows the same precedent of a cited, local
+ * reimplementation rather than a cross-file header dependency
+ * (test_sycl_moe.c's own top comment cites test_sycl_kernels.c for this),
+ * so this header follows that established convention instead of
+ * retrofitting test_sycl_moe.c, test_sycl_matmul.c, or test_sycl_hc.c.
+ * A real extraction (this header included by all three, their local
+ * copies deleted) was tried and reverted: it would edit three already-
+ * landed, already-ablated test files to serve a fourth, which risks the
+ * tested code to tidy the testing code, and a later, deliberate
+ * consolidation pass across the whole suite is the right place for it,
+ * not here. */
 
 #ifndef DS4_TEST_SYCL_LAYER_WEIGHTS_H
 #define DS4_TEST_SYCL_LAYER_WEIGHTS_H
 
+#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -122,7 +133,7 @@ static inline uint64_t ds4_tw_tensor_bytes(uint32_t type, uint64_t elements) {
     return blocks * (uint64_t)block_bytes;
 }
 
-/* ---- Ported block encoders ------------------------------------------------
+/* ---- Block encoders, ported not shared -------------------------------------------------
  *
  * See the file header comment above for why these are ported (cited,
  * line-for-line copies) rather than shared by extraction. */
@@ -271,23 +282,34 @@ static inline void test_encode_q8_0_row(unsigned char *row, uint32_t in_dim, uin
     }
 }
 
+/* Deterministic pseudo-random floats in a small range, with a non-affine
+ * per-element term so no two rows are proportional to each other: per
+ * design-spec section 6f, an ablation downstream of a normalisation
+ * (Sinkhorn row/column normalisation here) can be laundered invisible by
+ * purely affine test data.  Ported from tests/test_sycl_hc.c:147
+ * (fill_val). */
+static inline float fill_val(uint32_t i, uint32_t j) {
+    return sinf((float)(i * 7 + j * 13 + 1)) * 0.7f + 0.05f * (float)((i * j) % 11);
+}
+
 /* Deterministic, non-zero, small-amplitude float fill for the plain F32/
  * F16 tensors (norms, HC scale/base, attn_sinks, the router, the HC mix
  * matrices, token_embd) that have no pre-existing block encoder to reuse.
  * `salt` distinguishes one tensor from another so no two tensors end up
- * with the same values by coincidence. center +/- scale/2. */
-static inline float ds4_tw_hashed_float(uint64_t i, uint32_t salt, float center, float scale) {
-    const uint32_t h = (uint32_t)((i * 2654435761ull) ^ ((uint64_t)salt * 2246822519ull));
-    const float frac = (float)((h >> 16) % 1000u) / 1000.0f - 0.5f; /* [-0.5, 0.5) */
-    return center + scale * frac;
-}
-
+ * with the same values by coincidence, the same technique
+ * tests/test_sycl_hc.c itself uses at its own fill_val call sites (an
+ * offset folded into the second argument, e.g. fill_val(t, h + 50));
+ * this header ports fill_val itself (see above) rather than inventing
+ * its own hash, per the survey this task requires.
+ * scale/center rescale fill_val's own non-affine output uniformly, which
+ * does not reintroduce the affine-ablation-hiding problem fill_val
+ * itself avoids. */
 static inline void ds4_tw_fill_f32(float *dst, uint64_t n, uint32_t salt, float center, float scale) {
-    for (uint64_t i = 0; i < n; i++) dst[i] = ds4_tw_hashed_float(i, salt, center, scale);
+    for (uint64_t i = 0; i < n; i++) dst[i] = center + scale * fill_val((uint32_t)i, salt);
 }
 
 static inline void ds4_tw_fill_f16(uint16_t *dst, uint64_t n, uint32_t salt, float center, float scale) {
-    for (uint64_t i = 0; i < n; i++) dst[i] = f32_to_f16_bits(ds4_tw_hashed_float(i, salt, center, scale));
+    for (uint64_t i = 0; i < n; i++) dst[i] = f32_to_f16_bits(center + scale * fill_val((uint32_t)i, salt));
 }
 
 /* ---- Tensor descriptors ---------------------------------------------------
