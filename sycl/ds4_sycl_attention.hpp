@@ -300,6 +300,8 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                 use_mask, n_head, head_dim, use_vec4);
                     });
         });
+        /* Wait kept -- this function's only kernel, and
+         * sinks_guard may own scratch this function frees on return. */
         dq.wait_and_throw();
         ds4_sycl_profile_record_named("attn_decode_mixed_one_fast_oldhip", _ds4_prof_ev1);
     } catch (const sycl::exception &e) {
@@ -815,6 +817,9 @@ static int sycl_attention_decode_batch_launch(
                         });
             });
         }
+        /* Wait kept -- this function's only kernel (one of two
+         * mutually exclusive branches), and sinks_guard may own scratch
+         * this function frees on return. */
         dq.wait_and_throw();
         ds4_sycl_profile_record_named("attn_decode_mixed_batch", _ds4_prof_ev2);
     } catch (const sycl::exception &e) {
@@ -1571,6 +1576,8 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                     n_comp, top_k, pos0, ratio, n_head, head_dim, use_vec4);
                         });
             });
+            /* Wait kept -- this branch's only kernel, and
+             * sinks_guard may own scratch this function frees on return. */
             dq.wait_and_throw();
             ds4_sycl_profile_record_named("attn_decode_indexed_mixed_one_fast_oldhip", _ds4_prof_ev3);
             return 1;
@@ -1590,7 +1597,11 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                                                          ptopk, n_tokens);
                                });
             });
-            dq.wait_and_throw();
+            /* No wait here -- dq is in_order, so whichever kernel
+             * below reads psorted (the heads8_online kernel or the general
+             * kernel, both submitted to dq right after this) cannot start
+             * before this sort kernel finishes. Each of those two branches
+             * keeps its own final wait, which covers this sort too. */
             ds4_sycl_profile_record_named("indexer_topk_sort_512_asc", _ds4_prof_ev4);
             psorted = sorted_buf;
         }
@@ -1615,6 +1626,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                     n_head, head_dim);
                         });
             });
+            /* Wait kept -- covers this kernel and the sort above,
+             * and sinks_guard/sorted_guard may each own scratch this
+             * function frees on return. */
             dq.wait_and_throw();
             ds4_sycl_profile_record_named("attn_indexed_mixed_heads8_online", _ds4_prof_ev5);
             return 1;
@@ -1638,6 +1652,9 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                 n_head, head_dim);
                     });
         });
+        /* Wait kept -- covers this kernel and the sort above, and
+         * sinks_guard/sorted_guard may each own scratch this function
+         * frees on return. */
         dq.wait_and_throw();
         ds4_sycl_profile_record_named("attn_indexed_mixed", _ds4_prof_ev6);
     } catch (const sycl::exception &e) {
@@ -1909,6 +1926,9 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
                                 psinks, pq, prows, n_head, head_dim, use_vec4);
                     });
         });
+        /* Wait kept -- this function's only kernel, and
+         * sinks_guard/rows_guard may each own scratch this function frees
+         * on return. */
         dq.wait_and_throw();
         ds4_sycl_profile_record_named("attn_decode_rows_rope", _ds4_prof_ev7);
     } catch (const sycl::exception &e) {
@@ -1985,9 +2005,14 @@ static void sycl_attention_prefill_unpack_heads_launch(
         const uint32_t t  = (uint32_t)(qi / n_head);
         heads[gid] = tmp[((uint64_t)h * n_tokens + t) * head_dim + d];
     });
-    /* Every caller drains this launch with its own dq.wait_and_throw()
-     * immediately after, so this event only needs to reach the profiler,
-     * not be waited here too. */
+    /* Every caller's queue is in_order (ds4_sycl.cpp), so this
+     * event only needs to reach the profiler, not be waited here too: a
+     * caller that needs a real completion signal (a host read, or freeing
+     * scratch this launch's inputs live in) already has its own wait
+     * further down its own call chain, and callers that loop this launch
+     * across tiles (sycl_attention_prefill_mixed_cublas_tiled) rely on
+     * exactly that in_order guarantee to run every tile back to back with
+     * no wait between them at all. */
     ds4_sycl_profile_record_named("attn_prefill_unpack_heads", ev);
 }
 
@@ -2084,17 +2109,16 @@ static void sycl_attention_prefill_raw_kernel(
  *    kernels, in this exact order:
  *      (a) score GEMM: scores = (1/sqrt(head_dim)) * K^T Q, batched over
  *          n_head.
- *      (b) softmax kernel, ordered after (a) by an explicit
- *          wait_and_throw() on the GEMM's returned event before this
- *          launch submits -- chosen over passing the event as a
- *          dependency because every other multi-stage entry in this
- *          backend already uses a trailing host wait between stages
- *          (spec 6t's "self-waiting helpers" discipline), and this
- *          entry's stages are strictly sequential with no independent work
- *          to overlap in the meantime.
+ *      (b) softmax kernel, reading (a)'s output.
  *      (c) value GEMM: out = V * scores, batched over n_head, again with
  *          stride_a == 0 broadcasting raw_kv.
- *      (d) unpack kernel, ordered after (c) the same way as (b) after (a).
+ *      (d) unpack kernel, reading (c)'s output.
+ *    (a)-(d) are ordered against each other by dq being in_order
+ *    (ds4_sycl.cpp), not by a host wait between them -- this entry's
+ *    stages are strictly sequential with no independent work to overlap
+ *    in the meantime, so in_order costs nothing here and removes three of
+ *    this path's four host round trips. The one wait this path keeps is
+ *    after (d), guarding the scratch this path frees on return.
  *    This is the path that makes long-context prefill correct at all: the
  *    scalar fallback below refuses whenever window == 0 && n_tokens > 256,
  *    so before oneMKL there was no path here above 256 combined keys, let
@@ -2160,6 +2184,8 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                                     n_tokens, 0u, window, 1u, n_head, head_dim);
                         });
             });
+            /* Wait kept -- this branch's only kernel, and
+             * sinks_guard may own scratch this function frees on return. */
             dq.wait_and_throw();
             ds4_sycl_profile_record_named("attn_static_mixed_heads8_online", _ds4_prof_ev8);
             return 1;
@@ -2192,7 +2218,13 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                     0.0f,
                     scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * n_tokens),
                     (int64_t)n_head);
-            ev1.wait_and_throw();
+            /* No wait on ev1 -- dq is in_order (ds4_sycl.cpp), so
+             * the softmax kernel below cannot start before this GEMM
+             * completes, and the unpack kernel's wait at the end of this
+             * branch is the one wait this branch needs: it runs before
+             * sinks_guard/scores_guard/out_guard free their scratch, and
+             * it covers everything submitted to dq before it, ev1 and the
+             * softmax kernel included. */
             ds4_sycl_profile_record_named("attn_prefill_raw_qk_gemm", ev1);
 
             sycl::event _ds4_prof_ev9 = dq.submit([&](sycl::handler &h) {
@@ -2206,7 +2238,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                                     n_keys);
                         });
             });
-            dq.wait_and_throw();
+            /* No wait here, same reasoning as ev1 above. */
             ds4_sycl_profile_record_named("attn_prefill_raw_softmax", _ds4_prof_ev9);
 
             sycl::event ev2 = sycl_gemm_batch_f32(
@@ -2218,11 +2250,14 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                     0.0f,
                     out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * n_tokens),
                     (int64_t)n_head);
-            ev2.wait_and_throw();
+            /* No wait here, same reasoning as ev1 above. */
             ds4_sycl_profile_record_named("attn_prefill_raw_av_gemm", ev2);
 
             sycl_attention_prefill_unpack_heads_launch(dq, pheads, out_tmp, n_tokens, n_head,
                                                        head_dim);
+            /* Wait kept -- covers ev1, the softmax kernel, ev2 and
+             * this unpack kernel, and sinks_guard/scores_guard/out_guard
+             * may each own scratch this function frees on return. */
             dq.wait_and_throw();
             return 1;
         }
@@ -2241,6 +2276,8 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                                 n_tokens, window, n_head, head_dim);
                     });
         });
+        /* Wait kept -- this branch's only kernel, and sinks_guard
+         * may own scratch this function frees on return. */
         dq.wait_and_throw();
         ds4_sycl_profile_record_named("attn_prefill_raw_scalar", _ds4_prof_ev10);
     } catch (const std::exception &e) {
@@ -2563,8 +2600,21 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
     sycl_device_scratch_guard out_guard(dq, out_tmp);
 
     sycl_attention_prefill_pack_mixed_kv_launch(dq, kv, praw, pcomp, n_tokens, n_comp, head_dim);
-    dq.wait_and_throw();
-
+    /* No wait here or anywhere in the loop below, only a single
+     * one after the loop exits. dq is in_order (ds4_sycl.cpp), so every
+     * kernel and GEMM below runs strictly in submission order: the score
+     * GEMM cannot start before this pack kernel finishes, the softmax
+     * kernel cannot start before the score GEMM finishes, and so on
+     * through the unpack at the end of each iteration. scores/out_tmp are
+     * reused across iterations (kv is written once above and only read
+     * from here on), so iteration i+1's score GEMM writes `scores` only
+     * after iteration i's value GEMM has finished reading it, and
+     * iteration i+1's value GEMM writes `out_tmp` only after iteration i's
+     * unpack has finished reading it -- again by submission order on the
+     * same queue, with no host wait required to make either true. The
+     * wait after the loop is the one this function needs: it runs before
+     * kv_guard/scores_guard/out_guard free their scratch, and it covers
+     * every iteration's work, the initial pack included. */
     const float scale = 1.0f / sycl::sqrt((float)head_dim);
     for (uint32_t t0 = 0; t0 < n_tokens; t0 += tile_tokens) {
         const uint32_t nt = (t0 + tile_tokens <= n_tokens) ? tile_tokens : (n_tokens - t0);
@@ -2579,7 +2629,6 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
                 0.0f,
                 scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * nt),
                 (int64_t)n_head);
-        ev1.wait_and_throw();
         ds4_sycl_profile_record_named("attn_prefill_mixed_qk_gemm", ev1);
 
         sycl::event _ds4_prof_ev11 = dq.submit([&](sycl::handler &h) {
@@ -2593,7 +2642,6 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
                                 window, ratio, n_keys);
                     });
         });
-        dq.wait_and_throw();
         ds4_sycl_profile_record_named("attn_prefill_mixed_softmax_tile", _ds4_prof_ev11);
 
         sycl::event ev2 = sycl_gemm_batch_f32(
@@ -2605,13 +2653,12 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
                 0.0f,
                 out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * nt),
                 (int64_t)n_head);
-        ev2.wait_and_throw();
         ds4_sycl_profile_record_named("attn_prefill_mixed_av_gemm", ev2);
 
         sycl_attention_prefill_unpack_heads_launch(
                 dq, pheads + (uint64_t)t0 * n_head * head_dim, out_tmp, nt, n_head, head_dim);
-        dq.wait_and_throw();
     }
+    dq.wait_and_throw();
     return 1;
 }
 
@@ -2627,9 +2674,11 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
  * 2. The GEMM path (head_dim == 512, n_tokens > 1): oneMKL gemm_batch,
  *    packed KV, broadcasting the packed table across every head via
  *    stride_a == 0, same four-stage shape as the raw-only entry's GEMM
- *    path (score GEMM, softmax, value GEMM, unpack), each stage ordered
- *    against the next by an explicit wait_and_throw() on the GEMM's
- *    returned event, for the same reason given there.
+ *    path (score GEMM, softmax, value GEMM, unpack). The four
+ *    stages are ordered against each other by dq being in_order
+ *    (ds4_sycl.cpp), not by a host wait between them; the one wait this
+ *    path keeps is after the unpack, guarding the scratch this path frees
+ *    on return.
  * 3. The tiled variant of 2, taken when the non-tiled scratch would
  *    exceed 4 GiB or when its allocation fails outright. ROCm gates the
  *    size check on g_quality_mode, which is permanently false on this
@@ -2719,8 +2768,12 @@ static int sycl_attention_prefill_mixed_launch(
 
         sycl_attention_prefill_pack_mixed_kv_launch(dq, kv, praw, pcomp, n_tokens, n_comp,
                                                     head_dim);
-        dq.wait_and_throw();
-
+        /* No wait until the unpack launch below, same reasoning
+         * as sycl_attention_prefill_mixed_cublas_tiled above -- dq is
+         * in_order, so pack, ev1, softmax, ev2 and unpack all run in
+         * submission order with no host wait needed between them, and the
+         * final wait covers all of them before kv_guard/scores_guard/
+         * out_guard free their scratch. */
         const float scale = 1.0f / sycl::sqrt((float)head_dim);
         sycl::event ev1 = sycl_gemm_batch_f32(
                 dq, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
@@ -2731,7 +2784,6 @@ static int sycl_attention_prefill_mixed_launch(
                 0.0f,
                 scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * n_tokens),
                 (int64_t)n_head);
-        ev1.wait_and_throw();
         ds4_sycl_profile_record_named("attn_prefill_mixed_qk_gemm", ev1);
 
         sycl::event _ds4_prof_ev13 = dq.submit([&](sycl::handler &h) {
@@ -2745,7 +2797,6 @@ static int sycl_attention_prefill_mixed_launch(
                                 ratio, n_keys);
                     });
         });
-        dq.wait_and_throw();
         ds4_sycl_profile_record_named("attn_prefill_mixed_softmax", _ds4_prof_ev13);
 
         sycl::event ev2 = sycl_gemm_batch_f32(
@@ -2757,7 +2808,6 @@ static int sycl_attention_prefill_mixed_launch(
                 0.0f,
                 out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * n_tokens),
                 (int64_t)n_head);
-        ev2.wait_and_throw();
         ds4_sycl_profile_record_named("attn_prefill_mixed_av_gemm", ev2);
 
         sycl_attention_prefill_unpack_heads_launch(dq, pheads, out_tmp, n_tokens, n_head,
@@ -2788,6 +2838,15 @@ static int sycl_attention_prefill_mixed_launch(
                             n_tokens, n_comp, window, ratio, n_head, head_dim);
                 });
     });
+    /* Wait kept. Unlike the other branches above, psinks here is
+     * not this function's own scratch: it is a pointer into a
+     * sycl_device_scratch_guard the CALLER owns (every extern "C" entry
+     * that reaches this helper stages attn_sinks itself before calling
+     * in), and that guard is freed as soon as this call returns, on the
+     * caller's own return path. This function has no visibility into
+     * whether the caller launches anything else afterward, so it cannot
+     * assume a later wait will cover this kernel; it must leave with the
+     * GPU already caught up. */
     dq.wait_and_throw();
     ds4_sycl_profile_record_named("attn_prefill_mixed_scalar", _ds4_prof_ev14);
     return 1;
