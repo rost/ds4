@@ -1675,15 +1675,21 @@ Multi-GPU layer placement uses the same flags as CUDA:
 ./ds4 -m gguf/ds4flash.gguf --sycl --gpu-vram auto --gpu-devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13 -p "Hello"
 ```
 
-`--gpu-vram auto` queries free VRAM per device through Level Zero Sysman and
-already works today. A few other multi-GPU code paths (the DSpark support
-model's tier selection among them) call a separate per-tier free-VRAM query,
-`ds4_gpu_tier_free_vram`, that is still a stub returning 0 as of this writing
-and is being implemented in a separate, concurrent line of work on this
-branch; until it lands, those specific paths degrade rather than fail, so
-plain multi-GPU placement and `--gpu-vram auto` are unaffected. `--gpu-vram`
-also accepts an explicit comma-separated GiB budget per device instead of
-`auto`.
+`--gpu-vram auto` queries free VRAM per device through Level Zero Sysman.
+**Treat its numbers with suspicion on Intel hardware.** On the development A770
+the Sysman free-memory reading does not move under real allocation pressure: it
+reports total memory by another name, so `auto` will happily claim a card is
+empty when it is not. If the layer packer over-commits a device, pass an
+explicit comma-separated GiB budget per device instead of `auto`, sized with
+headroom. Whether Battlemage and a current Level Zero driver report this
+correctly is untested and worth checking first on any new machine.
+
+`ds4_gpu_tier_free_vram`, the separate per-tier query used by multi-tier
+placement and the per-device weight cache, is implemented and deliberately does
+not use a live Sysman query for the reason above. It reports a static ceiling
+(total device memory minus a reserve) minus the bytes this backend has itself
+committed on that tier, so it is honest by construction: it only ever reports
+what it knows was not spent, and it decreases exactly as caches admit.
 
 `--cuda-tensor-parallel` is refused outright on this backend: DeepSeek's
 tensor/expert-parallel decode path is CUDA-only work that nothing here
