@@ -58552,6 +58552,22 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
+#ifdef DS4_SYCL_BUILD
+    /* The tensor/expert-parallel decode path is CUDA-only work: nothing in
+     * this backend implements it, so letting it through here would run
+     * into stubbed entries deep in a decode graph instead of failing
+     * cleanly at startup. Refuse regardless of GPU count; plain multi-GPU
+     * layer placement (--gpu-vram / --gpu-devices) is unaffected. */
+    if (opt->cuda_tensor_parallel) {
+        fprintf(stderr,
+                "ds4: --cuda-tensor-parallel is not implemented on the SYCL "
+                "backend; use --gpu-vram/--gpu-devices for layer placement "
+                "across GPUs instead\n");
+        free(e);
+        *out = NULL;
+        return 1;
+    }
+#endif
     if (opt->dspark && (!opt->mtp_path || !opt->mtp_path[0])) {
         fprintf(stderr, "ds4: --dspark requires --mtp FILE\n");
         free(e);
