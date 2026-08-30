@@ -612,17 +612,21 @@ static long file_size(const char *path) {
  * (ds4_prefill_cap_for_prompt, ds4.c:12165, caps prefill_cap at the
  * context size). The ratio-128 harness has no such requirement and keeps
  * the smaller context used before. */
-static ds4_engine_options make_opt(const char *path) {
+static ds4_engine_options make_opt_ctx(const char *path, int context_size) {
     ds4_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = path;
     opt.backend = DS4_BACKEND_CUDA; /* SYCL reuses this constant; spec section 4. */
-    opt.context_size = g_load_ratio == 4u ? 8192 : 64;
+    opt.context_size = context_size;
     opt.load_slice = true;
     opt.load_layer_start = g_load_layer;
     opt.load_layer_end = g_load_layer;
     opt.load_output = false;
     return opt;
+}
+
+static ds4_engine_options make_opt(const char *path) {
+    return make_opt_ctx(path, g_load_ratio == 4u ? 8192 : 64);
 }
 
 static int ablation_attempt(const char *path) {
@@ -934,6 +938,106 @@ int main(int argc, char **argv) {
         ds4_engine_close(e2);
         ds4_gpu_cleanup();
         CHECK(unsetenv("DS4_CUDA_DIRECT_MODEL") == 0, "unsetenv failed");
+    }
+
+    /* ---- Rank the prefill kernels across batch sizes
+     * that straddle the MoE dispatch thresholds. This layer's routed
+     * format is IQ2_XXS gate/up, Q2_K down (iq2_path, sycl/ds4_sycl_
+     * moe_launch.hpp's sycl_routed_moe_iq2_dispatch), whose only
+     * sorted-pairs threshold is `n_tokens > 1u` -- read directly out of
+     * that function rather than assumed. Q4_K's threshold there is
+     * `n_tokens >= 32u` and MXFP4's is `n_tokens > 4u` (tiny_batch
+     * `n_tokens <= 4u`), but neither format is present in this layer's
+     * tensors regardless of n_tokens, so no batch size here can reach
+     * them; the sizes below still straddle those thresholds anyway so
+     * the coverage statement printed for each size is honest about
+     * what it does and does not exercise, rather than silently leaving
+     * two entire dispatch regimes unstated.
+     *
+     * Each size gets its own fresh engine (the one-time ~0.3s model-
+     * range cache install the earlier engine_open traces show is paid
+     * again, not folded into the per-call timing) and its own context,
+     * sized only as large as that size's repeats need, since
+     * prefill_cap is capped at context_size (ds4_prefill_cap_for_prompt,
+     * ds4.c:12165). Skipped in ratio-4 mode: that configuration is
+     * measured separately below with its own, much larger,
+     * context. */
+    if (g_load_ratio != 4u) {
+        static const uint32_t batch_sizes[] = { 1u, 2u, 5u, 32u, 64u };
+        static const char *const batch_notes[] = {
+            "decode; no MoE sorted-pairs path exists at n_tokens==1 for any format",
+            "crosses this layer's iq2_path sorted-pairs gate (n_tokens>1); MXFP4/Q4_K gates unreached (format absent)",
+            "crosses MXFP4's n_tokens>4 tile gate; MXFP4 itself unreached (format absent in this layer)",
+            "crosses Q4_K's n_tokens>=32 tile gate; Q4_K itself unreached (format absent in this layer)",
+            "this harness's prefill_cap ceiling (context_size=64)",
+        };
+        const int n_sizes = (int)(sizeof(batch_sizes) / sizeof(batch_sizes[0]));
+        for (int si = 0; si < n_sizes; si++) {
+            const uint32_t b = batch_sizes[si];
+            const int repeats = 5;
+            uint32_t ctx = (uint32_t)(repeats + 1) * b;
+            if (ctx < 64u) ctx = 64u;
+
+            ds4_engine_options optb = make_opt_ctx(path, (int)ctx);
+            ds4_engine *eb = NULL;
+            CHECK(ds4_engine_open(&eb, &optb) == 0, "ds4_engine_open failed for the batch sweep");
+            ds4_session *sb = NULL;
+            CHECK(ds4_session_create(&sb, eb, optb.context_size) == 0,
+                  "ds4_session_create failed for the batch sweep");
+
+            const uint64_t bhc = (uint64_t)b * hc_dim;
+            float *bin = (float *)malloc(bhc * sizeof(float));
+            float *bout = (float *)calloc((size_t)bhc, sizeof(float));
+            int *btok = (int *)malloc((size_t)b * sizeof(int));
+            CHECK(bin != NULL && bout != NULL && btok != NULL,
+                  "out of memory allocating batch-sweep buffers");
+            for (uint64_t i = 0; i < bhc; i++) bin[i] = fill_val((uint32_t)i, 99u + b);
+            for (uint32_t t = 0; t < b; t++) btok[t] = (int)(t % FLASH_N_VOCAB);
+
+            double total_ms = 0.0;
+            for (int r = 0; r <= repeats; r++) {
+                char errb[256];
+                errb[0] = '\0';
+                if (r == 1) {
+                    ds4_sycl_test_profile_reset();
+                    ds4_sycl_test_profile_enable(1);
+                }
+                const double bt0 = now_secs();
+                int rcb = ds4_session_eval_layer_slice(sb, btok, b, /*pos0=*/(uint32_t)r * b,
+                                                       g_load_layer, g_load_layer,
+                                                       bin, bout, /*output_logits=*/false, NULL,
+                                                       errb, sizeof(errb));
+                const double bt1 = now_secs();
+                CHECK(rcb == 0, errb[0] ? errb : "batch-sweep eval failed");
+                if (r == 0) {
+                    /* Discard the first execution's timing (measurement
+                     * discipline: a freshly linked binary's first
+                     * execution reads far above its warm cost), but
+                     * still check its output is real. */
+                    for (uint64_t i = 0; i < bhc; i++) {
+                        CHECK(isfinite(bout[i]), "batch-sweep output has a non-finite value");
+                    }
+                } else {
+                    total_ms += (bt1 - bt0) * 1000.0;
+                }
+            }
+            ds4_sycl_test_profile_enable(0);
+            fprintf(stderr,
+                    "  prefill batch=%-3u %.4f ms/eval (warm avg of %d) -- %s\n",
+                    b, total_ms / repeats, repeats, batch_notes[si]);
+            {
+                char label[96];
+                snprintf(label, sizeof(label), "kernel ranking, batch=%u", b);
+                print_kernel_ranking(label, repeats);
+            }
+
+            free(bin);
+            free(bout);
+            free(btok);
+            ds4_session_free(sb);
+            ds4_engine_close(eb);
+            ds4_gpu_cleanup();
+        }
     }
 
     /* ---- Ablation: corrupt layer 3's first tensor's rel_offset so its
