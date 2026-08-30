@@ -44,6 +44,14 @@ namespace {
 static uint32_t g_sycl_moe_last_staged_expert_count = 0;
 static uint64_t g_sycl_moe_last_staged_bytes = 0;
 
+/* Set at the end of every sycl_routed_moe_launch call to whether
+ * that call used gate/up/down tables the model-range cache had already
+ * made device-resident (true) rather than staging any of them (false).
+ * Staged-count/bytes alone cannot distinguish "resident, nothing to
+ * stage" from "n_total_expert or unique_count happened to be 0", so this
+ * is its own counter rather than inferred from the other two. */
+static bool g_sycl_moe_last_used_resident_weights = false;
+
 /* ---- routed_moe_build_plan, moe_launch.cuh:451-509 ------------------
  *
  * gate_type/down_type numeric values are ds4's DS4_TENSOR_* enum:
@@ -358,24 +366,34 @@ static int sycl_routed_moe_q2k_dispatch(
  * rather than written a fourth time.  Callers still own their own
  * sycl_device_scratch_guard triple for the returned pointers (this
  * function never partially succeeds without freeing what it allocated,
- * but ownership of a successful stage passes to the caller). */
+ * but ownership of a successful stage passes to the caller).
+ *
+ * Each of the three pointers is staged (or passed through, if
+ * the model-range cache already made it device-resident) independently
+ * via sycl_stage_host_bytes, since sycl_routed_moe_launch's caller only
+ * reaches this function when NOT all three are resident (see its own
+ * comment): one or two may still be cached while the rest still needs
+ * staging. *_owned reports which of the three the caller must free
+ * (false for a passed-through cached pointer -- the cache owns that
+ * memory and frees it exactly once at teardown, spec 6g). */
 static bool sycl_moe_stage_weights(sycl::queue &q, const char *gate_w, const char *up_w,
                                    const char *down_w, uint64_t gate_bytes, uint64_t down_bytes,
-                                   void **gate_dev, void **up_dev, void **down_dev) {
-    *gate_dev = sycl::malloc_device((size_t)gate_bytes, q);
-    *up_dev = sycl::malloc_device((size_t)gate_bytes, q);
-    *down_dev = sycl::malloc_device((size_t)down_bytes, q);
-    if (!*gate_dev || !*up_dev || !*down_dev) {
-        if (*gate_dev) sycl::free(*gate_dev, q);
-        if (*up_dev) sycl::free(*up_dev, q);
-        if (*down_dev) sycl::free(*down_dev, q);
-        *gate_dev = *up_dev = *down_dev = nullptr;
+                                   void **gate_dev, void **up_dev, void **down_dev,
+                                   bool *gate_owned, bool *up_owned, bool *down_owned) {
+    sycl_device_scratch_guard gate_guard = sycl_stage_host_bytes(q, gate_w, gate_bytes);
+    sycl_device_scratch_guard up_guard = sycl_stage_host_bytes(q, up_w, gate_bytes);
+    sycl_device_scratch_guard down_guard = sycl_stage_host_bytes(q, down_w, down_bytes);
+    if (!gate_guard.p || !up_guard.p || !down_guard.p) {
         return false;
     }
-    q.memcpy(*gate_dev, gate_w, (size_t)gate_bytes);
-    q.memcpy(*up_dev, up_w, (size_t)gate_bytes);
-    q.memcpy(*down_dev, down_w, (size_t)down_bytes);
-    q.wait_and_throw();
+    *gate_dev = gate_guard.p;   *gate_owned = gate_guard.owns;
+    *up_dev   = up_guard.p;     *up_owned   = up_guard.owns;
+    *down_dev = down_guard.p;   *down_owned = down_guard.owns;
+    /* Ownership (or the lack of it) has already been captured above;
+     * null the locals so their destructors, run when this function
+     * returns, neither free what the caller now owns nor double-account
+     * a pass-through pointer's non-ownership. */
+    gate_guard.p = up_guard.p = down_guard.p = nullptr;
     return true;
 }
 
@@ -485,6 +503,31 @@ static bool sycl_moe_stage_selected_experts(
         uint64_t down_expert_bytes, const int32_t *remap_host, uint32_t pair_count,
         void **gate_dev, void **up_dev, void **down_dev, void **sel_dev) {
     *gate_dev = *up_dev = *down_dev = *sel_dev = nullptr;
+
+    /* This function's whole design is a HOST-side gather (std::memcpy
+     * below, not a SYCL queue op) of scattered per-expert rows out of
+     * gate_w/up_w/down_w before the one crossing to device. That is only
+     * ever valid when those three are ordinary host pointers. The
+     * model-range cache can make sycl_model_range_ptr return an already
+     * device-resident pointer instead, and a std::memcpy from device
+     * memory is undefined behaviour, not a slow path -- exactly spec 6g's
+     * "wrong pointer produces plausible wrong numbers with no error"
+     * shape, except here it could just as easily crash. sycl_routed_moe_
+     * launch's own dispatch is written to never call this function with a
+     * resident pointer (it takes the direct-use path instead, skipping
+     * compaction entirely, since compaction buys nothing once the source
+     * needs no staging), so this check should never fire; keep it as a
+     * hard refusal rather than removing it, since a future caller adding
+     * another call site is exactly the mistake this exists to catch. */
+    if (sycl_ptr_is_device_resident(q, gate_w) || sycl_ptr_is_device_resident(q, up_w) ||
+        sycl_ptr_is_device_resident(q, down_w)) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "sycl_moe_stage_selected_experts called with a device-resident "
+                "source pointer; refusing rather than host-memcpy from device "
+                "memory\n");
+        return false;
+    }
+
     uint64_t gate_bytes = 0, down_bytes = 0, sel_bytes = 0;
     if (!sycl_u64_mul_checked(unique_count, gate_expert_bytes, &gate_bytes) ||
         !sycl_u64_mul_checked(unique_count, down_expert_bytes, &down_bytes) ||
@@ -727,6 +770,32 @@ static int sycl_routed_moe_launch(
         sycl_block_q8_K *xq = (sycl_block_q8_K *)down->ptr;
         sycl_block_q8_K *midq = (sycl_block_q8_K *)gate->ptr;
         sycl_moe_q8_k_quantize(q, xq, (const float *)x->ptr, expert_in_dim, n_tokens);
+        /* This backend's queues are out-of-order raw-USM queues (spec 6t):
+         * a kernel reading xq/midq has no SYCL-tracked dependency on the
+         * quantise kernel above, since both address raw pointers rather
+         * than buffers/accessors. Previously, every path (compaction
+         * AND full-table staging) unconditionally called sycl_moe_build_
+         * expert_compaction, whose own q.memcpy(selected...).wait_and_
+         * throw() -- for an entirely unrelated tensor -- happened to also
+         * drain this queue's earlier submissions, including the quantise
+         * kernel, as an incidental side effect. Skipping that call
+         * whenever any weight table is already resident (below) removes
+         * that incidental fence along with it, so this wait is added back
+         * explicitly: a genuine cross-kernel data dependency must never
+         * depend on an unrelated call happening to also flush the queue.
+         * It stays regardless of whether any table below is staged,
+         * compacted or read resident. Investigated as the suspected cause
+         * when tests/test_sycl_gguf_load.c (a real 256-expert GGUF file)
+         * first turned up all-zero MoE output with the model-range cache
+         * active: adding this wait alone did not fix that failure, so it
+         * was not the defect that test exposed (see sycl_copy_host_to_
+         * device_paged_safe, ds4_sycl_common.hpp, for the one that was:
+         * an unrelated DMA-vs-unfaulted-mmap-page defect in how the cache
+         * itself copied bytes in, upstream of this function entirely).
+         * Kept anyway because the race it closes is real independent of
+         * that unrelated defect, and removing it would silently reopen
+         * it. */
+        q.wait_and_throw();
 
         /* gate_w/up_w/down_w point into model_map, ordinary host memory (or
          * a plain host-backed test fixture): a SYCL kernel cannot
@@ -768,22 +837,54 @@ static int sycl_routed_moe_launch(
          * came out. Decode's real union (n_expert_used, 6 of 256 for
          * Flash) sits far below this threshold; a wide prefill batch's
          * union approaches the full table and is
-         * exactly what this fallback is for. */
+         * exactly what this fallback is for.
+         *
+         * If the model-range cache already made all three of
+         * gate_w/up_w/down_w device-resident (sycl_model_range_ptr
+         * above), none of this applies: there is nothing to stage and
+         * nothing to compact, so every kernel below can read the whole
+         * per-layer table directly at its real expert id, exactly like
+         * CUDA's cuda_model_range_ptr path. Compaction's own host
+         * readback (sycl_moe_build_expert_compaction's q.memcpy(...).
+         * wait_and_throw()) is skipped too in that case: it exists only
+         * to shrink a copy this call no longer needs to make, so running
+         * it anyway would reintroduce exactly the blocking wait residency
+         * is meant to remove. A PARTIAL residency (one or two of the
+         * three cached, not all three) still forces the plain per-pointer
+         * staging path below rather than compaction: sycl_moe_stage_
+         * selected_experts's host gather cannot read a device pointer
+         * (it refuses if handed one), so compaction is only considered
+         * when none of the three is resident yet. */
+        const bool gate_resident = sycl_ptr_is_device_resident(q, gate_w);
+        const bool up_resident = sycl_ptr_is_device_resident(q, up_w);
+        const bool down_resident = sycl_ptr_is_device_resident(q, down_w);
+        const bool all_resident = gate_resident && up_resident && down_resident;
+        const bool any_resident = gate_resident || up_resident || down_resident;
+
         std::vector<int32_t> unique_ids, remap_ids;
-        const bool compaction_shape_ok = sycl_moe_build_expert_compaction(
-                q, (const int32_t *)selected->ptr, pair_count, n_total_expert,
-                &unique_ids, &remap_ids);
-        const uint32_t unique_count =
-                compaction_shape_ok ? (uint32_t)unique_ids.size() : n_total_expert;
-        const bool use_compaction =
-                compaction_shape_ok && unique_count > 0u && unique_count <= n_total_expert / 2u;
+        bool use_compaction = false;
+        uint32_t unique_count = n_total_expert;
+        if (!any_resident) {
+            const bool compaction_shape_ok = sycl_moe_build_expert_compaction(
+                    q, (const int32_t *)selected->ptr, pair_count, n_total_expert,
+                    &unique_ids, &remap_ids);
+            unique_count = compaction_shape_ok ? (uint32_t)unique_ids.size() : n_total_expert;
+            use_compaction =
+                    compaction_shape_ok && unique_count > 0u && unique_count <= n_total_expert / 2u;
+        }
 
         void *gate_dev = nullptr, *up_dev = nullptr, *down_dev = nullptr, *remap_dev = nullptr;
+        bool gate_owned = true, up_owned = true, down_owned = true;
         ds4_gpu_tensor remapped_selected{};
         const ds4_gpu_tensor *effective_selected = selected;
         uint32_t effective_n_total_expert = n_total_expert;
 
-        if (use_compaction) {
+        if (all_resident) {
+            gate_dev = const_cast<char *>(gate_w);
+            up_dev = const_cast<char *>(up_w);
+            down_dev = const_cast<char *>(down_w);
+            gate_owned = up_owned = down_owned = false;
+        } else if (use_compaction) {
             if (!sycl_moe_stage_selected_experts(
                         q, gate_w, up_w, down_w, unique_ids.data(), unique_count,
                         gate_expert_bytes, down_expert_bytes, remap_ids.data(), pair_count,
@@ -796,17 +897,20 @@ static int sycl_routed_moe_launch(
             effective_n_total_expert = unique_count;
         } else {
             if (!sycl_moe_stage_weights(q, gate_w, up_w, down_w, plan.gate_bytes, plan.down_bytes,
-                                        &gate_dev, &up_dev, &down_dev)) {
+                                        &gate_dev, &up_dev, &down_dev,
+                                        &gate_owned, &up_owned, &down_owned)) {
                 return 0;
             }
         }
-        sycl_device_scratch_guard gate_guard(q, gate_dev);
-        sycl_device_scratch_guard up_guard(q, up_dev);
-        sycl_device_scratch_guard down_guard(q, down_dev);
+        sycl_device_scratch_guard gate_guard(q, gate_dev, gate_owned);
+        sycl_device_scratch_guard up_guard(q, up_dev, up_owned);
+        sycl_device_scratch_guard down_guard(q, down_dev, down_owned);
         sycl_device_scratch_guard remap_guard(q, remap_dev);
 
-        g_sycl_moe_last_staged_expert_count = use_compaction ? unique_count : n_total_expert;
-        g_sycl_moe_last_staged_bytes =
+        g_sycl_moe_last_used_resident_weights = all_resident;
+        g_sycl_moe_last_staged_expert_count =
+                all_resident ? 0u : (use_compaction ? unique_count : n_total_expert);
+        g_sycl_moe_last_staged_bytes = all_resident ? 0ull :
                 2ull * (uint64_t)g_sycl_moe_last_staged_expert_count * gate_expert_bytes +
                 (uint64_t)g_sycl_moe_last_staged_expert_count * down_expert_bytes;
 
@@ -863,6 +967,14 @@ extern "C" uint32_t ds4_sycl_moe_test_last_staged_expert_count(void) {
 
 extern "C" uint64_t ds4_sycl_moe_test_last_staged_bytes(void) {
     return g_sycl_moe_last_staged_bytes;
+}
+
+/* Test-only instrumentation: whether the most recently completed
+ * sycl_routed_moe_launch call read gate/up/down straight from a
+ * model-range-cached device buffer instead of staging (or compacting)
+ * anything. See g_sycl_moe_last_used_resident_weights above. */
+extern "C" int ds4_sycl_moe_test_last_used_resident_weights(void) {
+    return g_sycl_moe_last_used_resident_weights ? 1 : 0;
 }
 
 /* ---- ABI entries ------------------------------------------------------
