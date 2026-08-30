@@ -56,6 +56,7 @@
 /tests/test_sycl_full_token
 /tests/test_sycl_prefill_batch
 /tests/test_sycl_gguf_load
+/tests/test_sycl_placement
 *.o
 *.dSYM/
 __pycache__/
