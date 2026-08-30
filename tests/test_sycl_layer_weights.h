@@ -61,10 +61,19 @@
 
 /* ---- The synthetic shape ------------------------------------------------
  *
- * One layer, compress ratio 0 (the attention compressor and indexer are
- * out of scope: metal_graph_encode_decode_layer_phase only dereferences
- * layer->attn_compressor_... / layer->indexer_... when ds4_layer_compress_ratio
- * (il) != 0).  n_embd == n_ff_exp == 256 so every routed-expert row needs
+ * Every layer this header builds carries attention compressor tensors,
+ * and layers where ds4_tw_compress_ratio(il) == 4 additionally carry
+ * indexer tensors (see that function's own comment below): Flash's own
+ * ratio pattern is "0, 0, 4, 128, 4, 128, ..." and metal_graph_encode_
+ * decode_layer_phase only dereferences layer->attn_compressor_... /
+ * layer->indexer_... when ds4_layer_compress_ratio(il) != 0, so a caller
+ * that leaves g_ds4_compress_ratios at its all-zero DS4_TEST_HOOKS default
+ * exercises the exact same ratio-0 configuration this header built before
+ * these tensors existed, from the same weight buffer a caller that sets
+ * per-layer ratios uses to exercise the compressed path -- one buffer, two
+ * configurations, so a difference in engine output between them can only
+ * come from the ratio flag, never from different underlying weights.
+ * n_embd == n_ff_exp == 256 so every routed-expert row needs
  * exactly one 256-wide quant block (kMoeQK, sycl/ds4_sycl_moe.hpp:255;
  * build_plan rejects expert_in_dim/expert_mid_dim not a multiple of it,
  * sycl/ds4_sycl_moe_launch.hpp:57-58).  n_lora_q and n_lora_o are
@@ -104,6 +113,27 @@
 #define DS4_TW_N_HC                  4u
 #define DS4_TW_N_HC_SINKHORN_ITER    1u
 #define DS4_TW_N_SWA                 8u
+/* Matches the n_indexer_head / n_indexer_head_dim / n_indexer_top_k
+ * literals every DS4_TEST_HOOKS entry point in ds4.c already sets on its
+ * own g_ds4_shape (ds4.c:57614-57616 and its four siblings), so this
+ * header's own compressor/indexer tensor shapes below and the shape the
+ * engine is actually configured with cannot drift apart. */
+#define DS4_TW_N_INDEXER_HEAD        2u
+/* Fixed at 128, not model-configurable: every real Flash/GLM-DSA GGUF
+ * preset in this file sets n_indexer_head_dim to exactly 128 (ds4.c:569,
+ * 607, 646, 689), and sycl/ds4_sycl_indexer.hpp's Hadamard+FP4 QAT round
+ * trip (ds4_gpu_dsv4_indexer_qat_tensor, its own kernel at :144) hard-
+ * rejects any other value with `head_dim != 128u`: the transform is a
+ * fixed 128-wide hardware trick, not a parameterised kernel. This is also
+ * comfortably >= DS4_TW_N_ROT (16): sycl/ds4_sycl_compressor.hpp's
+ * ds4_gpu_compressor_update_tensor rejects n_rot > head_dim, since the
+ * indexer's RoPE tail rotates n_indexer_head_dim by n_rot exactly as the
+ * main attention path rotates n_head_dim. The smaller value (8, later 16)
+ * this header used before the indexer weights existed was never
+ * validated against either invariant, because the compressor/indexer code
+ * that checks them had never executed. */
+#define DS4_TW_N_INDEXER_HEAD_DIM    128u
+#define DS4_TW_N_INDEXER_TOP_K       4u
 
 /* Derived exactly as weights_validate_layout derives them (ds4.c:5027-
  * 5030): hc_dim = n_embd*n_hc, hc_mix_dim = 2*n_hc + n_hc*n_hc, q_dim =
@@ -112,6 +142,37 @@
 #define DS4_TW_HC_MIX_DIM   (2u * DS4_TW_N_HC + DS4_TW_N_HC * DS4_TW_N_HC)
 #define DS4_TW_Q_DIM        (DS4_TW_N_HEAD * DS4_TW_N_HEAD_DIM)
 #define DS4_TW_OUT_LOW_DIM  (DS4_TW_N_OUT_GROUP * DS4_TW_N_LORA_O)
+
+/* Flash's own per-layer compression ratio (ds4_expected_layer_compress_
+ * ratio, ds4.c:1086-1096, DS4_VARIANT_FLASH case): layers 0 and 1 are
+ * uncompressed, even layers from 2 up use ratio 4 (compressor + indexer),
+ * odd layers from 3 up use ratio 128 (compressor only, no indexer --
+ * weights_layer_has_required, ds4.c:4888-4907, only requires the six
+ * indexer_* fields when ratio == 4, never for ratio == 128). Reproduced
+ * here, not included from ds4.c, because ds4_expected_layer_compress_ratio
+ * is a static function private to that translation unit; this is the same
+ * literal switch, just addressable from a plain-C test file. With
+ * DS4_TW_N_LAYER == 4 this gives the exact "0, 0, 4, 128" pattern
+ * required: both ratio-0 layers, plus one of each compressed regime. */
+static inline uint32_t ds4_tw_compress_ratio(uint32_t il) {
+    if (il < 2u) return 0u;
+    return (il & 1u) == 0u ? 4u : 128u;
+}
+
+/* A decode position whose (pos + 1) is divisible by both compressed
+ * ratios this shape uses (4 and 128; lcm(4, 128) - 1 == 127), so a SINGLE
+ * one-shot decode call (ds4_test_graph_full_token_encode_impl builds a
+ * fresh graph and calls metal_graph_eval_token_raw_swa exactly once, at
+ * whatever pos it is given -- there is no persistent multi-step decode
+ * loop here) reaches "emit" (ds4.c:22613's `((pos + 1u) % ratio) == 0u`)
+ * for layer 2 (ratio 4) and layer 3 (ratio 128) at the same time, in the
+ * same call. At pos 0 -- every other decode hook's fixed position --
+ * emit is false for every ratio > 1, so the attention compressor's own
+ * output cache stays permanently empty and the compressed and ratio-0
+ * paths compute identically by construction: pos 0 cannot distinguish
+ * them, per design-spec 6w. This position can, and the compressed
+ * decode assertion uses it for exactly that reason. */
+#define DS4_TW_COMPRESSED_DECODE_POS 127u
 
 /* ---- Tensor type codes this layer uses -----------------------------------
  *
@@ -394,6 +455,27 @@ typedef struct {
      * zeroed (abs_offset/bytes/elements all 0) for top-k layers, exactly
      * like a real ds4_layer_weights leaves the pointer NULL. */
     ds4_tw_tensor ffn_gate_tid2eid;
+    /* Attention compressor and indexer, reserved and filled only for
+     * layers where ds4_tw_compress_ratio(il) says they apply, left zeroed
+     * otherwise. ds4_layer_weights (ds4.c:4126-4138) also declares
+     * indexer_attn_k, indexer_k_norm and indexer_k_norm_b, but those three
+     * are read only by weights_glm_dsa_layer_has_required and the GLM-DSA
+     * graph path (ds4.c:4809-4823, 40404-40406, 44599-47569); Flash is
+     * DS4_MODEL_FAMILY_DEEPSEEK4, whose weights_layer_has_required
+     * (ds4.c:4888-4907) and weights_validate_layout (ds4.c:5058-5075)
+     * never reference them, so this header does not build them -- adding
+     * three tensors nothing on Flash's path ever reads would not add
+     * coverage, only dead scaffolding. */
+    ds4_tw_tensor attn_compressor_ape;
+    ds4_tw_tensor attn_compressor_kv;
+    ds4_tw_tensor attn_compressor_gate;
+    ds4_tw_tensor attn_compressor_norm;
+    ds4_tw_tensor indexer_attn_q_b;
+    ds4_tw_tensor indexer_proj;
+    ds4_tw_tensor indexer_compressor_ape;
+    ds4_tw_tensor indexer_compressor_kv;
+    ds4_tw_tensor indexer_compressor_gate;
+    ds4_tw_tensor indexer_compressor_norm;
 } ds4_tw_layer;
 
 typedef struct {
@@ -541,6 +623,37 @@ static inline int ds4_test_build_flash_layer_weights(ds4_tw_flash_weights *out) 
         ds4_tw_reserve(&l->attn_output_a, &cursor, DS4_TW_TYPE_Q8_0, 2,
                        DS4_TW_N_HEAD_DIM * (DS4_TW_N_HEAD / DS4_TW_N_OUT_GROUP), DS4_TW_OUT_LOW_DIM, 0);
         ds4_tw_reserve(&l->attn_output_b, &cursor, DS4_TW_TYPE_Q8_0, 2, DS4_TW_OUT_LOW_DIM, DS4_TW_N_EMBD, 0);
+
+        /* Attention compressor and indexer, shapes taken from
+         * weights_validate_layout (ds4.c:5058-5075): coff is 2 for ratio 4
+         * (the compressor also carries the indexer's rope-neighbour pair)
+         * and 1 for ratio 128; comp_width = coff * n_head_dim;
+         * index_width = 2 * n_indexer_head_dim (always coff==2, ratio 4 is
+         * the only case that reserves indexer tensors at all).  Left
+         * zeroed for a layer whose ratio is 0, exactly like
+         * ffn_gate_tid2eid is left zeroed for a top-k-routed layer above. */
+        {
+            const uint32_t ratio = ds4_tw_compress_ratio(il);
+            if (ratio != 0u) {
+                const uint32_t coff = ratio == 4u ? 2u : 1u;
+                const uint64_t comp_width = (uint64_t)coff * DS4_TW_N_HEAD_DIM;
+                ds4_tw_reserve(&l->attn_compressor_ape, &cursor, DS4_TW_TYPE_F16, 2, comp_width, ratio, 0);
+                ds4_tw_reserve(&l->attn_compressor_kv, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_N_EMBD, comp_width, 0);
+                ds4_tw_reserve(&l->attn_compressor_gate, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_N_EMBD, comp_width, 0);
+                ds4_tw_reserve(&l->attn_compressor_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_HEAD_DIM, 0, 0);
+            }
+            if (ratio == 4u) {
+                const uint64_t index_q_dim = (uint64_t)DS4_TW_N_INDEXER_HEAD * DS4_TW_N_INDEXER_HEAD_DIM;
+                const uint64_t index_width = 2u * DS4_TW_N_INDEXER_HEAD_DIM;
+                ds4_tw_reserve(&l->indexer_attn_q_b, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_N_LORA_Q, index_q_dim, 0);
+                ds4_tw_reserve(&l->indexer_proj, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_N_EMBD, DS4_TW_N_INDEXER_HEAD, 0);
+                ds4_tw_reserve(&l->indexer_compressor_ape, &cursor, DS4_TW_TYPE_F16, 2, index_width, ratio, 0);
+                ds4_tw_reserve(&l->indexer_compressor_kv, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_N_EMBD, index_width, 0);
+                ds4_tw_reserve(&l->indexer_compressor_gate, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_N_EMBD, index_width, 0);
+                ds4_tw_reserve(&l->indexer_compressor_norm, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_N_INDEXER_HEAD_DIM, 0, 0);
+            }
+        }
+
         ds4_tw_reserve(&l->hc_ffn_fn, &cursor, DS4_TW_TYPE_F16, 2, DS4_TW_HC_DIM, DS4_TW_HC_MIX_DIM, 0);
         ds4_tw_reserve(&l->hc_ffn_scale, &cursor, DS4_TW_TYPE_F32, 1, 3, 0, 0);
         ds4_tw_reserve(&l->hc_ffn_base, &cursor, DS4_TW_TYPE_F32, 1, DS4_TW_HC_MIX_DIM, 0, 0);
@@ -604,6 +717,35 @@ static inline int ds4_test_build_flash_layer_weights(ds4_tw_flash_weights *out) 
                         /*salt=*/8u + s, 0.0f, 0.2f);
         ds4_tw_fill_q8_0_dense(out->buf, &l->attn_output_a, /*salt_base=*/3000u + sb);
         ds4_tw_fill_q8_0_dense(out->buf, &l->attn_output_b, /*salt_base=*/4000u + sb);
+
+        /* Only the tensors ds4_tw_compress_ratio(il) actually reserved
+         * above have a non-zero abs_offset/elements to fill; a ratio-0
+         * layer's compressor/indexer ds4_tw_tensor fields are still
+         * zeroed from the reserve pass and ds4_tw_fill_f16/f32 on zero
+         * elements is a no-op, so no extra branch is needed here beyond
+         * the one already in the reserve pass. Salts 18-27 are unused by
+         * every other fill call in this loop (2-13 above). */
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->attn_compressor_ape.abs_offset),
+                        l->attn_compressor_ape.elements, /*salt=*/18u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->attn_compressor_kv.abs_offset),
+                        l->attn_compressor_kv.elements, /*salt=*/19u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->attn_compressor_gate.abs_offset),
+                        l->attn_compressor_gate.elements, /*salt=*/20u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f32((float *)(out->buf + l->attn_compressor_norm.abs_offset),
+                        l->attn_compressor_norm.elements, /*salt=*/21u + s, 1.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->indexer_attn_q_b.abs_offset),
+                        l->indexer_attn_q_b.elements, /*salt=*/22u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->indexer_proj.abs_offset),
+                        l->indexer_proj.elements, /*salt=*/23u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->indexer_compressor_ape.abs_offset),
+                        l->indexer_compressor_ape.elements, /*salt=*/24u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->indexer_compressor_kv.abs_offset),
+                        l->indexer_compressor_kv.elements, /*salt=*/25u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(out->buf + l->indexer_compressor_gate.abs_offset),
+                        l->indexer_compressor_gate.elements, /*salt=*/26u + s, 0.0f, 0.1f);
+        ds4_tw_fill_f32((float *)(out->buf + l->indexer_compressor_norm.abs_offset),
+                        l->indexer_compressor_norm.elements, /*salt=*/27u + s, 1.0f, 0.1f);
+
         ds4_tw_fill_f16((uint16_t *)(out->buf + l->hc_ffn_fn.abs_offset), l->hc_ffn_fn.elements,
                         /*salt=*/9u + s, 0.0f, 0.1f);
         ds4_tw_fill_f32((float *)(out->buf + l->hc_ffn_scale.abs_offset), l->hc_ffn_scale.elements,
