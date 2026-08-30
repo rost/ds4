@@ -40,7 +40,7 @@ mmq tier, which is the shape this port follows.
 ```
   ds4_sycl.cpp  (571 lines)          ds4_sycl_unavailable.cpp  (243 lines)
   +--------------------------+       +------------------------------+
-  | device + queue discovery |       | 165 stubs for entries this   |
+  | device + queue discovery |       | 90 stubs for entries this    |
   | g_devices, g_current_tier|       | backend does not implement   |
   |                          |       |                              |
   | tensor ABI:              |       | SYCL_UNAVAILABLE_NONZERO_OK  |
@@ -99,10 +99,14 @@ explicit at each line instead of hiding it behind a shared `return 0`.
   ds4_sycl_moe_launch.hpp     712   routed MoE dispatcher
 ```
 
-Roughly 70 ABI entries are implemented; 165 remain stubbed. Most of the stubs
-are permanently out of scope (GLM, PRO, Metal-only tensor parallelism,
-CUDA-only paths ROCm also lacks). The genuinely unfinished parts are attention,
-the indexer, hyper-connections, and multi-GPU.
+Roughly 190 ABI entries are implemented; 90 remain stubbed (87 via the macros
+plus 3 hand-written). A stub reachability audit
+(`ds4-sycl-stub-reachability-v2.md`) traced every one of them outward through
+its enclosing preprocessor and runtime gates and found **none reachable with
+consequence on the ordinary Flash decode path**, single-session or batched.
+
+Most of what remains is permanently out of scope: GLM (35), DSpark, PRO, and
+CUDA-only paths. The rest is tensor parallelism and a few multi-tier entries.
 
 ## How a call flows
 
@@ -317,12 +321,21 @@ plausible-looking wrong answer.
   cards are two dies behind a PCIe switch, so it is the most likely thing to
   bite on first contact with the real machine.
 * **The streaming expert cache is implemented but not wired in.** Routed MoE's
-  three lookup hooks are hardcoded false and it stages weights fresh from the
-  host mmap on every call, so the cache, its eviction and its per-tier state
-  are correct, tested, and currently unused.
-* **No end-to-end run against real weights** has happened. Every subsystem is
-  verified against a CPU oracle on synthetic data, which is real verification
-  but is not the same as producing a token.
+  three lookup hooks are hardcoded false, so the cache, its eviction and its
+  per-tier state are correct, tested, and currently unused. This matters much
+  less than it once did: routed MoE now stages only the experts a call actually
+  selects rather than the whole per-layer table, which cut host-to-device
+  traffic by about 42x (72.6 GiB to roughly 1.7 GiB per token at Flash's shape).
+* **Tensor parallelism is not implemented.** `--cuda-tensor-parallel` is refused
+  at startup on this backend. A single token stream therefore uses one GPU at a
+  time; multi-GPU placement gives capacity, not single-stream speed.
+* **No end-to-end run against real weights** has happened. That said, the
+  engine's own decode path now runs end to end on synthetic weights: a complete
+  Flash decoder layer, then a complete token through the output head to logits,
+  over a 4-layer shape covering both hash-routed and gate-routed layers, with
+  bit-identical output across 65 repeats. A real GGUF also opens through
+  `ds4_engine_open`. What has never happened is a token from the real 80 GB
+  model.
 * **Performance is untuned.** Weight staging is per call with no cross-call
   cache, oneMKL's `compute_mode` and the GEMM-versus-kernel dispatch
   thresholds (the mixed-prefill tiled path's 4 GiB cap among them) are all at
