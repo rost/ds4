@@ -531,6 +531,17 @@ static int ablation_attempt(const char *path) {
 extern uint64_t ds4_sycl_test_stage_host_bytes_total(void);
 extern void     ds4_sycl_test_stage_host_bytes_reset(void);
 
+/* sycl/ds4_sycl_common.hpp test/report-only hook; not
+ * part of the ABI. Per-kernel device profiling, active only between
+ * ds4_sycl_test_profile_enable(1) and ds4_sycl_test_profile_enable(0), so
+ * only the measurement loop below is counted, not engine setup. Requires
+ * DS4_SYCL_PROFILE to have been set before ds4_gpu_init built the queues:
+ * property::queue::enable_profiling() is a construction-time property. */
+extern void     ds4_sycl_test_profile_enable(int enable);
+extern void     ds4_sycl_test_profile_reset(void);
+extern uint64_t ds4_sycl_test_profile_kernel_ns(void);
+extern uint64_t ds4_sycl_test_profile_kernel_count(void);
+
 static double now_secs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -563,6 +574,13 @@ int main(int argc, char **argv) {
      * smaller by comparison for the wrong reason. ds4_gpu_init is
      * idempotent (ds4_sycl.cpp: `if (g_initialised) return 1`), so calling
      * it again inside ds4_engine_open below is a no-op. */
+    /* Must be set before this first ds4_gpu_init call,
+     * which is what actually builds every tier's queue
+     * (ds4_sycl_build_devices). property::queue::enable_profiling() is a
+     * construction-time property; setting the env var later would build
+     * a non-profiling queue that ds4_sycl_test_profile_enable(1) could not
+     * retroactively fix. */
+    CHECK(setenv("DS4_SYCL_PROFILE", "1", 1) == 0, "setenv DS4_SYCL_PROFILE failed");
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init for the free-VRAM baseline");
     const uint64_t free_vram_before_open = ds4_gpu_tier_free_vram(0);
 
@@ -633,8 +651,10 @@ int main(int argc, char **argv) {
      * DS4_N_LAYER layers, so the report scales this by that count rather
      * than claiming this number is already a whole token. */
     {
-        const int repeats = 5;
+        const int repeats = 20;
         ds4_sycl_test_stage_host_bytes_reset();
+        ds4_sycl_test_profile_reset();
+        ds4_sycl_test_profile_enable(1);
         const double t0 = now_secs();
         for (int r = 0; r < repeats; r++) {
             char err2[256];
@@ -653,11 +673,30 @@ int main(int argc, char **argv) {
             CHECK(rc2 == 0, err2[0] ? err2 : "measurement eval failed");
         }
         const double t1 = now_secs();
+        ds4_sycl_test_profile_enable(0);
         const uint64_t bytes_per_call = ds4_sycl_test_stage_host_bytes_total() / (uint64_t)repeats;
+        const double total_ms = (t1 - t0) * 1000.0;
+        const double kernel_ms = (double)ds4_sycl_test_profile_kernel_ns() / 1.0e6;
+        const uint64_t kernel_count = ds4_sycl_test_profile_kernel_count();
+        /* "kernel" here is a LOWER BOUND: this instrumentation covers most
+         * but not all wait_and_throw call sites in the backend (some
+         * launch through a helper this measurement does not reach; see
+         * ds4_sycl_profile_record's comment in ds4_sycl_common.hpp for why
+         * an inter-kernel gap is not reported at all). "non-kernel" is
+         * therefore an UPPER BOUND on drain/host/harness time combined,
+         * not a clean measurement of drain overhead alone. */
+        fprintf(stderr,
+                "  profile (cache ON, real 1.83 GiB layer, %d repeats): "
+                "total %.3f ms/layer-eval, summed kernel (lower bound) "
+                "%.3f ms/layer-eval (%llu kernels/layer-eval captured), "
+                "non-kernel (upper bound) %.3f ms/layer-eval\n",
+                repeats, total_ms / repeats, kernel_ms / repeats,
+                (unsigned long long)(kernel_count / (uint64_t)repeats),
+                (total_ms - kernel_ms) / repeats);
         fprintf(stderr,
                 "  measurement (cache ON, real 1.83 GiB layer, %d repeats): "
                 "%.3f ms/layer-eval, %llu bytes staged/layer-eval\n",
-                repeats, (t1 - t0) * 1000.0 / repeats, (unsigned long long)bytes_per_call);
+                repeats, total_ms / repeats, (unsigned long long)bytes_per_call);
     }
 
     free(input_hc);
