@@ -249,15 +249,20 @@ static bool sycl_stream_is_protected(const sycl_stream_resident_expert &e, uint3
     return false;
 }
 
-/* Spec 6t: this backend's queues are out-of-order and every resident- or
- * selected-cache buffer is raw USM, so nothing orders a kernel's read of
- * e.gate/e.up/e.down (or st.selected.gate/up/down) against a later free of
- * that same allocation or a later reuse of the same pooled slab by a
- * different expert. Freeing or reusing such a buffer while a kernel might
- * still be reading it is undefined behaviour by the SYCL USM
- * specification, independent of whether this driver happens to make it
- * survive in practice (see spec 6g on why an ablation of this exact shape
- * produced no observable failure elsewhere in this project).
+/* Spec 6t: every resident- or selected-cache buffer here is raw USM, which
+ * carries no automatic dependency tracking between separate submit()
+ * calls, so nothing orders a kernel's read of e.gate/e.up/e.down (or
+ * st.selected.gate/up/down) against a later free of that same allocation
+ * or a later reuse of the same pooled slab by a different expert. This
+ * queue is property::queue::in_order(), which would order two such
+ * commands if both were ever submitted to it, but a free is not a queue
+ * command at all -- sycl::free happens on the host, so in_order gives it
+ * no ordering against anything still in flight on the queue either.
+ * Freeing or reusing such a buffer while a kernel might still be reading
+ * it is undefined behaviour by the SYCL USM specification, independent of
+ * whether this driver happens to make it survive in practice (see spec 6g
+ * on why an ablation of this exact shape produced no observable failure
+ * elsewhere in this project).
  *
  * No kernel currently reads any of these buffers: ds4_sycl_moe_launch.hpp's
  * sycl_stream_layer_expert_cache_apply_lookup / sycl_stream_selected_apply_
@@ -283,7 +288,9 @@ static bool sycl_stream_is_protected(const sycl_stream_resident_expert &e, uint3
  * for the whole queue instead. Once a real consumer exists and this
  * queue-wide wait is shown to cost something on a hot eviction path, an
  * event scoped to that consumer (the same upgrade ROCm already made) is
- * the next step, not converting the queue to in_order. */
+ * the next step; the queue's own in_order property does not
+ * substitute for that, since it cannot order a host-side free against a
+ * still-running kernel either way. */
 static void sycl_stream_reclaim_wait(sycl::queue &q, sycl_stream_tier_state &st,
                                      const char *what) {
     st.reclaim_waits++;

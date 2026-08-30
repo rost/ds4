@@ -127,21 +127,60 @@ std::vector<sycl::device> ds4_sycl_enumerate_gpus() {
  * rather than being dropped.  Tier order always follows `wanted`'s order,
  * independent of how devices group into contexts. */
 
-/* Measurement-only: property::queue::enable_profiling()
- * makes event::get_profiling_info usable on every event this queue
- * produces, at a per-submission cost real enough not to pay by default.
- * Gated on DS4_SYCL_PROFILE, read once at queue construction, so an
- * ordinary run or test pays nothing; a measurement run sets it before
- * ds4_gpu_init so every tier's queue is built profiling-capable from the
- * start. Deliberately does not add property::queue::in_order: spec-level
- * guidance elsewhere in this backend is that in_order would serialise the
- * very kernel overlap this backend is trying to make possible, and a
- * measurement tool must not change the thing it is trying to measure. */
+/* Every tier's queue is built with property::queue::in_order.
+ *
+ * Previously, every kernel launch and every device memcpy in this
+ * backend ended in its own wait_and_throw() (grep wait_and_throw across
+ * every sycl header in this tree: 213 call sites, essentially one per
+ * launch). That is a full host round trip after every single kernel, and
+ * it is also why an out-of-order queue was safe with no dependency
+ * tracking at all: with at most one outstanding command at any time,
+ * submission order and completion order coincided trivially, in_order or
+ * not.
+ *
+ * The whole point of this change is to stop paying that round trip within
+ * one tier's kernel chain, which means two or more commands can now be
+ * in flight on the same queue with no host wait between them. Raw
+ * malloc_device USM carries no automatic dependency tracking between
+ * separate submit() calls (spec 6t), so once that host wait is gone,
+ * something has to guarantee the second kernel does not start reading
+ * what the first kernel has not finished writing. Two designs were
+ * evaluated against this source before choosing:
+ *
+ *   (a) property::queue::in_order here, removing the per-kernel host
+ *       wait and relying on the queue itself to run submissions in
+ *       submission order.
+ *   (b) Leave the queue out-of-order and thread an explicit sycl::event
+ *       through every launch in a chain, recording each into a per-tier
+ *       pending list end_commands/synchronize drains.
+ *
+ * (a) was chosen. The decisive fact is that (b)'s only advantage over (a)
+ * -- preserving concurrency between two independent kernels dispatched to
+ * the same queue -- does not exist to preserve: the self-waiting
+ * discipline above means no two kernels in this codebase have ever run
+ * concurrently on the same queue. (a) costs nothing relative to that
+ * baseline and closes an entire class of missed-dependency bug at the
+ * queue level instead of asking every one of 213 call sites to wire its
+ * own event correctly, which is exactly the failure mode (b) risks per
+ * spec 6j: a wrong dependency there is not recoverable by testing. Every
+ * tier still gets its own queue (ds4_sycl_build_devices below), so tier T
+ * and tier T+1 remain fully independent and still overlap across GPUs
+ * exactly as the wave-scheduling prefill pipeline needs; in_order only
+ * orders commands within one queue, never across queues. An older
+ * comment here read in_order as something that would "serialise the
+ * kernel overlap this backend is trying to make possible" -- true only
+ * for a form of intra-tier concurrency that was never actually exploited
+ * by any code in this tree, per the self-waiting discipline just
+ * described; that comment is superseded by this one.
+ * property::queue::enable_profiling() is unaffected by this and keeps its
+ * own DS4_SYCL_PROFILE gate below, since it has a real per-submission
+ * cost in_order does not. */
 static sycl::property_list ds4_sycl_queue_properties(void) {
     if (getenv("DS4_SYCL_PROFILE")) {
-        return sycl::property_list{sycl::property::queue::enable_profiling()};
+        return sycl::property_list{sycl::property::queue::in_order(),
+                                    sycl::property::queue::enable_profiling()};
     }
-    return sycl::property_list{};
+    return sycl::property_list{sycl::property::queue::in_order()};
 }
 
 void ds4_sycl_build_devices(const std::vector<sycl::device> &wanted,

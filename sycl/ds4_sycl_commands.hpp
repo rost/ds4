@@ -42,12 +42,15 @@ extern "C" int ds4_gpu_commands_active(void) { return 0; }
  * nonzero-means-success convention (ds4_gpu.h:111, confirmed against
  * cuda_ok's polarity at rocm/ds4_rocm_runtime.cuh:6093).
  *
- * Spec 6t is why this cannot be a no-op: this backend's queues are built
- * without property::queue::in_order (ds4_sycl.cpp:151) and every allocation
- * is raw malloc_device USM, so nothing tracks completion automatically
- * between the caller and whatever this tier's queue has outstanding. A
- * caller relying on this entry to mean "the GPU is done" needs an actual
- * wait, not a trivial success return.
+ * Spec 6t is why this cannot be a no-op. Every tier's queue is
+ * property::queue::in_order() (ds4_sycl.cpp, ds4_sycl_queue_properties),
+ * which orders commands within that queue against each other, but that is
+ * an ordering between device-side commands, not a completion signal to
+ * the host: every allocation is raw malloc_device USM, so nothing tracks
+ * completion automatically between the caller and whatever this tier's
+ * queue has outstanding, in_order or not. A caller relying on this entry
+ * to mean "the GPU is done" needs an actual wait, not a trivial success
+ * return.
  *
  * g_devices.empty() is checked directly rather than routed through
  * ds4_sycl_queue/ds4_sycl_current_queue: that helper aborts the process on

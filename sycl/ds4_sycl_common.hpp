@@ -362,11 +362,14 @@ static inline bool sycl_ptr_is_device_resident(sycl::queue &q, const void *ptr) 
  * Every wait_and_throw call site instrumented for this measurement now
  * captures its own kernel's sycl::event explicitly (either one that was
  * already a named local, or a newly introduced one) rather than reaching
- * for queue::ext_oneapi_get_last_event(): that DPC++ extension throws on
- * an out-of-order queue, and spec-level guidance elsewhere in this backend
- * is that converting these queues to in_order would serialise the very
- * kernel overlap this backend is trying to make possible, which a
- * measurement tool must not do just to make itself easier to write.
+ * for queue::ext_oneapi_get_last_event(). Written when these queues were
+ * still out-of-order, where that DPC++ extension throws; every tier's
+ * queue is now property::queue::in_order() (ds4_sycl.cpp,
+ * ds4_sycl_queue_properties), so the extension would no longer throw, but
+ * explicit per-kernel capture is kept anyway: it names exactly which
+ * event this measurement is timing at the call site, which reads better
+ * than a queue-global "whatever was last submitted" even where both are
+ * legal.
  *
  * Deliberately does NOT compute an inter-kernel "gap" by subtracting one
  * event's command_submit from a previous event's command_end. A first

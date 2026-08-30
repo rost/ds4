@@ -548,10 +548,13 @@ extern "C" int ds4_gpu_tensor_wait_xdev_default(const ds4_gpu_tensor *src, int d
  * either device, and a remote_tmp scratch tensor on out's device is
  * required only when it does not).
  *
- * ORDERING WITHOUT in_order QUEUES, spec 6g/6j: ds4_sycl.cpp:151 builds
- * every queue out-of-order, so nothing here may assume that submitting A
- * then B on one queue runs A before B. This entry does not need to,
- * because every operation in this backend's cross-device path already
+ * ORDERING ACROSS DEVICES, spec 6g/6j: an in_order queue (ds4_sycl.cpp)
+ * only orders commands within that one queue; it says
+ * nothing about ordering between a command on tier A's queue and a
+ * command on tier B's queue, which is the case that matters here (out
+ * and remote_tmp can live on different tiers). This entry does not need
+ * cross-queue ordering either, because every operation in this backend's
+ * cross-device path already
  * blocks before returning: ds4_gpu_tensor_copy_xdev above ends every one
  * of its branches (same-device copy, validated-peer copy, host bounce)
  * in wait_and_throw() before returning 1, and the add kernel below ends
