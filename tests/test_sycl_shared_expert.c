@@ -1182,6 +1182,142 @@ static int test_shared_mid_swiglu(void) {
     return 0;
 }
 
+/* Expert-parallel decode: ds4_gpu_shared_mid_swiglu_q8_0_decode_
+ * exact_tensor. Everything this box can test is exercised here: the
+ * unconditional (selected == NULL) path, the ownership-balance predicate's
+ * assigned and not-assigned outcomes for both home_rank values (ported
+ * from ds4_cuda.cu:5281-5299 -- home_count <= peer_count keeps ties on the
+ * home rank), and the correctness of the assigned computation against the
+ * same oracle test_shared_mid_swiglu already validates. mid->device_id and
+ * x->device_id are both tier 0 here (one GPU), so every call below takes
+ * this entry's same-device delegation branch; the genuinely cross-device
+ * write (a different rank's tier computing into this tensor's home tier)
+ * needs a second card. On the B60 machine, check: home_rank=true assigned,
+ * home_rank=false assigned, and not-assigned all still hold with mid and
+ * x's tensors actually on different tiers, particularly that a
+ * not-assigned call leaves the OTHER tier's mid buffer untouched rather
+ * than silently faulting or hanging on the cross-device path. */
+static int test_shared_mid_swiglu_decode_exact(void) {
+    enum { IN_DIM = 40, OUT_DIM = 7 };
+    const uint64_t row_bytes = 68;
+    const float clamp = 1.0e6f;
+
+    unsigned char wg[OUT_DIM * 68];
+    unsigned char wu[OUT_DIM * 68];
+    float x[IN_DIM];
+    float want_gate[OUT_DIM], want_up[OUT_DIM], want_mid[OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(wg + (size_t)o * row_bytes, IN_DIM, o, 13);
+        test_encode_q8_0_row(wu + (size_t)o * row_bytes, IN_DIM, o, 130);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) {
+        x[k] = ((float)(((k + 7) * 3) % 15) - 7.0f) * 0.05f;
+    }
+    oracle_shared_gate_up_swiglu(want_gate, want_up, want_mid, x, wg, wu, IN_DIM, OUT_DIM,
+                                 row_bytes, clamp);
+
+    unsigned char combined[sizeof(wg) + sizeof(wu)];
+    memcpy(combined, wg, sizeof(wg));
+    memcpy(combined + sizeof(wg), wu, sizeof(wu));
+    const uint64_t gate_offset = 0;
+    const uint64_t up_offset = sizeof(wg);
+    const uint64_t model_size = sizeof(combined);
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tmid = ds4_gpu_tensor_alloc((uint64_t)OUT_DIM * sizeof(float));
+    CHECK(tx && tmid, "shared_mid_swiglu_decode_exact: allocation failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0,
+          "shared_mid_swiglu_decode_exact: write x");
+
+    /* selected == NULL: unconditional compute, must match the plain entry
+     * exactly (this is a thin wrapper around it). */
+    CHECK(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
+                  tmid, combined, model_size, gate_offset, up_offset, IN_DIM, OUT_DIM, tx, clamp,
+                  /*selected=*/NULL, /*prequant=*/NULL, /*expert_split=*/1u,
+                  /*home_rank=*/true) != 0,
+          "shared_mid_swiglu_decode_exact: unconditional call");
+    float got_mid[OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(tmid, 0, got_mid, sizeof(got_mid)) != 0,
+          "shared_mid_swiglu_decode_exact: unconditional readback");
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got_mid[i], want_mid[i], 1e-2,
+                    "shared_mid_swiglu_decode_exact: unconditional mid mismatch");
+    }
+
+    /* Ownership predicate: expert_split=4, four experts below the split
+     * (home-heavy) and two at/above it (peer-light). home_count=4 >
+     * peer_count=2, so home_rank=true must NOT be assigned (mid left
+     * untouched) and home_rank=false MUST be assigned (peer_count <
+     * home_count). */
+    const int32_t sel_home_heavy[6] = {0, 1, 2, 3, 4, 5};
+    ds4_gpu_tensor *tsel = ds4_gpu_tensor_alloc(sizeof(sel_home_heavy));
+    CHECK(tsel, "shared_mid_swiglu_decode_exact: selected alloc");
+    CHECK(ds4_gpu_tensor_write(tsel, 0, sel_home_heavy, sizeof(sel_home_heavy)) != 0,
+          "shared_mid_swiglu_decode_exact: write selected");
+
+    const float sentinel = -12345.0f;
+    float sentinel_row[OUT_DIM];
+    for (int i = 0; i < OUT_DIM; i++) sentinel_row[i] = sentinel;
+    CHECK(ds4_gpu_tensor_write(tmid, 0, sentinel_row, sizeof(sentinel_row)) != 0,
+          "shared_mid_swiglu_decode_exact: seed sentinel");
+    CHECK(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
+                  tmid, combined, model_size, gate_offset, up_offset, IN_DIM, OUT_DIM, tx, clamp,
+                  tsel, NULL, 4u, /*home_rank=*/true) != 0,
+          "shared_mid_swiglu_decode_exact: not-assigned call must still report success");
+    CHECK(ds4_gpu_tensor_read(tmid, 0, got_mid, sizeof(got_mid)) != 0,
+          "shared_mid_swiglu_decode_exact: not-assigned readback");
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got_mid[i], sentinel, 0.0,
+                    "shared_mid_swiglu_decode_exact: not-assigned rank must leave mid untouched");
+    }
+
+    CHECK(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
+                  tmid, combined, model_size, gate_offset, up_offset, IN_DIM, OUT_DIM, tx, clamp,
+                  tsel, NULL, 4u, /*home_rank=*/false) != 0,
+          "shared_mid_swiglu_decode_exact: assigned peer call");
+    CHECK(ds4_gpu_tensor_read(tmid, 0, got_mid, sizeof(got_mid)) != 0,
+          "shared_mid_swiglu_decode_exact: assigned peer readback");
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got_mid[i], want_mid[i], 1e-2,
+                    "shared_mid_swiglu_decode_exact: assigned peer mid mismatch");
+    }
+
+    /* Tie: three below the split, three at/above it. home_count ==
+     * peer_count == 3, and ties stay on the home rank. */
+    const int32_t sel_tie[6] = {0, 1, 2, 4, 5, 6};
+    CHECK(ds4_gpu_tensor_write(tsel, 0, sel_tie, sizeof(sel_tie)) != 0,
+          "shared_mid_swiglu_decode_exact: write tied selected");
+    CHECK(ds4_gpu_tensor_write(tmid, 0, sentinel_row, sizeof(sentinel_row)) != 0,
+          "shared_mid_swiglu_decode_exact: reseed sentinel for tie");
+    CHECK(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
+                  tmid, combined, model_size, gate_offset, up_offset, IN_DIM, OUT_DIM, tx, clamp,
+                  tsel, NULL, 4u, /*home_rank=*/false) != 0,
+          "shared_mid_swiglu_decode_exact: tie, peer call must still report success");
+    CHECK(ds4_gpu_tensor_read(tmid, 0, got_mid, sizeof(got_mid)) != 0,
+          "shared_mid_swiglu_decode_exact: tie peer readback");
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got_mid[i], sentinel, 0.0,
+                    "shared_mid_swiglu_decode_exact: a tie must not assign the peer rank");
+    }
+    CHECK(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
+                  tmid, combined, model_size, gate_offset, up_offset, IN_DIM, OUT_DIM, tx, clamp,
+                  tsel, NULL, 4u, /*home_rank=*/true) != 0,
+          "shared_mid_swiglu_decode_exact: tie, home call");
+    CHECK(ds4_gpu_tensor_read(tmid, 0, got_mid, sizeof(got_mid)) != 0,
+          "shared_mid_swiglu_decode_exact: tie home readback");
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got_mid[i], want_mid[i], 1e-2,
+                    "shared_mid_swiglu_decode_exact: a tie must assign the home rank");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tmid);
+    ds4_gpu_tensor_free(tsel);
+    fprintf(stderr, "  test_shared_mid_swiglu_decode_exact OK\n");
+    return 0;
+}
+
 /* Batched rows path: ds4_gpu_shared_gate_up_swiglu_q8_0_rows_tensor with
  * n_tok > 1, backed by the internal
  * shared_gate_up_swiglu_q8_0_batch_sharedx_w32_kernel port
@@ -1693,6 +1829,10 @@ int main(void) {
         return 1;
     }
     if (test_shared_mid_swiglu() != 0) {
+        ds4_gpu_cleanup();
+        return 1;
+    }
+    if (test_shared_mid_swiglu_decode_exact() != 0) {
         ds4_gpu_cleanup();
         return 1;
     }
