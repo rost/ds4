@@ -77,9 +77,11 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_build_derived_artifacts)
  * weight stages it from the host mmap into a fresh sycl::malloc_device
  * scratch buffer, waits for that staging copy, launches its kernel(s),
  * then waits again before returning so the RAII sycl_device_scratch_guard
- * can free the scratch (this exists because ds4_gpu_device_cache_tensors
- * is itself still stubbed for SYCL below, so nothing device-resident
- * survives between calls to be reused). The same probe confirmed that
+ * can free the scratch. Note ds4_gpu_device_cache_tensors is now
+ * implemented (sycl/ds4_sycl_placement.hpp), but no kernel entry point
+ * reads it yet, so in practice nothing device-resident survives between
+ * calls and the per-call staging stands. Wiring that cache into the kernel
+ * launch paths is the prerequisite this blocker really rests on. The same probe confirmed that
  * calling wait()/wait_and_throw() on an event or queue while the queue is
  * in graph-recording mode throws sycl::exception synchronously ("wait
  * method cannot be used for an event associated with a command graph").
