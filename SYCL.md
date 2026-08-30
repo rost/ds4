@@ -121,9 +121,11 @@ Taking a routed-MoE decode as the example, since it touches the most machinery:
     |
     |  1. validate arguments          <-- overflow-safe, per-entry polarity
     |  2. build a plan                <-- picks a format path from gate/down type
-    |  3. STAGE WEIGHTS TO DEVICE     <-- mandatory, see "the mmap trap"
-    |  4. quantise activations to Q8_K
-    |  5. dispatch on the format path
+    |  3. RESOLVE THE WEIGHT POINTER  <-- device-resident? pass through.
+    |                                     not cached? stage. See "weights"
+    |  4. compact to the SELECTED experts only   <-- 6 of 256, not 256
+    |  5. quantise activations to Q8_K
+    |  6. dispatch on the format path
     v
         +-------------+-------------+-------------+-------------+
         |  q4k_path   |  iq2_path   |  q2k_path   | mxfp4_path  |
@@ -171,12 +173,53 @@ pointer does not fault. It reads zeros and the launch reports success.
                                         reports success.
 ```
 
-Every subsystem stages. `sycl_stage_host_bytes` in the common header does it
-and returns an RAII guard. Where only a scalar is needed, it is read on the host
-before launch instead.
-
 This cost real time once: a MoE decode path returned all-zero output with no
 exception raised, and the cause was one unstaged pointer.
+
+### The second trap, one layer lower, and it is worse
+
+Staging is not enough on its own. **A device memcpy whose source is a
+file-backed mmap pointer can silently DMA zeros** for pages the CPU has not
+faulted in yet. The copy engine reads the mapping before the kernel has
+populated it, and reports success.
+
+Every synthetic test builds its fixture in host memory the CPU just wrote, so
+every page is resident and the race never fires. It only appears with a real
+mmap'd model, and it appears more the larger the model, because fewer of its
+pages will ever have been touched. On the real 80 GB Flash model, where most
+pages are never CPU-touched by design, large regions would have arrived as
+zeros.
+
+`sycl_copy_host_to_device_paged_safe` stages every host-to-device copy through a
+resident heap buffer first, forcing the pages to fault in on the CPU before the
+DMA reads them. **Never hand an mmap pointer straight to a device copy.** Spec
+6y has the details; `tests/test_sycl_gguf_load.c`, which builds a real GGUF on
+disk, is the only test that can catch a regression here.
+
+### Weights are device-resident now, so most calls stage nothing
+
+`ds4_gpu_cache_model_range` allocates device memory for a range, copies it once
+through the paged-safe helper, and registers it per tier. `sycl_model_range_ptr`
+then resolves a request to that device pointer, sub-range containment included,
+exactly as CUDA's `cuda_model_range_ptr` does.
+
+All staging funnels through three helpers, and each passes through with no
+allocation, no copy and no wait when handed a pointer that is already
+device-resident:
+
+| Helper | Used by |
+|---|---|
+| `sycl_stage_host_bytes` | dense, attention, norm, hc, compressor, fp8 kv |
+| `sycl_moe_stage_weights` | routed MoE, full table |
+| `sycl_moe_stage_selected_experts` | routed MoE, compacted |
+
+Measured on a real 1.83 GiB GGUF: **94.6 ms and 195 MB staged per layer-eval
+before, 18.8 ms and zero bytes after.**
+
+The cache is **bounded** by `ds4_gpu_tier_free_vram`. An 80 GB model does not fit
+one 24 GB card, so what fits is cached and the rest stages exactly as before.
+Both paths are live and both must stay correct; on a single-GPU development box
+the staging fallback is the one that actually runs.
 
 ## Testing, and what it cannot see
 
@@ -311,33 +354,119 @@ That strictness is deliberate. Level Zero has no unified virtual addressing to
 paper over a wrong-device pointer, so a clean failure is far better than a
 plausible-looking wrong answer.
 
+## Multi-GPU: what exists and what it buys
+
+There are **two** parallelism mechanisms in `ds4.c` and they buy different
+things. Confusing them wastes weeks.
+
+```
+   PIPELINE PLACEMENT                    EXPERT PARALLELISM
+   (multi-tier, capacity)                (cuda_tp_ep, latency)
+
+   layer 0..10   -> GPU 0                token N's MoE work
+   layer 11..21  -> GPU 1                  |
+   layer 22..32  -> GPU 2                  +--> experts  0..127 -> GPU 0
+   layer 33..42  -> GPU 3                  +--> experts 128..255 -> GPU 1
+        |                                        |
+   one GPU busy at a time                  both busy on the SAME token
+   NO single-stream speedup                ~2x, ownership is two-way
+   lets an 80 GB model exist               combines to one answer
+   on 24 GB cards
+```
+
+**Pipeline placement** is gated on `e->multi_tier`, built from a
+`ds4_gpu_config` the CLI derives from `--gpu-vram` / `--gpu-devices`. Its
+linchpin is `ds4_gpu_tier_free_vram`: `engine_classify_multi_tier` refuses a
+config whose budgets are zero, so a wrong answer there makes every later entry
+unreachable and the failure looks like something else entirely. It reports a
+static ceiling minus self-tracked commitments rather than a live Level Zero
+Sysman query, because on this driver Sysman's free-memory reading does not move
+under allocation pressure (spec 6p). A number that never decreases is worse than
+a conservative constant, because the placement planner believes it.
+
+**Expert parallelism** is gated on `g->cuda_tp_ep`, which needs a placement AND
+`--cuda-tensor-parallel`. Note this is NOT the Metal `tp_world == 2` mechanism:
+`ds4_engine_tp_bind` is compiled out on any non-Apple build, so every
+`tp_world`-gated entry here is a permanent no-op. The reachable path is the CUDA
+one, because `e->backend == DS4_BACKEND_CUDA` is true for a SYCL build.
+
+Ownership composes with expert compaction: a rank stages only the experts it
+owns AND only those the token selected. Staging too much is a silent 42x
+regression that no correctness test catches.
+
+`--cuda-tensor-parallel` is refused at startup unless every routed layer is
+`(Q4_K, Q4_K)` or `(IQ2_XXS, Q2_K)`, which are the owned-decode kernels that
+exist. Flash is the second pair.
+
+## Performance: where the time goes
+
+Two structural costs dominated, and one is fixed.
+
+**Weight staging, fixed twice over.** Routed MoE used to stage all 256 experts
+per layer to read 6, which was 72.6 GiB of host-to-device traffic per token
+across Flash's 43 routed layers. Compaction cut that 42x. Device residency then
+removed staging entirely for cached ranges.
+
+**Queue drains, under investigation.** `sycl/*.hpp` holds around 208
+`wait_and_throw` calls: most ABI entries drain the queue after launching. The
+ABI already has command batching (`ds4_gpu_begin_commands` /
+`end_commands` / `synchronize`), but `begin_commands` is `{ return 1; }` and
+every entry orders itself instead, so batching exists and is unused.
+
+The drains were necessary while every call owned staging scratch that had to be
+freed on return. Device residency removes the scratch on cached paths, which is
+what makes deferring them possible. Whether that is actually where the time goes
+is being measured rather than assumed: a real GGUF layer takes 18.8 ms against
+roughly 0.16 ms of memory traffic, so something costs 100x, and it is worth
+knowing what before optimising it.
+
+**Do not quote a tokens-per-second figure derived from bandwidth arithmetic.**
+The measurement above contradicts it, and tuning has never been done.
+
 ## Known gaps
 
-* **Multi-GPU is written but unverified.** Tier switching, per-tier allocation,
-  cross-device copies and per-tier streaming caches are all implemented, but
-  this development machine has one GPU. In particular the peer-access
-  byte-validation protocol has never run off-diagonal. That protocol exists
-  because CUDA's peer-access reporting lied on real hardware, and the target
-  cards are two dies behind a PCIe switch, so it is the most likely thing to
-  bite on first contact with the real machine.
-* **The streaming expert cache is implemented but not wired in.** Routed MoE's
-  three lookup hooks are hardcoded false, so the cache, its eviction and its
-  per-tier state are correct, tested, and currently unused. This matters much
-  less than it once did: routed MoE now stages only the experts a call actually
-  selects rather than the whole per-layer table, which cut host-to-device
-  traffic by about 42x (72.6 GiB to roughly 1.7 GiB per token at Flash's shape).
-* **Tensor parallelism is not implemented.** `--cuda-tensor-parallel` is refused
-  at startup on this backend. A single token stream therefore uses one GPU at a
-  time; multi-GPU placement gives capacity, not single-stream speed.
-* **No end-to-end run against real weights** has happened. That said, the
-  engine's own decode path now runs end to end on synthetic weights: a complete
-  Flash decoder layer, then a complete token through the output head to logits,
-  over a 4-layer shape covering both hash-routed and gate-routed layers, with
-  bit-identical output across 65 repeats. A real GGUF also opens through
-  `ds4_engine_open`. What has never happened is a token from the real 80 GB
-  model.
-* **Performance is untuned.** Weight staging is per call with no cross-call
-  cache, oneMKL's `compute_mode` and the GEMM-versus-kernel dispatch
-  thresholds (the mixed-prefill tiled path's 4 GiB cap among them) are all at
-  their ROCm-literal defaults, and no tuning result from the development A770
-  should be trusted for the Battlemage target.
+Ordered by how likely each is to bite on first contact with real hardware.
+
+* **The compressor and indexer path has never run through the engine.** Flash's
+  compress ratios are 0 for layers 0 and 1 and then 4 or 128 alternating, so
+  **41 of 43 layers use it** and 2 do not. Every `DS4_TEST_HOOKS` entry does
+  `memset(g_ds4_compress_ratios, 0, ...)`, so every engine-level test runs the
+  configuration only those 2 layers have. This is the largest untested surface
+  and it subsumes the mixed prefill path, where long-context prefill and its own
+  oneMKL GEMM live.
+* **Nothing has run against real weights.** The engine's real decode path does
+  run end to end on synthetic weights: a complete Flash layer, then a complete
+  token through the output head to logits, over a 4-layer shape covering both
+  hash-routed and gate-routed layers, bit-identical across 65 repeats. A real
+  GGUF opens through `ds4_engine_open`. What has never happened is a token from
+  the real 80 GB model.
+* **Multi-GPU is written but has never run on more than one card.** Tier
+  switching, per-tier allocation, cross-device copies, placement classification,
+  the per-device weight cache and expert-parallel decode are all implemented and
+  none has seen a second device. The peer-access byte-validation protocol in
+  particular has never run off-diagonal; it exists because CUDA's peer-access
+  reporting lied on real hardware, and the target cards are two dies behind a
+  PCIe switch.
+* **`device_id` is treated as a direct index into `g_devices`** throughout this
+  backend, which is only correct when `device_indices[i] == i` for every tier. A
+  non-contiguous `--gpu-devices` filter would target the wrong physical card.
+  **Use a contiguous device list until this is fixed.**
+* **`--gpu-vram auto` cannot be trusted on Intel.** It reads Level Zero Sysman,
+  which on this driver reports total memory as free. Pass explicit per-device
+  budgets. `ds4_gpu_tier_free_vram` deliberately does not use that query.
+* **Performance is untuned and we are ~100x off bandwidth-bound.** oneMKL's
+  `compute_mode` and the GEMM-versus-kernel dispatch thresholds are at their
+  ROCm-literal defaults, no A770 tuning result should be trusted for Battlemage,
+  and the per-call queue drain described above is unresolved.
+* **The streaming expert cache is implemented but not wired in.** Its three
+  lookup hooks are hardcoded false. This matters much less than it once did:
+  compaction and device residency between them removed most of what it would
+  have saved.
+* **Decode graph capture is unavailable.** The extension works on this stack,
+  but `wait()` throws during graph recording and the per-entry waits are not all
+  gone yet. See the record in `ds4_sycl_unavailable.cpp`.
+* **Metal tensor parallelism (`tp_world == 2`) can never run here.** Its bind
+  function is compiled out on non-Apple builds. Entries gated on it are
+  permanent no-ops; the reachable mechanism is `cuda_tp_ep`.
+* **MXFP4 owned decode is not implemented.** Flash does not use MXFP4, and
+  CUDA's path there uses a different kernel family entirely.
