@@ -344,15 +344,24 @@ static int sycl_attention_output_a_stage(sycl::queue &q, float *low_ptr,
 
     sycl::event ev_q = sycl_quantize_q8_0_rows_launch(q, xq, xscale, heads_ptr, group_dim,
                                    (uint32_t)blocks_a, x_rows);
-    /* The preq kernel below reads xq/xscale, which the quantize kernel just
-     * wrote. Both are separate q.submit() calls to the same out-of-order
-     * queue over raw USM (no buffer/accessor dependency tracking), so
-     * nothing guarantees the preq kernel does not start, or even run
-     * concurrently, before the quantize kernel's writes land. This wait
-     * establishes that ordering explicitly; the wait_and_throw() below,
-     * after the preq launch, only orders this function's return against the
-     * caller, not the two kernels against each other. */
-    q.wait_and_throw();
+    /* HISTORICAL NOTE (spec 6t): the preq kernel below reads xq/xscale,
+     * which the quantize kernel just wrote, as two separate q.submit()
+     * calls over raw USM (no buffer/accessor dependency tracking).
+     * Previously, this queue was out-of-order, so nothing guaranteed the preq
+     * kernel would not start, or even run concurrently, before the
+     * quantize kernel's writes landed; an audit found this exact gap and
+     * fixed it with a targeted wait here rather than by converting the
+     * queue to in_order, since in_order was, at the time, a decision
+     * nobody had taken for the backend as a whole.
+     *
+     * That decision was later taken (ds4_sycl.cpp, ds4_sycl_queue_
+     * properties): q is now in_order, so ev_p below cannot start before
+     * ev_q completes purely from submission order, with no host wait
+     * required to make that true. The targeted wait that used to be here
+     * is therefore redundant and removed; ev_p's own wait below (needed
+     * regardless, since xq_guard/xscale_guard free their scratch when
+     * this function returns) already covers everything submitted to q
+     * before it, ev_q included. */
     ds4_sycl_profile_record_named("attn_output_quantize_q8_0_rows", ev_q);
     sycl::event ev_p = sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim,
                                     rank, n_groups, blocks_a, low_dim, n_tokens);
@@ -385,7 +394,9 @@ static int sycl_attention_output_a_stage_rows_exact(
     sycl_quantize_q8_0_group_slice_rows_launch(q, xq, xscale, heads_ptr, group_dim,
                                                (uint32_t)blocks_a, n_groups_total, group0,
                                                group_cnt, n_rows);
-    q.wait_and_throw();
+    /* No wait here, same reasoning as sycl_attention_output_a_
+     * stage above -- q is in_order, so the preq launch below cannot start
+     * before this quantize kernel completes. */
     sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim, rank, group_cnt,
                                     blocks_a, low_dim, n_rows);
     q.wait_and_throw();
