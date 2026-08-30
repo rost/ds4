@@ -1468,6 +1468,15 @@ static void sycl_attention_static_mixed_heads8_online_kernel(
 
 }  // namespace
 
+/* Test-only instrumentation, same rationale as
+ * g_sycl_attn_test_prefill_static_mixed_calls below: counts how many
+ * times ds4_gpu_attention_indexed_mixed_batch_heads_tensor below has
+ * actually reached a kernel launch, so a test can confirm the indexer's
+ * top-k-selected attention path did NOT run for a case expected to take
+ * the sibling static-mixed entry instead, not merely that it was never
+ * asked to. */
+static uint64_t g_sycl_attn_test_indexed_mixed_calls = 0;
+
 /* ds4_gpu_attention_indexed_mixed_batch_heads_tensor, attention_launch.cuh:
  * 474-921: the largest entry ported in this header. Branch order matches
  * the ROCm source exactly: n_tokens == 1 always takes the oldhip fast
@@ -1522,6 +1531,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
     if (n_head == 0u || head_dim == 0u) return 1;
     if (g_devices.empty()) return 0;
 
+    g_sycl_attn_test_indexed_mixed_calls++;
     try {
         sycl::queue &dq = ds4_sycl_queue(heads->device_id);
         const char *sinks_host = sycl_model_range_ptr(
@@ -1629,6 +1639,16 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         return 0;
     }
     return 1;
+}
+
+/* Test-only instrumentation: reports and resets the counter
+ * above. See g_sycl_attn_test_indexed_mixed_calls's own comment. */
+extern "C" uint64_t ds4_sycl_test_attn_indexed_mixed_calls(void) {
+    return g_sycl_attn_test_indexed_mixed_calls;
+}
+
+extern "C" void ds4_sycl_test_attn_indexed_mixed_calls_reset(void) {
+    g_sycl_attn_test_indexed_mixed_calls = 0;
 }
 
 namespace {
@@ -2750,6 +2770,19 @@ static int sycl_attention_prefill_mixed_launch(
 
 }  // namespace
 
+/* Test-only instrumentation: counts how many times
+ * ds4_gpu_attention_prefill_static_mixed_heads_tensor below has actually
+ * reached its real kernel launch, as opposed to being called and bailing
+ * out on invalid arguments or n_head == 0. This backend's compressed
+ * attention path (compressor + indexer) had never executed through the
+ * engine until this counter was added, so a numbers-only comparison of
+ * its output is not enough to show this specific entry point, as opposed to one of its
+ * siblings (ds4_gpu_attention_indexed_mixed_batch_heads_tensor,
+ * ds4_gpu_attention_decode_mixed_batch_heads_tensor), is the one that ran;
+ * per design-spec 6w, only a counter distinguishes "this code path ran"
+ * from "the output happens to look plausible". */
+static uint64_t g_sycl_attn_test_prefill_static_mixed_calls = 0;
+
 /* ds4_gpu_attention_prefill_static_mixed_heads_tensor, attention_launch.cuh:
  * 922-941: delegates to attention_prefill_mixed_launch with comp_mask =
  * NULL, use_comp_mask = 0, now extended beyond the small-window static
@@ -2801,6 +2834,7 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
         const float *praw   = (const float *)raw_kv->ptr;
         const float *pcomp  = n_comp ? (const float *)comp_kv->ptr : praw;
 
+        g_sycl_attn_test_prefill_static_mixed_calls++;
         return sycl_attention_prefill_mixed_launch(dq, pheads, psinks, pq, praw, pcomp,
                                                    n_tokens, n_comp, window, ratio, n_head,
                                                    head_dim);
@@ -2809,6 +2843,18 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
                 e.what());
         return 0;
     }
+}
+
+/* Test-only instrumentation: reports and resets the counter
+ * above. See g_sycl_attn_test_prefill_static_mixed_calls's own comment
+ * for why a counter, not an output comparison, is what proves this
+ * specific entry point ran. */
+extern "C" uint64_t ds4_sycl_test_attn_prefill_static_mixed_calls(void) {
+    return g_sycl_attn_test_prefill_static_mixed_calls;
+}
+
+extern "C" void ds4_sycl_test_attn_prefill_static_mixed_calls_reset(void) {
+    g_sycl_attn_test_prefill_static_mixed_calls = 0;
 }
 
 /* Tensor parallelism: TP row-range attention prefill. Reached
