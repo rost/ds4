@@ -1615,6 +1615,121 @@ static int test_shared_down_hc_expand_owned_q8_0(void) {
     return 0;
 }
 
+/* The two sub-branches of sycl_moe_owned_packed_component's
+ * prefix-pair path (ds4_sycl_moe_owned.hpp:62) that
+ * test_shared_down_hc_expand_owned_q8_0's fixture above never reaches.
+ * That fixture's group 0 ({0, 4, 1}) gives peer mask 0b010 and group 1
+ * ({5, 2, 3}) gives 0b101; neither satisfies (mask & 3) == 3. This is the
+ * FUSED consumer of sycl_moe_owned_packed_combine_row (the block_v term in
+ * shared_down_hc_expand_owned_q8_0_tensor, ds4_sycl_hc.hpp:1006), separate
+ * from the unfused ABI entry covered in tests/test_sycl_moe.c's
+ * test_q4k_owned_decode_packed_prefix_pair: a fused path that unpacks
+ * differently from the unfused one is exactly the divergence a partial
+ * test misses. As in test_shared_down_hc_expand_owned_q8_0 above, the
+ * oracle is an independent call to the unfused combine entry, so this
+ * checks wiring agreement between the two call sites at the prefix-pair
+ * branch, not the branch's own arithmetic (that is the unfused test's
+ * job). */
+static int hc_owned_prefix_case(const char *label, const int32_t selected[6]) {
+    enum { IN_DIM = 20, EXPERT_SPLIT = 3 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)N_HC_EXPAND_EMBD * row_bytes;
+
+    unsigned char weights[N_HC_EXPAND_EMBD * 34];
+    float x[IN_DIM];
+    float home_slots[6 * N_HC_EXPAND_EMBD];
+    float peer_packed[4 * N_HC_EXPAND_EMBD];
+    float residual[N_HC * N_HC_EXPAND_EMBD];
+    float split[MIX_HC];
+    float hc_want[N_HC * N_HC_EXPAND_EMBD];
+
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        hc_test_encode_q8_0_row(weights + (size_t)o * row_bytes, IN_DIM, o + 1u);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) x[k] = (float)((k * 5u + 1u) % 7u) - 3.0f;
+    for (uint32_t i = 0; i < 6u * N_HC_EXPAND_EMBD; i++) home_slots[i] = fill_val(i, i + 5u) * 0.9f;
+    for (uint32_t i = 0; i < 4u * N_HC_EXPAND_EMBD; i++) {
+        peer_packed[i] = fill_val(i + 40u, i + 11u) * 1.1f;
+    }
+    for (int h = 0; h < N_HC; h++) {
+        for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+            residual[h * N_HC_EXPAND_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 1.7f;
+        }
+    }
+    for (int i = 0; i < MIX_HC; i++) split[i] = fill_val(3u, (uint32_t)i + 60) * 0.4f;
+
+    ds4_gpu_tensor *tx      = alloc_write(x, sizeof(x));
+    ds4_gpu_tensor *thome   = alloc_write(home_slots, sizeof(home_slots));
+    ds4_gpu_tensor *tpeer   = alloc_write(peer_packed, sizeof(peer_packed));
+    ds4_gpu_tensor *tsel    = alloc_write(selected, 6 * sizeof(int32_t));
+    ds4_gpu_tensor *tres    = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tsplit  = alloc_write(split, sizeof(split));
+    ds4_gpu_tensor *tshared = ds4_gpu_tensor_alloc((uint64_t)N_HC_EXPAND_EMBD * sizeof(float));
+    ds4_gpu_tensor *tout    = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tx && thome && tpeer && tsel && tres && tsplit && tshared && tout,
+          "shared_down_hc_expand_owned prefix-pair: alloc failed");
+
+    ds4_gpu_tensor *tcombine = ds4_gpu_tensor_alloc((uint64_t)N_HC_EXPAND_EMBD * sizeof(float));
+    CHECK(tcombine, "shared_down_hc_expand_owned prefix-pair: combine alloc");
+    CHECK(ds4_gpu_routed_moe_owned_packed_combine_tensor(tcombine, thome, tpeer, tsel,
+                                                         N_HC_EXPAND_EMBD, EXPERT_SPLIT) != 0,
+          "shared_down_hc_expand_owned prefix-pair: independent combine call");
+    float combine_want[N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tcombine, 0, combine_want, sizeof(combine_want)) != 0,
+          "shared_down_hc_expand_owned prefix-pair: read combine");
+
+    float block_want[N_HC_EXPAND_EMBD];
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        const float dot = hc_oracle_q8_0_dot(x, weights + (size_t)o * row_bytes, IN_DIM);
+        block_want[o] = dot + combine_want[o];
+    }
+    oracle_hc_post_one(hc_want, block_want, residual, split + N_HC, split + 2 * N_HC,
+                       N_HC_EXPAND_EMBD, N_HC);
+
+    CHECK(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
+              tout, tshared, weights, weight_bytes, 0, IN_DIM, N_HC_EXPAND_EMBD, tx, thome, tpeer,
+              tsel, EXPERT_SPLIT, tres, tsplit, N_HC_EXPAND_EMBD, N_HC) != 0,
+          "shared_down_hc_expand_owned prefix-pair: call");
+
+    float hc_got[N_HC * N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout, 0, hc_got, sizeof(hc_got)) != 0,
+          "shared_down_hc_expand_owned prefix-pair: read out_hc");
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_want[i], 1e-2,
+                    "shared_down_hc_expand_owned prefix-pair: out_hc mismatch");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(thome);
+    ds4_gpu_tensor_free(tpeer);
+    ds4_gpu_tensor_free(tsel);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tshared);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tcombine);
+    fprintf(stderr, "  shared_down_hc_expand_owned prefix-pair case (%s) OK\n", label);
+    return 0;
+}
+
+static int test_shared_down_hc_expand_owned_q8_0_prefix_pair(void) {
+    /* Group 0 = {3, 4, 0}: peer (owns [3,6)) holds slots 0 and 1 (3, 4) but
+     * not slot 2 (0, home-owned): peer mask 0b011. Component 0 packs
+     * slot0+slot1 with prefix_pair set; component 1 returns -1. */
+    const int32_t selected_011[6] = {3, 4, 0, 5, 1, 2};
+    if (hc_owned_prefix_case("mask 0b011", selected_011) != 0) return 1;
+
+    /* Group 0 = {3, 4, 5}: peer holds all three slots: mask 0b111.
+     * Component 0 packs slot0+slot1 with prefix_pair set; component 1
+     * returns slot0+2 (5, unpacked separately from the pre-summed pair). */
+    const int32_t selected_111[6] = {3, 4, 5, 0, 1, 2};
+    if (hc_owned_prefix_case("mask 0b111", selected_111) != 0) return 1;
+
+    fprintf(stderr, "  test_shared_down_hc_expand_owned_q8_0_prefix_pair OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_repeat_hc() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1637,6 +1752,7 @@ int main(void) {
     if (test_shared_down_hc_expand_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_shared_down_hc_expand_add_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_shared_down_hc_expand_owned_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_shared_down_hc_expand_owned_q8_0_prefix_pair() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_hc OK\n");
     return 0;
