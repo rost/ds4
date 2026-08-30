@@ -154,12 +154,12 @@ static void sycl_quantize_q8_0_rows_kernel(sycl::nd_item<1> it, int8_t *xq,
 /* n_rows independent activation vectors of length in_dim each, quantised
  * block-by-block: each work-group covers exactly one (row, block) pair,
  * 32 work-items wide, matching the kernel above. */
-static void sycl_quantize_q8_0_rows_launch(sycl::queue &q, int8_t *xq,
+static sycl::event sycl_quantize_q8_0_rows_launch(sycl::queue &q, int8_t *xq,
                                            float *xscale, const float *x,
                                            uint32_t in_dim, uint32_t blocks,
                                            uint64_t n_rows) {
-    if (n_rows == 0 || blocks == 0) return;
-    q.submit([&](sycl::handler &h) {
+    if (n_rows == 0 || blocks == 0) return sycl::event();
+    return q.submit([&](sycl::handler &h) {
         h.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>((size_t)(n_rows * blocks * 32u)),
                                   sycl::range<1>(32u)),
@@ -299,14 +299,14 @@ static void sycl_grouped_q8_0_a_preq_kernel(sycl::nd_item<1> it, float *low,
 /* n_tokens * n_groups * rank independent output rows, one 8-lane sub-group
  * per row. `low_dim` is passed precomputed (n_groups * rank) since every
  * caller below has already overflow-checked it. */
-static void sycl_grouped_q8_0_a_preq_launch(sycl::queue &q, float *low,
+static sycl::event sycl_grouped_q8_0_a_preq_launch(sycl::queue &q, float *low,
                                             const unsigned char *w,
                                             const int8_t *xq, const float *xscale,
                                             uint32_t group_dim, uint64_t rank,
                                             uint32_t n_groups, uint64_t blocks,
                                             uint64_t low_dim, uint64_t n_tokens) {
-    if (low_dim == 0 || n_tokens == 0) return;
-    sycl::event _ds4_prof_ev15 = q.submit([&](sycl::handler &h) {
+    if (low_dim == 0 || n_tokens == 0) return sycl::event();
+    return q.submit([&](sycl::handler &h) {
         h.parallel_for(
                 sycl::nd_range<1>(
                         sycl::range<1>((size_t)(low_dim * n_tokens * kGroupedQ8ASubgroupWidth)),
@@ -342,7 +342,7 @@ static int sycl_attention_output_a_stage(sycl::queue &q, float *low_ptr,
     sycl_device_scratch_guard xscale_guard(q, xscale);
     if (!xq || !xscale) return 0;
 
-    sycl_quantize_q8_0_rows_launch(q, xq, xscale, heads_ptr, group_dim,
+    sycl::event ev_q = sycl_quantize_q8_0_rows_launch(q, xq, xscale, heads_ptr, group_dim,
                                    (uint32_t)blocks_a, x_rows);
     /* The preq kernel below reads xq/xscale, which the quantize kernel just
      * wrote. Both are separate q.submit() calls to the same out-of-order
@@ -353,9 +353,11 @@ static int sycl_attention_output_a_stage(sycl::queue &q, float *low_ptr,
      * after the preq launch, only orders this function's return against the
      * caller, not the two kernels against each other. */
     q.wait_and_throw();
-    sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim,
+    ds4_sycl_profile_record_named("attn_output_quantize_q8_0_rows", ev_q);
+    sycl::event ev_p = sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim,
                                     rank, n_groups, blocks_a, low_dim, n_tokens);
     q.wait_and_throw();
+    ds4_sycl_profile_record_named("attn_output_grouped_q8_0_a_preq", ev_p);
     return 1;
 }
 
@@ -906,13 +908,13 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
  * sycl_grouped_q8_0_a_preq_kernel's row/tok/group decomposition exactly,
  * with a direct float dot against sycl_q4_k_dequant in place of that
  * kernel's quantise-then-int8-dot A-stage. */
-static void sycl_grouped_q4_k_a_launch(sycl::queue &q, float *low,
+static sycl::event sycl_grouped_q4_k_a_launch(sycl::queue &q, float *low,
                                        const unsigned char *w, const float *heads,
                                        uint32_t group_dim, uint64_t rank,
                                        uint32_t n_groups, uint64_t row_bytes,
                                        uint64_t low_dim, uint64_t n_tokens) {
-    if (low_dim == 0 || n_tokens == 0) return;
-    sycl::event _ds4_prof_ev17 = q.parallel_for(sycl::range<1>((size_t)(low_dim * n_tokens)), [=](sycl::id<1> gid) {
+    if (low_dim == 0 || n_tokens == 0) return sycl::event();
+    return q.parallel_for(sycl::range<1>((size_t)(low_dim * n_tokens)), [=](sycl::id<1> gid) {
         const uint64_t row = gid[0] % low_dim;
         const uint64_t tok = gid[0] / low_dim;
         const uint64_t group = row / rank;
@@ -994,10 +996,11 @@ extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         sycl_device_scratch_guard w_guard = sycl_stage_host_bytes(q, out_a_ptr, slice_bytes);
         if (!w_guard.p) return 0;
 
-        sycl_grouped_q4_k_a_launch(q, (float *)low->ptr, (const unsigned char *)w_guard.p,
+        sycl::event ev = sycl_grouped_q4_k_a_launch(q, (float *)low->ptr, (const unsigned char *)w_guard.p,
                                    (const float *)heads->ptr, (uint32_t)group_dim, rank,
                                    group_cnt, row_bytes, low_dim, 1u);
         q.wait_and_throw();
+        ds4_sycl_profile_record_named("attn_output_grouped_q4_k_a", ev);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_low_q4_K_slice failed: %s\n",
                 e.what());
@@ -1072,10 +1075,11 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         sycl_device_scratch_guard w_guard = sycl_stage_host_bytes(q, out_a_ptr, out_a_bytes);
         if (!w_guard.p) return 0;
 
-        sycl_grouped_q4_k_a_launch(q, (float *)low->ptr, (const unsigned char *)w_guard.p,
+        sycl::event ev = sycl_grouped_q4_k_a_launch(q, (float *)low->ptr, (const unsigned char *)w_guard.p,
                                    (const float *)heads->ptr, (uint32_t)group_dim, rank,
                                    n_groups, row_bytes, low_dim, n_tokens);
         q.wait_and_throw();
+        ds4_sycl_profile_record_named("attn_output_grouped_q4_k_a", ev);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_q4_K_batch A-stage failed: %s\n",
                 e.what());

@@ -184,7 +184,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
                 q, (float *)out->ptr, dw, (const float *)x->ptr,
                 (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev68);
+        ds4_sycl_profile_record_named("matmul_f16", _ds4_prof_ev68);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_f16 failed: %s\n", e.what());
         return 0;
@@ -242,13 +242,15 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         uint16_t *dwb = (uint16_t *)dwb_guard.p;
         if (!dwb) return 0;
 
-        sycl_matmul_f16_launch(q, (float *)out_a->ptr, dwa, (const float *)x->ptr,
-                               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        sycl::event _ds4_prof_ev68a = sycl_matmul_f16_launch(
+                q, (float *)out_a->ptr, dwa, (const float *)x->ptr,
+                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         sycl::event _ds4_prof_ev68b = sycl_matmul_f16_launch(
                 q, (float *)out_b->ptr, dwb, (const float *)x->ptr,
                 (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev68b);
+        ds4_sycl_profile_record_named("matmul_f16", _ds4_prof_ev68a);
+        ds4_sycl_profile_record_named("matmul_f16", _ds4_prof_ev68b);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_f16_pair failed: %s\n", e.what());
         return 0;
@@ -349,7 +351,7 @@ static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
                 (uint32_t)in_dim, (uint32_t)out_dim,
                 (uint32_t)n_tok, row_bytes);
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev69);
+        ds4_sycl_profile_record_named("matmul_q8_0", _ds4_prof_ev69);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0 failed: %s\n", e.what());
         return 0;
@@ -867,7 +869,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(
                 q, (float *)out->ptr, dw, (const float *)x->ptr,
                 (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev72);
+        ds4_sycl_profile_record_named("matmul_f32", _ds4_prof_ev72);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_f32 failed: %s\n", e.what());
         return 0;
@@ -978,7 +980,7 @@ static int sycl_dense_quant_matmul_general(
                 (uint32_t)out_dim, (uint32_t)n_tok,
                 row_bytes, dequant);
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev73);
+        ds4_sycl_profile_record_named(what, _ds4_prof_ev73);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s matmul failed: %s\n", what, e.what());
         return 0;

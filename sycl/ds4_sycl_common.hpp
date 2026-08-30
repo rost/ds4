@@ -406,12 +406,90 @@ static inline void ds4_sycl_profile_record(const sycl::event &ev) {
 extern "C" void ds4_sycl_test_profile_enable(int enable) {
     g_sycl_profile_enabled = enable != 0;
 }
+
+/* Per-kernel-family device time, layered on top of the
+ * aggregate counters above. A fixed small table of named buckets keyed by
+ * a call site's own string literal (compared by content, not pointer
+ * identity, so two call sites can legitimately share one bucket): this is
+ * test/report-only instrumentation used to RANK the dense-matmul kernel
+ * family before deciding which one is worth rewriting first, not a
+ * runtime hot path, so an O(buckets) linear scan per call is fine. Only
+ * the call sites being ranked pass a name; every other
+ * call site keeps calling the unnamed ds4_sycl_profile_record above,
+ * which still counts toward the aggregate total the existing gguf-load
+ * measurement already reports. */
+struct sycl_profile_bucket {
+    const char *name;
+    uint64_t    ns;
+    uint64_t    count;
+};
+static constexpr int kSyclProfileMaxBuckets = 16;
+static sycl_profile_bucket g_sycl_profile_buckets[kSyclProfileMaxBuckets];
+static int g_sycl_profile_bucket_count = 0;
+
+static inline void ds4_sycl_profile_record_named(const char *name, const sycl::event &ev) {
+    if (!g_sycl_profile_enabled) return;
+    ds4_sycl_profile_record(ev);
+    try {
+        const uint64_t start_ns = ev.get_profiling_info<
+            sycl::info::event_profiling::command_start>();
+        const uint64_t end_ns = ev.get_profiling_info<
+            sycl::info::event_profiling::command_end>();
+        if (end_ns <= start_ns) return;
+        const uint64_t dur = end_ns - start_ns;
+        for (int i = 0; i < g_sycl_profile_bucket_count; i++) {
+            if (strcmp(g_sycl_profile_buckets[i].name, name) == 0) {
+                g_sycl_profile_buckets[i].ns += dur;
+                g_sycl_profile_buckets[i].count++;
+                return;
+            }
+        }
+        if (g_sycl_profile_bucket_count < kSyclProfileMaxBuckets) {
+            g_sycl_profile_buckets[g_sycl_profile_bucket_count] = {name, dur, 1};
+            g_sycl_profile_bucket_count++;
+        }
+    } catch (const sycl::exception &) {
+        /* Same reasoning as ds4_sycl_profile_record above: profiling info
+         * unavailable for this event should not fail a real call. */
+    }
+}
+
 extern "C" void ds4_sycl_test_profile_reset(void) {
     g_sycl_profile_kernel_ns = 0;
     g_sycl_profile_kernel_count = 0;
+    g_sycl_profile_bucket_count = 0;
 }
 extern "C" uint64_t ds4_sycl_test_profile_kernel_ns(void) { return g_sycl_profile_kernel_ns; }
 extern "C" uint64_t ds4_sycl_test_profile_kernel_count(void) { return g_sycl_profile_kernel_count; }
+extern "C" uint64_t ds4_sycl_test_profile_bucket_count(void) {
+    return (uint64_t)g_sycl_profile_bucket_count;
+}
+extern "C" const char *ds4_sycl_test_profile_bucket_name(uint64_t i) {
+    return i < (uint64_t)g_sycl_profile_bucket_count ? g_sycl_profile_buckets[i].name : "";
+}
+extern "C" uint64_t ds4_sycl_test_profile_bucket_ns(uint64_t i) {
+    return i < (uint64_t)g_sycl_profile_bucket_count ? g_sycl_profile_buckets[i].ns : 0;
+}
+extern "C" uint64_t ds4_sycl_test_profile_bucket_calls(uint64_t i) {
+    return i < (uint64_t)g_sycl_profile_bucket_count ? g_sycl_profile_buckets[i].count : 0;
+}
+
+/* N-wide sub-group tree reduction via shuffle: every lane passes its own
+ * partial sum and gets back the fully-reduced total. Used by the tiled
+ * dense-matmul kernels in ds4_sycl_matmul.hpp for the sub-group
+ * cooperative reduction over one output row's dot product. Mirrors the
+ * shuffle shape of ds4_sycl_moe.hpp's own reqd_sub_group_size(N) row
+ * reductions (sycl_moe_subgroup_sum); kept as a separate small copy here,
+ * rather than shared with that file, so callers of this header do not
+ * take on a dependency on ds4_sycl_moe.hpp's own include position in the
+ * single translation unit that assembles every sycl header file. */
+template <int N>
+static inline float sycl_subgroup_sum(sycl::sub_group sg, float v) {
+    for (int offset = N >> 1; offset > 0; offset >>= 1) {
+        v += sycl::shift_group_left(sg, v, (uint32_t)offset);
+    }
+    return v;
+}
 
 /* Test/report-only instrumentation: cumulative bytes actually
  * copied host-to-device by sycl_stage_host_bytes below (never incremented

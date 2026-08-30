@@ -91,7 +91,7 @@ extern "C" uint64_t ds4_sycl_shared_expert_test_fast_path_hits(void) {
  * store_gate_up is not a parameter here: gate and up are ALWAYS written
  * (see the file header comment for why), unlike ROCm's kernel which takes
  * it as a runtime flag. */
-static void sycl_shared_gate_up_swiglu_q8_0_rows_w32(
+static sycl::event sycl_shared_gate_up_swiglu_q8_0_rows_w32(
         sycl::queue &q, float *gate, float *up, float *mid,
         const unsigned char *wg, const unsigned char *wu, const float *x,
         uint32_t n_blocks, uint32_t out_dim, uint64_t row_bytes,
@@ -100,7 +100,7 @@ static void sycl_shared_gate_up_swiglu_q8_0_rows_w32(
     const uint32_t n_groups = (out_dim + kRowsPerBlock - 1u) / kRowsPerBlock;
     const size_t local_size = (size_t)kRowsPerBlock * 32u;
 
-    sycl::event _ds4_prof_ev146 = q.submit([&](sycl::handler &h) {
+    return q.submit([&](sycl::handler &h) {
         h.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>((size_t)n_groups * local_size),
                                   sycl::range<1>(local_size)),
@@ -217,11 +217,12 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
             unsigned char *dwu = (unsigned char *)dwu_guard.p;
             if (!dwu) return 0;
 
-            sycl_shared_gate_up_swiglu_q8_0_rows_w32(
+            sycl::event ev = sycl_shared_gate_up_swiglu_q8_0_rows_w32(
                     q, (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                     dwg, dwu, (const float *)x->ptr, (uint32_t)(in_dim >> 5u),
                     (uint32_t)out_dim, row_bytes, clamp);
             q.wait_and_throw();
+            ds4_sycl_profile_record_named("shared_expert_gate_up_swiglu_q8_0_w32", ev);
             g_sycl_shared_fast_path_hits++;
         } catch (const sycl::exception &e) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX

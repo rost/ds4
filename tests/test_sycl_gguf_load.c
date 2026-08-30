@@ -542,6 +542,15 @@ extern void     ds4_sycl_test_profile_reset(void);
 extern uint64_t ds4_sycl_test_profile_kernel_ns(void);
 extern uint64_t ds4_sycl_test_profile_kernel_count(void);
 
+/* sycl/ds4_sycl_common.hpp test/report-only hook; not
+ * part of the ABI. Per-kernel-family device time, layered on the
+ * aggregate above, used to rank the dense-matmul kernel family before
+ * deciding which one is worth rewriting first. */
+extern uint64_t    ds4_sycl_test_profile_bucket_count(void);
+extern const char *ds4_sycl_test_profile_bucket_name(uint64_t i);
+extern uint64_t    ds4_sycl_test_profile_bucket_ns(uint64_t i);
+extern uint64_t    ds4_sycl_test_profile_bucket_calls(uint64_t i);
+
 static double now_secs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -697,6 +706,45 @@ int main(int argc, char **argv) {
                 "  measurement (cache ON, real 1.83 GiB layer, %d repeats): "
                 "%.3f ms/layer-eval, %llu bytes staged/layer-eval\n",
                 repeats, total_ms / repeats, (unsigned long long)bytes_per_call);
+
+        /* Rank the named kernel-family buckets by device time, so the
+         * most expensive dense-matmul kernel is identified from a real
+         * measurement before any of them is rewritten. Simple insertion
+         * sort: at most kSyclProfileMaxBuckets (16) entries. */
+        {
+            const uint64_t nb = ds4_sycl_test_profile_bucket_count();
+            const char *names[16];
+            double ms[16];
+            uint64_t calls[16];
+            uint64_t n = nb < 16 ? nb : 16;
+            for (uint64_t i = 0; i < n; i++) {
+                names[i] = ds4_sycl_test_profile_bucket_name(i);
+                ms[i] = (double)ds4_sycl_test_profile_bucket_ns(i) / 1.0e6 / repeats;
+                calls[i] = ds4_sycl_test_profile_bucket_calls(i) / (uint64_t)repeats;
+            }
+            for (uint64_t i = 1; i < n; i++) {
+                const char *nm = names[i];
+                double mv = ms[i];
+                uint64_t cv = calls[i];
+                int64_t j = (int64_t)i - 1;
+                while (j >= 0 && ms[j] < mv) {
+                    names[j + 1] = names[j];
+                    ms[j + 1] = ms[j];
+                    calls[j + 1] = calls[j];
+                    j--;
+                }
+                names[j + 1] = nm;
+                ms[j + 1] = mv;
+                calls[j + 1] = cv;
+            }
+            fprintf(stderr, "  per-kernel-family ranking (cache ON, %d repeats):\n",
+                    repeats);
+            for (uint64_t i = 0; i < n; i++) {
+                fprintf(stderr, "    %2llu. %-40s %8.4f ms/layer-eval (%llu calls/layer-eval)\n",
+                        (unsigned long long)(i + 1), names[i], ms[i],
+                        (unsigned long long)calls[i]);
+            }
+        }
     }
 
     free(input_hc);
