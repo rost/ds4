@@ -2,11 +2,11 @@
 
 /* Routed-MoE dispatcher: the two ABI entries and the shared launcher they
  * both call.  Ported from rocm/ds4_rocm_moe_launch.cuh, which is
- * ~2,113 lines in `routed_moe_launch` alone.  This header implements the
- * dispatcher skeleton once, with one delimited block per quantised
- * format, and fills in only the q4k_path block; the other three blocks
- * return 0 (a clean failure) with a comment naming what fills each in,
- * per the "dispatcher structure" decision.
+ * ~2,113 lines in `routed_moe_launch` alone.  The dispatcher skeleton is
+ * one delimited block per quantised format; all four (Q4_K, IQ2_XXS
+ * paired with either Q2_K or IQ2_XXS down, standalone Q2_K, MXFP4) are
+ * filled in below, landed incrementally as each format block's own
+ * comment describes.
  *
  * Return convention for both ABI entries: NONZERO means success, 0 means
  * failure.  Verified against `routed_moe_launch` (moe_launch.cuh:733,
