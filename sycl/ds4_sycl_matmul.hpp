@@ -106,46 +106,46 @@ extern "C" int ds4_sycl_test_gemm_batch_smoke(void) {
     return 1;
 }
 
-/* Submits (without waiting) out[t][o] = sum_k x[t][k] * f16_to_f32(w[o][k])
- * for one weight table, row-major out_dim rows of in_dim half values each.
+/* Converts an F16 weight table (bit-pattern uint16_t, row-major out_dim
+ * rows of in_dim half values each) to F32, one work-item per element.
  * Shared by both weight offsets of ds4_gpu_matmul_f16_pair_tensor below.
- * ROCm additionally special-cases n_tok == 1 with a perf-tuned kernel
- * (rocm/ds4_rocm_matmul.cuh:873-931); one general kernel covering every
- * n_tok is enough for correctness. */
-/* Returns the launched kernel's event (a measurement-only
- * change, needed so a caller can feed it to ds4_sycl_profile_record; every
- * caller either discards it or captures it purely for that purpose, so
- * this carries no behavioural change). */
-static sycl::event sycl_matmul_f16_launch(sycl::queue &q, float *out,
-                                   const uint16_t *w, const float *x,
-                                   uint32_t in_dim, uint32_t out_dim,
-                                   uint32_t n_tok) {
-    const uint64_t n = (uint64_t)n_tok * out_dim;
+ *
+ * This used to be a per-element dequant fused directly
+ * into a one-work-item-per-output-element dot-product kernel
+ * (sycl_matmul_f16_launch, ranked the most expensive dense-matmul kernel
+ * in measurement, 5.530 ms/layer-eval). Splitting the dequant
+ * out into its own embarrassingly-parallel elementwise kernel, then
+ * handing the actual dot products to oneMKL's F32 GEMM
+ * (sycl_gemm_batch_f32, ds4_sycl_common.hpp, the same helper the
+ * attention prefill path already uses), is the F32/F16 half of the two
+ * different problems being solved: a GEMM library can tile and
+ * cooperate across a whole row in a way a single serial work-item
+ * cannot.
+ *
+ * F32 output, not a native half-precision GEMM, is a deliberate choice:
+ * oneMKL's (half, half, half, half) GEMM instantiation this backend uses
+ * elsewhere (sycl_gemm_f16) only produces a half output, but this entry's
+ * ABI contract is an F32 output tensor, so a native half GEMM would still
+ * need a second unpack kernel afterward -- no cheaper than this approach
+ * -- while also computing in lower precision than the naive kernel it
+ * replaces did. Expanding the weights to F32 once and letting the GEMM's
+ * own (already float) internal accumulation do the rest loses no more
+ * precision than the kernel being replaced. */
+static sycl::event sycl_f16_to_f32_launch(sycl::queue &q, float *out,
+                                   const uint16_t *w, uint64_t n) {
     return q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
-        const uint32_t o  = (uint32_t)(gid % out_dim);
-        const uint32_t t  = (uint32_t)(gid / out_dim);
-        const float    *xr = x + (uint64_t)t * in_dim;
-        const uint16_t *wr = w + (uint64_t)o * in_dim;
-        float sum = 0.0f;
-        for (uint32_t k = 0; k < in_dim; k++) {
-            sum += xr[k] * (float)sycl::bit_cast<sycl::half>(wr[k]);
-        }
-        out[gid] = sum;
+        out[gid] = (float)sycl::bit_cast<sycl::half>(w[gid]);
     });
 }
 
-/* Core dense F16 matmul entry.  ROCm's own implementation
- * (rocm/ds4_rocm_matmul.cuh:804-869) has a genuine non-cuBLAS kernel
- * fallback (matmul_f16_kernel / matmul_f16_ordered_chunks_kernel /
- * matmul_f16_f32_sharedx_warp_rows_w32_kernel, gated the same way the
- * Q8_0 GEMM fast path is: g_cublas_ready && n_tok > 1), so despite oneMKL
- * now being available, a hand-written kernel is the correct port here, not
- * a GEMM: this backend has no perf-tuning phase yet (future work's territory)
- * and every one of ROCm's three kernel-selection branches computes the
- * identical dot product with only tiling differences.  Delegates to
- * sycl_matmul_f16_launch, the same general one-work-item-per-output-element
- * kernel ds4_gpu_matmul_f16_pair_tensor below already uses for every
- * n_tok. */
+/* Core dense F16 matmul entry: out[t][o] = sum_k x[t][k] * f16_to_f32(w[o][k]).
+ * ROCm's own implementation (rocm/ds4_rocm_matmul.cuh:804-869) has a
+ * genuine non-cuBLAS kernel fallback, gated the same way the Q8_0 GEMM
+ * fast path is (g_cublas_ready && n_tok > 1); this port instead always
+ * takes the oneMKL GEMM path (see sycl_f16_to_f32_launch's own comment for
+ * why), now that measurement shows the previous
+ * hand-written kernel was the single most expensive dense-matmul kernel on
+ * a real layer-eval. */
 extern "C" int ds4_gpu_matmul_f16_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
@@ -180,12 +180,45 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
         uint16_t *dw = (uint16_t *)dw_guard.p;
         if (!dw) return 0;
 
-        sycl::event _ds4_prof_ev68 = sycl_matmul_f16_launch(
-                q, (float *)out->ptr, dw, (const float *)x->ptr,
-                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
-        q.wait_and_throw();
-        ds4_sycl_profile_record_named("matmul_f16", _ds4_prof_ev68);
-    } catch (const sycl::exception &e) {
+        float *w_f32 = sycl::malloc_device<float>((size_t)(out_dim * in_dim), q);
+        if (!w_f32) return 0;
+        sycl_device_scratch_guard wf32_guard(q, w_f32);
+        sycl::event ev_cvt = sycl_f16_to_f32_launch(q, w_f32, dw, out_dim * in_dim);
+        ev_cvt.wait_and_throw();
+        ds4_sycl_profile_record_named("matmul_f16_convert", ev_cvt);
+
+        /* out (n_tok x out_dim row-major) as column-major is (out_dim x
+         * n_tok); m=out_dim, n=n_tok, k=in_dim, matching sycl_gemm_batch_f32's
+         * own comment and the raw-KV prefill GEMM's argument shape
+         * (ds4_sycl_attention.hpp:2152): the weight-like operand (row-major
+         * out_dim x in_dim, so column-major in_dim x out_dim) is transa=trans
+         * to get out_dim x in_dim; the activation-like operand (row-major
+         * n_tok x in_dim, so column-major in_dim x n_tok already) is
+         * transb=nontrans. batch_size=1 since this is a single weight table,
+         * not a batch. */
+        sycl::event ev = sycl_gemm_batch_f32(
+                q, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                (int64_t)out_dim, (int64_t)n_tok, (int64_t)in_dim,
+                1.0f,
+                w_f32, (int64_t)in_dim, 0,
+                (const float *)x->ptr, (int64_t)in_dim, 0,
+                0.0f,
+                /* stride_c must be a real (nonzero) per-batch stride even
+                 * at batch_size == 1: unlike stride_a, oneMKL has no
+                 * broadcast case for C and raises invalid_argument on 0
+                 * (sycl_gemm_batch_f32's own comment, ds4_sycl_common.hpp;
+                 * confirmed empirically here too). */
+                (float *)out->ptr, (int64_t)out_dim, (int64_t)out_dim * (int64_t)n_tok,
+                1);
+        ev.wait_and_throw();
+        ds4_sycl_profile_record_named("matmul_f16", ev);
+    } catch (const std::exception &e) {
+        /* std::exception, not sycl::exception: oneapi::mkl::invalid_argument
+         * is on a different branch of the hierarchy (spec 6v; see the
+         * gemm_batch smoke test's own comment above for the exact wording),
+         * and a sycl::exception-only handler here would let a bad GEMM
+         * argument terminate the whole process instead of this entry
+         * returning its failure value. */
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_f16 failed: %s\n", e.what());
         return 0;
     }
@@ -242,16 +275,46 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
         uint16_t *dwb = (uint16_t *)dwb_guard.p;
         if (!dwb) return 0;
 
-        sycl::event _ds4_prof_ev68a = sycl_matmul_f16_launch(
-                q, (float *)out_a->ptr, dwa, (const float *)x->ptr,
-                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
-        sycl::event _ds4_prof_ev68b = sycl_matmul_f16_launch(
-                q, (float *)out_b->ptr, dwb, (const float *)x->ptr,
-                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        float *wa_f32 = sycl::malloc_device<float>((size_t)(out_dim * in_dim), q);
+        if (!wa_f32) return 0;
+        sycl_device_scratch_guard wa32_guard(q, wa_f32);
+        float *wb_f32 = sycl::malloc_device<float>((size_t)(out_dim * in_dim), q);
+        if (!wb_f32) return 0;
+        sycl_device_scratch_guard wb32_guard(q, wb_f32);
+
+        sycl::event ev_cvt_a = sycl_f16_to_f32_launch(q, wa_f32, dwa, out_dim * in_dim);
+        sycl::event ev_cvt_b = sycl_f16_to_f32_launch(q, wb_f32, dwb, out_dim * in_dim);
         q.wait_and_throw();
-        ds4_sycl_profile_record_named("matmul_f16", _ds4_prof_ev68a);
-        ds4_sycl_profile_record_named("matmul_f16", _ds4_prof_ev68b);
-    } catch (const sycl::exception &e) {
+        ds4_sycl_profile_record_named("matmul_f16_convert", ev_cvt_a);
+        ds4_sycl_profile_record_named("matmul_f16_convert", ev_cvt_b);
+
+        sycl::event ev_a = sycl_gemm_batch_f32(
+                q, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                (int64_t)out_dim, (int64_t)n_tok, (int64_t)in_dim,
+                1.0f,
+                wa_f32, (int64_t)in_dim, 0,
+                (const float *)x->ptr, (int64_t)in_dim, 0,
+                0.0f,
+                /* stride_c must be nonzero even at batch_size == 1; see
+                 * ds4_gpu_matmul_f16_tensor's own comment above. */
+                (float *)out_a->ptr, (int64_t)out_dim, (int64_t)out_dim * (int64_t)n_tok,
+                1);
+        sycl::event ev_b = sycl_gemm_batch_f32(
+                q, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
+                (int64_t)out_dim, (int64_t)n_tok, (int64_t)in_dim,
+                1.0f,
+                wb_f32, (int64_t)in_dim, 0,
+                (const float *)x->ptr, (int64_t)in_dim, 0,
+                0.0f,
+                (float *)out_b->ptr, (int64_t)out_dim, (int64_t)out_dim * (int64_t)n_tok,
+                1);
+        ev_a.wait_and_throw();
+        ev_b.wait_and_throw();
+        ds4_sycl_profile_record_named("matmul_f16", ev_a);
+        ds4_sycl_profile_record_named("matmul_f16", ev_b);
+    } catch (const std::exception &e) {
+        /* std::exception, not sycl::exception: see
+         * ds4_gpu_matmul_f16_tensor's own comment above for why. */
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_f16_pair failed: %s\n", e.what());
         return 0;
     }
@@ -934,9 +997,16 @@ static sycl::event sycl_matmul_f32_launch(sycl::queue &q, float *out, const floa
 /* Core dense F32 matmul entry.  ROCm's own implementation
  * (rocm/ds4_rocm_matmul.cuh:967-991) has a genuine non-cuBLAS kernel
  * fallback (matmul_f32_kernel), gated the same way the Q8_0 GEMM fast path
- * is (g_cublas_ready && n_tok > 1); same reasoning as
- * ds4_gpu_matmul_f16_tensor above for why a hand-written kernel, not a
- * GEMM, is the correct port despite oneMKL now being available. */
+ * is (g_cublas_ready && n_tok > 1). Kept as this hand-written kernel
+ * rather than converted to a GEMM the way ds4_gpu_matmul_f16_tensor and
+ * ds4_gpu_matmul_q8_0_tensor above were: real-layer-eval measurement
+ * shows zero calls to this entry at
+ * all in the DeepSeek V4 Flash checkpoint this backend targets (every
+ * dense weight tensor in that shape is Q8_0 or F16, never plain F32), so
+ * rewriting it cannot be measured against the real workload and would be
+ * exactly the kind of unranked, unmeasured work worth avoiding. Revisit
+ * if a checkpoint that actually uses F32 dense weights shows up in a
+ * future profile. */
 extern "C" int ds4_gpu_matmul_f32_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

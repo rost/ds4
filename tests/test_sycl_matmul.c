@@ -898,11 +898,11 @@ static int test_matmul_f32(void) {
 
 /* Same discriminating shape as test_matmul_f16_pair, applied to the single
  * (non-paired) F16 dense matmul entry, cited to
- * rocm/ds4_rocm_matmul.cuh:804-814/873-931.  This backend has no
- * cuBLAS/oneMKL batched-GEMM fast path wired for this entry either (same
- * reasoning as test_matmul_f32 above), reusing the general kernel already
- * built for ds4_gpu_matmul_f16_pair_tensor
- * (sycl_matmul_f16_launch, sycl/ds4_sycl_matmul.hpp). */
+ * rocm/ds4_rocm_matmul.cuh:804-814/873-931.  This entry
+ * expands its F16 weight table to F32 device-side, then runs the actual
+ * dot products through oneMKL's F32 GEMM (sycl_gemm_batch_f32,
+ * sycl/ds4_sycl_matmul.hpp), replacing the one-work-item-per-output-element
+ * kernel this comment used to describe. */
 static int test_matmul_f16(void) {
     enum { IN_DIM = 37, OUT_DIM = 5, N_TOK = 3 };
 
