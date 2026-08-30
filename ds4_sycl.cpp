@@ -810,6 +810,12 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
 #include "sycl/ds4_sycl_moe.hpp"
 #include "sycl/ds4_sycl_moe_launch.hpp"
 
+/* Expert-parallel decode: owned-routed-MoE entries, reusing
+ * sycl_routed_moe_launch and sycl_moe_stage_selected_experts above. Must
+ * come before ds4_sycl_hc.hpp, which reuses its
+ * sycl_moe_owned_packed_combine_row for the owned hc-expand fusion. */
+#include "sycl/ds4_sycl_moe_owned.hpp"
+
 /* Same scoping reason as the includes above. */
 #include "sycl/ds4_sycl_hc.hpp"
 

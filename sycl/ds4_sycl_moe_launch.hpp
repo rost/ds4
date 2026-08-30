@@ -35,7 +35,12 @@ namespace {
  * whole point of staging n_expert_used experts instead of n_total_expert
  * is invisible in decode's numeric output -- the same weights end up at
  * the same addresses either way -- so per spec 6w, only a counter, not
- * an oracle comparison, can prove compaction actually happened. */
+ * an oracle comparison, can prove compaction actually happened.
+ *
+ * Also set by sycl_routed_moe_one_owned_q4k (ds4_sycl_moe_owned.hpp)
+ * to the distinct owned-and-selected expert count its own compaction
+ * stages, the same counter reused for the same reason: composing
+ * ownership with compaction is invisible in the decode output too. */
 static uint32_t g_sycl_moe_last_staged_expert_count = 0;
 static uint64_t g_sycl_moe_last_staged_bytes = 0;
 
