@@ -37,20 +37,30 @@ int main(void) {
               superset, 5) == 0,
           "superset of required widths must be accepted");
 
-    const uint32_t exact[] = {8, 16, 32};
+    const uint32_t exact[] = {16, 32};
     CHECK(ds4_sycl_missing_required_subgroup_width(
-              exact, 3) == 0,
+              exact, 2) == 0,
           "exact match of required widths must be accepted");
 
-    const uint32_t unordered[] = {32, 8, 16};
+    const uint32_t unordered[] = {32, 16};
     CHECK(ds4_sycl_missing_required_subgroup_width(
-              unordered, 3) == 0,
+              unordered, 2) == 0,
           "required widths out of ascending order must be accepted");
 
-    const uint32_t missing_8[] = {16, 32};
+    /* The two real devices this backend has run on, by the widths they
+     * actually report.  Xe2 is the reason width 8 is not required: the
+     * Arc Pro B60 reports {16, 32} and nothing else, so requiring 8 --
+     * which this backend did until B60 silicon was first available to
+     * test against -- refused every Battlemage card at startup. */
+    const uint32_t xe2_b60[] = {16, 32};
     CHECK(ds4_sycl_missing_required_subgroup_width(
-              missing_8, 2) == 8,
-          "missing width 8 must be reported");
+              xe2_b60, 2) == 0,
+          "Xe2 (Arc Pro B60) reporting {16, 32} must be accepted");
+
+    const uint32_t xe1_a770[] = {8, 16, 32};
+    CHECK(ds4_sycl_missing_required_subgroup_width(
+              xe1_a770, 3) == 0,
+          "Xe1 (A770) reporting {8, 16, 32} must still be accepted");
 
     const uint32_t missing_16[] = {8, 32};
     CHECK(ds4_sycl_missing_required_subgroup_width(
@@ -62,8 +72,15 @@ int main(void) {
               missing_32, 2) == 32,
           "missing width 32 must be reported");
 
+    /* Width 8 on its own satisfies nothing: it is not required, and the
+     * two widths that are required are both absent. */
+    const uint32_t only_8[] = {8};
     CHECK(ds4_sycl_missing_required_subgroup_width(
-              NULL, 0) == 8,
+              only_8, 1) == 16,
+          "a device offering only width 8 must be refused");
+
+    CHECK(ds4_sycl_missing_required_subgroup_width(
+              NULL, 0) == 16,
           "empty supported list must report the first required width");
 
     fprintf(stderr, "test_sycl_subgroup_guard OK\n");

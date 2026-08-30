@@ -167,18 +167,19 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
                                sycl::range<2>(256u, 1u)),
-             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
                  const int32_t local = remap[slot];
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
-                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t lane = sycl_moe_lane8(sg);
                  const uint32_t row_lane = (uint32_t)(it.get_local_id(0) >> 3);
                  const uint32_t row_block = (uint32_t)it.get_group(0);
                  for (uint32_t rr = 0; rr < 4u; rr++) {
-                     const uint32_t row = row_block * 128u + row_lane + rr * 32u;
-                     if (row >= expert_mid_dim) continue;
+                     const uint32_t row_want = row_block * 128u + row_lane + rr * 32u;
+                     const bool row_ok = row_want < expert_mid_dim;
+                     const uint32_t row = row_ok ? row_want : 0u;
                      const sycl_block_q4_K *gr = (const sycl_block_q4_K *)
                              (gate_base + (uint64_t)expert * gate_expert_bytes +
                               (uint64_t)row * gate_row_bytes);
@@ -192,7 +193,7 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
                      }
                      gate = sycl_moe_subgroup_sum<8>(sg, gate);
                      up = sycl_moe_subgroup_sum<8>(sg, up);
-                     if (lane == 0u) {
+                     if (row_ok && lane == 0u) {
                          if (clamp > 1.0e-6f) {
                              if (gate > clamp) gate = clamp;
                              if (up > clamp) up = clamp;
@@ -230,18 +231,19 @@ static void sycl_moe_lut_gate_up_mid_decode_owned(
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
                                sycl::range<2>(256u, 1u)),
-             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
                  const int32_t local = remap[slot];
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
-                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t lane = sycl_moe_lane8(sg);
                  const uint32_t row_lane = (uint32_t)(it.get_local_id(0) >> 3);
                  const uint32_t row_block = (uint32_t)it.get_group(0);
                  for (uint32_t rr = 0; rr < 4u; rr++) {
-                     const uint32_t row = row_block * 128u + row_lane + rr * 32u;
-                     if (row >= expert_mid_dim) continue;
+                     const uint32_t row_want = row_block * 128u + row_lane + rr * 32u;
+                     const bool row_ok = row_want < expert_mid_dim;
+                     const uint32_t row = row_ok ? row_want : 0u;
                      const sycl_block_iq2_xxs *gr = (const sycl_block_iq2_xxs *)
                              (gate_base + (uint64_t)expert * gate_expert_bytes +
                               (uint64_t)row * gate_row_bytes);
@@ -255,7 +257,7 @@ static void sycl_moe_lut_gate_up_mid_decode_owned(
                      }
                      gate = sycl_moe_subgroup_sum<8>(sg, gate);
                      up = sycl_moe_subgroup_sum<8>(sg, up);
-                     if (lane == 0u) {
+                     if (row_ok && lane == 0u) {
                          if (clamp > 1.0e-6f) {
                              if (gate > clamp) gate = clamp;
                              if (up > clamp) up = clamp;
@@ -349,16 +351,17 @@ static void sycl_moe_q4k_down_owned_slots(
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
                                sycl::range<2>(256u, 1u)),
-             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
                  const int32_t local = remap[slot];
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
-                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
-                 const uint32_t row = (uint32_t)it.get_group(0) * 32u +
+                 const uint32_t lane = sycl_moe_lane8(sg);
+                 const uint32_t row_want = (uint32_t)it.get_group(0) * 32u +
                                       (uint32_t)(it.get_local_id(0) >> 3);
-                 if (row >= out_dim) return;
+                 const bool row_ok = row_want < out_dim;
+                 const uint32_t row = row_ok ? row_want : 0u;
                  const sycl_block_q4_K *wr = (const sycl_block_q4_K *)
                          (down_base + (uint64_t)expert * down_expert_bytes +
                           (uint64_t)row * down_row_bytes);
@@ -368,7 +371,7 @@ static void sycl_moe_q4k_down_owned_slots(
                      acc += sycl_dev_dot_q4_k_q8_k_block(wr + b, xqb + b);
                  }
                  acc = sycl_moe_subgroup_sum<8>(sg, acc);
-                 if (lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
+                 if (row_ok && lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
              });
      });
      _ds4_prof_ev121.wait_and_throw();
@@ -388,16 +391,17 @@ static void sycl_moe_lut_down_owned_slots(
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
                                sycl::range<2>(256u, 1u)),
-             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
                  const int32_t local = remap[slot];
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
-                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
-                 const uint32_t row = (uint32_t)it.get_group(0) * 32u +
+                 const uint32_t lane = sycl_moe_lane8(sg);
+                 const uint32_t row_want = (uint32_t)it.get_group(0) * 32u +
                                       (uint32_t)(it.get_local_id(0) >> 3);
-                 if (row >= out_dim) return;
+                 const bool row_ok = row_want < out_dim;
+                 const uint32_t row = row_ok ? row_want : 0u;
                  const sycl_block_q2_K *wr = (const sycl_block_q2_K *)
                          (down_base + (uint64_t)expert * down_expert_bytes +
                           (uint64_t)row * down_row_bytes);
@@ -407,7 +411,7 @@ static void sycl_moe_lut_down_owned_slots(
                      acc += sycl_dev_dot_q2_k_q8_k_block(wr + b, xqb + b);
                  }
                  acc = sycl_moe_subgroup_sum<8>(sg, acc);
-                 if (lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
+                 if (row_ok && lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
              });
      });
      _ds4_prof_ev122.wait_and_throw();
@@ -432,19 +436,20 @@ static void sycl_moe_q4k_down_owned_packed(
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 4u),
                                sycl::range<2>(256u, 1u)),
-             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t packed_slot = (uint32_t)it.get_group(1);
                  bool prefix_pair = false;
                  const int first_slot = sycl_moe_owned_packed_component(
                          orig_selected, packed_slot / 2u, packed_slot & 1u, expert_base,
                          expert_count, &prefix_pair);
                  sycl::sub_group sg = it.get_sub_group();
-                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
-                 const uint32_t row = (uint32_t)it.get_group(0) * 32u +
+                 const uint32_t lane = sycl_moe_lane8(sg);
+                 const uint32_t row_want = (uint32_t)it.get_group(0) * 32u +
                                       (uint32_t)(it.get_local_id(0) >> 3);
-                 if (row >= out_dim) return;
+                 const bool row_ok = row_want < out_dim;
+                 const uint32_t row = row_ok ? row_want : 0u;
                  if (first_slot < 0) {
-                     if (lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = 0.0f;
+                     if (row_ok && lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = 0.0f;
                      return;
                  }
                  const uint32_t n_slots = prefix_pair ? 2u : 1u;
@@ -463,9 +468,9 @@ static void sycl_moe_q4k_down_owned_packed(
                          acc += sycl_dev_dot_q4_k_q8_k_block(wr + b, xqb + b);
                      }
                      acc = sycl_moe_subgroup_sum<8>(sg, acc);
-                     if (lane == 0u) packed = prefix_pair ? packed + acc : acc;
+                     if (row_ok && lane == 0u) packed = prefix_pair ? packed + acc : acc;
                  }
-                 if (lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
+                 if (row_ok && lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
              });
      });
      _ds4_prof_ev123.wait_and_throw();
@@ -486,19 +491,20 @@ static void sycl_moe_lut_down_owned_packed(
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 4u),
                                sycl::range<2>(256u, 1u)),
-             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t packed_slot = (uint32_t)it.get_group(1);
                  bool prefix_pair = false;
                  const int first_slot = sycl_moe_owned_packed_component(
                          orig_selected, packed_slot / 2u, packed_slot & 1u, expert_base,
                          expert_count, &prefix_pair);
                  sycl::sub_group sg = it.get_sub_group();
-                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
-                 const uint32_t row = (uint32_t)it.get_group(0) * 32u +
+                 const uint32_t lane = sycl_moe_lane8(sg);
+                 const uint32_t row_want = (uint32_t)it.get_group(0) * 32u +
                                       (uint32_t)(it.get_local_id(0) >> 3);
-                 if (row >= out_dim) return;
+                 const bool row_ok = row_want < out_dim;
+                 const uint32_t row = row_ok ? row_want : 0u;
                  if (first_slot < 0) {
-                     if (lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = 0.0f;
+                     if (row_ok && lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = 0.0f;
                      return;
                  }
                  const uint32_t n_slots = prefix_pair ? 2u : 1u;
@@ -517,9 +523,9 @@ static void sycl_moe_lut_down_owned_packed(
                          acc += sycl_dev_dot_q2_k_q8_k_block(wr + b, xqb + b);
                      }
                      acc = sycl_moe_subgroup_sum<8>(sg, acc);
-                     if (lane == 0u) packed = prefix_pair ? packed + acc : acc;
+                     if (row_ok && lane == 0u) packed = prefix_pair ? packed + acc : acc;
                  }
-                 if (lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
+                 if (row_ok && lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
              });
      });
      _ds4_prof_ev124.wait_and_throw();

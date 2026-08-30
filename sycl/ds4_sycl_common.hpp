@@ -53,13 +53,26 @@ static inline int sycl_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c,
 }
 
 /* Every [[sycl::reqd_sub_group_size(N)]] width this backend's kernels
- * require, enumerated directly from the sycl headers (2026-08-29): width 8
- * appears 15 times (ds4_sycl_moe.hpp x12, ds4_sycl_attention.hpp x2,
- * ds4_sycl_attention_output.hpp x1 via kGroupedQ8ASubgroupWidth), width 16
- * appears 2 times (ds4_sycl_moe.hpp), width 32 appears 11 times
+ * require, enumerated directly from the sycl headers (2026-08-31): width
+ * 16 appears 25 times (ds4_sycl_moe.hpp x14, ds4_sycl_moe_owned.hpp x6,
+ * ds4_sycl_attention.hpp x2, plus one each behind a named constant in
+ * ds4_sycl_attention_output.hpp via kGroupedQ8ASubgroupWidth,
+ * ds4_sycl_hc.hpp via kHcExpandTileSubgroup and ds4_sycl_matmul.hpp via
+ * kQ8_0TileSubgroup); width 32 appears 12 times
  * (ds4_sycl_attention.hpp x4, ds4_sycl_moe.hpp x2,
- * ds4_sycl_shared_expert.hpp x2, ds4_sycl_attention_output.hpp x1,
- * ds4_sycl_indexer.hpp x1, ds4_sycl_router.hpp x1).
+ * ds4_sycl_shared_expert.hpp x2, ds4_sycl_attention_output.hpp x2,
+ * ds4_sycl_indexer.hpp x1, ds4_sycl_router.hpp x1).  Count them by name
+ * as well as by literal: three of the width-16 sites are spelled as a
+ * constant and a numeric grep alone will miss them.
+ *
+ * WIDTH 8 IS DELIBERATELY ABSENT AND MUST STAY ABSENT. Xe2 (Battlemage,
+ * Arc Pro B60) reports sub-group widths {16, 32} only; Xe1 (Alchemist,
+ * A770) also offered 8. Requiring 8 refuses every Xe2 card outright, which
+ * is what this backend did until B60 silicon was first available to test
+ * against. Kernels that want an 8-lane cooperative group get one by
+ * running in a 16-wide sub-group and treating it as two independent
+ * 8-lane halves (sycl_moe_lane8, ds4_sycl_moe.hpp), which is the same
+ * masked-partition scheme CUDA uses inside its own 32-wide warps.
  *
  * Per spec 6m, [[sycl::reqd_sub_group_size(N)]] is NOT a hard requirement
  * on this stack: a device that cannot honour N is not refused by the
@@ -76,7 +89,7 @@ static inline int sycl_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c,
  * LISTED HERE, ADD THE WIDTH HERE TOO, or ds4_gpu_init will not check for
  * it and a device unable to honour it will silently corrupt that kernel's
  * output. */
-static constexpr uint32_t kRequiredSubGroupWidths[] = {8u, 16u, 32u};
+static constexpr uint32_t kRequiredSubGroupWidths[] = {16u, 32u};
 
 static inline int sycl_tensor_has_bytes(const ds4_gpu_tensor *t, uint64_t bytes) {
     return t && t->ptr && t->bytes >= bytes;

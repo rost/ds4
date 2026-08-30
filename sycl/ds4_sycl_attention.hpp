@@ -321,10 +321,15 @@ static inline float sycl_attn_dot4(sycl::float4 a, sycl::float4 b) {
 }
 
 /* warp_sum_f32 / attention_warp_sum_oldhip_w32 shape, generalised over the
- * sub-group width: a shuffle-down reduction tree. Ported as a genuine
- * sycl::sub_group reduction rather than a masked partition of a wider warp,
- * so no mask is needed the way CUDA needs one to fence a shuffle to a
- * sub-range of its 32-wide warp. Note that [[sycl::reqd_sub_group_size(N)]]
+ * sub-group width: a shuffle-down reduction tree. Where N is the whole
+ * hardware sub-group width this is a genuine sycl::sub_group reduction,
+ * needing none of the masking CUDA uses to fence a shuffle to a sub-range
+ * of its 32-wide warp. At N=8 it IS a partition of a wider sub-group,
+ * because Xe2 has no 8-wide sub-group: it runs inside a 16-wide one as two
+ * independent halves. It still needs no mask, because shift_group_left
+ * only ever reads higher lanes, so lane 0's result depends on lanes 0-7
+ * and lane 8's on lanes 8-15 (fuller note on sycl_moe_subgroup_sum,
+ * ds4_sycl_moe.hpp). Note that [[sycl::reqd_sub_group_size(N)]]
  * is advisory, not enforced by the driver on this stack (spec 6m): a
  * device unable to honour N does not fail the kernel launch, it silently
  * runs a different width, which would make this reduction's compiled-in
@@ -352,8 +357,9 @@ static inline float sycl_attn_subgroup_sum(sycl::sub_group sg, float v) {
  * this is a true batch (n_tokens > 1): a plain per-lane strided loop when
  * there is nothing to gain from parallelising a single row's dot product
  * (visible_comp == 0 or n_tokens == 1, matching the CUDA source exactly),
- * and an 8-lane-per-row grouping, 8-wide via reqd_sub_group_size, genuine
- * only via ds4_gpu_init's device guard (spec 6m), otherwise. The
+ * and an 8-lane-per-row grouping otherwise, run as one half of a 16-wide
+ * reqd_sub_group_size sub-group and genuine only via ds4_gpu_init's device
+ * guard (spec 6m). The
  * block-wide max/sum reductions (CUDA's own plain shared-
  * memory `partial[]` tree, not the oldhip warp-shuffle scheme) are
  * substituted with sycl_block_row_reduce for the same reason as the oldhip
@@ -808,7 +814,7 @@ static int sycl_attention_decode_batch_launch(
                 h.parallel_for(
                         sycl::nd_range<2>(sycl::range<2>((size_t)n_tokens * kBlock, n_head),
                                           sycl::range<2>(kBlock, 1)),
-                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                        [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                             sycl_attention_decode_mixed_kernel(
                                     it, scores, raw_rows, reduce_scratch, raw_meta, pheads,
                                     psinks, pq, praw, pcomp, pmask, use_comp_mask, n_tokens,
@@ -1644,7 +1650,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             h.parallel_for(
                     sycl::nd_range<2>(sycl::range<2>((size_t)n_tokens * kBlock, n_head),
                                       sycl::range<2>(kBlock, 1)),
-                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                    [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                         sycl_attention_indexed_mixed_kernel(
                                 it, scores, raw_rows, comp_rows, reduce_scratch, raw_meta,
                                 comp_meta, pheads, psinks, pq, praw, pcomp, psorted, n_tokens,

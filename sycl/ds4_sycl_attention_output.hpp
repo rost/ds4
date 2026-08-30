@@ -245,20 +245,21 @@ static void sycl_quantize_q8_0_group_slice_rows_launch(sycl::queue &q, int8_t *x
  * warp_sum_f32 reduction over the same per-lane partials.
  *
  * ROCm's own kernel always uses a 32-lane reduction here (`lane =
- * threadIdx.x & 31`, `warp_sum_f32`). This port deliberately uses an
- * 8-lane sub-group instead: correctness is identical either way (each lane
- * simply owns more or fewer blocks before the final sum; Flash's real
- * shape has blocks=128, divisible by both 8 and 32 with no remainder), and
- * using 8 here alongside the 32-wide quantiser above exercises both
- * sub-group widths the tech stack calls for. It also gives the
- * required ablation ("an 8-wide reduction done at 16 or 32 lanes, built as
- * a genuine sub-group spanning two logical groups") a real substrate: none
- * of the nine named kernels has a genuine 8-wide hardware reduction (their
- * "8" in "warp8" counts 8 independent 32-wide warps per thread block, not
- * an 8-wide reduction), so this port supplies one rather than fabricate the
- * ablation against a width that was never actually 8-wide anywhere in the
- * ROCm source. */
-static constexpr uint32_t kGroupedQ8ASubgroupWidth = 8u;
+ * threadIdx.x & 31`, `warp_sum_f32`). The width is free: correctness is
+ * identical either way, each lane simply owns more or fewer blocks before
+ * the final sum, and Flash's real shape has blocks=128, divisible by 8, 16
+ * and 32 alike with no remainder.
+ *
+ * 16 is the narrowest width every supported device actually has. This was
+ * 8 until B60 silicon showed that Xe2 has no 8-wide sub-group at all (see
+ * kRequiredSubGroupWidths, ds4_sycl_common.hpp). Unlike the MoE kernels,
+ * which keep 8-lane halves inside a 16-wide sub-group so their
+ * accumulation order survives unchanged, this kernel widens genuinely: it
+ * is written entirely in terms of the constant below, reduce_over_group
+ * included, so the only effect is that each lane owns half as many blocks.
+ * That does shift float32 accumulation order, which this kernel's tests
+ * already tolerate by construction. */
+static constexpr uint32_t kGroupedQ8ASubgroupWidth = 16u;
 
 static void sycl_grouped_q8_0_a_preq_kernel(sycl::nd_item<1> it, float *low,
                                             const unsigned char *w,
@@ -296,8 +297,8 @@ static void sycl_grouped_q8_0_a_preq_kernel(sycl::nd_item<1> it, float *low,
     if (lane == 0u) low[tok * low_dim + row] = acc;
 }
 
-/* n_tokens * n_groups * rank independent output rows, one 8-lane sub-group
- * per row. `low_dim` is passed precomputed (n_groups * rank) since every
+/* n_tokens * n_groups * rank independent output rows, one
+ * kGroupedQ8ASubgroupWidth-lane sub-group per row. `low_dim` is passed precomputed (n_groups * rank) since every
  * caller below has already overflow-checked it. */
 static sycl::event sycl_grouped_q8_0_a_preq_launch(sycl::queue &q, float *low,
                                             const unsigned char *w,

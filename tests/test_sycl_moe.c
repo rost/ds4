@@ -457,27 +457,45 @@ static int test_q8_k_quantize_rejects_partial_row(void) {
  * to be zero"). */
 static int test_subgroup_sum(void) {
     const int widths[2] = {8, 16};
+    /* Both an even and an odd group count.  The 8-lane path has no 8-wide
+     * sub-group to run in (Xe2 has only 16 and 32), so it packs two groups
+     * into the two halves of one 16-wide sub-group.  An odd count is the
+     * only shape that leaves a half idle, and so the only one that
+     * exercises the guard stopping that half from writing out[n_groups]. */
+    const int group_counts[2] = {6, 7};
+    enum { MAX_GROUPS = 7 };
     for (int wi = 0; wi < 2; wi++) {
         const int width = widths[wi];
-        enum { N_GROUPS = 6 };
-        float in[6 * 16];
-        float want[6];
-        for (int g = 0; g < N_GROUPS; g++) {
-            float sum = 0.0f;
-            for (int lane = 0; lane < width; lane++) {
-                float v = (float)(g * 100 + lane + 1);
-                in[g * width + lane] = v;
-                sum += v;
+        for (int ci = 0; ci < 2; ci++) {
+            const int n_groups = group_counts[ci];
+            float in[MAX_GROUPS * 16];
+            float want[MAX_GROUPS];
+            for (int g = 0; g < n_groups; g++) {
+                float sum = 0.0f;
+                for (int lane = 0; lane < width; lane++) {
+                    float v = (float)(g * 100 + lane + 1);
+                    in[g * width + lane] = v;
+                    sum += v;
+                }
+                want[g] = sum;
             }
-            want[g] = sum;
-        }
-        float got[N_GROUPS];
-        char msg[64];
-        snprintf(msg, sizeof(msg), "subgroup_sum: width %d call failed", width);
-        CHECK(ds4_sycl_moe_test_subgroup_sum(width, in, N_GROUPS, got) != 0, msg);
-        for (int g = 0; g < N_GROUPS; g++) {
-            snprintf(msg, sizeof(msg), "subgroup_sum: width %d group %d mismatch", width, g);
-            CHECK_CLOSE(got[g], want[g], 1e-3, msg);
+            /* One slot past the end, left as a sentinel: an idle half that
+             * wrote its zero anyway would land exactly here. */
+            float got[MAX_GROUPS + 1];
+            const float sentinel = -12345.0f;
+            got[n_groups] = sentinel;
+            char msg[96];
+            snprintf(msg, sizeof(msg), "subgroup_sum: width %d n_groups %d call failed",
+                     width, n_groups);
+            CHECK(ds4_sycl_moe_test_subgroup_sum(width, in, (uint32_t)n_groups, got) != 0, msg);
+            for (int g = 0; g < n_groups; g++) {
+                snprintf(msg, sizeof(msg), "subgroup_sum: width %d n_groups %d group %d mismatch",
+                         width, n_groups, g);
+                CHECK_CLOSE(got[g], want[g], 1e-3, msg);
+            }
+            snprintf(msg, sizeof(msg), "subgroup_sum: width %d n_groups %d wrote past out",
+                     width, n_groups);
+            CHECK(got[n_groups] == sentinel, msg);
         }
     }
     fprintf(stderr, "  test_subgroup_sum OK\n");

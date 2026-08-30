@@ -1708,15 +1708,17 @@ reach an unimplemented kernel mid-decode.
   tested, but the development machine has one GPU. The 14-logical-GPU target
   topology, and Battlemage's PCIe-switched dual-die cards specifically, have
   never been exercised.
-* **The sub-group width guard is dangerous precisely because it has never
-  fired.** This backend's kernels require GPU sub-group widths 8, 16, and 32.
-  A GPU that does not report one of these silently runs a different width
-  with no error, and every kernel using that width returns plausible wrong
-  numbers rather than failing, so `ds4` checks every enumerated device at
-  startup and refuses to start, naming the missing width, if any device lacks
-  one. The A770 offers exactly {8, 16, 32}, so this guard has never actually
-  triggered; it is unverified on the hardware it exists for; Battlemage's
-  architecture change (SIMD8 to SIMD16-native) makes width 8 the one to watch.
+* **The sub-group width guard has now fired, on the width it was pointed at.**
+  This backend's kernels require GPU sub-group widths 16 and 32. A GPU that
+  does not report one of these silently runs a different width with no error,
+  and every kernel using that width returns plausible wrong numbers rather
+  than failing, so `ds4` checks every enumerated device at startup and refuses
+  to start, naming the missing width, if any device lacks one. Width 8 was
+  required too, until B60 hardware showed that Xe2 reports only {16, 32}; the
+  A770's Xe1 offers {8, 16, 32}, so the requirement had gone unchallenged.
+  The twenty kernels that wanted an 8-lane cooperative group now run as two
+  8-lane halves of a 16-wide sub-group, which leaves their accumulation order
+  unchanged.
 * **Flash does not fit on one GPU.** The routed 2-bit quant is about 81 GB on
   disk; a single card in the 14-logical-GPU target has 24 GB. Either spread
   layers across GPUs with `--gpu-vram`/`--gpu-devices`, or use
