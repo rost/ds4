@@ -28,20 +28,6 @@
 #define SYCL_UNAVAILABLE_ZERO_OK(name)    extern "C" int name(...) { return 1; }
 #define SYCL_UNAVAILABLE_VOID(name) extern "C" void name(...) { }
 
-/* Tensor parallelism is Metal-only, permanently out of scope. */
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_kslice_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_output_q8_tp_tensor)
-
-/* ds4_gpu_hc_expand_add_tensor does not appear in rocm/ds4_rocm_hc_output_
- * launch.cuh or anywhere else under rocm/: it is implemented only in
- * ds4_cuda.cu and ds4_metal.m (CUDA-and-Metal, not Metal-only as this
- * comment previously said), so there is no ROCm structural reference to
- * port from and this stub is permanently correct as-is. */
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_hc_expand_add_tensor)
-
-extern "C" uint64_t ds4_gpu_tp_big_gate_kick(...) { return 0; }
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_tp_big_gate_wait)
-
 /* Everything below was harvested from real link errors: build, extract the
  * undefined ds4_gpu_ symbols, grep each one's declared return type in
  * ds4_gpu.h (ds4_gpu_args.h for ds4_gpu_args_probe_auto_cuda), and add the
@@ -65,14 +51,10 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_set_glm_model)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_set_quality)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_keepalive_pause)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_set_attn_head_split)
-SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_suspend_expert_sharding)
 
 /* int returns. */
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_add_xdev_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_noncausal_raw_batch_heads_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_output_low_q8_rows_exact_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_prefill_raw_heads_range_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_prefill_static_mixed_heads_range_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_build_derived_artifacts)
 /* Entry-specific convention, not the usual nonzero-means-success family
@@ -131,14 +113,10 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_store_compact_kv_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_store_indexer_k_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_glm_value_project_typed_batch_heads_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_indexer_top1_value_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_f16_rms_fold_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_f16_router_rows_exact_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_decode_rows_exact_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_kslice_rows_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_matmul_q8_0_top1_tensor)
 /* ds4_gpu_matmul_quant_decode_mpp_model_view_tensor stays stubbed: its only
  * call site (ds4.c:41241, glm_graph_matmul_q8_0_decode_tensor) is in the
  * glm_graph_* family, GLM-only, out of scope for this Flash-only backend
@@ -173,6 +151,3 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_should_use_managed_kv_cache)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_tensor_copy_async)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_tp_batch_gate_encode)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_tp_big_gate_encode)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_tp_gate_encode)
