@@ -34,7 +34,19 @@
  *      output is the cheapest race detector available. This is checked
  *      with several independent repeats, not a single pair, and any
  *      mismatch is reported as a flaky result rather than absorbed into a
- *      tolerance. */
+ *      tolerance.
+ *
+ * A fifth assertion beyond the four above and beyond the
+ * cache comparison: with ds4_test_graph_full_token_encode_compressed,
+ * layers 2 and 3 (Flash's own ratio pattern, "0, 0, 4, 128") drive the
+ * attention compressor, and layer 2 additionally drives the indexer --
+ * metal_graph_encode_decode_layer_phase dereferences those fields only
+ * when the layer's ratio is non-zero, and every DS4_TEST_HOOKS entry point
+ * had forced every layer to ratio 0 until now, so this path had
+ * never executed through the engine before. The assertion that matters
+ * most, per design-spec 6w: the compressed run's logits must differ from
+ * the ratio-0 baseline for the identical input and weight buffer, or the
+ * compressor is not running and every other assertion is vacuous. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -62,6 +74,18 @@
  * per call. */
 int ds4_test_graph_full_token_encode(int token, float *out_logits, uint64_t out_logits_floats);
 int ds4_test_graph_full_token_encode_cached(int token, float *out_logits, uint64_t out_logits_floats);
+
+/* Layers 2 and 3 (Flash's own ratio pattern) drive the attention
+ * compressor, and layer 2 additionally drives the indexer -- the largest
+ * untested surface on this backend before now, per this file's own
+ * updated top comment below. Both run at DS4_TW_COMPRESSED_DECODE_POS, not
+ * position 0 -- see ds4_test_graph_full_token_encode_compressed's own
+ * ds4.c comment for why position 0 cannot tell the two paths apart.
+ * _baseline is the identical run at ratio 0, same position, same weight
+ * buffer: the ratio-0 half of the spec 6w comparison below. */
+int ds4_test_graph_full_token_encode_compressed(int token, float *out_logits, uint64_t out_logits_floats);
+int ds4_test_graph_full_token_encode_compressed_baseline(int token, float *out_logits,
+                                                          uint64_t out_logits_floats);
 
 /* sycl/ds4_sycl_model_cache.hpp test-only hooks; not part of the
  * ABI. Used below to prove the cached run actually took the cached path,
@@ -165,13 +189,20 @@ static int measure_bytes_and_time(int repeats) {
  * synthetic weights), returning 1 if every repeat succeeded and produced
  * bit-identical logits to the first, 0 on the first failure or mismatch. A
  * mismatch prints which repeat first diverged and at which vocab index, so
- * a flaky run is reported as a flaky run rather than silently retried. */
+ * a flaky run is reported as a flaky run rather than silently retried.
+ * encode_fn is a parameter so the identical loop and identical
+ * flaky-vs-clean diagnostic serve both ds4_test_graph_full_token_encode and
+ * ds4_test_graph_full_token_encode_compressed below, rather than a second,
+ * drifting copy of this function. */
 #define DS4_FULL_TOKEN_DETERMINISM_REPEATS 5
 
-static int check_determinism(int token, const float *baseline) {
+typedef int (*ds4_test_full_token_encode_fn)(int, float *, uint64_t);
+
+static int check_determinism(ds4_test_full_token_encode_fn encode_fn,
+                             int token, const float *baseline) {
     for (int r = 0; r < DS4_FULL_TOKEN_DETERMINISM_REPEATS; r++) {
         float logits[DS4_TW_N_VOCAB];
-        if (!ds4_test_graph_full_token_encode(token, logits, DS4_TW_N_VOCAB)) {
+        if (!encode_fn(token, logits, DS4_TW_N_VOCAB)) {
             fprintf(stderr,
                     "FAIL: determinism repeat %d of token %d failed to encode\n",
                     r, token);
@@ -246,7 +277,7 @@ int main(void) {
      * the in_order property; this is the cheapest available detector for
      * a queue-ordering race across a graph with enough concurrent work
      * (four layers of routed MoE) to expose one. */
-    CHECK(check_determinism(/*token=*/3, logits_a) != 0,
+    CHECK(check_determinism(ds4_test_graph_full_token_encode, /*token=*/3, logits_a) != 0,
           "the same token did not produce bit-identical logits across "
           "repeated encodes -- see the diagnostic above for whether this "
           "was a clean failure or a flaky one");
@@ -290,6 +321,58 @@ int main(void) {
     fprintf(stderr,
             "  test_sycl_full_token OK (determinism stable across %d repeats, "
             "cached vs uncached bit-identical)\n",
+            DS4_FULL_TOKEN_DETERMINISM_REPEATS);
+
+    /* Assertion 6: the compressor and indexer, driven for the
+     * first time on this backend, at DS4_TW_COMPRESSED_DECODE_POS (see
+     * ds4_test_graph_full_token_encode_compressed's own ds4.c comment for
+     * why not position 0). logits_baseline below is the clean ratio-0
+     * baseline for token 3 at the SAME position, from the exact same
+     * weight buffer ds4_test_graph_full_token_encode_compressed uses.
+     * Layers 0 and 1 stay at ratio 0 either way; layers 2 and 3
+     * dereference layer->attn_compressor_... and (layer 2 only)
+     * layer->indexer_... only when compressed. The one assertion that
+     * matters most (spec 6w): if this run produced the SAME logits as the
+     * ratio-0 baseline, the compressor is not running and every other
+     * assertion below is vacuous. */
+    float logits_baseline[DS4_TW_N_VOCAB];
+    memset(logits_baseline, 0, sizeof(logits_baseline));
+    CHECK(ds4_test_graph_full_token_encode_compressed_baseline(/*token=*/3, logits_baseline,
+                                                                DS4_TW_N_VOCAB) != 0,
+          "the ratio-0 baseline at DS4_TW_COMPRESSED_DECODE_POS failed to encode");
+    for (uint64_t i = 0; i < DS4_TW_N_VOCAB; i++) {
+        CHECK(isfinite(logits_baseline[i]),
+              "ratio-0 baseline (at DS4_TW_COMPRESSED_DECODE_POS) logits contain a "
+              "non-finite value");
+    }
+
+    float logits_compressed[DS4_TW_N_VOCAB];
+    memset(logits_compressed, 0, sizeof(logits_compressed));
+    CHECK(ds4_test_graph_full_token_encode_compressed(/*token=*/3, logits_compressed,
+                                                      DS4_TW_N_VOCAB) != 0,
+          "a full DeepSeek V4 Flash token failed to encode with the "
+          "attention compressor and indexer enabled");
+
+    int compressed_any_diff = 0;
+    for (uint64_t i = 0; i < DS4_TW_N_VOCAB; i++) {
+        CHECK(isfinite(logits_compressed[i]),
+              "compressed-path token logits contain a non-finite value");
+        if (logits_compressed[i] != logits_baseline[i]) compressed_any_diff = 1;
+    }
+    CHECK(compressed_any_diff,
+          "enabling the attention compressor and indexer did not change the "
+          "logits at all -- the compressed path did not actually run");
+
+    CHECK(check_determinism(ds4_test_graph_full_token_encode_compressed, /*token=*/3,
+                            logits_compressed) != 0,
+          "the compressed path is not deterministic: repeated encodes of "
+          "the same token diverged -- see the diagnostic above for whether "
+          "this was a clean failure or a flaky one");
+
+    fprintf(stderr,
+            "  test_sycl_full_token compressed path OK (layers 2 and 3 at "
+            "ratio 4 and 128 differ from the ratio-0 baseline, deterministic "
+            "across %d repeats)\n",
             DS4_FULL_TOKEN_DETERMINISM_REPEATS);
 
     if (measure_bytes_and_time(10)) return 1;

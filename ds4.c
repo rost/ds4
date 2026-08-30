@@ -58075,19 +58075,36 @@ typedef struct {
                attn_output_a, attn_output_b, hc_ffn_fn, hc_ffn_scale,
                hc_ffn_base, ffn_norm, ffn_gate_inp, ffn_gate_exps,
                ffn_up_exps, ffn_down_exps, ffn_gate_shexp, ffn_up_shexp,
-               ffn_down_shexp, ffn_gate_tid2eid;
+               ffn_down_shexp, ffn_gate_tid2eid,
+               attn_compressor_ape, attn_compressor_kv, attn_compressor_gate,
+               attn_compressor_norm, indexer_attn_q_b, indexer_proj,
+               indexer_compressor_ape, indexer_compressor_kv,
+               indexer_compressor_gate, indexer_compressor_norm;
 } ds4_test_tw_layer_storage;
 
 /* Fills every ds4_layer_weights field but ffn_gate_tid2eid from twl into
  * st's matching ds4_tensor and points l at it.  ffn_gate_tid2eid is only
  * copied and bound when has_tid2eid is set; otherwise l->ffn_gate_tid2eid
  * is left NULL, exactly the choice weights_bind_layer (ds4.c:5948) makes
- * for a real model's top-k layers. */
+ * for a real model's top-k layers.
+ *
+ * The attention compressor fields are bound whenever ds4_tw_compress_ratio
+ * (il) != 0, and the indexer fields whenever it == 4, mirroring
+ * weights_layer_has_required's own ratio gating (ds4.c:4888-4907) exactly:
+ * a ratio-0 layer's l->attn_compressor_* / l->indexer_* are left NULL here
+ * the same way a real model's would be, even though twl (built by
+ * tests/test_sycl_layer_weights.h for every layer regardless of the
+ * caller's chosen g_ds4_compress_ratios) may hold zeroed-but-present
+ * ds4_tw_tensor descriptors for them. il is the tw layer's own index (the
+ * shape's own static compression pattern), independent of whatever ratio
+ * the caller has or has not turned on in g_ds4_compress_ratios[il] for
+ * this run. */
 static void ds4_test_tw_layer_to_weights(
         ds4_layer_weights        *l,
         ds4_test_tw_layer_storage *st,
         const ds4_tw_layer       *twl,
-        bool                       has_tid2eid) {
+        bool                       has_tid2eid,
+        uint32_t                   il) {
     ds4_test_tw_to_tensor(&st->hc_attn_fn, &twl->hc_attn_fn);
     ds4_test_tw_to_tensor(&st->hc_attn_scale, &twl->hc_attn_scale);
     ds4_test_tw_to_tensor(&st->hc_attn_base, &twl->hc_attn_base);
@@ -58142,6 +58159,44 @@ static void ds4_test_tw_layer_to_weights(
     } else {
         l->ffn_gate_tid2eid = NULL;
     }
+
+    const uint32_t ratio = ds4_tw_compress_ratio(il);
+    if (ratio != 0u) {
+        ds4_test_tw_to_tensor(&st->attn_compressor_ape, &twl->attn_compressor_ape);
+        ds4_test_tw_to_tensor(&st->attn_compressor_kv, &twl->attn_compressor_kv);
+        ds4_test_tw_to_tensor(&st->attn_compressor_gate, &twl->attn_compressor_gate);
+        ds4_test_tw_to_tensor(&st->attn_compressor_norm, &twl->attn_compressor_norm);
+        l->attn_compressor_ape  = &st->attn_compressor_ape;
+        l->attn_compressor_kv   = &st->attn_compressor_kv;
+        l->attn_compressor_gate = &st->attn_compressor_gate;
+        l->attn_compressor_norm = &st->attn_compressor_norm;
+    } else {
+        l->attn_compressor_ape  = NULL;
+        l->attn_compressor_kv   = NULL;
+        l->attn_compressor_gate = NULL;
+        l->attn_compressor_norm = NULL;
+    }
+    if (ratio == 4u) {
+        ds4_test_tw_to_tensor(&st->indexer_attn_q_b, &twl->indexer_attn_q_b);
+        ds4_test_tw_to_tensor(&st->indexer_proj, &twl->indexer_proj);
+        ds4_test_tw_to_tensor(&st->indexer_compressor_ape, &twl->indexer_compressor_ape);
+        ds4_test_tw_to_tensor(&st->indexer_compressor_kv, &twl->indexer_compressor_kv);
+        ds4_test_tw_to_tensor(&st->indexer_compressor_gate, &twl->indexer_compressor_gate);
+        ds4_test_tw_to_tensor(&st->indexer_compressor_norm, &twl->indexer_compressor_norm);
+        l->indexer_attn_q_b        = &st->indexer_attn_q_b;
+        l->indexer_proj            = &st->indexer_proj;
+        l->indexer_compressor_ape  = &st->indexer_compressor_ape;
+        l->indexer_compressor_kv   = &st->indexer_compressor_kv;
+        l->indexer_compressor_gate = &st->indexer_compressor_gate;
+        l->indexer_compressor_norm = &st->indexer_compressor_norm;
+    } else {
+        l->indexer_attn_q_b        = NULL;
+        l->indexer_proj            = NULL;
+        l->indexer_compressor_ape  = NULL;
+        l->indexer_compressor_kv   = NULL;
+        l->indexer_compressor_gate = NULL;
+        l->indexer_compressor_norm = NULL;
+    }
 }
 
 /* One level deeper still than ds4_test_graph_full_layer_encode: that hook
@@ -58177,11 +58232,26 @@ static void ds4_test_tw_layer_to_weights(
  * invoked directly since this hook builds no real ds4_engine. The public
  * wrapper below always passes false, preserving every existing caller's
  * behaviour exactly; ds4_test_graph_full_token_encode_cached passes true,
- * so a test can compare the two and require bit-identical logits. */
+ * so a test can compare the two and require bit-identical logits.
+ *
+ * compressed: when true, every layer's g_ds4_compress_ratios[il]
+ * is set to ds4_tw_compress_ratio(il) after the unconditional all-zero
+ * memset below, giving Flash's own "0, 0, 4, 128" pattern across this
+ * hook's DS4_TW_N_LAYER == 4 layers -- layers 2 and 3 then drive the
+ * attention compressor, and layer 2 (ratio 4) additionally drives the
+ * indexer, through metal_graph_encode_decode_layer_phase for the first
+ * time on this backend. false preserves every existing caller's ratio-0
+ * behaviour exactly, from the identical weight buffer (see this header's
+ * own comment on ds4_test_build_flash_layer_weights): the tensors exist
+ * either way, only whether the engine is told to read them changes. */
 static int ds4_test_graph_full_token_encode_impl(int token, float *out_logits,
                                                   uint64_t out_logits_floats,
-                                                  bool cache_model) {
+                                                  bool cache_model,
+                                                  bool compressed,
+                                                  uint32_t pos) {
     const ds4_shape saved_shape = g_ds4_shape;
+    uint32_t saved_compress_ratios[DS4_MAX_LAYER];
+    memcpy(saved_compress_ratios, g_ds4_compress_ratios, sizeof(saved_compress_ratios));
 
     g_ds4_shape = (ds4_shape){
         .name = "test-flash-token",
@@ -58205,9 +58275,9 @@ static int ds4_test_graph_full_token_encode_impl(int token, float *out_logits,
         .n_ff_dense = 32,
         .n_hash_layer = DS4_TW_N_HASH_LAYER,
         .n_swa = DS4_TW_N_SWA,
-        .n_indexer_head = 2,
-        .n_indexer_head_dim = 8,
-        .n_indexer_top_k = 4,
+        .n_indexer_head = DS4_TW_N_INDEXER_HEAD,
+        .n_indexer_head_dim = DS4_TW_N_INDEXER_HEAD_DIM,
+        .n_indexer_top_k = DS4_TW_N_INDEXER_TOP_K,
         .n_hc = DS4_TW_N_HC,
         .n_hc_sinkhorn_iter = DS4_TW_N_HC_SINKHORN_ITER,
         .rms_eps = DS4_DEFAULT_RMS_EPS,
@@ -58221,20 +58291,28 @@ static int ds4_test_graph_full_token_encode_impl(int token, float *out_logits,
         .compress_rope_freq_base = DS4_DEFAULT_COMPRESS_ROPE_FREQ_BASE,
         .rope_orig_ctx = DS4_DEFAULT_ROPE_ORIG_CTX,
     };
-    /* Compress ratio 0 for every layer: the attention compressor and
-     * indexer are out of scope (see tests/test_sycl_layer_weights.h's
-     * header comment), matching the synthetic weights this hook builds
-     * below. */
+    /* Every DS4_TEST_HOOKS entry point starts from all-zero ratios; a
+     * compressed run then overwrites its own layers on top of that
+     * baseline rather than replacing the memset, so the baseline this
+     * hook has always used is still visible in the diff and still the
+     * literal starting state for every call. */
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    if (compressed) {
+        for (uint32_t il = 0; il < DS4_TW_N_LAYER; il++) {
+            g_ds4_compress_ratios[il] = ds4_tw_compress_ratio(il);
+        }
+    }
 
     if (out_logits_floats != DS4_TW_N_VOCAB) {
         g_ds4_shape = saved_shape;
+        memcpy(g_ds4_compress_ratios, saved_compress_ratios, sizeof(saved_compress_ratios));
         return 0;
     }
 
     ds4_tw_flash_weights tw;
     if (!ds4_test_build_flash_layer_weights(&tw)) {
         g_ds4_shape = saved_shape;
+        memcpy(g_ds4_compress_ratios, saved_compress_ratios, sizeof(saved_compress_ratios));
         return 0;
     }
 
@@ -58277,7 +58355,7 @@ static int ds4_test_graph_full_token_encode_impl(int token, float *out_logits,
     ds4_test_tw_layer_storage layer_storage[DS4_TW_N_LAYER];
     for (uint32_t il = 0; il < DS4_TW_N_LAYER; il++) {
         ds4_test_tw_layer_to_weights(&weights.layer[il], &layer_storage[il],
-                                     &tw.layer[il], il < DS4_TW_N_HASH_LAYER);
+                                     &tw.layer[il], il < DS4_TW_N_HASH_LAYER, il);
     }
 
     ds4_gpu_graph g;
@@ -58297,18 +58375,20 @@ static int ds4_test_graph_full_token_encode_impl(int token, float *out_logits,
      * the output head, end_commands, then read DS4_N_VOCAB logits back. */
     if (ok) {
         ok = metal_graph_eval_token_raw_swa(&g, &model, &weights,
-                                            token, /*pos=*/0, out_logits);
+                                            token, pos, out_logits);
     }
 
     metal_graph_free(&g);
     ds4_test_free_flash_layer_weights(&tw);
     g_ds4_shape = saved_shape;
+    memcpy(g_ds4_compress_ratios, saved_compress_ratios, sizeof(saved_compress_ratios));
     return ok ? 1 : 0;
 }
 
 int ds4_test_graph_full_token_encode(int token, float *out_logits, uint64_t out_logits_floats) {
     return ds4_test_graph_full_token_encode_impl(token, out_logits, out_logits_floats,
-                                                 /*cache_model=*/false);
+                                                 /*cache_model=*/false, /*compressed=*/false,
+                                                 /*pos=*/0u);
 }
 
 /* Identical to ds4_test_graph_full_token_encode above except the
@@ -58320,7 +58400,44 @@ int ds4_test_graph_full_token_encode(int token, float *out_logits, uint64_t out_
 int ds4_test_graph_full_token_encode_cached(int token, float *out_logits,
                                             uint64_t out_logits_floats) {
     return ds4_test_graph_full_token_encode_impl(token, out_logits, out_logits_floats,
-                                                 /*cache_model=*/true);
+                                                 /*cache_model=*/true, /*compressed=*/false,
+                                                 /*pos=*/0u);
+}
+
+/* Layers 2 and 3 (Flash's own ratio pattern) drive the attention
+ * compressor (metal_graph_encode_decode_layer_phase, ds4.c:21856) and
+ * layer 2 additionally drives the indexer -- both dereferenced only when
+ * ds4_layer_compress_ratio(il) != 0, which every DS4_TEST_HOOKS entry
+ * point had forced to 0 for every layer until this hook.
+ *
+ * Runs at DS4_TW_COMPRESSED_DECODE_POS, not position 0: this hook builds
+ * one graph and calls metal_graph_eval_token_raw_swa exactly once, so
+ * position 0 is also the very first token the compressor has ever seen,
+ * "emit" is false for both compressed layers at that position (ds4.c:
+ * 22613), and the compressor's own output cache never gets a row to
+ * contribute -- the compressed and ratio-0 paths would compute
+ * identically at position 0 by construction, telling a test nothing
+ * (design-spec 6w). DS4_TW_COMPRESSED_DECODE_POS instead makes both
+ * layers emit into their cache on this single call, so the difference
+ * the test needs to observe actually has something to differ over.
+ *
+ * ds4_test_graph_full_token_encode_compressed_baseline below is the
+ * ratio-0 half of that comparison, at the SAME position and from the
+ * IDENTICAL weight buffer, so a caller requiring the two outputs to
+ * differ is checking that the ratio flag alone, not a difference in
+ * position or data, changed what the engine computed. */
+int ds4_test_graph_full_token_encode_compressed(int token, float *out_logits,
+                                                uint64_t out_logits_floats) {
+    return ds4_test_graph_full_token_encode_impl(token, out_logits, out_logits_floats,
+                                                 /*cache_model=*/false, /*compressed=*/true,
+                                                 DS4_TW_COMPRESSED_DECODE_POS);
+}
+
+int ds4_test_graph_full_token_encode_compressed_baseline(int token, float *out_logits,
+                                                          uint64_t out_logits_floats) {
+    return ds4_test_graph_full_token_encode_impl(token, out_logits, out_logits_floats,
+                                                 /*cache_model=*/false, /*compressed=*/false,
+                                                 DS4_TW_COMPRESSED_DECODE_POS);
 }
 
 /* Prefill, a batch of tokens at once, through the engine's real
@@ -58387,9 +58504,9 @@ static ds4_shape ds4_test_prefill_layer_shape(void) {
         .n_ff_dense = 32,
         .n_hash_layer = 0,
         .n_swa = DS4_TW_N_SWA,
-        .n_indexer_head = 2,
-        .n_indexer_head_dim = 8,
-        .n_indexer_top_k = 4,
+        .n_indexer_head = DS4_TW_N_INDEXER_HEAD,
+        .n_indexer_head_dim = DS4_TW_N_INDEXER_HEAD_DIM,
+        .n_indexer_top_k = DS4_TW_N_INDEXER_TOP_K,
         .n_hc = DS4_TW_N_HC,
         .n_hc_sinkhorn_iter = DS4_TW_N_HC_SINKHORN_ITER,
         .rms_eps = DS4_DEFAULT_RMS_EPS,
@@ -58405,7 +58522,12 @@ static ds4_shape ds4_test_prefill_layer_shape(void) {
     };
 }
 
-static int ds4_test_prefill_fixture_build(ds4_test_prefill_fixture *f) {
+/* il selects which of tw's DS4_TW_N_LAYER layers f->layer points at.
+ * Every existing caller passes 0 (Flash's own ratio-0 layer), preserving
+ * their exact prior behaviour; the compressed prefill hooks below
+ * pass a layer whose ds4_tw_compress_ratio is non-zero instead, from the
+ * same synthetic model buffer. */
+static int ds4_test_prefill_fixture_build(ds4_test_prefill_fixture *f, uint32_t il) {
     memset(f, 0, sizeof(*f));
     if (!ds4_test_build_flash_layer_weights(&f->tw)) return 0;
 
@@ -58416,9 +58538,9 @@ static int ds4_test_prefill_fixture_build(ds4_test_prefill_fixture *f) {
 
     memset(&f->weights, 0, sizeof(f->weights));
     f->weights.token_embd = &f->token_embd_t;
-    f->layer = &f->weights.layer[0];
-    ds4_test_tw_layer_to_weights(f->layer, &f->layer_storage, &f->tw.layer[0],
-                                 /*has_tid2eid=*/false);
+    f->layer = &f->weights.layer[il];
+    ds4_test_tw_layer_to_weights(f->layer, &f->layer_storage, &f->tw.layer[il],
+                                 /*has_tid2eid=*/false, il);
     return 1;
 }
 
@@ -58435,25 +58557,47 @@ static void ds4_test_prefill_fixture_free(ds4_test_prefill_fixture *f) {
  * and make the batch sizes not directly comparable. */
 enum { DS4_TEST_PREFILL_GRAPH_CAP = 64u };
 
+/* The compressed-prefill hooks below need n_tokens >= ratio for
+ * n_comp = n_tokens / ratio (ds4.c:28676-28679, the zero_prefix branch)
+ * to be non-zero at all: with zero compressed history the mixed-attention
+ * branches at ds4.c:29383/29517 are skipped entirely (n_comp == 0), so
+ * "compression ran" would be untestable regardless of which layer or
+ * ratio is chosen. Layer 3's ratio is 128 (ds4_tw_compress_ratio), so
+ * n_tokens == 128 gives n_comp == 1 exactly: the smallest batch that can
+ * possibly exercise this path for that layer. */
+enum { DS4_TEST_PREFILL_COMPRESSED_GRAPH_CAP = 128u };
+
 /* Drives metal_graph_encode_layer_batch (ds4.c:30533) for a single layer
  * over `n_tokens` positions starting at pos0 == 0, reading back every
  * token's post-FFN hidden-connection state (metal_graph_batch_cur_hc after
- * the cur/next swap metal_graph_encode_layer_batch itself performs). */
-int ds4_test_graph_prefill_layer_batch_encode(const int *tokens, uint32_t n_tokens,
-                                              float *out_hc, uint64_t out_hc_floats) {
+ * the cur/next swap metal_graph_encode_layer_batch itself performs).
+ *
+ * il selects which of the fixture's DS4_TW_N_LAYER layers actually
+ * encodes, compressed selects Flash's own ratio for that layer or leaves
+ * every layer at 0 (see ds4_test_prefill_fixture_build and ds4_test_graph_
+ * full_token_encode_impl's own comment on the same flag), and graph_cap
+ * sizes raw_cap/ctx_size/prefill_cap together, per the comment on
+ * DS4_TEST_PREFILL_GRAPH_CAP above. The three public entry points below
+ * fix these at the values each one needs; il and compressed are threaded
+ * straight through to metal_graph_encode_layer_batch's own il and to
+ * g_ds4_compress_ratios, never re-derived. */
+static int ds4_test_graph_prefill_layer_batch_encode_il_impl(
+        const int *tokens, uint32_t n_tokens, float *out_hc, uint64_t out_hc_floats,
+        uint32_t il, bool compressed, uint32_t graph_cap) {
     const ds4_shape saved_shape = g_ds4_shape;
     g_ds4_shape = ds4_test_prefill_layer_shape();
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
+    if (compressed) g_ds4_compress_ratios[il] = ds4_tw_compress_ratio(il);
 
     const uint64_t hc_dim = (uint64_t)DS4_TW_N_HC * DS4_TW_N_EMBD;
-    if (!tokens || n_tokens == 0 || n_tokens > DS4_TEST_PREFILL_GRAPH_CAP ||
+    if (!tokens || n_tokens == 0 || n_tokens > graph_cap ||
         out_hc_floats != (uint64_t)n_tokens * hc_dim) {
         g_ds4_shape = saved_shape;
         return 0;
     }
 
     ds4_test_prefill_fixture f;
-    if (!ds4_test_prefill_fixture_build(&f)) {
+    if (!ds4_test_prefill_fixture_build(&f, il)) {
         g_ds4_shape = saved_shape;
         return 0;
     }
@@ -58466,9 +58610,9 @@ int ds4_test_graph_prefill_layer_batch_encode(const int *tokens, uint32_t n_toke
     ds4_gpu_graph g;
     memset(&g, 0, sizeof(g));
     bool ok = metal_graph_alloc_raw_cap(&g, &f.weights, f.layer,
-                                        /*raw_cap=*/DS4_TEST_PREFILL_GRAPH_CAP,
-                                        /*ctx_size=*/DS4_TEST_PREFILL_GRAPH_CAP,
-                                        /*prefill_cap=*/DS4_TEST_PREFILL_GRAPH_CAP,
+                                        /*raw_cap=*/graph_cap,
+                                        /*ctx_size=*/graph_cap,
+                                        /*prefill_cap=*/graph_cap,
                                         /*enable_mtp=*/false,
                                         /*placement=*/NULL,
                                         /*cuda_tensor_parallel=*/false,
@@ -58485,7 +58629,7 @@ int ds4_test_graph_prefill_layer_batch_encode(const int *tokens, uint32_t n_toke
     }
     if (ok) ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
-        ok = metal_graph_encode_layer_batch(&g, &f.model, f.layer, /*il=*/0,
+        ok = metal_graph_encode_layer_batch(&g, &f.model, f.layer, il,
                                             /*pos0=*/0, n_tokens);
     }
     if (ok) ok = ds4_gpu_end_commands() != 0;
@@ -58499,6 +58643,41 @@ int ds4_test_graph_prefill_layer_batch_encode(const int *tokens, uint32_t n_toke
     ds4_test_prefill_fixture_free(&f);
     g_ds4_shape = saved_shape;
     return ok ? 1 : 0;
+}
+
+int ds4_test_graph_prefill_layer_batch_encode(const int *tokens, uint32_t n_tokens,
+                                              float *out_hc, uint64_t out_hc_floats) {
+    return ds4_test_graph_prefill_layer_batch_encode_il_impl(
+            tokens, n_tokens, out_hc, out_hc_floats,
+            /*il=*/0u, /*compressed=*/false, DS4_TEST_PREFILL_GRAPH_CAP);
+}
+
+/* Layer 3 (ds4_tw_compress_ratio(3) == 128) at ratio 0, from the
+ * SAME fixture weights ds4_test_graph_prefill_layer_batch_encode_compressed
+ * below uses at ratio 128. This is the ratio-0 baseline half of the spec
+ * 6w comparison: a caller requiring the two outputs to differ on the
+ * identical input and weights is checking that the ratio flag alone, not
+ * a difference in data, changed what the engine computed. */
+int ds4_test_graph_prefill_layer_batch_encode_compressed_baseline(
+        const int *tokens, uint32_t n_tokens, float *out_hc, uint64_t out_hc_floats) {
+    return ds4_test_graph_prefill_layer_batch_encode_il_impl(
+            tokens, n_tokens, out_hc, out_hc_floats,
+            /*il=*/3u, /*compressed=*/false, DS4_TEST_PREFILL_COMPRESSED_GRAPH_CAP);
+}
+
+/* Drives layer 3 at its own ratio (128) through the real prefill
+ * batch path with n_tokens large enough (DS4_TEST_PREFILL_COMPRESSED_
+ * GRAPH_CAP's own comment) for n_comp != 0, which is what reaches
+ * ds4_gpu_attention_prefill_static_mixed_heads_tensor at ds4.c:29532 --
+ * the "mixed path" the coverage audit identifies as the largest remaining
+ * untested surface in long-context prefill, and the entry point
+ * sycl/ds4_sycl_attention.hpp's test-only counter
+ * ds4_sycl_test_attn_prefill_static_mixed_calls confirms actually ran. */
+int ds4_test_graph_prefill_layer_batch_encode_compressed(
+        const int *tokens, uint32_t n_tokens, float *out_hc, uint64_t out_hc_floats) {
+    return ds4_test_graph_prefill_layer_batch_encode_il_impl(
+            tokens, n_tokens, out_hc, out_hc_floats,
+            /*il=*/3u, /*compressed=*/true, DS4_TEST_PREFILL_COMPRESSED_GRAPH_CAP);
 }
 
 /* The decode-side reference for the assertion above: decodes the same
@@ -58524,7 +58703,7 @@ int ds4_test_graph_decode_layer_sequence_encode(const int *tokens, uint32_t n_to
     }
 
     ds4_test_prefill_fixture f;
-    if (!ds4_test_prefill_fixture_build(&f)) {
+    if (!ds4_test_prefill_fixture_build(&f, /*il=*/0u)) {
         g_ds4_shape = saved_shape;
         return 0;
     }

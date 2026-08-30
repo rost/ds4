@@ -38,7 +38,14 @@
  * fixture is deliberately not changed to head_dim ==
  * 512 to chase that path: a decode-side reachability trace
  * shows it is not reachable from this entry regardless of head_dim, for the
- * window value a single-GPU raw-attention layer ever supplies. */
+ * window value a single-GPU raw-attention layer ever supplies.
+ *
+ * A compressed-prefill block is added at the end of main: every batch
+ * above runs layer 0 at ratio 0, so none of them reach
+ * ds4_gpu_attention_prefill_static_mixed_heads_tensor (ds4.c:29532),
+ * dereferenced only when ds4_layer_compress_ratio(il) != 0. That entry is
+ * where long-context prefill over compressed KV lives, and it had never
+ * executed through the engine before now. */
 
 #include "ds4_gpu.h"
 #include "ds4_gpu_mgpu.h"
@@ -63,7 +70,35 @@ int ds4_test_graph_prefill_layer_batch_encode(const int *tokens, uint32_t n_toke
 int ds4_test_graph_decode_layer_sequence_encode(const int *tokens, uint32_t n_tokens,
                                                 float *out_hc, uint64_t out_hc_floats);
 
+/* Layer 3 (ds4_tw_compress_ratio(3) == 128) through the same real
+ * batch path, at ratio 128 and at ratio 0 from the identical fixture
+ * weights -- see both functions' own ds4.c comments. */
+int ds4_test_graph_prefill_layer_batch_encode_compressed(const int *tokens, uint32_t n_tokens,
+                                                         float *out_hc, uint64_t out_hc_floats);
+int ds4_test_graph_prefill_layer_batch_encode_compressed_baseline(
+        const int *tokens, uint32_t n_tokens, float *out_hc, uint64_t out_hc_floats);
+
+/* sycl/ds4_sycl_attention.hpp test-only hooks; not part of the
+ * ABI. Count how many times ds4_gpu_attention_prefill_static_mixed_heads_
+ * tensor and its sibling ds4_gpu_attention_indexed_mixed_batch_heads_
+ * tensor have actually reached a kernel launch, so this test can show
+ * WHICH of the two mixed-attention entries the compressed prefill run
+ * below took, not just that some path produced plausible-looking output
+ * (design-spec 6w). */
+extern uint64_t ds4_sycl_test_attn_prefill_static_mixed_calls(void);
+extern void     ds4_sycl_test_attn_prefill_static_mixed_calls_reset(void);
+extern uint64_t ds4_sycl_test_attn_indexed_mixed_calls(void);
+extern void     ds4_sycl_test_attn_indexed_mixed_calls_reset(void);
+
 #define DS4_TEST_PREFILL_MAX_TOKENS 64u
+
+/* The smallest batch that can reach n_comp != 0 for layer 3's
+ * ratio (128) in a single zero_prefix prefill chunk (n_comp = n_tokens /
+ * ratio, ds4.c:28676-28679) -- see
+ * ds4_test_graph_prefill_layer_batch_encode_compressed's own ds4.c
+ * comment for why n_comp != 0 is required to reach the mixed-attention
+ * branches at all. */
+#define DS4_TEST_PREFILL_COMPRESSED_TOKENS 128u
 
 /* Deterministic, non-affine, bounded token ids (spec 6f/6n: an affine
  * progression launders bugs a real, varied prompt would not). `salt`
@@ -200,6 +235,79 @@ int main(void) {
                     "(at index %llu) max_rel_diff=%.6f\n",
                     n_tokens, max_abs_diff, (unsigned long long)max_diff_idx, max_rel_diff);
         }
+    }
+
+    /* Prefill through the compressed mixed-attention path. Every
+     * batch above ran at ratio 0 (layer 0); this drives layer 3, whose
+     * ds4_tw_compress_ratio is 128, at a batch size large enough for
+     * n_comp != 0. Three claims, in order of value:
+     *   1. Output differs from the ratio-0 baseline for the identical
+     *      input and weight buffer (spec 6w) -- proves the compressor
+     *      actually ran, not just that the call returned success.
+     *   2. ds4_gpu_attention_prefill_static_mixed_heads_tensor's own call
+     *      counter went from 0 to non-zero, and its sibling
+     *      ds4_gpu_attention_indexed_mixed_batch_heads_tensor's counter
+     *      stayed at 0 -- proves WHICH mixed-attention entry executed,
+     *      not merely that some kernel did.
+     *   3. Determinism holds with compression on. */
+    {
+        static int compressed_tokens[DS4_TEST_PREFILL_COMPRESSED_TOKENS];
+        static float compressed_out[DS4_TEST_PREFILL_COMPRESSED_TOKENS * DS4_TW_HC_DIM];
+        static float baseline_out[DS4_TEST_PREFILL_COMPRESSED_TOKENS * DS4_TW_HC_DIM];
+        static float compressed_out_repeat[DS4_TEST_PREFILL_COMPRESSED_TOKENS * DS4_TW_HC_DIM];
+        const uint64_t n_floats = (uint64_t)DS4_TEST_PREFILL_COMPRESSED_TOKENS * hc_dim;
+
+        fill_tokens(compressed_tokens, DS4_TEST_PREFILL_COMPRESSED_TOKENS, /*salt=*/7u);
+
+        CHECK(ds4_test_graph_prefill_layer_batch_encode_compressed_baseline(
+                      compressed_tokens, DS4_TEST_PREFILL_COMPRESSED_TOKENS,
+                      baseline_out, n_floats) != 0,
+              "compressed-prefill ratio-0 baseline (layer 3) failed to encode");
+        CHECK(check_finite_and_nonzero(baseline_out, n_floats,
+                                       "compressed-prefill ratio-0 baseline output"),
+              "compressed-prefill ratio-0 baseline output");
+
+        ds4_sycl_test_attn_prefill_static_mixed_calls_reset();
+        ds4_sycl_test_attn_indexed_mixed_calls_reset();
+        CHECK(ds4_test_graph_prefill_layer_batch_encode_compressed(
+                      compressed_tokens, DS4_TEST_PREFILL_COMPRESSED_TOKENS,
+                      compressed_out, n_floats) != 0,
+              "compressed prefill batch encode (layer 3, ratio 128) failed");
+        CHECK(check_finite_and_nonzero(compressed_out, n_floats, "compressed prefill output"),
+              "compressed prefill output");
+
+        int compressed_any_diff = 0;
+        for (uint64_t i = 0; i < n_floats; i++) {
+            if (compressed_out[i] != baseline_out[i]) { compressed_any_diff = 1; break; }
+        }
+        CHECK(compressed_any_diff,
+              "enabling compression did not change the prefill output at all -- "
+              "the compressed path did not actually run");
+
+        const uint64_t static_mixed_calls = ds4_sycl_test_attn_prefill_static_mixed_calls();
+        const uint64_t indexed_mixed_calls = ds4_sycl_test_attn_indexed_mixed_calls();
+        CHECK(static_mixed_calls > 0,
+              "ds4_gpu_attention_prefill_static_mixed_heads_tensor never reached its "
+              "kernel launch during the compressed prefill run");
+        CHECK(indexed_mixed_calls == 0,
+              "ds4_gpu_attention_indexed_mixed_batch_heads_tensor ran during a ratio-128 "
+              "prefill batch, which should only ever take the static-mixed path");
+
+        CHECK(ds4_test_graph_prefill_layer_batch_encode_compressed(
+                      compressed_tokens, DS4_TEST_PREFILL_COMPRESSED_TOKENS,
+                      compressed_out_repeat, n_floats) != 0,
+              "compressed prefill batch encode repeat failed");
+        CHECK(memcmp(compressed_out, compressed_out_repeat, (size_t)n_floats * sizeof(float)) == 0,
+              "compressed prefill output is not deterministic across repeats");
+
+        fprintf(stderr,
+                "  compressed prefill (layer 3, ratio 128, n_tokens=%u): differs from "
+                "ratio-0 baseline, ds4_gpu_attention_prefill_static_mixed_heads_tensor "
+                "called %llu time(s), ds4_gpu_attention_indexed_mixed_batch_heads_tensor "
+                "called %llu time(s), deterministic across repeat\n",
+                DS4_TEST_PREFILL_COMPRESSED_TOKENS,
+                (unsigned long long)static_mixed_calls,
+                (unsigned long long)indexed_mixed_calls);
     }
 
     fprintf(stderr, "  test_sycl_prefill_batch OK\n");
