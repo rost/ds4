@@ -667,6 +667,55 @@ extern const char *ds4_sycl_test_profile_bucket_name(uint64_t i);
 extern uint64_t    ds4_sycl_test_profile_bucket_ns(uint64_t i);
 extern uint64_t    ds4_sycl_test_profile_bucket_calls(uint64_t i);
 
+/* Sums the calls/eval of every profile bucket whose name
+ * starts with `prefix`, so "did the indexer subsystem fire" can be
+ * answered by counter evidence (spec's own standard, matching how the
+ * compressed-attention test proved which attention entry ran) instead of by re-deriving which of
+ * the many indexer_topk_* / indexer_scores_* / attn_indexed_mixed*
+ * bucket names (dc91266) a given call path happens to use. `repeats`
+ * divides out multi-repeat accumulation the same way print_kernel_ranking
+ * does; pass 1 to read a raw undivided total. */
+static uint64_t sum_calls_with_prefix(const char *prefix, int repeats) {
+    uint64_t total = 0;
+    const uint64_t nb = ds4_sycl_test_profile_bucket_count();
+    const size_t plen = strlen(prefix);
+    for (uint64_t i = 0; i < nb; i++) {
+        const char *nm = ds4_sycl_test_profile_bucket_name(i);
+        if (nm && strncmp(nm, prefix, plen) == 0) {
+            total += ds4_sycl_test_profile_bucket_calls(i) / (uint64_t)repeats;
+        }
+    }
+    return total;
+}
+
+/* The gated top-k selection kernels specifically, as
+ * distinct from the indexer's other, always-on per-token bucket
+ * ("indexer_qat_hadamard_fp4", ds4_gpu_dsv4_indexer_qat_tensor: called
+ * unconditionally to build the indexer's own Q/K representation every
+ * time index data is computed, ds4.c:22924-29228, regardless of whether
+ * n_comp has crossed DS4_N_INDEXER_TOP_K) and "indexer_argmax"
+ * (ds4_gpu_argmax_tensor, ds4.c:31317 and friends: greedy-decode logits
+ * argmax, unrelated to the indexer despite living in ds4_sycl_
+ * indexer.hpp and sharing its bucket-name prefix). A bare "indexer"
+ * prefix match on the first attempt at this check silently counted the
+ * always-on QAT bucket and reported a false "the indexer fired" on a
+ * plain 21-step decode loop; this file's own run caught it, which is
+ * exactly spec 6i's warning that a check able to pass for the wrong
+ * reason needs sharper discrimination, not just any nonzero count. */
+static uint64_t sum_indexer_selection_calls(int repeats) {
+    return sum_calls_with_prefix("indexer_topk", repeats) +
+           sum_calls_with_prefix("indexer_scores", repeats);
+}
+
+/* Both indexed-attention families: the batched path (ds4.c:29331,
+ * "attn_indexed_mixed*") and the single-token fast path (ds4.c:1560ish,
+ * "attn_decode_indexed_mixed_one_fast_oldhip"), which a bare
+ * "attn_indexed" prefix would miss. */
+static uint64_t sum_indexed_attention_calls(int repeats) {
+    return sum_calls_with_prefix("attn_indexed", repeats) +
+           sum_calls_with_prefix("attn_decode_indexed", repeats);
+}
+
 /* Rank the named kernel-family buckets by device time, so
  * the most expensive kernel is identified from a real measurement before
  * any of them is rewritten. Simple insertion sort: at most kSyclProfileMaxBuckets
@@ -1038,6 +1087,126 @@ int main(int argc, char **argv) {
             ds4_engine_close(eb);
             ds4_gpu_cleanup();
         }
+    }
+
+    /* ---- Does the ratio-4 indexer subsystem, and the
+     * ratio-4 indexed attention path, actually fire?
+     *
+     * (a) Single decode steps. The correctness-check call above (one
+     * eval at pos0=0) plus the earlier 20-repeat decode loop
+     * (pos0=1..20) are both n_tokens==1 calls against this same layer-2,
+     * ratio-4 session, and their kernel-family bucket counts are still
+     * live: nothing between there and here calls ds4_sycl_test_profile_
+     * reset. The persistent-graph decode gate is
+     * `layer_n_comp[il] > decode_sparse_threshold && layer_n_index_
+     * comp[il] > DS4_N_INDEXER_TOP_K` (ds4.c:22946-22950). At ratio 4,
+     * comp_counts[t] = (pos0 + t + 1) / ratio (ds4.c:28858), so after 21
+     * decode steps layer_n_comp is at most 21 / 4 = 5, nowhere near
+     * DS4_N_INDEXER_TOP_K (512 in this harness's metadata) -- the
+     * counters below confirm that arithmetic instead of just asserting
+     * it. */
+    if (g_load_ratio == 4u) {
+        const uint64_t decode_indexer_calls = sum_indexer_selection_calls(1);
+        const uint64_t decode_indexed_attn_calls = sum_indexed_attention_calls(1);
+        fprintf(stderr,
+                "  (a) single-decode firing check: indexer "
+                "kernel calls=%llu, attn_indexed_mixed calls=%llu over 21 "
+                "n_tokens==1 calls at ratio 4 (layer_n_comp tops out at 5, "
+                "gate needs > %u)\n",
+                (unsigned long long)decode_indexer_calls,
+                (unsigned long long)decode_indexed_attn_calls,
+                (unsigned)FLASH_N_INDEXER_TOP_K);
+        CHECK(decode_indexer_calls == 0 && decode_indexed_attn_calls == 0,
+              "indexer/indexed-attention kernels fired on a single decode step at ratio 4 -- gate arithmetic above is wrong");
+
+        /* (b) One large zero_prefix prefill call. n_comp ends the call at
+         * (pos0 + n_tokens) / ratio = n_tokens / 4 for pos0 == 0
+         * (ds4.c:28858); DS4_N_INDEXER_TOP_K is 512 here, so n_tokens
+         * must exceed 2048 for `ratio == 4 && n_comp > DS4_N_INDEXER_
+         * TOP_K` (ds4.c:29384) to go true within this one call.
+         * big_n_tokens=2100 clears that (n_comp=525) with an
+         * unambiguous integer margin while staying far inside this
+         * session's prefill_cap (4096 at context_size=8192, per ds4_
+         * prefill_cap_for_prompt's >4096-prompt-length branch,
+         * ds4.c:12165 -- this harness's own engine_open trace confirms
+         * prefill_cap=4096 for this context size).
+         *
+         * Each repeat needs its own fresh engine and session: a
+         * zero_prefix (pos0 == 0) call is only legal once per session
+         * (ds4_session_slice_check_timeline rejects a second pos0 == 0
+         * against an already-advanced position, the same reason the
+         * cache-OFF measurement above reopens per repeat), so there is
+         * no way to average this measurement inside one persistent
+         * session the way the decode loop does. */
+        const uint32_t big_n_tokens = 2100u;
+        const int repeats = 5;
+        double total_ms = 0.0;
+        for (int r = 0; r <= repeats; r++) {
+            ds4_engine_options optc = make_opt(path);
+            ds4_engine *ec = NULL;
+            CHECK(ds4_engine_open(&ec, &optc) == 0, "ds4_engine_open failed for the ratio-4 prefill run");
+            ds4_session *sc = NULL;
+            CHECK(ds4_session_create(&sc, ec, optc.context_size) == 0,
+                  "ds4_session_create failed for the ratio-4 prefill run");
+
+            const uint64_t chc = (uint64_t)big_n_tokens * hc_dim;
+            float *cin = (float *)malloc(chc * sizeof(float));
+            float *cout = (float *)calloc((size_t)chc, sizeof(float));
+            int *ctok = (int *)malloc((size_t)big_n_tokens * sizeof(int));
+            CHECK(cin != NULL && cout != NULL && ctok != NULL,
+                  "out of memory allocating prefill buffers");
+            for (uint64_t i = 0; i < chc; i++) cin[i] = fill_val((uint32_t)i, 199u);
+            for (uint32_t t = 0; t < big_n_tokens; t++) ctok[t] = (int)(t % FLASH_N_VOCAB);
+
+            if (r == 1) {
+                ds4_sycl_test_profile_reset();
+                ds4_sycl_test_profile_enable(1);
+            }
+            char errc[256];
+            errc[0] = '\0';
+            const double ct0 = now_secs();
+            int rcc = ds4_session_eval_layer_slice(sc, ctok, big_n_tokens, /*pos0=*/0,
+                                                   g_load_layer, g_load_layer,
+                                                   cin, cout, /*output_logits=*/false, NULL,
+                                                   errc, sizeof(errc));
+            const double ct1 = now_secs();
+            CHECK(rcc == 0, errc[0] ? errc : "prefill eval failed");
+            for (uint64_t i = 0; i < chc; i++) {
+                CHECK(isfinite(cout[i]), "prefill output has a non-finite value");
+            }
+            if (r == 0) {
+                /* Discard the first execution's timing (measurement
+                 * discipline: a freshly linked binary's first execution
+                 * reads far above its warm cost), but still check its
+                 * output and leave profiling off during it. */
+                ds4_sycl_test_profile_enable(0);
+            } else {
+                total_ms += (ct1 - ct0) * 1000.0;
+            }
+
+            free(cin);
+            free(cout);
+            free(ctok);
+            ds4_session_free(sc);
+            ds4_engine_close(ec);
+            ds4_gpu_cleanup();
+        }
+        ds4_sycl_test_profile_enable(0);
+
+        const uint64_t prefill_indexer_calls = sum_indexer_selection_calls(repeats);
+        const uint64_t prefill_indexed_attn_calls = sum_indexed_attention_calls(repeats);
+        fprintf(stderr,
+                "  (b) prefill n_tokens=%u ratio4: %.3f ms/eval "
+                "(warm avg of %d), n_comp=%u > DS4_N_INDEXER_TOP_K=%u, "
+                "indexer kernel calls=%llu/eval, attn_indexed_mixed "
+                "calls=%llu/eval\n",
+                big_n_tokens, total_ms / repeats, repeats, big_n_tokens / 4u,
+                (unsigned)FLASH_N_INDEXER_TOP_K,
+                (unsigned long long)prefill_indexer_calls,
+                (unsigned long long)prefill_indexed_attn_calls);
+        CHECK(prefill_indexer_calls > 0 && prefill_indexed_attn_calls > 0,
+              "indexer/indexed-attention kernels did NOT fire on the ratio-4 large prefill -- the ratio-4 firing premise failed");
+        print_kernel_ranking("prefill kernel ranking (ratio4)", repeats);
     }
 
     /* ---- Ablation: corrupt layer 3's first tensor's rel_offset so its
