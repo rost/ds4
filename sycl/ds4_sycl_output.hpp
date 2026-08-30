@@ -128,16 +128,22 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
     if (!scale_p || !base_p) return 0;
     if (g_devices.empty()) return 0;
 
-    /* scale and base live in the host mmap; copy the few bytes we need to
-     * the device rather than dereferencing host memory from a kernel. */
-    const float scale = *(const float *)scale_p;
-
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
-        float *dbase = sycl::malloc_device<float>(n_hc, q);
+
+        /* scale and base may live in the host mmap, or already be
+         * device-resident if the model-range cache cached this range
+         * (sycl_model_range_ptr above): a raw host dereference of scale_p
+         * would be undefined behaviour once it can be a device pointer
+         * (spec 6l/6g), so read the one scalar with a real queue.memcpy
+         * instead, which SYCL performs correctly whichever kind of USM
+         * pointer scale_p turns out to be. */
+        float scale = 0.0f;
+        q.memcpy(&scale, scale_p, sizeof(float)).wait_and_throw();
+
+        sycl_device_scratch_guard dbase_guard = sycl_stage_host_bytes(q, base_p, row_bytes);
+        float *dbase = (float *)dbase_guard.p;
         if (!dbase) return 0;
-        sycl_device_scratch_guard dbase_guard(q, dbase);
-        q.memcpy(dbase, base_p, (size_t)row_bytes).wait_and_throw();
 
         float       *o  = (float *)out->ptr;
         const float *pp = (const float *)pre->ptr;

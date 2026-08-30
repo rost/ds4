@@ -210,17 +210,12 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         try {
             sycl::queue &q = ds4_sycl_queue(gate->device_id);
 
-            unsigned char *dwg =
-                    sycl::malloc_device<unsigned char>((size_t)weight_bytes, q);
+            sycl_device_scratch_guard dwg_guard = sycl_stage_host_bytes(q, wg, weight_bytes);
+            unsigned char *dwg = (unsigned char *)dwg_guard.p;
             if (!dwg) return 0;
-            sycl_device_scratch_guard dwg_guard(q, dwg);
-            unsigned char *dwu =
-                    sycl::malloc_device<unsigned char>((size_t)weight_bytes, q);
+            sycl_device_scratch_guard dwu_guard = sycl_stage_host_bytes(q, wu, weight_bytes);
+            unsigned char *dwu = (unsigned char *)dwu_guard.p;
             if (!dwu) return 0;
-            sycl_device_scratch_guard dwu_guard(q, dwu);
-
-            q.memcpy(dwg, wg, (size_t)weight_bytes).wait_and_throw();
-            q.memcpy(dwu, wu, (size_t)weight_bytes).wait_and_throw();
 
             sycl_shared_gate_up_swiglu_q8_0_rows_w32(
                     q, (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
@@ -597,17 +592,12 @@ static int sycl_shared_gate_up_swiglu_q8_0_batch(
     try {
         sycl::queue &q = ds4_sycl_queue(gate->device_id);
 
-        unsigned char *dwg =
-                sycl::malloc_device<unsigned char>((size_t)weight_bytes, q);
+        sycl_device_scratch_guard dwg_guard = sycl_stage_host_bytes(q, wg, weight_bytes);
+        unsigned char *dwg = (unsigned char *)dwg_guard.p;
         if (!dwg) return 0;
-        sycl_device_scratch_guard dwg_guard(q, dwg);
-        unsigned char *dwu =
-                sycl::malloc_device<unsigned char>((size_t)weight_bytes, q);
+        sycl_device_scratch_guard dwu_guard = sycl_stage_host_bytes(q, wu, weight_bytes);
+        unsigned char *dwu = (unsigned char *)dwu_guard.p;
         if (!dwu) return 0;
-        sycl_device_scratch_guard dwu_guard(q, dwu);
-
-        q.memcpy(dwg, wg, (size_t)weight_bytes).wait_and_throw();
-        q.memcpy(dwu, wu, (size_t)weight_bytes).wait_and_throw();
 
         float *pgate = (float *)gate->ptr;
         float *pup = (float *)up->ptr;

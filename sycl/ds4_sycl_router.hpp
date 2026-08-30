@@ -370,18 +370,17 @@ extern "C" int ds4_gpu_router_select_tensor(
     try {
         sycl::queue &q = ds4_sycl_queue(selected->device_id);
 
-        /* The bias/hash table lives in the host mmap; stage it to device
+        /* The bias/hash table lives in the host mmap (or is already
+         * device-resident, per the model-range cache); stage it to device
          * scratch under a guard, same as ds4_sycl_compressor.hpp's APE
-         * staging -- never a bare malloc_device/free pair. */
-        unsigned char *dscratch = nullptr;
-        if (scratch_bytes != 0u) {
-            dscratch = sycl::malloc_device<unsigned char>((size_t)scratch_bytes, q);
-            if (!dscratch) return 0;
-        }
-        sycl_device_scratch_guard scratch_guard(q, dscratch);
-        if (dscratch) {
-            q.memcpy(dscratch, scratch_src, (size_t)scratch_bytes).wait_and_throw();
-        }
+         * staging -- never a bare malloc_device/free pair. Skip the call
+         * entirely for scratch_bytes == 0: neither has_bias nor hash_mode
+         * needs a table then, and scratch_src may be null. */
+        sycl_device_scratch_guard scratch_guard = scratch_bytes != 0u
+                ? sycl_stage_host_bytes(q, scratch_src, scratch_bytes)
+                : sycl_device_scratch_guard(q, nullptr);
+        unsigned char *dscratch = (unsigned char *)scratch_guard.p;
+        if (scratch_bytes != 0u && !dscratch) return 0;
 
         const float   *dbias = (has_bias && !hash_mode) ? (const float *)dscratch : nullptr;
         const int32_t *dhash = hash_mode ? (const int32_t *)dscratch : nullptr;
@@ -470,15 +469,11 @@ extern "C" int ds4_gpu_router_select_batch_tensor(
 
         /* Same staging pattern as the single-token entry above: never a
          * bare malloc_device/free pair. */
-        unsigned char *dscratch = nullptr;
-        if (scratch_bytes != 0u) {
-            dscratch = sycl::malloc_device<unsigned char>((size_t)scratch_bytes, q);
-            if (!dscratch) return 0;
-        }
-        sycl_device_scratch_guard scratch_guard(q, dscratch);
-        if (dscratch) {
-            q.memcpy(dscratch, scratch_src, (size_t)scratch_bytes).wait_and_throw();
-        }
+        sycl_device_scratch_guard scratch_guard = scratch_bytes != 0u
+                ? sycl_stage_host_bytes(q, scratch_src, scratch_bytes)
+                : sycl_device_scratch_guard(q, nullptr);
+        unsigned char *dscratch = (unsigned char *)scratch_guard.p;
+        if (scratch_bytes != 0u && !dscratch) return 0;
 
         const float   *dbias = (has_bias && !hash_mode) ? (const float *)dscratch : nullptr;
         const int32_t *dhash = hash_mode ? (const int32_t *)dscratch : nullptr;

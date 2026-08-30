@@ -967,10 +967,9 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
     try {
         sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
 
-        unsigned char *dw = sycl::malloc_device<unsigned char>((size_t)weight_bytes, q);
+        sycl_device_scratch_guard dw_guard = sycl_stage_host_bytes(q, wptr, weight_bytes);
+        unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
-        sycl_device_scratch_guard dw_guard(q, dw);
-        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
 
         float         *ohc  = (float *)out_hc->ptr;
         float         *bo   = (float *)block_out->ptr;

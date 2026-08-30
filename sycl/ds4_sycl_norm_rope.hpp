@@ -137,12 +137,14 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(
         /* ROCm hands the host pointer straight to the kernel because CUDA
          * has the registered model device-accessible.  SYCL cannot
          * dereference the host mmap from a kernel, so stage the weight row
-         * into device scratch.  The guard frees it on every path including
-         * the exception path. */
-        float *dw = sycl::malloc_device<float>(n, q);
+         * into device scratch (or pass through a pointer the model-range
+         * cache already made device-resident, sycl_stage_host_bytes,
+         * ds4_sycl_common.hpp).  The guard frees an owned allocation on
+         * every path including the exception path, and frees nothing for
+         * a passed-through pointer. */
+        sycl_device_scratch_guard dw_guard = sycl_stage_host_bytes(q, wptr, weight_bytes);
+        float *dw = (float *)dw_guard.p;
         if (!dw) return 0;
-        sycl_device_scratch_guard dw_guard(q, dw);
-        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
 
         float       *o  = (float *)out->ptr;
         const float *px = (const float *)x->ptr;
@@ -269,20 +271,20 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         sycl::queue &sq = ds4_sycl_queue(q_out->device_id);
 
         /* Two independent weight vectors, each staged into its own device
-         * scratch buffer under its own guard, following the same staging
-         * pattern used above.  A device allocation of width 0 is permitted to
-         * return either a null or a valid pointer (SYCL spec); only treat
-         * null as failure when the corresponding width is nonzero, since
-         * one side's width can be 0 while the other's is not. */
-        float *dqw = sycl::malloc_device<float>(q_n, sq);
+         * scratch buffer under its own guard (or passed through if the
+         * model-range cache already made it device-resident), matching
+         * the staging pattern above.  A device allocation of width
+         * 0 is permitted to return either a null or a valid pointer (SYCL
+         * spec); only treat null as failure when the corresponding width
+         * is nonzero, since one side's width can be 0 while the other's
+         * is not. */
+        sycl_device_scratch_guard dqw_guard = sycl_stage_host_bytes(sq, q_wptr, q_weight_bytes);
+        float *dqw = (float *)dqw_guard.p;
         if (!dqw && q_n != 0u) return 0;
-        sycl_device_scratch_guard dqw_guard(sq, dqw);
-        if (q_n != 0u) sq.memcpy(dqw, q_wptr, (size_t)q_weight_bytes).wait_and_throw();
 
-        float *dkvw = sycl::malloc_device<float>(kv_n, sq);
+        sycl_device_scratch_guard dkvw_guard = sycl_stage_host_bytes(sq, kv_wptr, kv_weight_bytes);
+        float *dkvw = (float *)dkvw_guard.p;
         if (!dkvw && kv_n != 0u) return 0;
-        sycl_device_scratch_guard dkvw_guard(sq, dkvw);
-        if (kv_n != 0u) sq.memcpy(dkvw, kv_wptr, (size_t)kv_weight_bytes).wait_and_throw();
 
         float       *qo   = (float *)q_out->ptr;
         const float *qx   = (const float *)q->ptr;

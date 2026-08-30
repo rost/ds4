@@ -162,15 +162,12 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
     if (!wptr) return 0;
     if (g_devices.empty()) return 0;
 
-    const size_t weight_elems = (size_t)(weight_bytes / sizeof(uint16_t));
-
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
 
-        uint16_t *dw = sycl::malloc_device<uint16_t>(weight_elems, q);
+        sycl_device_scratch_guard dw_guard = sycl_stage_host_bytes(q, wptr, weight_bytes);
+        uint16_t *dw = (uint16_t *)dw_guard.p;
         if (!dw) return 0;
-        sycl_device_scratch_guard dw_guard(q, dw);
-        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
 
         sycl_matmul_f16_launch(q, (float *)out->ptr, dw, (const float *)x->ptr,
                                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
@@ -222,20 +219,15 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     if (!wa_ptr || !wb_ptr) return 0;
     if (g_devices.empty()) return 0;
 
-    const size_t weight_elems = (size_t)(weight_bytes / sizeof(uint16_t));
-
     try {
         sycl::queue &q = ds4_sycl_queue(out_a->device_id);
 
-        uint16_t *dwa = sycl::malloc_device<uint16_t>(weight_elems, q);
+        sycl_device_scratch_guard dwa_guard = sycl_stage_host_bytes(q, wa_ptr, weight_bytes);
+        uint16_t *dwa = (uint16_t *)dwa_guard.p;
         if (!dwa) return 0;
-        sycl_device_scratch_guard dwa_guard(q, dwa);
-        uint16_t *dwb = sycl::malloc_device<uint16_t>(weight_elems, q);
+        sycl_device_scratch_guard dwb_guard = sycl_stage_host_bytes(q, wb_ptr, weight_bytes);
+        uint16_t *dwb = (uint16_t *)dwb_guard.p;
         if (!dwb) return 0;
-        sycl_device_scratch_guard dwb_guard(q, dwb);
-
-        q.memcpy(dwa, wa_ptr, (size_t)weight_bytes).wait_and_throw();
-        q.memcpy(dwb, wb_ptr, (size_t)weight_bytes).wait_and_throw();
 
         sycl_matmul_f16_launch(q, (float *)out_a->ptr, dwa, (const float *)x->ptr,
                                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
@@ -333,11 +325,9 @@ static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
 
-        unsigned char *dw = sycl::malloc_device<unsigned char>(
-                (size_t)weight_bytes, q);
+        sycl_device_scratch_guard dw_guard = sycl_stage_host_bytes(q, wptr, weight_bytes);
+        unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
-        sycl_device_scratch_guard dw_guard(q, dw);
-        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
 
         sycl_q8_0_matmul_launch(q, (float *)out->ptr, dw, (const float *)x->ptr,
                                 (uint32_t)in_dim, (uint32_t)out_dim,
@@ -554,11 +544,9 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
 
-        unsigned char *dw = sycl::malloc_device<unsigned char>(
-                (size_t)weight_bytes, q);
+        sycl_device_scratch_guard dw_guard = sycl_stage_host_bytes(q, wptr, weight_bytes);
+        unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
-        sycl_device_scratch_guard dw_guard(q, dw);
-        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
 
         float       *out_ptr = (float *)out->ptr;
         const float *x_ptr   = (const float *)x->ptr;
@@ -715,11 +703,9 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
     try {
         sycl::queue &q = ds4_sycl_queue(out_h->device_id);
 
-        unsigned char *dw = sycl::malloc_device<unsigned char>(
-                (size_t)weight_bytes, q);
+        sycl_device_scratch_guard dw_guard = sycl_stage_host_bytes(q, wptr, weight_bytes);
+        unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
-        sycl_device_scratch_guard dw_guard(q, dw);
-        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
 
         sycl::half *w_h = sycl::malloc_device<sycl::half>(
                 (size_t)(out_dim * in_dim), q);
@@ -851,11 +837,9 @@ extern "C" int ds4_gpu_matmul_f32_tensor(
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
 
-        float *dw = sycl::malloc_device<float>(
-                (size_t)(weight_bytes / sizeof(float)), q);
+        sycl_device_scratch_guard dw_guard = sycl_stage_host_bytes(q, wptr, weight_bytes);
+        float *dw = (float *)dw_guard.p;
         if (!dw) return 0;
-        sycl_device_scratch_guard dw_guard(q, dw);
-        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
 
         sycl_matmul_f32_launch(q, (float *)out->ptr, dw, (const float *)x->ptr,
                                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
@@ -960,11 +944,9 @@ static int sycl_dense_quant_matmul_general(
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
 
-        unsigned char *dw = sycl::malloc_device<unsigned char>(
-                (size_t)weight_bytes, q);
+        sycl_device_scratch_guard dw_guard = sycl_stage_host_bytes(q, wptr, weight_bytes);
+        unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
-        sycl_device_scratch_guard dw_guard(q, dw);
-        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
 
         sycl_dense_quant_matmul_launch(q, (float *)out->ptr, dw,
                                        (const float *)x->ptr, (uint32_t)in_dim,
@@ -1094,11 +1076,9 @@ static int sycl_dense_quant_matmul_kslice_general(
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
 
-        unsigned char *dw = sycl::malloc_device<unsigned char>(
-                (size_t)weight_bytes, q);
+        sycl_device_scratch_guard dw_guard = sycl_stage_host_bytes(q, wptr, weight_bytes);
+        unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
-        sycl_device_scratch_guard dw_guard(q, dw);
-        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
 
         float       *out_ptr = (float *)out->ptr;
         const float *x_ptr   = (const float *)x->ptr + x_elem_off;
