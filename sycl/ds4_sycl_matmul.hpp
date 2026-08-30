@@ -184,7 +184,12 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
         if (!w_f32) return 0;
         sycl_device_scratch_guard wf32_guard(q, w_f32);
         sycl::event ev_cvt = sycl_f16_to_f32_launch(q, w_f32, dw, out_dim * in_dim);
-        ev_cvt.wait_and_throw();
+        /* No wait here. q is in_order (ds4_sycl.cpp), so the GEMM
+         * submitted just below starts only once this convert kernel has
+         * finished; ev.wait_and_throw() below is the one wait this
+         * function needs, since it runs before dw_guard/wf32_guard free
+         * their scratch at scope exit and it also covers everything
+         * submitted to q before it, ev_cvt included. */
         ds4_sycl_profile_record_named("matmul_f16_convert", ev_cvt);
 
         /* out (n_tok x out_dim row-major) as column-major is (out_dim x
@@ -284,7 +289,10 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
 
         sycl::event ev_cvt_a = sycl_f16_to_f32_launch(q, wa_f32, dwa, out_dim * in_dim);
         sycl::event ev_cvt_b = sycl_f16_to_f32_launch(q, wb_f32, dwb, out_dim * in_dim);
-        q.wait_and_throw();
+        /* No wait here, same reasoning as
+         * ds4_gpu_matmul_f16_tensor above -- q is in_order, so both GEMMs
+         * below start only after both converts finish, and ev_b's wait
+         * further down is the one wait this function needs. */
         ds4_sycl_profile_record_named("matmul_f16_convert", ev_cvt_a);
         ds4_sycl_profile_record_named("matmul_f16_convert", ev_cvt_b);
 
@@ -308,7 +316,13 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
                 0.0f,
                 (float *)out_b->ptr, (int64_t)out_dim, (int64_t)out_dim * (int64_t)n_tok,
                 1);
-        ev_a.wait_and_throw();
+        /* ev_a's own wait is redundant and dropped -- q is
+         * in_order, so ev_b (submitted right after ev_a on the same
+         * queue) cannot complete before ev_a does, and ev_b's wait below
+         * is the one wait this function needs: it runs before
+         * dwa_guard/dwb_guard/wa32_guard/wb32_guard free their scratch at
+         * scope exit, and it covers everything submitted to q before it,
+         * ev_a and both converts included. */
         ev_b.wait_and_throw();
         ds4_sycl_profile_record_named("matmul_f16", ev_a);
         ds4_sycl_profile_record_named("matmul_f16", ev_b);
@@ -519,6 +533,8 @@ static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
                 : sycl_q8_0_matmul_launch(
                         q, (float *)out->ptr, dw, (const float *)x->ptr,
                         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, row_bytes);
+        /* Wait kept -- this function's only kernel, and dw_guard
+         * may own scratch this function frees on return. */
         q.wait_and_throw();
         ds4_sycl_profile_record_named("matmul_q8_0", ev);
     } catch (const sycl::exception &e) {
@@ -754,6 +770,8 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
             }
             out_ptr[gid] = sum;
         });
+        /* Wait kept -- this function's only kernel, and dw_guard
+         * may own scratch this function frees on return. */
         q.wait_and_throw();
         ds4_sycl_profile_record(_ds4_prof_ev70);
     } catch (const sycl::exception &e) {
@@ -902,7 +920,16 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
         sycl_device_scratch_guard wh_guard(q, w_h);
         sycl::event _ds4_prof_ev71 = sycl_q8_0_to_f16_launch(
                 q, w_h, dw, (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
-        q.wait_and_throw();
+        /* No wait here or after the activation convert below.
+         * The function comment above (written before in_order queues)
+         * still correctly describes the two converts as independent of
+         * each other; what changes is how that independence is honoured.
+         * q is in_order, so both still run in submission order regardless
+         * -- in_order queue semantics never permitted the runtime to skip
+         * ahead to the GEMM early, waited or not -- and ev.wait_and_throw()
+         * below, which runs before dw_guard/wh_guard/xh_guard free their
+         * scratch, is the one wait this function needs; it covers both
+         * converts too. */
         ds4_sycl_profile_record(_ds4_prof_ev71);
 
         sycl::half *x_h = sycl::malloc_device<sycl::half>(
@@ -911,7 +938,6 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
         sycl_device_scratch_guard xh_guard(q, x_h);
         sycl::event _ds4_prof_ev71b =
                 sycl_f32_to_f16_launch(q, x_h, (const float *)x->ptr, n_tok * in_dim);
-        q.wait_and_throw();
         ds4_sycl_profile_record(_ds4_prof_ev71b);
 
         sycl::event ev = sycl_gemm_f16(
@@ -922,6 +948,9 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
                 x_h, (int64_t)in_dim,
                 sycl::half(0.0f),
                 (sycl::half *)out_h->ptr, (int64_t)out_dim);
+        /* Wait kept -- covers both converts above plus this GEMM,
+         * and dw_guard/wh_guard/xh_guard may each own scratch this
+         * function frees on return. */
         ev.wait_and_throw();
         ds4_sycl_profile_record(ev);
     } catch (const std::exception &e) {
@@ -1044,6 +1073,8 @@ extern "C" int ds4_gpu_matmul_f32_tensor(
         sycl::event _ds4_prof_ev72 = sycl_matmul_f32_launch(
                 q, (float *)out->ptr, dw, (const float *)x->ptr,
                 (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        /* Wait kept -- this function's only kernel, and dw_guard
+         * may own scratch this function frees on return. */
         q.wait_and_throw();
         ds4_sycl_profile_record_named("matmul_f32", _ds4_prof_ev72);
     } catch (const sycl::exception &e) {
@@ -1155,6 +1186,8 @@ static int sycl_dense_quant_matmul_general(
                 (const float *)x->ptr, (uint32_t)in_dim,
                 (uint32_t)out_dim, (uint32_t)n_tok,
                 row_bytes, dequant);
+        /* Wait kept -- this function's only kernel, and dw_guard
+         * may own scratch this function frees on return. */
         q.wait_and_throw();
         ds4_sycl_profile_record_named(what, _ds4_prof_ev73);
     } catch (const sycl::exception &e) {
@@ -1298,6 +1331,8 @@ static int sycl_dense_quant_matmul_kslice_general(
              }
              out_ptr[o] = sum;
          });
+         /* Wait kept -- this function's only kernel, and dw_guard
+          * may own scratch this function frees on return. */
          _ds4_prof_ev74.wait_and_throw();
          ds4_sycl_profile_record(_ds4_prof_ev74);
     } catch (const sycl::exception &e) {
