@@ -40012,6 +40012,42 @@ static bool glm_tp_validate_ownership_kernels(
     return true;
 }
 
+/* CUDA expert-parallel decode (g->cuda_tp_ep, gated on placement
+ * plus --cuda-tensor-parallel, ds4.c:16897-16904) is reachable on this
+ * backend now that ds4_gpu_routed_moe_one_owned_tensor and its siblings
+ * are implemented (sycl/ds4_sycl_moe_owned.hpp) -- but that decode entry
+ * only implements the Q4_K routed-expert format (gate_type==12 &&
+ * down_type==12); IQ2_XXS/Q2_K and MXFP4 owned decode return 0 there, a
+ * clean failure deep in a running decode call rather than a startup
+ * refusal. Checked here instead, mirroring glm_tp_validate_ownership_
+ * kernels immediately above: a mismatched model refuses in five minutes
+ * at startup, with a message naming the layer and type, rather than
+ * failing decode with no explanation once a session is already running.
+ * ds4_gpu_routed_moe_batch_owned_tensor has no such restriction (it
+ * delegates to the ordinary multi-format dispatcher), so this check is
+ * conservative in the direction of refusing more than strictly necessary
+ * for prefill/batch-only use -- acceptable per the "a wrong refusal
+ * costs five minutes" guidance, since --cuda-tensor-parallel's whole
+ * point is decode latency. */
+static bool sycl_cuda_tp_ep_validate_q4k(
+        const ds4_weights *weights,
+        uint32_t          *bad_layer,
+        uint32_t          *bad_type) {
+    if (!weights) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &weights->layer[il];
+        if (!l->ffn_gate_exps) continue;
+        if (l->ffn_gate_exps->type == DS4_TENSOR_Q4_K &&
+            l->ffn_down_exps->type == DS4_TENSOR_Q4_K) {
+            continue;
+        }
+        if (bad_layer) *bad_layer = il;
+        if (bad_type) *bad_type = l->ffn_gate_exps->type;
+        return false;
+    }
+    return true;
+}
+
 static bool glm_graph_stream_map_token(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -58552,22 +58588,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-#ifdef DS4_SYCL_BUILD
-    /* The tensor/expert-parallel decode path is CUDA-only work: nothing in
-     * this backend implements it, so letting it through here would run
-     * into stubbed entries deep in a decode graph instead of failing
-     * cleanly at startup. Refuse regardless of GPU count; plain multi-GPU
-     * layer placement (--gpu-vram / --gpu-devices) is unaffected. */
-    if (opt->cuda_tensor_parallel) {
-        fprintf(stderr,
-                "ds4: --cuda-tensor-parallel is not implemented on the SYCL "
-                "backend; use --gpu-vram/--gpu-devices for layer placement "
-                "across GPUs instead\n");
-        free(e);
-        *out = NULL;
-        return 1;
-    }
-#endif
     if (opt->dspark && (!opt->mtp_path || !opt->mtp_path[0])) {
         fprintf(stderr, "ds4: --dspark requires --mtp FILE\n");
         free(e);
@@ -58708,6 +58728,32 @@ static int ds4_engine_open_internal(ds4_engine **out,
             g_tp_shard_model_bytes =
                 model_map_span_vec_total_bytes(&shard_spans);
             free(shard_spans.v);
+        }
+    }
+#endif
+#ifdef DS4_SYCL_BUILD
+    /* Narrowed from an earlier blanket refusal now that the CUDA
+     * expert-parallel decode entries are implemented for real, but
+     * only for Q4_K routed experts: see sycl_cuda_tp_ep_validate_q4k's own
+     * comment. Deliberately still refuses the model families with no
+     * ownership-aware decode kernel at all, per the same "a wrong refusal
+     * costs five minutes; a wrongly-permitted path costs a day" reasoning
+     * as the GLM check just above. */
+    if (e->cuda_tensor_parallel) {
+        uint32_t bad_layer = 0;
+        uint32_t bad_type = 0;
+        if (!sycl_cuda_tp_ep_validate_q4k(&e->weights, &bad_layer, &bad_type)) {
+            fprintf(stderr,
+                    "ds4: --cuda-tensor-parallel on the SYCL backend requires "
+                    "Q4_K-quantised routed experts (the only format the owned "
+                    "expert-parallel decode kernels implement); layer %u uses "
+                    "routed-expert type %u. Use --gpu-vram/--gpu-devices for "
+                    "plain layer placement across GPUs instead\n",
+                    bad_layer,
+                    bad_type);
+            ds4_engine_close(e);
+            *out = NULL;
+            return 1;
         }
     }
 #endif
