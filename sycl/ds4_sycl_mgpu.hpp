@@ -537,6 +537,176 @@ extern "C" int ds4_gpu_tensor_wait_xdev_default(const ds4_gpu_tensor *src, int d
     return ds4_gpu_tensor_wait_xdev(src, dst_tier);
 }
 
+/* Tensor parallelism: cross-rank combine, out = local + remote.
+ * This is THE cross-rank exchange primitive: ds4.c's TP paths call it to
+ * fold a peer's partial block output into this rank's own, reconstructing
+ * the full-width result the two ranks jointly computed. Ported from
+ * ds4_cuda.cu:18647-18683 exactly, including its device-ownership shape
+ * (out and local must already live on the same device; remote may live on
+ * either device, and a remote_tmp scratch tensor on out's device is
+ * required only when it does not).
+ *
+ * ORDERING WITHOUT in_order QUEUES, spec 6g/6j: ds4_sycl.cpp:151 builds
+ * every queue out-of-order, so nothing here may assume that submitting A
+ * then B on one queue runs A before B. This entry does not need to,
+ * because every operation in this backend's cross-device path already
+ * blocks before returning: ds4_gpu_tensor_copy_xdev above ends every one
+ * of its branches (same-device copy, validated-peer copy, host bounce)
+ * in wait_and_throw() before returning 1, and the add kernel below ends
+ * in the same q.wait_and_throw(). Combined with this whole backend's
+ * standing convention that every GPU-touching entry point runs
+ * synchronously from the caller's perspective (grep wait_and_throw across
+ * every sycl header in this tree: every kernel launch and every memcpy in
+ * this codebase already does this), submission order and completion order
+ * coincide by
+ * construction: by the time ds4_gpu_tensor_copy_xdev returns, remote_tmp
+ * is fully populated and visible to any subsequent operation, so the add
+ * kernel below is correctly ordered after it with no event, fence or
+ * in_order queue property required. This is the "ordering discipline"
+ * that was said to be missing: it does not need a new mechanism,
+ * it needs every new TP entry to keep following the mechanism every
+ * existing entry in this backend already follows, and to never launch a
+ * kernel that reads a cross-device copy's destination before that copy's
+ * own wait_and_throw() has returned.
+ *
+ * The reverse discipline failure -- reading remote_tmp before the copy
+ * lands, or freeing it before the add kernel that reads it has finished --
+ * is exactly spec 6g's use-after-free and 6j's too-small-to-race launch:
+ * neither is exercisable on one GPU (there is no second device for
+ * remote_tmp to ever be genuinely cross-device), so this entry's
+ * same-device path (od == ld == rd) is the only one a single A770 can
+ * verify; the cross-device branch is verified by inspection only. See
+ * the cross-device verification notes for what to check first on the B60 machine.
+ *
+ * NONZERO means success, matching ds4_gpu.h and ds4_cuda.cu's own return
+ * shape. n == 0 is a free success (`return 1`), matching ds4_cuda.cu:
+ * 18656 exactly, unlike this file's own ds4_gpu_tensor_copy_xdev above
+ * (bytes == 0 is also free success there) but UNLIKE ds4_gpu_add_tensor
+ * in ds4_sycl_output.hpp (n == 0 there still runs the empty kernel and
+ * falls through to `return 1` the same way, so behaviourally identical,
+ * just structured as an explicit early return here to match ds4_cuda.cu's
+ * own early return at :18656 line-for-line). */
+extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *local,
+                                       const ds4_gpu_tensor *remote,
+                                       ds4_gpu_tensor *remote_tmp, uint32_t n) {
+    if (!sycl_tensor_has_f32(out, n) || !sycl_tensor_has_f32(local, n) ||
+        !sycl_tensor_has_f32(remote, n)) {
+        return 0;
+    }
+    if (n == 0u) return 1;
+    if (g_devices.empty()) return 0;
+
+    const int od = out->device_id >= 0 ? out->device_id : g_current_tier;
+    const int ld = local->device_id >= 0 ? local->device_id : g_current_tier;
+    const int rd = remote->device_id >= 0 ? remote->device_id : g_current_tier;
+    if (od != ld) return 0;
+
+    const ds4_gpu_tensor *rhs = remote;
+    if (rd != od) {
+        const int rtd = remote_tmp && remote_tmp->device_id >= 0
+                                 ? remote_tmp->device_id
+                                 : g_current_tier;
+        if (!sycl_tensor_has_f32(remote_tmp, n) || rtd != od) return 0;
+        if (!ds4_gpu_tensor_copy_xdev(remote_tmp, remote, (uint64_t)n * sizeof(float))) {
+            return 0;
+        }
+        rhs = remote_tmp;
+    }
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(od);
+        float       *o  = (float *)out->ptr;
+        const float *pl = (const float *)local->ptr;
+        const float *pr = (const float *)rhs->ptr;
+        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+            o[i] = pl[i] + pr[i];
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "add_xdev failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* Tensor parallelism: the ds4_gpu_tp_* per-layer gate family.
+ *
+ * ds4_gpu.h documents this whole family as "Tensor-parallel per-layer
+ * gates (Metal only)": the encoder closes the current Metal command
+ * buffer, signals a shared event, queues the exchange on a service
+ * thread, and waits for a CPU-signalled release before the combine
+ * kernel runs. That mechanism is Metal command-buffer machinery with no
+ * SYCL analogue, and it turns out CUDA never built one either: checked
+ * directly against ds4_cuda.cu (not inferred from the Metal-only
+ * docstring), every one of these six entries is ALREADY a stub there --
+ * ds4_gpu_tp_gate_encode and ds4_gpu_tp_big_gate_encode literally print
+ * "ds4: CUDA stub called" and return 0 (ds4_cuda.cu:30461-30471);
+ * ds4_gpu_tp_big_gate_kick, ds4_gpu_tp_big_gate_wait,
+ * ds4_gpu_tp_batch_gate_encode and ds4_gpu_tp_suspend_expert_sharding are
+ * unconditional `(void)every_argument; return 0;` / no-op void
+ * (ds4_cuda.cu:30804-30829). CUDA and ROCm multi-GPU machines never
+ * exercise tensor parallelism at all: ds4_engine_tp_bind (ds4.c) refuses
+ * to bind on any backend other than DS4_BACKEND_METAL
+ * ("tensor parallelism requires the Metal backend", checked directly),
+ * which is the ONLY place g->tp_world is ever set to 2
+ * (ds4.c: `if (e->tp.active) { s->graph.tp_world = 2; ... }`). That gate
+ * is unconditional on backend identity, not on GPU count, so g->tp_world
+ * cannot reach 2 on this backend even with two real Intel GPUs present --
+ * a backend-level gate, not a hardware limit, so it would hold even on a
+ * machine with more GPUs than the one A770 this was tested on.
+ *
+ * Given that, e->backend == DS4_BACKEND_CUDA is true for a SYCL build
+ * (spec's own standing rule), so the CUDA branch is authoritative, and
+ * the CUDA branch's authoritative behaviour for all six of these entries
+ * is "always fail / no-op". Faithfully mirroring that is the CORRECT
+ * port, not a placeholder stub: every signature below is the real, fixed
+ * ds4_gpu.h signature (not the unavailable file's variadic `...`), and
+ * every return value is checked against ds4_cuda.cu's actual line rather
+ * than picked from the macro default. NONZERO means success for every
+ * int-returning entry here (ds4_gpu.h), so `return 0` reports failure
+ * faithfully; ds4_gpu_tp_big_gate_kick returns a uint64_t sequence number
+ * with 0 documented as failure (ds4_gpu.h), matching CUDA's `return 0`
+ * exactly. */
+extern "C" int ds4_gpu_tp_gate_encode(uint32_t layer, uint32_t gate) {
+    (void)layer; (void)gate;
+    return 0;
+}
+
+extern "C" int ds4_gpu_tp_big_gate_encode(uint32_t layer, uint32_t rows,
+                                          const ds4_gpu_tensor *out_t,
+                                          ds4_gpu_tensor *in_t, uint64_t bytes) {
+    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
+    return 0;
+}
+
+extern "C" uint64_t ds4_gpu_tp_big_gate_kick(uint32_t layer, uint32_t rows,
+                                             const ds4_gpu_tensor *out_t,
+                                             ds4_gpu_tensor *in_t, uint64_t bytes) {
+    (void)layer; (void)rows; (void)out_t; (void)in_t; (void)bytes;
+    return 0;
+}
+
+extern "C" int ds4_gpu_tp_big_gate_wait(uint64_t seq) {
+    (void)seq;
+    return 0;
+}
+
+extern "C" int ds4_gpu_tp_batch_gate_encode(uint32_t layer, uint32_t rows) {
+    (void)layer; (void)rows;
+    return 0;
+}
+
+/* The coordinator-only DSpark support model does not participate in TP
+ * (ds4_gpu.h's own comment on this entry); ds4.c saves and restores
+ * g->tp_world to 0 around the encode this brackets
+ * (ds4.c:32655-32698/33746-33842) rather than querying this flag back,
+ * so there is no backend-side consumer of the suspended state for this
+ * entry to track even in principle. Matches ds4_cuda.cu:30804-30806
+ * exactly. */
+extern "C" void ds4_gpu_tp_suspend_expert_sharding(int suspend) {
+    (void)suspend;
+}
+
 /* --gpu-vram auto CLI probe. Zero means success, nonzero on failure with
  * errbuf populated (ds4_gpu_args.h:63, confirmed against ROCm's real
  * implementation, ds4_rocm_compat.cu:144-186, which returns 1 on every one

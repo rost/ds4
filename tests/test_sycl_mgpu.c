@@ -17,6 +17,7 @@
 #include "ds4_gpu_args.h"
 #include "ds4_gpu_mgpu.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -358,6 +359,136 @@ static int test_copy_xdev3_same_device(void) {
     return 0;
 }
 
+/* ---- Tensor parallelism: ds4_gpu_add_xdev_tensor ------------- */
+
+static int test_add_xdev_same_device(void) {
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 1;
+    cfg.device_indices[0] = 0;
+    CHECK(ds4_gpu_init_multi(&cfg) != 0, "init_multi for add_xdev");
+
+    enum { N = 4096 };
+    float host_local[N], host_remote[N], want[N], got[N];
+    for (int i = 0; i < N; i++) {
+        host_local[i] = (float)((i * 7) % 991) * 0.1f;
+        host_remote[i] = (float)((i * 13) % 773) * 0.05f - 3.0f;
+        want[i] = host_local[i] + host_remote[i];
+    }
+
+    ds4_gpu_tensor out, local, remote;
+    memset(&out, 0, sizeof(out));
+    memset(&local, 0, sizeof(local));
+    memset(&remote, 0, sizeof(remote));
+    CHECK(ds4_gpu_tensor_alloc_on(&out, 0, sizeof(want)) == 0, "add_xdev: alloc out");
+    CHECK(ds4_gpu_tensor_alloc_on(&local, 0, sizeof(host_local)) == 0, "add_xdev: alloc local");
+    CHECK(ds4_gpu_tensor_alloc_on(&remote, 0, sizeof(host_remote)) == 0, "add_xdev: alloc remote");
+    CHECK(ds4_gpu_tensor_write(&local, 0, host_local, sizeof(host_local)) != 0,
+          "add_xdev: write local");
+    CHECK(ds4_gpu_tensor_write(&remote, 0, host_remote, sizeof(host_remote)) != 0,
+          "add_xdev: write remote");
+
+    /* Same device end to end (od == ld == rd): the only path a single GPU
+     * can exercise. remote_tmp is NULL here on purpose -- the same-device
+     * branch must never touch it, matching ds4_cuda.cu's own `if (rd !=
+     * od)` guard around the only place remote_tmp is read. */
+    CHECK(ds4_gpu_add_xdev_tensor(&out, &local, &remote, NULL, N) != 0,
+          "add_xdev: same-device call");
+    CHECK(ds4_gpu_tensor_read(&out, 0, got, sizeof(got)) != 0, "add_xdev: read out");
+    for (int i = 0; i < N; i++) {
+        CHECK(fabsf(got[i] - want[i]) <= 1e-4f, "add_xdev: value mismatch");
+    }
+
+    /* n == 0 is a free success, matching ds4_cuda.cu:18656 exactly. */
+    CHECK(ds4_gpu_add_xdev_tensor(&out, &local, &remote, NULL, 0) != 0,
+          "add_xdev: n=0 must succeed");
+
+    /* Validation: undersized tensors and NULLs must be rejected. */
+    ds4_gpu_tensor small;
+    memset(&small, 0, sizeof(small));
+    CHECK(ds4_gpu_tensor_alloc_on(&small, 0, sizeof(float) * 2) == 0, "add_xdev: alloc small");
+    CHECK(ds4_gpu_add_xdev_tensor(&small, &local, &remote, NULL, N) == 0,
+          "add_xdev: undersized out must be rejected");
+    CHECK(ds4_gpu_add_xdev_tensor(&out, &small, &remote, NULL, N) == 0,
+          "add_xdev: undersized local must be rejected");
+    CHECK(ds4_gpu_add_xdev_tensor(&out, &local, &small, NULL, N) == 0,
+          "add_xdev: undersized remote must be rejected");
+    CHECK(ds4_gpu_add_xdev_tensor(NULL, &local, &remote, NULL, N) == 0,
+          "add_xdev: null out must be rejected");
+
+    ds4_gpu_tensor_free_in_place(&out);
+    ds4_gpu_tensor_free_in_place(&local);
+    ds4_gpu_tensor_free_in_place(&remote);
+    ds4_gpu_tensor_free_in_place(&small);
+    ds4_gpu_cleanup();
+    fprintf(stderr, "  test_add_xdev_same_device OK\n");
+    return 0;
+}
+
+/* Cross-device branch (rd != od, the actual cross-rank exchange path):
+ * requires a second physical GPU. Honest skip on this A770, per the
+ * standing testing-honesty rule -- do not fake coverage of a path that
+ * cannot run here. First thing to check on the B60 machine: this exact
+ * test with have >= 2, confirming out == local + remote after a genuine
+ * device-to-device copy_xdev, not just that the call returns nonzero. */
+static int test_add_xdev_cross_device_or_skip(void) {
+    int have = physical_device_count();
+    if (have < 2) {
+        fprintf(stderr, "skip: add_xdev cross-device path wanted 2 GPUs, have %d "
+                        "(verify this case on the B60 machine)\n", have);
+        return 0;
+    }
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 0;
+    cfg.device_indices[1] = 1;
+    CHECK(ds4_gpu_init_multi(&cfg) != 0, "init_multi for add_xdev cross-device");
+
+    enum { N = 4096 };
+    float host_local[N], host_remote[N], want[N], got[N];
+    for (int i = 0; i < N; i++) {
+        host_local[i] = (float)((i * 7) % 991) * 0.1f;
+        host_remote[i] = (float)((i * 13) % 773) * 0.05f - 3.0f;
+        want[i] = host_local[i] + host_remote[i];
+    }
+
+    ds4_gpu_tensor out, local, remote, remote_tmp;
+    memset(&out, 0, sizeof(out));
+    memset(&local, 0, sizeof(local));
+    memset(&remote, 0, sizeof(remote));
+    memset(&remote_tmp, 0, sizeof(remote_tmp));
+    CHECK(ds4_gpu_tensor_alloc_on(&out, 0, sizeof(want)) == 0, "add_xdev: alloc out");
+    CHECK(ds4_gpu_tensor_alloc_on(&local, 0, sizeof(host_local)) == 0, "add_xdev: alloc local");
+    CHECK(ds4_gpu_tensor_alloc_on(&remote, 1, sizeof(host_remote)) == 0,
+          "add_xdev: alloc remote on tier 1");
+    CHECK(ds4_gpu_tensor_alloc_on(&remote_tmp, 0, sizeof(host_remote)) == 0,
+          "add_xdev: alloc remote_tmp on tier 0");
+    CHECK(ds4_gpu_tensor_write(&local, 0, host_local, sizeof(host_local)) != 0,
+          "add_xdev: write local");
+    CHECK(ds4_gpu_tensor_write(&remote, 0, host_remote, sizeof(host_remote)) != 0,
+          "add_xdev: write remote");
+
+    CHECK(ds4_gpu_add_xdev_tensor(&out, &local, &remote, &remote_tmp, N) != 0,
+          "add_xdev: cross-device call");
+    CHECK(ds4_gpu_tensor_read(&out, 0, got, sizeof(got)) != 0, "add_xdev: read out");
+    for (int i = 0; i < N; i++) {
+        CHECK(fabsf(got[i] - want[i]) <= 1e-4f, "add_xdev: cross-device value mismatch");
+    }
+    /* Missing/undersized remote_tmp on a genuine cross-device call must be
+     * rejected, not silently fall back to the same-device path. */
+    CHECK(ds4_gpu_add_xdev_tensor(&out, &local, &remote, NULL, N) == 0,
+          "add_xdev: cross-device without remote_tmp must be rejected");
+
+    ds4_gpu_tensor_free_in_place(&out);
+    ds4_gpu_tensor_free_in_place(&local);
+    ds4_gpu_tensor_free_in_place(&remote);
+    ds4_gpu_tensor_free_in_place(&remote_tmp);
+    ds4_gpu_cleanup();
+    fprintf(stderr, "  test_add_xdev_cross_device OK\n");
+    return 0;
+}
+
 /* ---- ds4_gpu_tensor_wait_xdev[_default] -------------------------------- */
 
 static int test_wait_xdev(void) {
@@ -558,6 +689,8 @@ int main(void) {
     if (test_copy_xdev_same_device()) return 1;
     if (test_copy_xdev_default_and_ordered_same_device()) return 1;
     if (test_copy_xdev3_same_device()) return 1;
+    if (test_add_xdev_same_device()) return 1;
+    if (test_add_xdev_cross_device_or_skip()) return 1;
     if (test_wait_xdev()) return 1;
     if (test_peer_bytecheck_baseline()) return 1;
     if (test_peer_bytecheck_corrupt_is_caught()) return 1;
