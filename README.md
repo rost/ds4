@@ -94,6 +94,8 @@ next sections.
   and CSV generation.
 - [tests/test-vectors/README.md](tests/test-vectors/README.md): official
   continuation vectors used for regression checks.
+- [SYCL.md](SYCL.md): the SYCL/Intel GPU backend's internal architecture, ABI
+  shape, and testing approach.
 
 ## Model Weights
 
@@ -1570,6 +1572,156 @@ Do not treat the CPU path as the production target. The CLI and `ds4-server`
 support the CPU backend for reference/debug use and share the same KV session
 and snapshot format as Metal and CUDA, but normal inference should use Metal or
 CUDA.
+
+## SYCL (Intel GPU)
+
+A fourth GPU backend targeting Intel Arc and Battlemage GPUs through SYCL 2020
+and Intel's DPC++ compiler. Scope is deliberately narrow: **DeepSeek V4 Flash
+only**, no PRO, no GLM. See [SYCL.md](SYCL.md) for the backend's internal
+architecture; this section is about getting it built and running.
+
+**Read this before spending time on it.** All development so far has run on a
+single Intel Arc A770 (Xe-HPG, 16 GB). This branch has never run against real
+model weights on any hardware, and it has never run on more than one GPU at
+once. The known limitations below are not edge cases; they are the current
+state.
+
+### Hardware and driver requirements
+
+* An Intel discrete GPU: Arc (Xe-HPG, e.g. A770) or Battlemage (Xe2, e.g. B60).
+  Linux only; there is no macOS or Windows path for this backend.
+* The GPU compute runtime: `intel-opencl-icd`, `libze-intel-gpu1`, `libze1`,
+  `libigc2`, `libigdgmm12`, and `linux-firmware-intel-graphics`. On Ubuntu
+  26.04 these came from the distribution's own `universe` repository; no
+  separate Intel apt repository was needed for the driver itself.
+* The user running `ds4` needs access to the DRM render node
+  (`/dev/dri/renderD128`):
+
+```sh
+sudo usermod -aG render,video "$USER"
+```
+
+  Log out and back in for the group change to take effect.
+* Resizable BAR is recommended. `ds4` warns at startup if it is not detected
+  (`WARNING: Resizable BAR not detected for device ...`) but continues; this
+  affects performance, not correctness.
+
+### The oneAPI toolchain, and the one detail that costs real time
+
+Building (and running) needs oneAPI **2025.3** with four components: the
+DPC++/C++ compiler, UMF, TBB, and MKL. All four must be sourced **in the same
+shell**, and **not** through `setvars.sh`:
+
+```sh
+source /opt/intel/oneapi/compiler/2025.3/env/vars.sh
+source /opt/intel/oneapi/umf/latest/env/vars.sh
+source /opt/intel/oneapi/tbb/latest/env/vars.sh
+source /opt/intel/oneapi/mkl/2025.3/env/vars.sh
+```
+
+`setvars.sh` does not work on the machine this was built against: its
+`/opt/intel/oneapi/compiler/latest` symlink can point at a partial install with
+no `icpx` on `PATH`. Source the four versioned `env/vars.sh` scripts directly
+instead, every time, including before running the built binaries: they set the
+library search path the binaries need at runtime, not only at compile time.
+Match the MKL version to the compiler version deliberately; an unversioned
+`mkl` install can resolve to a different release than the compiler.
+
+### Build
+
+```sh
+source /opt/intel/oneapi/compiler/2025.3/env/vars.sh
+source /opt/intel/oneapi/umf/latest/env/vars.sh
+source /opt/intel/oneapi/tbb/latest/env/vars.sh
+source /opt/intel/oneapi/mkl/2025.3/env/vars.sh
+make sycl
+```
+
+Plain `make`, with no target, does not build this backend. On Linux it prints
+the list of available targets instead of building anything; `make sycl` must
+be named explicitly. This produces `./ds4`, `./ds4-server`, `./ds4-bench`,
+`./ds4-eval`, and `./ds4-agent`.
+
+Run the test suite the same way, with the same four scripts sourced:
+
+```sh
+make test-sycl
+```
+
+This was verified end to end from a pristine `git clone` of this branch: with
+the four scripts sourced, `make sycl` builds all five binaries and `make
+test-sycl` runs clean.
+
+### Run
+
+The four backend-selecting flags are `--metal`, `--sycl`, `--cpu`, and
+`--backend NAME` (`metal`, `sycl`, or `cpu`). On Linux, a build with this
+backend compiled in also defaults to it with no flag at all:
+
+```sh
+./ds4 -m gguf/YOUR-MODEL.gguf --sycl -p "Hello"
+```
+
+Model weights are not downloaded here. See
+"Model Weights" above for the download commands; the routed 2-bit quant
+(`./download_model.sh ds4f-q2`, about 81 GB on disk) is the one sized for this
+backend's target hardware. Everything up to the point of actually loading a
+model has been verified on this branch; loading and decoding against a real
+GGUF has not.
+
+Multi-GPU layer placement uses the same flags as CUDA:
+
+```sh
+./ds4 -m gguf/ds4flash.gguf --sycl --gpu-vram auto --gpu-devices 0,1,2,3,4,5,6,7,8,9,10,11,12,13 -p "Hello"
+```
+
+`--gpu-vram auto` queries free VRAM per device through Level Zero Sysman and
+already works today. A few other multi-GPU code paths (the DSpark support
+model's tier selection among them) call a separate per-tier free-VRAM query,
+`ds4_gpu_tier_free_vram`, that is still a stub returning 0 as of this writing
+and is being implemented in a separate, concurrent line of work on this
+branch; until it lands, those specific paths degrade rather than fail, so
+plain multi-GPU placement and `--gpu-vram auto` are unaffected. `--gpu-vram`
+also accepts an explicit comma-separated GiB budget per device instead of
+`auto`.
+
+`--cuda-tensor-parallel` is refused outright on this backend: DeepSeek's
+tensor/expert-parallel decode path is CUDA-only work that nothing here
+implements, and the refusal fires at startup rather than letting the run
+reach an unimplemented kernel mid-decode.
+
+### Known limitations
+
+* **Never run against real weights.** Every subsystem is verified against a
+  CPU oracle on synthetic data, and one full synthetic decoder layer has run
+  through the engine's real decode path, but no GGUF has ever been loaded and
+  decoded on this backend on any hardware.
+* **Never run on more than one physical GPU.** Multi-GPU plumbing (tier
+  switching, per-tier allocation, cross-device copies, the peer-access
+  validation protocol, per-tier streaming caches) is implemented and unit
+  tested, but the development machine has one GPU. The 14-logical-GPU target
+  topology, and Battlemage's PCIe-switched dual-die cards specifically, have
+  never been exercised.
+* **The sub-group width guard is dangerous precisely because it has never
+  fired.** This backend's kernels require GPU sub-group widths 8, 16, and 32.
+  A GPU that does not report one of these silently runs a different width
+  with no error, and every kernel using that width returns plausible wrong
+  numbers rather than failing, so `ds4` checks every enumerated device at
+  startup and refuses to start, naming the missing width, if any device lacks
+  one. The A770 offers exactly {8, 16, 32}, so this guard has never actually
+  triggered; it is unverified on the hardware it exists for; Battlemage's
+  architecture change (SIMD8 to SIMD16-native) makes width 8 the one to watch.
+* **Flash does not fit on one GPU.** The routed 2-bit quant is about 81 GB on
+  disk; a single card in the 14-logical-GPU target has 24 GB. Either spread
+  layers across GPUs with `--gpu-vram`/`--gpu-devices`, or use
+  `--ssd-streaming` to keep the routed experts on SSD and stream them on
+  demand; a single GPU alone is not an option for this model at this
+  quantization.
+* **Nothing is tuned.** Weight staging happens fresh on every call with no
+  cross-call cache (the streaming expert cache is implemented and tested but
+  not wired into routed MoE yet), and matmul/GEMM dispatch thresholds are
+  carried over from ROCm's literal defaults. No timing measured on the A770
+  should be trusted for Battlemage.
 
 ## Steering
 
