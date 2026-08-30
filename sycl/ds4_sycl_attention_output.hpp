@@ -420,6 +420,84 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     return 1;
 }
 
+/* Tensor parallelism: the group-sliced attention output pair for
+ * a single TP rank, n_tokens == 1 only (ds4_gpu.h's own docstring on this
+ * entry). A rank owns groups [group0, group0+group_cnt) of the attention
+ * heads; this computes that rank's partial low-rank projection over just
+ * those groups, then the matching k-slice of the expand (B) projection,
+ * producing this rank's partial contribution to the full-width attention
+ * block output (which the caller sums with the peer's contribution the
+ * same way ds4_gpu_matmul_q8_0_kslice_rows_tensor's own callers do).
+ *
+ * ds4_cuda.cu's own implementation (ds4_cuda.cu:18460-18516) is itself
+ * pure composition, not a fused kernel: it builds a heads_slice view
+ * (legal as a flat pointer offset only because n_tokens == 1 makes the
+ * group0..group0+group_cnt range of a single row contiguous; a
+ * multi-row version would need a strided view instead, which is exactly
+ * why ds4_gpu_attention_output_low_q8_rows_exact_tensor -- the batched
+ * n_rows sibling of this entry, used by the multi-session verify-batch
+ * path -- is NOT implemented here: it has no single-row shortcut)
+ * and calls ds4_gpu_attention_output_low_q8_tensor then
+ * ds4_gpu_matmul_q8_0_kslice_rows_tensor. This port is a literal,
+ * line-for-line translation of that composition, both callees already
+ * implemented in this backend. Validation ported from
+ * ds4_cuda.cu:18474-18490. NONZERO means success, matching both composed
+ * calls (`&&`, matching CUDA's own `return ... && ...`). */
+extern "C" int ds4_gpu_attention_output_q8_tp_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups_total,
+        uint32_t                group0,
+        uint32_t                group_cnt,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads) {
+    if (!out || !low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        n_groups_total == 0u || group_cnt == 0u || group0 > n_groups_total ||
+        group_cnt > n_groups_total - group0 || out_dim == 0u) {
+        return 0;
+    }
+
+    uint64_t row_a_bytes = 0, low_dim_total = 0, k_off = 0, k_cnt = 0, heads_min_bytes = 0;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    if (!sycl_u64_mul_checked(blocks_a, 34u, &row_a_bytes) ||
+        !sycl_u64_mul_checked((uint64_t)n_groups_total, rank, &low_dim_total) ||
+        !sycl_u64_mul_checked((uint64_t)group0, rank, &k_off) ||
+        !sycl_u64_mul_checked((uint64_t)group_cnt, rank, &k_cnt) ||
+        (k_off % 32u) != 0u || (k_cnt % 32u) != 0u ||
+        !sycl_u64_mul_checked((uint64_t)group0 + group_cnt, group_dim, &heads_min_bytes) ||
+        !sycl_u64_mul_checked(heads_min_bytes, sizeof(float), &heads_min_bytes) ||
+        heads->bytes < heads_min_bytes ||
+        !sycl_tensor_has_f32(low, k_cnt) ||
+        !sycl_tensor_has_f32(out, out_dim)) {
+        return 0;
+    }
+
+    ds4_gpu_tensor heads_slice = *heads;
+    heads_slice.ptr = (char *)heads->ptr + (uint64_t)group0 * group_dim * sizeof(float);
+    heads_slice.bytes = (uint64_t)group_cnt * group_dim * sizeof(float);
+    heads_slice.owner = 0;
+
+    uint64_t a_off_delta = 0, a_off = 0;
+    if (!sycl_u64_mul_checked((uint64_t)group0, rank, &a_off_delta) ||
+        !sycl_u64_mul_checked(a_off_delta, row_a_bytes, &a_off_delta) ||
+        !sycl_u64_add_checked(out_a_offset, a_off_delta, &a_off)) {
+        return 0;
+    }
+
+    return ds4_gpu_attention_output_low_q8_tensor(low, model_map, model_size, a_off,
+                                                  group_dim, rank, group_cnt,
+                                                  &heads_slice) &&
+           ds4_gpu_matmul_q8_0_kslice_rows_tensor(out, model_map, model_size, out_b_offset,
+                                                  low_dim_total, out_dim, k_off, k_cnt,
+                                                  low, 1u);
+}
+
 /* Full two-stage batched projection, F32 output. Matches
  * ds4.c:10517-10535 (layer_grouped_out_batch): the grouped A-stage above,
  * generalised to n_tokens, then a plain Q8_0 matvec/matmul B-stage. Ported

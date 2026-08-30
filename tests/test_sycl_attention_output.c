@@ -373,6 +373,140 @@ static int test_attention_output_low_q8(void) {
     return 0;
 }
 
+/* As oracle_matmul_q8_0_raw above (plain, non-activation-quantised dot,
+ * matching ds4_gpu_matmul_q8_0_kslice_rows_tensor's actual contract, not
+ * ds4.c's own quantised matvec_q8_0_kslice), restricted to
+ * [in_start, in_start+in_count) of the FULL row's block addressing. */
+static void oracle_matmul_q8_0_kslice_raw(float *out, const float *x_slice,
+                                          const unsigned char *w, uint32_t out_dim,
+                                          uint64_t full_row_bytes, uint32_t in_start,
+                                          uint32_t in_count) {
+    for (uint32_t o = 0; o < out_dim; o++) {
+        const unsigned char *row = w + (size_t)o * full_row_bytes;
+        double sum = 0.0;
+        for (uint32_t k = 0; k < in_count; k++) {
+            const uint32_t col = in_start + k;
+            const uint32_t blk = col / 32u;
+            const uint32_t idx = col % 32u;
+            const unsigned char *bp = row + (size_t)blk * 34u;
+            const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+            const float scale = oracle_half_to_float(raw);
+            const signed char qv = (signed char)bp[2 + idx];
+            sum += (double)x_slice[k] * (double)scale * (double)qv;
+        }
+        out[o] = (float)sum;
+    }
+}
+
+/* Tensor parallelism: ds4_gpu_attention_output_q8_tp_tensor, one
+ * TP rank's group-sliced attention output pair, n_tokens == 1. RANK = 32
+ * (a multiple of 32) so any group0/group_cnt choice keeps k_off = group0*
+ * rank and k_cnt = group_cnt*rank block-aligned without needing dozens of
+ * groups just to satisfy that constraint -- GROUP0 = 2, GROUP_CNT = 3 out
+ * of N_GROUPS_TOTAL = 6 is a genuinely uneven, non-zero-based slice, not
+ * the whole range or a lucky group0 == 0 case. Oracle composes
+ * oracle_grouped_out_low (the already-proven A-stage, restricted to this
+ * rank's own group range) with oracle_matmul_q8_0_kslice_raw above (the
+ * plain B-stage matching ds4_gpu_matmul_q8_0_kslice_rows_tensor's actual,
+ * non-activation-quantised contract), the same two-stage composition
+ * ds4_gpu_attention_output_q8_tp_tensor itself is built from. */
+static int test_attention_output_q8_tp(void) {
+    enum {
+        GROUP_DIM = 37, RANK = 32, N_GROUPS_TOTAL = 6, GROUP0 = 2, GROUP_CNT = 3, OUT_DIM = 9
+    };
+    const uint32_t blocks_a = (GROUP_DIM + 31u) / 32u;
+    const uint64_t row_a_bytes = (uint64_t)blocks_a * 34u;
+    const uint32_t low_dim_total = N_GROUPS_TOTAL * RANK;
+    const uint32_t k_off = GROUP0 * RANK, k_cnt = GROUP_CNT * RANK;
+    const uint64_t blocks_b = (low_dim_total + 31u) / 32u;
+    const uint64_t row_b_bytes = blocks_b * 34u;
+    const uint64_t out_a_bytes = (uint64_t)N_GROUPS_TOTAL * RANK * row_a_bytes;
+    const uint64_t out_b_bytes = (uint64_t)OUT_DIM * row_b_bytes;
+    /* Both weight tables live in ONE model_map buffer, as the real model
+     * file does: out_a at offset OUT_A_OFF, out_b at offset OUT_B_OFF. A
+     * nonzero, unequal pair of offsets (not both 0) is deliberate: passing
+     * the same buffer for both offsets is exactly the mistake this test
+     * caught in its own first draft, when out_b_offset silently pointed
+     * back into out_a's table instead of a real out_b. */
+    const uint64_t out_a_off = 16, out_b_off = out_a_off + out_a_bytes + 8;
+    const uint64_t model_size = out_b_off + out_b_bytes;
+
+    unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+    float heads[N_GROUPS_TOTAL * GROUP_DIM];
+    CHECK(model != NULL, "attention_output_q8_tp: host alloc");
+    unsigned char *out_a = model + out_a_off;
+    unsigned char *out_b = model + out_b_off;
+
+    for (uint32_t g = 0; g < N_GROUPS_TOTAL; g++) {
+        for (uint32_t r = 0; r < RANK; r++) {
+            encode_q8_0_row(out_a + ((size_t)g * RANK + r) * row_a_bytes, GROUP_DIM,
+                            g * 13u + r + 2u);
+        }
+        fill_activation_row(heads + (size_t)g * GROUP_DIM, GROUP_DIM, g + 1u);
+    }
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        encode_q8_0_row(out_b + (size_t)o * row_b_bytes, low_dim_total, o + 40u);
+    }
+
+    float want_low[GROUP_CNT * RANK];
+    oracle_grouped_out_low(want_low, heads + (size_t)GROUP0 * GROUP_DIM,
+                           out_a + (size_t)GROUP0 * RANK * row_a_bytes, GROUP_CNT, GROUP_DIM,
+                           RANK);
+    float want_out[OUT_DIM];
+    oracle_matmul_q8_0_kslice_raw(want_out, want_low, out_b, OUT_DIM, row_b_bytes, k_off, k_cnt);
+
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(sizeof(heads));
+    ds4_gpu_tensor *tlow = ds4_gpu_tensor_alloc(sizeof(want_low));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(want_out));
+    CHECK(theads && tlow && tout, "attention_output_q8_tp: alloc");
+    CHECK(ds4_gpu_tensor_write(theads, 0, heads, sizeof(heads)) != 0,
+          "attention_output_q8_tp: write heads");
+
+    CHECK(ds4_gpu_attention_output_q8_tp_tensor(tout, tlow, model, model_size, out_a_off,
+                                                out_b_off, GROUP_DIM, RANK, N_GROUPS_TOTAL, GROUP0,
+                                                GROUP_CNT, OUT_DIM, theads) != 0,
+          "attention_output_q8_tp: call");
+
+    float got_low[GROUP_CNT * RANK], got_out[OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(tlow, 0, got_low, sizeof(got_low)) != 0,
+          "attention_output_q8_tp: read low");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got_out, sizeof(got_out)) != 0,
+          "attention_output_q8_tp: read out");
+    for (uint32_t i = 0; i < GROUP_CNT * RANK; i++) {
+        CHECK_CLOSE(got_low[i], want_low[i], 1e-2, "attention_output_q8_tp: low mismatch");
+    }
+    for (uint32_t i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got_out[i], want_out[i], 1e-2, "attention_output_q8_tp: out mismatch");
+    }
+
+    /* Validation ported from ds4_cuda.cu:18474-18490. */
+    CHECK(ds4_gpu_attention_output_q8_tp_tensor(tout, tlow, model, model_size, out_a_off,
+                                                out_b_off, GROUP_DIM, RANK, N_GROUPS_TOTAL,
+                                                N_GROUPS_TOTAL + 1u, GROUP_CNT, OUT_DIM,
+                                                theads) == 0,
+          "attention_output_q8_tp: group0 beyond n_groups_total must be rejected");
+    CHECK(ds4_gpu_attention_output_q8_tp_tensor(tout, tlow, model, model_size, out_a_off,
+                                                out_b_off, GROUP_DIM, RANK, N_GROUPS_TOTAL, GROUP0,
+                                                N_GROUPS_TOTAL - GROUP0 + 1u, OUT_DIM,
+                                                theads) == 0,
+          "attention_output_q8_tp: group_cnt exceeding remaining groups must be rejected");
+    CHECK(ds4_gpu_attention_output_q8_tp_tensor(tout, tlow, model, model_size, out_a_off,
+                                                out_b_off, GROUP_DIM, RANK, N_GROUPS_TOTAL, GROUP0,
+                                                0u, OUT_DIM, theads) == 0,
+          "attention_output_q8_tp: zero group_cnt must be rejected");
+    CHECK(ds4_gpu_attention_output_q8_tp_tensor(NULL, tlow, model, model_size, out_a_off,
+                                                out_b_off, GROUP_DIM, RANK, N_GROUPS_TOTAL, GROUP0,
+                                                GROUP_CNT, OUT_DIM, theads) == 0,
+          "attention_output_q8_tp: null out must be rejected");
+
+    ds4_gpu_tensor_free(theads);
+    ds4_gpu_tensor_free(tlow);
+    ds4_gpu_tensor_free(tout);
+    free(model);
+    fprintf(stderr, "  test_attention_output_q8_tp OK\n");
+    return 0;
+}
+
 /* Contention-scale regression test for the A-stage's own internal ordering:
  * sycl_attention_output_a_stage (ds4_sycl_attention_output.hpp) submits the
  * quantise kernel and the grouped preq dot-product kernel back to back on
@@ -1060,6 +1194,7 @@ int main(void) {
     if (test_quantize_q8_0_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_grouped_q8_0_a_preq() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_low_q8() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_attention_output_q8_tp() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_a_stage_contention() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_q8_batch() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_q8_batch_f16() != 0) { ds4_gpu_cleanup(); return 1; }
