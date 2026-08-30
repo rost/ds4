@@ -34,6 +34,7 @@
     } while (0)
 
 /* sycl/ds4_sycl_placement.hpp test-only hooks; not part of the ABI. */
+extern int      ds4_sycl_device_count(void);
 extern uint64_t ds4_sycl_test_placement_cache_bytes(int tier);
 extern int      ds4_sycl_test_placement_read_back(int tier, uint64_t source_offset,
                                                    uint64_t bytes, void *out);
@@ -66,8 +67,11 @@ static int test_tier_free_vram_bounds(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init for tier_free_vram bounds");
 
     CHECK(ds4_gpu_tier_free_vram(-1) == 0, "negative tier is 0");
-    CHECK(ds4_gpu_tier_free_vram(1) == 0,
-          "out-of-range tier on a one-device box is 0");
+    /* The first out-of-range tier is the device count, not a hardcoded 1:
+     * on a multi-GPU host tier 1 is a real device with real free VRAM.
+     * ds4_gpu_init() ran just above, so the count is live here. */
+    CHECK(ds4_gpu_tier_free_vram(ds4_sycl_device_count()) == 0,
+          "the first out-of-range tier is 0");
 
     const uint64_t free0 = ds4_gpu_tier_free_vram(0);
     CHECK(free0 > 0, "tier 0 free VRAM is nonzero on a real device");
@@ -143,8 +147,8 @@ static int test_device_cache_tensors_arg_validation(void) {
 
     CHECK(ds4_gpu_device_cache_tensors(-1, &r, 1) != 0,
           "negative device_id fails");
-    CHECK(ds4_gpu_device_cache_tensors(1, &r, 1) != 0,
-          "out-of-range device_id (only tier 0 exists) fails");
+    CHECK(ds4_gpu_device_cache_tensors(ds4_sycl_device_count(), &r, 1) != 0,
+          "device_id one past the last device fails");
     CHECK(ds4_gpu_device_cache_tensors(0, NULL, -1) != 0,
           "n_ranges < 0 with NULL ranges fails");
     CHECK(ds4_gpu_device_cache_tensors(0, &r, 0) == 0,
