@@ -348,6 +348,71 @@ static inline bool sycl_ptr_is_device_resident(sycl::queue &q, const void *ptr) 
     return sycl::get_pointer_type(ptr, q.get_context()) == sycl::usm::alloc::device;
 }
 
+/* Test/report-only instrumentation: per-kernel device
+ * profiling used to measure where a layer-eval's wall-clock time actually
+ * goes, before deciding whether draining the queue after every ABI entry
+ * is worth deferring. Disabled (one bool check per call site) unless
+ * DS4_SYCL_PROFILE is set before ds4_gpu_init runs, since
+ * property::queue::enable_profiling() is a queue-construction-time
+ * property (ds4_sycl.cpp, ds4_sycl_build_devices) and cannot be turned on
+ * after the fact. g_sycl_profile_enabled is a separate runtime switch so a
+ * test can reset and re-enable accumulation around just the loop it wants
+ * measured, without the setup phases before it polluting the totals.
+ *
+ * Every wait_and_throw call site instrumented for this measurement now
+ * captures its own kernel's sycl::event explicitly (either one that was
+ * already a named local, or a newly introduced one) rather than reaching
+ * for queue::ext_oneapi_get_last_event(): that DPC++ extension throws on
+ * an out-of-order queue, and spec-level guidance elsewhere in this backend
+ * is that converting these queues to in_order would serialise the very
+ * kernel overlap this backend is trying to make possible, which a
+ * measurement tool must not do just to make itself easier to write.
+ *
+ * Deliberately does NOT compute an inter-kernel "gap" by subtracting one
+ * event's command_submit from a previous event's command_end. A first
+ * attempt at that produced per-layer gap sums many times larger than the
+ * wall-clock total for the whole loop they came from, which is impossible
+ * if the two events are as close together as "consecutive kernels in one
+ * layer-eval" implies: the likely cause is Level Zero's device timestamp
+ * counter, which is narrow enough to wrap within the loop's runtime, so a
+ * naive subtraction between two events that are not actually adjacent
+ * (this measurement's coverage is real but partial: some call sites launch
+ * their kernel through a helper this instrumentation does not reach, so
+ * the "previous" recorded event can be from several real kernels earlier)
+ * aliases to a huge, meaningless value. Reporting a number here would be
+ * worse than not measuring it. Summing one event's own (command_end -
+ * command_start) does not have this problem: both timestamps come from the
+ * same command's own short window and cannot span a wrap in practice. */
+static bool     g_sycl_profile_enabled = false;
+static uint64_t g_sycl_profile_kernel_ns = 0;
+static uint64_t g_sycl_profile_kernel_count = 0;
+
+static inline void ds4_sycl_profile_record(const sycl::event &ev) {
+    if (!g_sycl_profile_enabled) return;
+    try {
+        const uint64_t start_ns = ev.get_profiling_info<
+            sycl::info::event_profiling::command_start>();
+        const uint64_t end_ns = ev.get_profiling_info<
+            sycl::info::event_profiling::command_end>();
+        if (end_ns > start_ns) g_sycl_profile_kernel_ns += (end_ns - start_ns);
+        g_sycl_profile_kernel_count++;
+    } catch (const sycl::exception &) {
+        /* Profiling info unavailable for this event (queue built without
+         * enable_profiling, or the event has no device command): skip
+         * rather than let a measurement-only probe fail a real call. */
+    }
+}
+
+extern "C" void ds4_sycl_test_profile_enable(int enable) {
+    g_sycl_profile_enabled = enable != 0;
+}
+extern "C" void ds4_sycl_test_profile_reset(void) {
+    g_sycl_profile_kernel_ns = 0;
+    g_sycl_profile_kernel_count = 0;
+}
+extern "C" uint64_t ds4_sycl_test_profile_kernel_ns(void) { return g_sycl_profile_kernel_ns; }
+extern "C" uint64_t ds4_sycl_test_profile_kernel_count(void) { return g_sycl_profile_kernel_count; }
+
 /* Test/report-only instrumentation: cumulative bytes actually
  * copied host-to-device by sycl_stage_host_bytes below (never incremented
  * on its pass-through branch). Since an audit confirmed every
@@ -412,7 +477,9 @@ static inline void sycl_copy_host_to_device_paged_safe(
     for (uint64_t done = 0; done < bytes; done += kChunk) {
         const uint64_t n = bytes - done < kChunk ? bytes - done : kChunk;
         memcpy(stage.data(), src + done, (size_t)n);
-        q.memcpy(dst + done, stage.data(), (size_t)n).wait_and_throw();
+        sycl::event _ds4_prof_ev18 = q.memcpy(dst + done, stage.data(), (size_t)n);
+        _ds4_prof_ev18.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev18);
     }
 }
 

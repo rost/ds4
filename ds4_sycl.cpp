@@ -126,6 +126,24 @@ std::vector<sycl::device> ds4_sycl_enumerate_gpus() {
  * device on a different platform still gets a valid queue of its own
  * rather than being dropped.  Tier order always follows `wanted`'s order,
  * independent of how devices group into contexts. */
+
+/* Measurement-only: property::queue::enable_profiling()
+ * makes event::get_profiling_info usable on every event this queue
+ * produces, at a per-submission cost real enough not to pay by default.
+ * Gated on DS4_SYCL_PROFILE, read once at queue construction, so an
+ * ordinary run or test pays nothing; a measurement run sets it before
+ * ds4_gpu_init so every tier's queue is built profiling-capable from the
+ * start. Deliberately does not add property::queue::in_order: spec-level
+ * guidance elsewhere in this backend is that in_order would serialise the
+ * very kernel overlap this backend is trying to make possible, and a
+ * measurement tool must not change the thing it is trying to measure. */
+static sycl::property_list ds4_sycl_queue_properties(void) {
+    if (getenv("DS4_SYCL_PROFILE")) {
+        return sycl::property_list{sycl::property::queue::enable_profiling()};
+    }
+    return sycl::property_list{};
+}
+
 void ds4_sycl_build_devices(const std::vector<sycl::device> &wanted,
                              std::vector<ds4_sycl_device> *out) {
     std::vector<sycl::platform> platforms;
@@ -150,7 +168,8 @@ void ds4_sycl_build_devices(const std::vector<sycl::device> &wanted,
         for (size_t k = 0; k < platforms.size(); k++) {
             if (platforms[k] == p) {
                 out->push_back(ds4_sycl_device{
-                    d, sycl::queue(contexts[k], d, ds4_sycl_async_handler)});
+                    d, sycl::queue(contexts[k], d, ds4_sycl_async_handler,
+                                   ds4_sycl_queue_properties())});
                 break;
             }
         }
@@ -656,7 +675,9 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset,
     try {
         sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
                                                               : g_current_tier);
-        q.memcpy((char *)tensor->ptr + offset, data, bytes).wait_and_throw();
+        sycl::event _ds4_prof_ev154 = q.memcpy((char *)tensor->ptr + offset, data, bytes);
+        _ds4_prof_ev154.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev154);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_write failed: %s\n", e.what());
@@ -678,7 +699,9 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
     try {
         sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
                                                               : g_current_tier);
-        q.memcpy(data, (const char *)tensor->ptr + offset, bytes).wait_and_throw();
+        sycl::event _ds4_prof_ev155 = q.memcpy(data, (const char *)tensor->ptr + offset, bytes);
+        _ds4_prof_ev155.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev155);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_read failed: %s\n", e.what());
@@ -739,7 +762,9 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
     try {
         sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
                                                               : g_current_tier);
-        q.fill((float *)tensor->ptr, value, (size_t)count).wait_and_throw();
+        sycl::event _ds4_prof_ev156 = q.fill((float *)tensor->ptr, value, (size_t)count);
+        _ds4_prof_ev156.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev156);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_fill_f32 failed: %s\n", e.what());
