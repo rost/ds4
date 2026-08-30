@@ -344,9 +344,14 @@ extern "C" int ds4_gpu_init(void) {
          * enumerated: ds4.c reads these directly (see ds4.c's engine setup
          * and multi-tier dispatch) and would otherwise still see the
          * single-tier default declared below even when g_devices holds
-         * every physical GPU on the box.  Only device_id is meaningful
-         * here; stream, cublas, scratch and budget belong to the
-         * multi-GPU plan and stay zeroed. */
+         * every physical GPU on the box.
+         *
+         * Only device_id is set here.  budget_bytes is filled in by
+         * ds4_gpu_init_multi (ds4_sycl_mgpu.hpp) from the caller's
+         * --gpu-vram/--gpu-devices config, and leaving it zero on this path
+         * is harmless: ds4.c never reads g_gpu[].budget_bytes, because
+         * layer placement carries its own per-tier budgets.  The remaining
+         * ds4_gpu_ctx fields are CUDA-shaped and unused by this backend. */
         size_t n = g_devices.size();
         if (n > (size_t)DS4_MAX_GPUS) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -359,18 +364,22 @@ extern "C" int ds4_gpu_init(void) {
             g_gpu[i].device_id = i;
         }
 
-        /* g_n_gpus > 1 arms ds4.c's multi-tier dispatch paths (gated on
-         * g_n_gpus <= 1), but this backend's tensor alloc and current-device
-         * entries are still failing stubs, so those paths cannot work yet.
-         * One clear message at init time beats letting the caller discover
-         * this through a mysterious nullptr or set_current_device failure. */
-        if (g_n_gpus > 1) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX
-                    "enumerated %d devices, but multi-GPU execution is not "
-                    "yet implemented in the SYCL backend; single-device use "
-                    "is expected until the multi-GPU work lands\n",
-                    g_n_gpus);
-        }
+        /* No multi-GPU warning here any more.  This used to print that
+         * multi-GPU execution was "not yet implemented", on the grounds
+         * that the tensor-alloc and current-device entries were failing
+         * stubs; all of them are implemented now, and the whole SYCL suite
+         * passes on a 14-device host.
+         *
+         * One difference from CUDA is worth knowing and is deliberately
+         * left as-is rather than silently changed: ds4_gpu_mgpu.h describes
+         * ds4_gpu_init as "a thin shim that builds a single-device config
+         * for device 0", which is exactly what ds4_cuda.cu:2769 does.  This
+         * backend instead exposes every enumerated device as a tier, so
+         * g_n_gpus > 1 on a multi-GPU host even when the caller asked for
+         * nothing, which arms ds4.c's _on(tier) allocation paths.  Those
+         * paths are implemented and tested, so this is not known to be
+         * wrong -- but it is a real behavioural difference from CUDA, and
+         * it cannot show up on a single-GPU host. */
 
         /* Per spec 6m, [[sycl::reqd_sub_group_size(N)]] is not enforced by
          * the driver on this stack: a device that cannot honour N silently
