@@ -22,13 +22,13 @@
  * unconditionally returns 0, so the SYCL stub is a faithful port of a real
  * stub in the reference implementation, not an omission.
  *
- * ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor also stays stubbed:
- * it exists only in ds4_cuda.cu (CUDA-only; rocm/ has no definition at
- * all), so under ROCm this entry hits the unavailable stub and ds4.c
- * falls back.  It is also multi-GPU aware (ds4_tensor_device_idx,
- * g_gpu_peer_ok, cuda_tmp_alloc_on), so it belongs with the multi-GPU
- * streaming plan if it is ever wanted on this backend.
+ * ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor: implemented
+ * below by delegating to ds4_gpu_shared_mid_swiglu_q8_0_tensor, plus the
+ * expert-parallel load-balance predicate and cross-device write CUDA's own
+ * bespoke kernel adds. See that entry's own comment for why delegation is
+ * safe here even though CUDA's version is a distinct kernel.
  *
+
  * Not ported at all: ds4_gpu_shared_gate_up_swiglu_q8_0_batch_tensor is a
  * ROCm-internal helper reached only from the rows entry, ported below as
  * an internal static function rather than an extern "C" entry point.  The
@@ -352,7 +352,17 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_model_view_tensor(
  * current work, and not a gap to close here ahead of the multi-GPU plan.
  * owner 0 is also deliberate: this wrapper does not own the scratch
  * allocation the way a real tensor would, since sycl_device_scratch_guard
- * below already owns and frees it. */
+ * below already owns and frees it.
+ *
+ * device_id is `mid->device_id`, NOT the struct-default 0 an earlier
+ * version of this wrapper left it at: `tmp` is allocated on
+ * ds4_sycl_queue(mid->device_id), so gate_tmp/up_tmp must report that same
+ * tier, or the delegated call below (which reads its own queue from
+ * gate_tmp->device_id) would compute on tier 0 regardless of where mid,
+ * and the memory it actually allocated, live. Harmless previously, since
+ * every tensor this backend touched lived on tier 0; ds4_gpu_shared_mid_
+ * swiglu_q8_0_decode_exact_tensor below delegates here from a genuinely
+ * non-zero tier, so the bug had to be fixed here, not just noted. */
 extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
         ds4_gpu_tensor       *mid,
         const void             *model_map,
@@ -379,9 +389,10 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
         if (!tmp) return 0;
         sycl_device_scratch_guard tmp_guard(q, tmp);
 
-        ds4_gpu_tensor gate_tmp = { tmp, out_dim * sizeof(float), 0, 0 };
+        ds4_gpu_tensor gate_tmp = { tmp, out_dim * sizeof(float), 0,
+                                    mid->device_id };
         ds4_gpu_tensor up_tmp = { tmp + out_dim, out_dim * sizeof(float), 0,
-                                  0 };
+                                  mid->device_id };
 
         return ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                 &gate_tmp, &up_tmp, mid, model_map, model_size, gate_offset,
@@ -389,6 +400,110 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_tensor(
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "shared gate/up mid wrapper failed: %s\n", e.what());
+        return 0;
+    }
+}
+
+/* Expert-parallel decode: the shared expert's gate/up/SwiGLU,
+ * load-balanced across the two EP ranks by whichever has fewer OWNED
+ * routed experts among this token's six selected slots, and written
+ * cross-device when the computing rank differs from `mid`'s home tier.
+ *
+ * Ported from ds4_cuda.cu:18552-18637 and its device kernel
+ * shared_mid_q8_0_preq_warp8_exact_kernel (:5264-5328). CUDA computes on
+ * whichever device is currently active (`cuda_decode_stream()`) and writes
+ * `mid` directly, relying on a validated peer-access pair to make that a
+ * legal cross-device pointer write. This backend has no established
+ * pattern for a kernel writing another device's USM allocation directly
+ * (every cross-device transfer elsewhere in this backend, including this
+ * backend's own MoE combine entries, is an explicit synchronous copy -- spec
+ * 6g/6j's cross-device discipline), so this port computes into local
+ * scratch on the ACTIVATION's device (`x->device_id`, the device the real
+ * kernel would run on) and then crosses to `mid`'s home tier via
+ * ds4_gpu_tensor_copy_xdev when the two differ, rather than assume a
+ * cross-device write would work.
+ *
+ * `selected`/`expert_split`/`home_rank` reproduce CUDA's per-call
+ * assignment predicate exactly (home_count <= peer_count keeps ties on the
+ * home rank), computed here from a synchronous 6-int32 readback rather
+ * than per-thread on device, since the predicate is identical for every
+ * row: either this whole call is assigned or none of it is.
+ *
+ * `prequant`: a CUDA-only cached-quantisation optimisation. This backend's
+ * shared-expert kernels never quantise the activation at all (dequantise
+ * WEIGHTS to float and dot against the plain float `x` instead, the design
+ * substitution documented on ds4_gpu_shared_gate_up_swiglu_q8_0_tensor's
+ * fused fast path above and shared again by ds4_sycl_hc.hpp's fused
+ * hc-expand), so this parameter has no correctness content on this
+ * backend and is deliberately unread. */
+extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
+        ds4_gpu_tensor       *mid,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                gate_offset,
+        uint64_t                up_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        float                   clamp,
+        const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *prequant,
+        uint32_t                expert_split,
+        bool                    home_rank) {
+    (void)prequant;
+    if (!mid || !x || !model_map || in_dim == 0u || out_dim == 0u ||
+        out_dim > UINT32_MAX ||
+        (selected && (selected->bytes < 6u * sizeof(int32_t) || expert_split == 0u))) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+
+    try {
+        if (selected) {
+            const int sel_dev = selected->device_id >= 0 ? selected->device_id
+                                                          : g_current_tier;
+            int32_t sel_host[6];
+            ds4_sycl_queue(sel_dev)
+                    .memcpy(sel_host, selected->ptr, sizeof(sel_host))
+                    .wait_and_throw();
+            uint32_t home_count = 0u, peer_count = 0u;
+            for (uint32_t i = 0; i < 6u; i++) {
+                const int32_t expert = sel_host[i];
+                if (expert >= 0 && (uint32_t)expert < expert_split) {
+                    home_count++;
+                } else if (expert >= 0 && (uint32_t)expert < 2u * expert_split) {
+                    peer_count++;
+                }
+            }
+            const bool assigned =
+                    home_rank ? home_count <= peer_count : peer_count < home_count;
+            if (!assigned) return 1;
+        }
+
+        const int compute_dev = x->device_id >= 0 ? x->device_id : g_current_tier;
+        if (mid->device_id == compute_dev) {
+            return ds4_gpu_shared_mid_swiglu_q8_0_tensor(
+                    mid, model_map, model_size, gate_offset, up_offset, in_dim,
+                    out_dim, x, clamp);
+        }
+
+        sycl::queue &cq = ds4_sycl_queue(compute_dev);
+        float *scratch = sycl::malloc_device<float>((size_t)out_dim, cq);
+        if (!scratch) return 0;
+        sycl_device_scratch_guard scratch_guard(cq, scratch);
+        ds4_gpu_tensor scratch_tensor = { scratch, out_dim * sizeof(float), 0,
+                                          compute_dev };
+        if (!ds4_gpu_shared_mid_swiglu_q8_0_tensor(&scratch_tensor, model_map,
+                                                   model_size, gate_offset,
+                                                   up_offset, in_dim, out_dim, x,
+                                                   clamp)) {
+            return 0;
+        }
+        return ds4_gpu_tensor_copy_xdev(mid, &scratch_tensor,
+                                        out_dim * sizeof(float));
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "shared mid swiglu decode exact failed: %s\n", e.what());
         return 0;
     }
 }

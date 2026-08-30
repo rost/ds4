@@ -142,6 +142,5 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor)
  * stub here and ds4.c falls back).  It is also multi-GPU aware
  * (ds4_tensor_device_idx, g_gpu_peer_ok, cuda_tmp_alloc_on), so it belongs
  * with the multi-GPU streaming plan if this backend ever wants it. */
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_should_use_managed_kv_cache)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_tensor_copy_async)
