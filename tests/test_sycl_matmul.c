@@ -326,6 +326,229 @@ static int test_matmul_q8_0(void) {
     return 0;
 }
 
+/* Oracle for the k-slice family: as oracle_matmul_q8_0 above, but each
+ * input row is already restricted to [in_start, in_start+in_count) and
+ * the dequant column addressed into the FULL row is in_start+k, not k --
+ * the weight table is staged whole (full_row_bytes), only the columns
+ * touched are restricted. Matches ds4_gpu_matmul_q8_0_kslice_rows_tensor's
+ * own contract exactly (ds4_cuda.cu:14859-14884). */
+static void oracle_matmul_q8_0_kslice(float *out, const float *x_slice,
+                                      const unsigned char *w,
+                                      uint32_t out_dim, uint32_t n_tok,
+                                      uint64_t full_row_bytes,
+                                      uint32_t in_start, uint32_t in_count) {
+    for (uint32_t t = 0; t < n_tok; t++) {
+        for (uint32_t o = 0; o < out_dim; o++) {
+            const unsigned char *row = w + (size_t)o * full_row_bytes;
+            double sum = 0.0;
+            for (uint32_t k = 0; k < in_count; k++) {
+                const uint32_t col = in_start + k;
+                const uint32_t blk = col / 32u;
+                const uint32_t idx = col % 32u;
+                const unsigned char *bp = row + (size_t)blk * 34u;
+                const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+                const float scale = oracle_half_to_float(raw);
+                const signed char qv = (signed char)bp[2 + idx];
+                sum += (double)x_slice[t * in_count + k] * (double)scale * (double)qv;
+            }
+            out[t * out_dim + o] = (float)sum;
+        }
+    }
+}
+
+/* Tensor parallelism: ds4_gpu_matmul_q8_0_kslice_rows_tensor,
+ * the split-matmul core. FULL_IN_DIM is not a multiple of 64 (96 is, so
+ * split at a non-half boundary too: HALF_A=32, HALF_B=64, both multiples
+ * of 32 as the contract requires, summing to 96) to exercise an uneven
+ * TP split, not just the symmetric case a real 2-way TP world would
+ * mostly use. */
+static int test_matmul_q8_0_kslice_rows(void) {
+    enum { FULL_IN_DIM = 96, OUT_DIM = 5, N_TOK = 3, HALF_A = 32, HALF_B = 64 };
+    const uint64_t full_blocks = (FULL_IN_DIM + 31u) / 32u;
+    const uint64_t full_row_bytes = full_blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * full_row_bytes;
+
+    unsigned char weights[OUT_DIM * 102]; /* full_row_bytes == 3*34 = 102 here */
+    float x_full[N_TOK * FULL_IN_DIM];
+    float want_full[N_TOK * OUT_DIM];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(weights + (size_t)o * full_row_bytes, FULL_IN_DIM, o);
+    }
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        for (uint32_t k = 0; k < FULL_IN_DIM; k++) {
+            x_full[t * FULL_IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+    oracle_matmul_q8_0(want_full, x_full, weights, FULL_IN_DIM, OUT_DIM, N_TOK,
+                       full_row_bytes);
+
+    /* Each rank's input row holds only its own contiguous slice, per this
+     * entry's own contract ("each input row contains only the owned
+     * contiguous K slice"), not the full FULL_IN_DIM-wide row. */
+    float xa[N_TOK * HALF_A], xb[N_TOK * HALF_B];
+    for (uint32_t t = 0; t < N_TOK; t++) {
+        memcpy(xa + t * HALF_A, x_full + t * FULL_IN_DIM, sizeof(float) * HALF_A);
+        memcpy(xb + t * HALF_B, x_full + t * FULL_IN_DIM + HALF_A, sizeof(float) * HALF_B);
+    }
+    float want_a[N_TOK * OUT_DIM], want_b[N_TOK * OUT_DIM];
+    oracle_matmul_q8_0_kslice(want_a, xa, weights, OUT_DIM, N_TOK, full_row_bytes, 0, HALF_A);
+    oracle_matmul_q8_0_kslice(want_b, xb, weights, OUT_DIM, N_TOK, full_row_bytes, HALF_A, HALF_B);
+
+    ds4_gpu_tensor *txa = ds4_gpu_tensor_alloc(sizeof(xa));
+    ds4_gpu_tensor *txb = ds4_gpu_tensor_alloc(sizeof(xb));
+    ds4_gpu_tensor *touta = ds4_gpu_tensor_alloc(sizeof(want_a));
+    ds4_gpu_tensor *toutb = ds4_gpu_tensor_alloc(sizeof(want_b));
+    CHECK(txa && txb && touta && toutb, "matmul_q8_0_kslice_rows: alloc failed");
+    CHECK(ds4_gpu_tensor_write(txa, 0, xa, sizeof(xa)) != 0,
+          "matmul_q8_0_kslice_rows: write xa");
+    CHECK(ds4_gpu_tensor_write(txb, 0, xb, sizeof(xb)) != 0,
+          "matmul_q8_0_kslice_rows: write xb");
+
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(touta, weights, weight_bytes, 0,
+                                                 FULL_IN_DIM, OUT_DIM, 0, HALF_A,
+                                                 txa, N_TOK) != 0,
+          "matmul_q8_0_kslice_rows: rank-a call");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(toutb, weights, weight_bytes, 0,
+                                                 FULL_IN_DIM, OUT_DIM, HALF_A, HALF_B,
+                                                 txb, N_TOK) != 0,
+          "matmul_q8_0_kslice_rows: rank-b call");
+
+    float got_a[N_TOK * OUT_DIM], got_b[N_TOK * OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(touta, 0, got_a, sizeof(got_a)) != 0,
+          "matmul_q8_0_kslice_rows: read rank-a");
+    CHECK(ds4_gpu_tensor_read(toutb, 0, got_b, sizeof(got_b)) != 0,
+          "matmul_q8_0_kslice_rows: read rank-b");
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got_a[i], want_a[i], 1e-2, "matmul_q8_0_kslice_rows: rank-a mismatch");
+        CHECK_CLOSE(got_b[i], want_b[i], 1e-2, "matmul_q8_0_kslice_rows: rank-b mismatch");
+    }
+
+    /* The TP invariant this whole family exists for: the two ranks'
+     * partial results, summed, reconstruct the SAME full-width projection
+     * a single non-split matmul over the whole row would produce. This is
+     * the property ds4_gpu_add_xdev_tensor / ds4_gpu_hc_expand_add_tensor
+     * rely on downstream; if this does not hold, no amount of correct
+     * cross-rank plumbing on top of it would produce a correct answer. */
+    for (int i = 0; i < N_TOK * OUT_DIM; i++) {
+        CHECK_CLOSE(got_a[i] + got_b[i], want_full[i], 1e-2,
+                    "matmul_q8_0_kslice_rows: split halves do not sum to the "
+                    "unsplit projection");
+    }
+
+    /* Validation ported from ds4_cuda.cu:14870-14884. */
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(touta, weights, weight_bytes, 0,
+                                                 0, OUT_DIM, 0, HALF_A, txa, N_TOK) == 0,
+          "matmul_q8_0_kslice_rows: zero full_in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(touta, weights, weight_bytes, 0,
+                                                 FULL_IN_DIM, 0, 0, HALF_A, txa, N_TOK) == 0,
+          "matmul_q8_0_kslice_rows: zero out_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(touta, weights, weight_bytes, 0,
+                                                 FULL_IN_DIM, OUT_DIM, 0, HALF_A, txa, 0) == 0,
+          "matmul_q8_0_kslice_rows: zero n_tok must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(touta, weights, weight_bytes, 0,
+                                                 FULL_IN_DIM, OUT_DIM, 1, HALF_A, txa, N_TOK) == 0,
+          "matmul_q8_0_kslice_rows: unaligned in_start must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(touta, weights, weight_bytes, 0,
+                                                 FULL_IN_DIM, OUT_DIM, 0, HALF_A + 1u, txa,
+                                                 N_TOK) == 0,
+          "matmul_q8_0_kslice_rows: unaligned in_count must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(touta, weights, weight_bytes, 0,
+                                                 FULL_IN_DIM, OUT_DIM, FULL_IN_DIM, 32u, txa,
+                                                 N_TOK) == 0,
+          "matmul_q8_0_kslice_rows: in_start beyond full_in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(touta, weights, weight_bytes, 0,
+                                                 FULL_IN_DIM, OUT_DIM, HALF_A,
+                                                 FULL_IN_DIM, txa, N_TOK) == 0,
+          "matmul_q8_0_kslice_rows: in_count exceeding remaining range must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(touta, weights, weight_bytes,
+                                                 weight_bytes, FULL_IN_DIM, OUT_DIM, 0,
+                                                 HALF_A, txa, N_TOK) == 0,
+          "matmul_q8_0_kslice_rows: out-of-range weight offset must be rejected");
+
+    ds4_gpu_tensor_free(txa);
+    ds4_gpu_tensor_free(txb);
+    ds4_gpu_tensor_free(touta);
+    ds4_gpu_tensor_free(toutb);
+    fprintf(stderr, "  test_matmul_q8_0_kslice_rows OK\n");
+    return 0;
+}
+
+/* Tensor parallelism: ds4_gpu_matmul_q8_0_kslice_tensor, the
+ * single-token wrapper. Differential against
+ * ds4_gpu_matmul_q8_0_kslice_rows_tensor: a call through the x_elem_off/
+ * n_tok=1 wrapper must produce exactly the same result as calling the
+ * rows entry directly on an equivalent pre-sliced view, since
+ * ds4_cuda.cu:30649-30671 implements the wrapper as exactly that
+ * delegation and this port matches it line-for-line. Note: this entry has ZERO call sites anywhere in ds4.c, so
+ * this test is the only thing that will ever exercise it. */
+static int test_matmul_q8_0_kslice(void) {
+    enum { FULL_IN_DIM = 96, OUT_DIM = 5, IN_START = 32, IN_COUNT = 64, X_ELEM_OFF = 7 };
+    const uint64_t full_blocks = (FULL_IN_DIM + 31u) / 32u;
+    const uint64_t full_row_bytes = full_blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * full_row_bytes;
+
+    unsigned char weights[OUT_DIM * 102];
+    /* x is wider than X_ELEM_OFF + IN_COUNT so the slice genuinely starts
+     * mid-buffer, exercising x_elem_off as a real offset, not a no-op. */
+    float x[X_ELEM_OFF + IN_COUNT + 5];
+
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        test_encode_q8_0_row(weights + (size_t)o * full_row_bytes, FULL_IN_DIM, o + 3u);
+    }
+    for (uint32_t k = 0; k < X_ELEM_OFF + IN_COUNT + 5u; k++) {
+        x[k] = (float)((k * 5u) % 7u) - 3.0f;
+    }
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(sizeof(float) * OUT_DIM);
+    ds4_gpu_tensor *tslice = ds4_gpu_tensor_alloc(sizeof(float) * IN_COUNT);
+    ds4_gpu_tensor *tout_ref = ds4_gpu_tensor_alloc(sizeof(float) * OUT_DIM);
+    CHECK(tx && tout && tslice && tout_ref, "matmul_q8_0_kslice: alloc failed");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0, "matmul_q8_0_kslice: write x");
+    CHECK(ds4_gpu_tensor_write(tslice, 0, x + X_ELEM_OFF, sizeof(float) * IN_COUNT) != 0,
+          "matmul_q8_0_kslice: write slice");
+
+    CHECK(ds4_gpu_matmul_q8_0_kslice_tensor(tout, weights, weight_bytes, 0, FULL_IN_DIM,
+                                            IN_START, IN_COUNT, OUT_DIM, tx,
+                                            X_ELEM_OFF) != 0,
+          "matmul_q8_0_kslice: call");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_rows_tensor(tout_ref, weights, weight_bytes, 0,
+                                                 FULL_IN_DIM, OUT_DIM, IN_START, IN_COUNT,
+                                                 tslice, 1u) != 0,
+          "matmul_q8_0_kslice: reference rows call");
+
+    float got[OUT_DIM], want[OUT_DIM];
+    CHECK(ds4_gpu_tensor_read(tout, 0, got, sizeof(got)) != 0, "matmul_q8_0_kslice: read");
+    CHECK(ds4_gpu_tensor_read(tout_ref, 0, want, sizeof(want)) != 0,
+          "matmul_q8_0_kslice: read reference");
+    for (int i = 0; i < OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], 1e-6,
+                    "matmul_q8_0_kslice: wrapper diverges from rows delegation");
+    }
+
+    /* Validation ported from ds4_cuda.cu:30660-30663. */
+    CHECK(ds4_gpu_matmul_q8_0_kslice_tensor(tout, weights, weight_bytes, 0, FULL_IN_DIM,
+                                            IN_START, IN_COUNT, OUT_DIM, tx,
+                                            (uint64_t)(X_ELEM_OFF + IN_COUNT + 5u) + 1u) == 0,
+          "matmul_q8_0_kslice: x_elem_off beyond x must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_tensor(tout, weights, weight_bytes, 0, FULL_IN_DIM,
+                                            IN_START, (uint64_t)(IN_COUNT + 5u) * 100u,
+                                            OUT_DIM, tx, X_ELEM_OFF) == 0,
+          "matmul_q8_0_kslice: k_cnt exceeding remaining x must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_tensor(NULL, weights, weight_bytes, 0, FULL_IN_DIM,
+                                            IN_START, IN_COUNT, OUT_DIM, NULL,
+                                            X_ELEM_OFF) == 0,
+          "matmul_q8_0_kslice: null x must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tslice);
+    ds4_gpu_tensor_free(tout_ref);
+    fprintf(stderr, "  test_matmul_q8_0_kslice OK\n");
+    return 0;
+}
+
 /* ds4_gpu_matmul_q8_0_decode_mpp_tensor is, per ROCm
  * (rocm/ds4_rocm_matmul.cuh:531-549), the exact same computation as
  * ds4_gpu_matmul_q8_0_tensor; it exists as a separate ABI entry only
@@ -1349,6 +1572,8 @@ int main(void) {
     if (test_matmul_f16_pair() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_f16_pair_compressor_store() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0_kslice_rows() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0_kslice() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_decode_mpp() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_decode_mpp_model_view() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_rows_scalar() != 0) { ds4_gpu_cleanup(); return 1; }

@@ -488,6 +488,141 @@ extern "C" int ds4_gpu_matmul_q8_0_pair_tensor(
                                     n_tok);
 }
 
+/* Tensor parallelism: the split-matmul family. Each TP rank owns
+ * a contiguous, block-aligned K range of a Q8_0 weight table; this entry
+ * computes that rank's partial projection, which the caller sums with the
+ * peer's partial result (ds4_gpu_add_xdev_tensor, ds4_sycl_mgpu.hpp) or
+ * folds directly into an HC combine (ds4_gpu_hc_expand_add_tensor,
+ * ds4_sycl_hc.hpp) to reconstruct the full-width result.
+ *
+ * "Rows" here are input rows: each of the n_tok rows of x holds only the
+ * owned in_count-wide slice (contiguous, pre-sliced by the caller), while
+ * every output row spans the full out_dim width -- ds4_gpu.h's own comment
+ * on the docstring for the singular ds4_gpu_matmul_q8_0_kslice_tensor
+ * below. Ported from ds4_cuda.cu's real kernel pair
+ * (quantize_q8_0_f32_kernel + matmul_q8_0_kslice_preq_warp8_kernel):
+ * this port skips CUDA's activation-side int8 prequantisation and dp4a
+ * fast path, for the same reason sycl_q8_0_matmul_general above already
+ * declines it (no direct SYCL equivalent worth chasing for a first port;
+ * a plain per-column dequant-and-accumulate is mathematically identical,
+ * only slower). Validation ported from ds4_cuda.cu:14859-14884 exactly,
+ * MINUS its `n_tok > 65535` check, which is a CUDA grid-dimension limit
+ * (blockIdx.y), not a semantic contract requirement, and has no SYCL
+ * analogue worth inventing.
+ *
+ * Weight staging copies the FULL row (out_dim * full_blocks * 34 bytes,
+ * same as ds4_cuda.cu's cuda_resolve_weight_ptr call): the model file
+ * itself is not physically sharded by rank, only the K-range each rank
+ * reads from it is, so this matches the CUDA reference's own behaviour,
+ * not a missed optimisation. NONZERO means success, matching ds4_gpu.h
+ * and ds4_cuda.cu's own `cuda_ok(...)` return. */
+extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                full_in_dim,
+        uint64_t                out_dim,
+        uint64_t                in_start,
+        uint64_t                in_count,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok) {
+    if (!out || !x || !model_map || full_in_dim == 0u || out_dim == 0u ||
+        in_count == 0u || n_tok == 0u || full_in_dim > UINT32_MAX ||
+        out_dim > UINT32_MAX) {
+        return 0;
+    }
+    if ((in_start % 32u) != 0u || (in_count % 32u) != 0u ||
+        in_start > full_in_dim || in_count > full_in_dim - in_start) {
+        return 0;
+    }
+
+    uint64_t full_row_bytes = 0, weight_bytes = 0;
+    if (!sycl_q8_0_row_bytes_checked(full_in_dim, &full_row_bytes) ||
+        !sycl_u64_mul_checked(out_dim, full_row_bytes, &weight_bytes) ||
+        !sycl_model_range_fits(model_size, weight_offset, weight_bytes) ||
+        !sycl_tensor_has_elems2(x, n_tok, in_count, sizeof(float)) ||
+        !sycl_tensor_has_elems2(out, n_tok, out_dim, sizeof(float))) {
+        return 0;
+    }
+    const char *wptr = sycl_model_range_ptr(model_map, weight_offset,
+                                            weight_bytes, model_size,
+                                            "q8_0_kslice_rows");
+    if (!wptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out->device_id);
+
+        unsigned char *dw = sycl::malloc_device<unsigned char>(
+                (size_t)weight_bytes, q);
+        if (!dw) return 0;
+        sycl_device_scratch_guard dw_guard(q, dw);
+        q.memcpy(dw, wptr, (size_t)weight_bytes).wait_and_throw();
+
+        float       *out_ptr = (float *)out->ptr;
+        const float *x_ptr   = (const float *)x->ptr;
+        const uint32_t out_dim32   = (uint32_t)out_dim;
+        const uint32_t n_tok32     = (uint32_t)n_tok;
+        const uint32_t in_start32  = (uint32_t)in_start;
+        const uint32_t in_count32  = (uint32_t)in_count;
+        const uint64_t n = (uint64_t)n_tok32 * out_dim32;
+        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+            const uint32_t o = (uint32_t)(gid % out_dim32);
+            const uint32_t t = (uint32_t)(gid / out_dim32);
+            const float         *xr = x_ptr + (uint64_t)t * in_count32;
+            const unsigned char *wr = dw + (uint64_t)o * full_row_bytes;
+            float sum = 0.0f;
+            for (uint32_t k = 0; k < in_count32; k++) {
+                sum += xr[k] * sycl_q8_0_dequant(wr, in_start32 + k);
+            }
+            out_ptr[gid] = sum;
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0_kslice_rows failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* Single-token convenience wrapper: builds a k_cnt-wide view of x starting
+ * at x_elem_off and delegates to the rows variant above with n_tok = 1,
+ * matching ds4_cuda.cu:30649-30671 exactly (it does the same x-slice
+ * construction and the same delegation, to ds4_gpu_matmul_q8_0_kslice_rows_
+ * tensor there too). Checked directly against every call site in ds4.c:
+ * this entry currently has ZERO call sites anywhere in the repo (confirmed
+ * by grep, matching stub-reachability-v2.md's own finding), so unlike the
+ * rows variant above this one is unreachable dead code today. Kept as a
+ * live, correct wrapper anyway (cheap given the rows variant already
+ * exists, and it is part of the authoritative 26-entry ABI list), not
+ * "Metal-only, out of scope" the way this file used to say: that claim was
+ * wrong for the row-batched sibling, which DOES have real call sites, so
+ * it was corrected rather than copied forward. */
+extern "C" int ds4_gpu_matmul_q8_0_kslice_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                full_in_dim,
+        uint64_t                k_off,
+        uint64_t                k_cnt,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                x_elem_off) {
+    if (!x) return 0;
+    uint64_t x_elems = x->bytes / sizeof(float);
+    if (x_elem_off > x_elems || k_cnt > x_elems - x_elem_off) return 0;
+
+    ds4_gpu_tensor x_slice = *x;
+    x_slice.ptr = (char *)x->ptr + x_elem_off * sizeof(float);
+    x_slice.bytes = k_cnt * sizeof(float);
+    x_slice.owner = 0;
+    return ds4_gpu_matmul_q8_0_kslice_rows_tensor(
+            out, model_map, model_size, weight_offset, full_in_dim, out_dim,
+            k_off, k_cnt, &x_slice, 1u);
+}
+
 namespace {
 
 /* Dequantises an entire Q8_0 weight table to F16, row-major out_dim rows of
