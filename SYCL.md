@@ -398,6 +398,66 @@ regression that no correctness test catches.
 `(Q4_K, Q4_K)` or `(IQ2_XXS, Q2_K)`, which are the owned-decode kernels that
 exist. Flash is the second pair.
 
+### There is a THIRD mechanism: pipelined prefill, and it is not the distributed mode
+
+`ds4_distributed.c` is TCP sockets with a coordinator and workers. It is for
+multiple MACHINES, and the README's 1.38x to 1.85x figures come from two
+MacBooks over Thunderbolt. **It is not what you use for multiple GPUs in one
+box.**
+
+The local equivalent is built into multi-tier placement.
+`metal_graph_build_prefill_stages` (`ds4.c:34132`) walks `g->placement[]` and
+groups contiguous same-tier layers into stages.
+`metal_graph_prefill_pipeline_stage_major` (around `ds4.c:34205`) then refuses
+unless **all** of these hold:
+
+```c
+metal_graph_build_prefill_stages(...) && n_stages >= 2   // needs 2+ GPUs
+mb_cap != 0 && mb_cap < n_tokens                          // microbatching on
+n_mb >= 2                                                 // 2+ microbatches
+```
+
+Given those, prefill is microbatched and pipelined across tiers: tier T works on
+microbatch N+1 while tier T+1 works on N. Ideal speedup is roughly
+`S / (1 + (S-1)/M)` for S stages and M microbatches.
+
+**Every ABI entry that path needs is implemented** (`tier_free_vram`,
+`register_model_map_no_copy`, `device_cache_tensors`, the `q8_cache_suppressed`
+pair, `tensor_copy_xdev_ordered`). It will not silently decline for a missing
+symbol. **It has never executed**, because a single GPU always yields
+`n_stages == 1`.
+
+### But it will not help until dispatch is asynchronous
+
+`sycl/*.hpp` holds **213 blocking `wait_and_throw` calls**, roughly one per
+kernel launch. For contrast, `ds4_cuda.cu` runs **351 launches behind 25 explicit
+syncs**.
+
+The pipeline's wave loop (`ds4.c:34308-34376`) only wins if dispatching to tier
+T+1 does not wait for tier T. That holds on CUDA. It does not hold here. As
+written, engaging the pipeline on SYCL pays real cross-device copy cost and
+recovers none of the overlap: roughly 1.0x, plausibly slightly worse.
+
+**That same synchronous pattern blocks three things**, which is why it matters
+more than any single one of them:
+
+1. pipelined prefill, worth roughly 2.5x to 4x for 4 to 7 stages
+2. decode graph capture, since `wait()` throws during graph recording
+3. about 38 percent of decode wall time, the 3.26 ms non-kernel remainder
+
+### The handoff, and the thing to check first on real hardware
+
+`ds4_gpu_tensor_copy_xdev` (`sycl/ds4_sycl_mgpu.hpp:443-497`) does a real
+single-hop peer-to-peer `queue.memcpy` when `g_gpu_peer_ok[src][dst]` was
+validated at init by a byte-exact round-trip probe. **Otherwise it falls back to
+a host bounce**, device to host then host to device, two hops.
+
+**That decision has never run off-diagonal.** Whether a B60's dual-die
+behind-a-PCIe-switch topology gets true peer access is unknown, and it is 32 MiB
+per 512-token microbatch boundary at Flash's shape. If it bounces, the pipeline
+economics change materially. **Check this before benchmarking anything
+multi-GPU**, or you will be measuring a hidden round trip.
+
 ## Performance: where the time goes
 
 Two structural costs dominated, and one is fixed.
