@@ -135,8 +135,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_set_decode_fast_attention)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_set_decode_score_vec4)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_set_model_fd)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_set_model_fd_for_map)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_add_q8_0_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor)
 /* Deliberately left stubbed: implemented ONLY in ds4_cuda.cu (CUDA-only;
  * rocm/ has no definition at all, so ROCm itself hits its own unavailable
  * stub here and ds4.c falls back).  It is also multi-GPU aware

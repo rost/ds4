@@ -27,9 +27,15 @@
  * rocm/ds4_rocm_matmul.cuh, outside this file's own kernel set; both
  * entries are implemented here via sycl_matmul_q8_0_hc_expand_labeled,
  * which reuses this file's HC-expand combine and sycl_q8_0_dequant from
- * ds4_sycl_common.hpp rather than duplicating either. */
+ * ds4_sycl_common.hpp rather than duplicating either.
+ *
+ * ds4_gpu_shared_down_hc_expand_add_q8_0_tensor and ds4_gpu_shared_down_
+ * hc_expand_owned_q8_0_tensor extend the same fused kernel with a
+ * second additive term and the expert-parallel owned-slots combine,
+ * respectively; see sycl_matmul_q8_0_hc_expand_labeled's own comment. */
 
 #include "ds4_sycl_common.hpp"
+#include "ds4_sycl_moe_owned.hpp"
 
 namespace {
 
@@ -878,24 +884,34 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
 
 /* Fuses a per-row Q8_0 dense matmul with the HC-expand combine above.
  * Ported from ROCm's cuda_matmul_q8_0_hc_expand_tensor_labeled
- * (rocm/ds4_rocm_matmul.cuh:690), which both
- * ds4_gpu_matmul_q8_0_hc_expand_tensor and
- * ds4_gpu_shared_down_hc_expand_q8_0_tensor below delegate to with
- * `block_add` NULL or non-NULL respectively.  Only the dp4a/prequantised-
- * activation fast path and the sharedx/warp tiling are not ported, the
- * same declined-for-now perf tier as sycl_q8_0_matmul_general in
- * sycl/ds4_sycl_matmul.hpp: this uses the identical shape-ungated scalar
- * dot product, one work-item per output row.
+ * (rocm/ds4_rocm_matmul.cuh:690) for the block_add path, and from
+ * ds4_cuda.cu's own matmul_q8_0_hc_expand_preq_warp8_kernel (:5493-5561,
+ * a CUDA-only superset of the ROCm kernel that adds block_add2 and the
+ * owned-slots routed-MoE combine) for the second add term and the owned
+ * path added here.  ds4_gpu_matmul_q8_0_hc_expand_tensor passes
+ * block_add/block_add2/owned all NULL, ds4_gpu_shared_down_hc_expand_q8_0_
+ * tensor passes only block_add, ds4_gpu_shared_down_hc_expand_add_q8_0_
+ * tensor passes both adds, and ds4_gpu_shared_down_hc_expand_
+ * owned_q8_0_tensor passes the four owned_* parameters instead
+ * of either add -- CUDA's own kernel treats has_owned_slots and has_add as
+ * mutually exclusive (the owned branch is checked first and the add
+ * branch is an `else if`), matching every real caller: no ds4.c call site
+ * ever asks for both. Only the dp4a/prequantised-activation fast path and
+ * the sharedx/warp tiling are not ported, the same declined-for-now perf
+ * tier as sycl_q8_0_matmul_general in sycl/ds4_sycl_matmul.hpp: this uses
+ * the identical shape-ungated scalar dot product, one work-item per
+ * output row.
  *
- * `block_add`, when non-NULL, is added into the raw matmul result BEFORE
- * the HC-expand combine, matching ROCm's `has_add` branch; `block_out`
- * always receives the RAW (pre-add) matmul result either way, also
- * matching ROCm (`block_out[d] = acc;` runs before `block_v` picks up the
- * addend). out_dim must equal n_embd: this fused family always produces
+ * `block_out` always receives the RAW (pre-add, pre-owned-combine) matmul
+ * result regardless of which branch runs, matching both CUDA and ROCm
+ * (`block_out[d] = acc;` / `bo[d] = acc;` runs before `block_v` picks up
+ * anything else) -- this is exactly the "raw pre-add" contract spec 6w
+ * found a blind test for this same family missed by never reading it
+ * back. out_dim must equal n_embd: this fused family always produces
  * exactly one HC-token-width row, the same requirement ROCm's own
  * validation enforces. Single-token only (t == 0 throughout): every
  * caller in ds4.c uses this for a decode-time projection, never a batch,
- * and ROCm's own kernel carries no token loop or stride either. */
+ * and neither reference kernel carries a token loop or stride either. */
 static int sycl_matmul_q8_0_hc_expand_labeled(
         ds4_gpu_tensor       *out_hc,
         ds4_gpu_tensor       *block_out,
@@ -906,12 +922,19 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
         uint64_t                out_dim,
         const ds4_gpu_tensor *x,
         const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *block_add2,
+        const ds4_gpu_tensor *owned_home_slots,
+        const ds4_gpu_tensor *owned_peer_packed,
+        const ds4_gpu_tensor *owned_selected,
+        uint32_t                owned_expert_split,
         const ds4_gpu_tensor *residual_hc,
         const ds4_gpu_tensor *split,
         uint32_t                n_embd,
         uint32_t                n_hc,
         const char             *label) {
     uint64_t row_bytes = 0, weight_bytes = 0, hc_bytes = 0, mix_hc64 = 0, split_bytes = 0;
+    const bool has_owned =
+            owned_home_slots != nullptr || owned_peer_packed != nullptr || owned_selected != nullptr;
     if (!out_hc || !block_out || !x || !residual_hc || !split || !model_map ||
         in_dim == 0u || out_dim == 0u || n_embd == 0u || n_hc == 0u ||
         out_dim != (uint64_t)n_embd ||
@@ -926,7 +949,14 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
         !sycl_tensor_has_bytes(residual_hc, hc_bytes) ||
         !sycl_tensor_has_bytes(split, split_bytes) ||
         !sycl_tensor_has_bytes(out_hc, hc_bytes) ||
-        (block_add && !sycl_tensor_has_elems(block_add, out_dim, sizeof(float)))) {
+        (block_add && !sycl_tensor_has_elems(block_add, out_dim, sizeof(float))) ||
+        (block_add2 && !sycl_tensor_has_elems(block_add2, out_dim, sizeof(float))) ||
+        (has_owned &&
+         (!owned_home_slots || !owned_peer_packed || !owned_selected ||
+          owned_expert_split == 0u ||
+          owned_home_slots->bytes < 6ull * out_dim * sizeof(float) ||
+          owned_peer_packed->bytes < 4ull * out_dim * sizeof(float) ||
+          owned_selected->bytes < 6u * sizeof(int32_t)))) {
         return 0;
     }
     const char *wptr = sycl_model_range_ptr(model_map, weight_offset, weight_bytes,
@@ -946,6 +976,11 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
         float         *bo   = (float *)block_out->ptr;
         const float   *xp   = (const float *)x->ptr;
         const float   *ba   = block_add ? (const float *)block_add->ptr : nullptr;
+        const float   *ba2  = block_add2 ? (const float *)block_add2->ptr : nullptr;
+        const float   *ohs  = has_owned ? (const float *)owned_home_slots->ptr : nullptr;
+        const float   *opp  = has_owned ? (const float *)owned_peer_packed->ptr : nullptr;
+        const int32_t *osel = has_owned ? (const int32_t *)owned_selected->ptr : nullptr;
+        const uint32_t osplit = owned_expert_split;
         const float   *res  = (const float *)residual_hc->ptr;
         const float   *sp0  = (const float *)split->ptr;
         const uint32_t embd = n_embd;
@@ -966,7 +1001,14 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
                 acc += xp[k] * sycl_q8_0_dequant(wr, k);
             }
             bo[d] = acc;
-            const float block_v = has_add ? acc + ba[d] : acc;
+            float block_v = acc;
+            if (has_owned) {
+                block_v += sycl_moe_owned_packed_combine_row(ohs, opp, osel, d, out_d, osplit);
+            } else if (has_add) {
+                float add_v = ba[d];
+                if (ba2) add_v += ba2[d];
+                block_v += add_v;
+            }
             for (uint32_t dst_hc = 0; dst_hc < hc; dst_hc++) {
                 const float v = sycl_hc_expand_general(block_v, post, comb, res,
                                                        embd, hc, mix_hc, mix_hc,
@@ -999,7 +1041,8 @@ extern "C" int ds4_gpu_matmul_q8_0_hc_expand_tensor(
     return sycl_matmul_q8_0_hc_expand_labeled(out_hc, block_out, model_map,
                                               model_size, weight_offset,
                                               in_dim, out_dim, x, nullptr,
-                                              residual_hc, split, n_embd, n_hc,
+                                              nullptr, nullptr, nullptr, nullptr,
+                                              0u, residual_hc, split, n_embd, n_hc,
                                               "q8_hc_expand");
 }
 
@@ -1020,9 +1063,74 @@ extern "C" int ds4_gpu_shared_down_hc_expand_q8_0_tensor(
     return sycl_matmul_q8_0_hc_expand_labeled(out_hc, shared_out, model_map,
                                               model_size, weight_offset,
                                               in_dim, out_dim, shared_mid,
-                                              routed_out, residual_hc, split,
-                                              n_embd, n_hc,
+                                              routed_out, nullptr, nullptr,
+                                              nullptr, nullptr, 0u, residual_hc,
+                                              split, n_embd, n_hc,
                                               "shared_down_hc_expand");
+}
+
+/* As ds4_gpu_shared_down_hc_expand_q8_0_tensor, but folds in a
+ * second additive term before the HC-expand combine.  Ported from
+ * ds4_cuda.cu:25805-25840 (CUDA-only: no ROCm equivalent), which delegates
+ * to the same fused kernel this file already uses with both add slots
+ * populated. */
+extern "C" int ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *shared_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *routed_out,
+        const ds4_gpu_tensor *routed_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return sycl_matmul_q8_0_hc_expand_labeled(out_hc, shared_out, model_map,
+                                              model_size, weight_offset,
+                                              in_dim, out_dim, shared_mid,
+                                              routed_out, routed_add, nullptr,
+                                              nullptr, nullptr, 0u, residual_hc,
+                                              split, n_embd, n_hc,
+                                              "shared_down_hc_expand_add");
+}
+
+/* Expert-parallel decode: as ds4_gpu_shared_down_hc_expand_q8_0_
+ * tensor, but the routed-MoE addend is this rank's own six unpacked slots
+ * plus the peer's four packed slots, combined via sycl_moe_owned_packed_
+ * combine_row (ds4_sycl_moe_owned.hpp) instead of a plain add. Ported from
+ * ds4_cuda.cu:25842-25880 (CUDA-only). `home_slots`/`peer_packed` are
+ * exactly the arguments ds4_gpu_routed_moe_owned_packed_combine_tensor
+ * takes; this entry fuses that same combine into the HC-expand's block_v
+ * term rather than materialising the intermediate `routed_out` add
+ * ds4_gpu_shared_down_hc_expand_add_q8_0_tensor above needs. */
+extern "C" int ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *shared_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *shared_mid,
+        const ds4_gpu_tensor *home_slots,
+        const ds4_gpu_tensor *peer_packed,
+        const ds4_gpu_tensor *selected,
+        uint32_t                expert_split,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    return sycl_matmul_q8_0_hc_expand_labeled(out_hc, shared_out, model_map,
+                                              model_size, weight_offset,
+                                              in_dim, out_dim, shared_mid,
+                                              nullptr, nullptr, home_slots,
+                                              peer_packed, selected, expert_split,
+                                              residual_hc, split, n_embd, n_hc,
+                                              "shared_down_hc_expand_owned");
 }
 
 /* Fuses hc_split_sinkhorn_kernel and hc_weighted_sum_kernel into one launch,
