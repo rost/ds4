@@ -22,9 +22,12 @@
  * n_expert. There is no reduced-size DeepSeek4 shape the loader will
  * accept, so this file uses the real Flash numbers throughout and instead
  * shrinks the file by loading only one transformer layer via the engine's
- * own distributed-pipeline slice mechanism (opt.load_slice, ds4.h): layer 3
- * (compress ratio 128, so no compressor/indexer complexity), with no token
- * embedding and no output head, since ds4_session_create only requires that
+ * own distributed-pipeline slice mechanism (opt.load_slice, ds4.h): by
+ * default layer 3 (compress ratio 128, so no compressor/indexer
+ * complexity), or layer 2 (ratio 4, indexer included) when
+ * DS4_TEST_GGUF_LAYER=2 is set (see configure_layer_mode below, added
+ * to rank the ratio-4 indexed path), with no token embedding and
+ * no output head, since ds4_session_create only requires that
  * weights_first_bound_layer find one bound layer (ds4.c:59577) and
  * ds4_session_eval_layer_slice only requires token_embd when layer_start is
  * 0 and only requires the output head when output_logits is requested
@@ -134,14 +137,49 @@
 #define FLASH_Q_DIM      (FLASH_N_HEAD * FLASH_N_HEAD_DIM)
 #define FLASH_OUT_LOW_DIM (FLASH_N_OUT_GROUP * FLASH_N_LORA_O)
 
-/* The one layer this file loads. Ratio 128 (ds4_expected_layer_compress_
- * ratio, ds4.c:1085: even layers >= 2 get 4, odd get 128) needs the
- * attn_compressor_* tensors but not the indexer ones, and is not a hash
- * layer (il >= DS4_N_HASH_LAYER == 3), so no ffn_gate_tid2eid either --
- * the smallest non-token_embd-requiring, non-trivial real Flash layer. */
-#define LOAD_LAYER   3u
-#define LOAD_RATIO 128u
-#define COMP_WIDTH (FLASH_N_HEAD_DIM) /* coff=1 for ratio != 4 */
+/* Which layer this file loads is now a runtime choice, read from
+ * DS4_TEST_GGUF_LAYER (default "3"). Two values are supported:
+ *
+ *   3 (default): ratio 128 (ds4_expected_layer_compress_ratio, ds4.c:1085:
+ *     even layers >= 2 get 4, odd get 128) needs the attn_compressor_*
+ *     tensors but not the indexer ones, and is not a hash layer
+ *     (il >= DS4_N_HASH_LAYER == 3), so no ffn_gate_tid2eid either -- the
+ *     smallest non-token_embd-requiring, non-trivial real Flash layer.
+ *     This is the configuration used for the per-kernel-family measurement.
+ *   2: ratio 4, which additionally needs the indexer_* tensors
+ *     (weights_bind_layer, ds4.c:5926-5933) and, since 2 < DS4_N_HASH_LAYER,
+ *     a real ffn_gate_tid2eid hash routing table (ds4.c:5943-5945) -- the
+ *     configuration that makes the indexer subsystem and the ratio-4
+ *     indexed attention path live.
+ *
+ * g_load_ratio is derived from g_load_layer by the same formula
+ * ds4_expected_layer_compress_ratio uses, not hardcoded per mode, so the
+ * two can never drift apart. g_comp_width follows weights_validate_layout's
+ * coff rule (ds4.c:5058-5075): coff is 2 for ratio 4 (the compressor also
+ * carries the indexer's rope-neighbour pair) and 1 for every other ratio. */
+static uint32_t g_load_layer = 3u;
+static uint32_t g_load_ratio = 128u;
+static uint32_t g_comp_width = FLASH_N_HEAD_DIM;
+static bool     g_load_layer_is_hash = false;
+
+static void configure_layer_mode(void) {
+    const char *env = getenv("DS4_TEST_GGUF_LAYER");
+    uint32_t layer = 3u;
+    if (env && env[0]) {
+        char *endp = NULL;
+        long v = strtol(env, &endp, 10);
+        if (endp == env || *endp != '\0' || (v != 2 && v != 3)) {
+            fprintf(stderr, "FAIL: DS4_TEST_GGUF_LAYER must be 2 or 3\n");
+            exit(1);
+        }
+        layer = (uint32_t)v;
+    }
+    g_load_layer = layer;
+    g_load_ratio = layer < 2u ? 0u : ((layer & 1u) == 0u ? 4u : 128u);
+    const uint32_t coff = g_load_ratio == 4u ? 2u : 1u;
+    g_comp_width = coff * FLASH_N_HEAD_DIM;
+    g_load_layer_is_hash = layer < FLASH_N_HASH_LAYER;
+}
 
 #define GGUF_MAGIC 0x46554747u
 #define GGUF_VERSION 3u
@@ -225,7 +263,9 @@ typedef struct {
     ds4_tw_tensor t;
 } dir_entry;
 
-#define MAX_TENSORS 32
+/* 27 tensors for ratio 128 (layer 3), plus 6 indexer tensors and 1
+ * ffn_gate_tid2eid hash table for ratio 4 (layer 2): 34, rounded up. */
+#define MAX_TENSORS 40
 static dir_entry g_dir[MAX_TENSORS];
 static uint32_t g_n_dir = 0;
 
@@ -239,7 +279,7 @@ static ds4_tw_tensor *reserve(uint64_t *cursor, const char *name, uint32_t type,
 }
 
 /* Builds the GGUF file at `path`: real-Flash-shape metadata for layer
- * LOAD_LAYER, a minimal tokenizer, and every tensor weights_bind_layer
+ * g_load_layer, a minimal tokenizer, and every tensor weights_bind_layer
  * requires for that layer's compress ratio. Returns the absolute file
  * offset of the first tensor's rel_offset field (for the ablation) via
  * *corrupt_offset_out, and the correct 8 bytes originally written there
@@ -273,13 +313,46 @@ static int build_gguf(const char *path, uint64_t *corrupt_offset_out,
     ds4_tw_tensor *attn_output_b = reserve(&cursor, "attn_output_b", DS4_TW_TYPE_Q8_0, 2,
                                            FLASH_OUT_LOW_DIM, FLASH_N_EMBD, 0);
     ds4_tw_tensor *attn_compressor_ape = reserve(&cursor, "attn_compressor_ape", DS4_TW_TYPE_F16, 2,
-                                                 COMP_WIDTH, LOAD_RATIO, 0);
+                                                 g_comp_width, g_load_ratio, 0);
     ds4_tw_tensor *attn_compressor_kv = reserve(&cursor, "attn_compressor_kv", DS4_TW_TYPE_F16, 2,
-                                                FLASH_N_EMBD, COMP_WIDTH, 0);
+                                                FLASH_N_EMBD, g_comp_width, 0);
     ds4_tw_tensor *attn_compressor_gate = reserve(&cursor, "attn_compressor_gate", DS4_TW_TYPE_F16, 2,
-                                                  FLASH_N_EMBD, COMP_WIDTH, 0);
+                                                  FLASH_N_EMBD, g_comp_width, 0);
     ds4_tw_tensor *attn_compressor_norm = reserve(&cursor, "attn_compressor_norm", DS4_TW_TYPE_F32, 1,
                                                   FLASH_N_HEAD_DIM, 0, 0);
+
+    /* Ratio 4 (layer 2) additionally needs the indexer
+     * tensors (weights_bind_layer, ds4.c:5926-5933), shapes taken from
+     * ds4_test_build_flash_layer_weights's own ratio==4 branch
+     * (tests/test_sycl_layer_weights.h:645-654): index_width is always
+     * 2 * n_indexer_head_dim (coff==2 for indexer tensors regardless of
+     * the attention compressor's own coff), since the indexer keeps its
+     * own compressed KV/score state separate from the attention
+     * compressor's. NULL for ratio != 4 so the fill calls below can be
+     * unconditional no-ops on zero elements, matching that header's own
+     * pattern. */
+    ds4_tw_tensor *indexer_attn_q_b = NULL;
+    ds4_tw_tensor *indexer_proj = NULL;
+    ds4_tw_tensor *indexer_compressor_ape = NULL;
+    ds4_tw_tensor *indexer_compressor_kv = NULL;
+    ds4_tw_tensor *indexer_compressor_gate = NULL;
+    ds4_tw_tensor *indexer_compressor_norm = NULL;
+    if (g_load_ratio == 4u) {
+        const uint64_t index_q_dim = (uint64_t)FLASH_N_INDEXER_HEAD * FLASH_N_INDEXER_HEAD_DIM;
+        const uint64_t index_width = 2u * FLASH_N_INDEXER_HEAD_DIM;
+        indexer_attn_q_b = reserve(&cursor, "indexer.attn_q_b", DS4_TW_TYPE_F16, 2,
+                                   FLASH_N_LORA_Q, index_q_dim, 0);
+        indexer_proj = reserve(&cursor, "indexer.proj", DS4_TW_TYPE_F16, 2,
+                               FLASH_N_EMBD, FLASH_N_INDEXER_HEAD, 0);
+        indexer_compressor_ape = reserve(&cursor, "indexer_compressor_ape", DS4_TW_TYPE_F16, 2,
+                                         index_width, g_load_ratio, 0);
+        indexer_compressor_kv = reserve(&cursor, "indexer_compressor_kv", DS4_TW_TYPE_F16, 2,
+                                        FLASH_N_EMBD, index_width, 0);
+        indexer_compressor_gate = reserve(&cursor, "indexer_compressor_gate", DS4_TW_TYPE_F16, 2,
+                                          FLASH_N_EMBD, index_width, 0);
+        indexer_compressor_norm = reserve(&cursor, "indexer_compressor_norm", DS4_TW_TYPE_F32, 1,
+                                          FLASH_N_INDEXER_HEAD_DIM, 0, 0);
+    }
     ds4_tw_tensor *hc_ffn_fn = reserve(&cursor, "hc_ffn_fn", DS4_TW_TYPE_F16, 2,
                                        FLASH_HC_DIM, FLASH_HC_MIX_DIM, 0);
     ds4_tw_tensor *hc_ffn_scale = reserve(&cursor, "hc_ffn_scale", DS4_TW_TYPE_F32, 1, 3, 0, 0);
@@ -301,9 +374,18 @@ static int build_gguf(const char *path, uint64_t *corrupt_offset_out,
     ds4_tw_tensor *ffn_down_shexp = reserve(&cursor, "ffn_down_shexp", DS4_TW_TYPE_Q8_0, 2,
                                             FLASH_N_FF_EXP, FLASH_N_EMBD, 0);
 
+    /* weights_bind_layer, ds4.c:5943-5945: layers below DS4_N_HASH_LAYER
+     * route by hash and require this table; layer 3 (ratio 128) does not,
+     * layer 2 (ratio 4) does. */
+    ds4_tw_tensor *ffn_gate_tid2eid = NULL;
+    if (g_load_layer_is_hash) {
+        ffn_gate_tid2eid = reserve(&cursor, "ffn_gate_tid2eid", DS4_TW_TYPE_I32, 2,
+                                   FLASH_N_EXPERT_USED, FLASH_N_VOCAB, 0);
+    }
+
     const uint64_t blob_size = cursor;
     fprintf(stderr, "ds4: generating layer-%u synthetic Flash GGUF, %.2f GiB tensor payload\n",
-            LOAD_LAYER, (double)blob_size / 1073741824.0);
+            g_load_layer, (double)blob_size / 1073741824.0);
     uint8_t *buf = (uint8_t *)calloc(1, (size_t)blob_size);
     CHECK(buf != NULL, "out of memory allocating GGUF tensor blob");
 
@@ -327,6 +409,20 @@ static int build_gguf(const char *path, uint64_t *corrupt_offset_out,
                     16, 0.0f, 0.1f);
     ds4_tw_fill_f32((float *)(buf + attn_compressor_norm->abs_offset), attn_compressor_norm->elements,
                     17, 1.0f, 0.1f);
+    if (g_load_ratio == 4u) {
+        ds4_tw_fill_f16((uint16_t *)(buf + indexer_attn_q_b->abs_offset),
+                        indexer_attn_q_b->elements, 22, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(buf + indexer_proj->abs_offset),
+                        indexer_proj->elements, 23, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(buf + indexer_compressor_ape->abs_offset),
+                        indexer_compressor_ape->elements, 24, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(buf + indexer_compressor_kv->abs_offset),
+                        indexer_compressor_kv->elements, 25, 0.0f, 0.1f);
+        ds4_tw_fill_f16((uint16_t *)(buf + indexer_compressor_gate->abs_offset),
+                        indexer_compressor_gate->elements, 26, 0.0f, 0.1f);
+        ds4_tw_fill_f32((float *)(buf + indexer_compressor_norm->abs_offset),
+                        indexer_compressor_norm->elements, 27, 1.0f, 0.1f);
+    }
     ds4_tw_fill_f16((uint16_t *)(buf + hc_ffn_fn->abs_offset), hc_ffn_fn->elements, 9, 0.0f, 0.1f);
     ds4_tw_fill_f32((float *)(buf + hc_ffn_scale->abs_offset), hc_ffn_scale->elements, 10, 0.5f, 0.2f);
     ds4_tw_fill_f32((float *)(buf + hc_ffn_base->abs_offset), hc_ffn_base->elements, 11, 0.0f, 0.1f);
@@ -338,6 +434,11 @@ static int build_gguf(const char *path, uint64_t *corrupt_offset_out,
     ds4_tw_fill_q8_0_dense(buf, ffn_gate_shexp, 5000u);
     ds4_tw_fill_q8_0_dense(buf, ffn_up_shexp, 6000u);
     ds4_tw_fill_q8_0_dense(buf, ffn_down_shexp, 7000u);
+    if (g_load_layer_is_hash) {
+        ds4_tw_fill_hash_tid2eid((int32_t *)(buf + ffn_gate_tid2eid->abs_offset),
+                                 FLASH_N_VOCAB, FLASH_N_EXPERT_USED, FLASH_N_EXPERT,
+                                 /*layer_salt=*/g_load_layer);
+    }
 
     /* ---- Metadata: every key config_validate_deepseek4_model requires
      * (ds4.c:5635-5745), matching DS4_SHAPE_FLASH exactly, plus the two
@@ -387,7 +488,7 @@ static int build_gguf(const char *path, uint64_t *corrupt_offset_out,
     for (uint32_t il = 0; il < FLASH_N_LAYER; il++) {
         ratios[il] = il < 2u ? 0u : ((il & 1u) == 0u ? 4u : 128u);
     }
-    assert(ratios[LOAD_LAYER] == LOAD_RATIO);
+    assert(ratios[g_load_layer] == g_load_ratio);
     w_kv_u32_array(&kw, "deepseek4.attention.compress_ratios", ratios, FLASH_N_LAYER, &n_kv);
 
     float clamps[FLASH_N_LAYER];
@@ -428,7 +529,7 @@ static int build_gguf(const char *path, uint64_t *corrupt_offset_out,
     for (uint32_t i = 0; i < g_n_dir; i++) {
         const dir_entry *e = &g_dir[i];
         char name[64];
-        snprintf(name, sizeof(name), "blk.%u.%s.weight", LOAD_LAYER, e->name);
+        snprintf(name, sizeof(name), "blk.%u.%s.weight", g_load_layer, e->name);
         w_str(&dw, name);
         w_u32(&dw, e->t.ndim);
         for (uint32_t d = 0; d < e->t.ndim; d++) w_u64(&dw, e->t.dim[d]);
@@ -496,19 +597,30 @@ static long file_size(const char *path) {
  * the GPU at all, since ds4_die here fires inside model_open, before
  * ds4_gpu_init is ever reached. */
 /* The one engine-open configuration this whole test uses: load only
- * LOAD_LAYER via the distributed-pipeline slice mechanism, no token
+ * g_load_layer via the distributed-pipeline slice mechanism, no token
  * embedding, no output head. Shared by the baseline open in main() and the
  * ablation's freshly exec'd re-open so the two configurations cannot drift
- * apart. */
+ * apart.
+ *
+ * The ratio-4 layer needs a context large enough that a
+ * single zero_prefix prefill call can push g->layer_n_comp[il] (which
+ * ends the call at roughly (pos0 + n_tokens) / ratio, ds4.c:28858) past
+ * DS4_N_INDEXER_TOP_K (512 in this harness's metadata) to make the
+ * indexed-attention branch (ratio == 4 && n_comp > DS4_N_INDEXER_TOP_K,
+ * ds4.c:29384) live at all -- that needs n_tokens > 2048, which in turn
+ * needs prefill_cap, and therefore context_size, at least that large
+ * (ds4_prefill_cap_for_prompt, ds4.c:12165, caps prefill_cap at the
+ * context size). The ratio-128 harness has no such requirement and keeps
+ * the smaller context used before. */
 static ds4_engine_options make_opt(const char *path) {
     ds4_engine_options opt;
     memset(&opt, 0, sizeof(opt));
     opt.model_path = path;
     opt.backend = DS4_BACKEND_CUDA; /* SYCL reuses this constant; spec section 4. */
-    opt.context_size = 64;
+    opt.context_size = g_load_ratio == 4u ? 8192 : 64;
     opt.load_slice = true;
-    opt.load_layer_start = LOAD_LAYER;
-    opt.load_layer_end = LOAD_LAYER;
+    opt.load_layer_start = g_load_layer;
+    opt.load_layer_end = g_load_layer;
     opt.load_output = false;
     return opt;
 }
@@ -558,6 +670,11 @@ static double now_secs(void) {
 }
 
 int main(int argc, char **argv) {
+    /* Must run before the ablation branch below: the ablation attempt is a
+     * freshly exec'd child (see its own comment) that calls make_opt()
+     * too, and DS4_TEST_GGUF_LAYER is inherited across exec, not re-read
+     * from anywhere else. */
+    configure_layer_mode();
     if (argc >= 3 && strcmp(argv[1], "--ablation-attempt") == 0) {
         return ablation_attempt(argv[2]);
     }
@@ -597,7 +714,7 @@ int main(int argc, char **argv) {
     ds4_engine *e = NULL;
     int rc = ds4_engine_open(&e, &opt);
     CHECK(rc == 0, "ds4_engine_open failed on the generated real GGUF file");
-    fprintf(stderr, "  ds4_engine_open OK (layer %u, real Flash shape)\n", LOAD_LAYER);
+    fprintf(stderr, "  ds4_engine_open OK (layer %u, real Flash shape)\n", g_load_layer);
 
     /* Proves the model-range cache actually committed real VRAM
      * for this ~1.83 GiB real GGUF layer, on the real ds4_engine_open path
@@ -634,7 +751,7 @@ int main(int argc, char **argv) {
     char err[256];
     err[0] = '\0';
     int eval_rc = ds4_session_eval_layer_slice(s, tokens, 1, /*pos0=*/0,
-                                               LOAD_LAYER, LOAD_LAYER,
+                                               g_load_layer, g_load_layer,
                                                input_hc, output_hc,
                                                /*output_logits=*/false, NULL,
                                                err, sizeof(err));
@@ -675,7 +792,7 @@ int main(int argc, char **argv) {
              * with a KV position mismatch rather than measuring anything
              * useful. */
             int rc2 = ds4_session_eval_layer_slice(s, tokens, 1, /*pos0=*/(uint32_t)(r + 1),
-                                                   LOAD_LAYER, LOAD_LAYER,
+                                                   g_load_layer, g_load_layer,
                                                    input_hc, output_hc,
                                                    /*output_logits=*/false, NULL,
                                                    err2, sizeof(err2));
@@ -796,7 +913,7 @@ int main(int argc, char **argv) {
              * continues from the single correctness-check call already
              * made against its session at pos 0. */
             int rc2 = ds4_session_eval_layer_slice(s2, tokens, 1, /*pos0=*/(uint32_t)r,
-                                                   LOAD_LAYER, LOAD_LAYER,
+                                                   g_load_layer, g_load_layer,
                                                    input_hc2, output_hc2,
                                                    /*output_logits=*/false, NULL,
                                                    err2, sizeof(err2));
