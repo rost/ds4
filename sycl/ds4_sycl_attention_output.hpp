@@ -169,6 +169,72 @@ static void sycl_quantize_q8_0_rows_launch(sycl::queue &q, int8_t *xq,
     });
 }
 
+/* Expert-parallel decode's session-batch attention-output split
+ * (metal_graph_encode_attn_post_session_batch, ds4.c:65901): as
+ * sycl_quantize_q8_0_rows_kernel above, but `heads` holds ALL
+ * n_groups_total groups per row and only [group0, group0+group_cnt) is
+ * quantised. That range is contiguous within one row (group indices are
+ * consecutive) but NOT contiguous across rows when group_cnt <
+ * n_groups_total, unlike the single-row TP entry
+ * (ds4_gpu_attention_output_q8_tp_tensor) whose n_tokens==1 heads_slice
+ * trick works only because a single row has no "across rows" case. Ported
+ * from ds4_cuda.cu's quantize_q8_0_group_slice_rows_kernel (referenced at
+ * :18420, not separately listed in this port's kernel inventory until this
+ * entry needed it): `out_row` (the flattened destination index) is compact
+ * (tok*group_cnt + local_group), `src_row` (where it reads from) strides
+ * by the FULL n_groups_total. */
+static void sycl_quantize_q8_0_group_slice_rows_kernel(sycl::nd_item<1> it, int8_t *xq,
+                                                        float *xscale, const float *heads,
+                                                        uint32_t group_dim, uint32_t blocks,
+                                                        uint32_t n_groups_total, uint32_t group0,
+                                                        uint32_t group_cnt) {
+    const uint32_t lane = (uint32_t)it.get_local_id(0);
+    const uint64_t rb = (uint64_t)it.get_group(0);
+    const uint32_t b = (uint32_t)(rb % blocks);
+    const uint64_t out_row = rb / blocks;
+    const uint64_t tok = out_row / group_cnt;
+    const uint64_t local_group = out_row - tok * group_cnt;
+    const uint64_t src_row = tok * n_groups_total + (group0 + local_group);
+    const uint32_t i0 = b * 32u;
+    const uint32_t bn = (group_dim - i0 < 32u) ? (group_dim - i0) : 32u;
+    const float *xr = heads + src_row * group_dim + i0;
+
+    const float lane_val = (lane < bn) ? sycl::fabs(xr[lane]) : 0.0f;
+    const sycl::sub_group sg = it.get_sub_group();
+    const float amax = sycl::reduce_over_group(sg, lane_val, sycl::maximum<float>());
+    const float d = amax / 127.0f;
+    const float id = d != 0.0f ? 1.0f / d : 0.0f;
+    if (lane == 0u) xscale[out_row * blocks + b] = d;
+
+    int8_t *dst = xq + (out_row * blocks + b) * 32u;
+    if (lane < bn) {
+        int v = (int)sycl::rint(xr[lane] * id);
+        v = v > 127 ? 127 : (v < -128 ? -128 : v);
+        dst[lane] = (int8_t)v;
+    } else {
+        dst[lane] = 0;
+    }
+}
+
+static void sycl_quantize_q8_0_group_slice_rows_launch(sycl::queue &q, int8_t *xq,
+                                                        float *xscale, const float *heads,
+                                                        uint32_t group_dim, uint32_t blocks,
+                                                        uint32_t n_groups_total, uint32_t group0,
+                                                        uint32_t group_cnt, uint64_t n_rows) {
+    if (n_rows == 0 || blocks == 0 || group_cnt == 0) return;
+    const uint64_t x_rows = n_rows * (uint64_t)group_cnt;
+    q.submit([&](sycl::handler &h) {
+        h.parallel_for(
+                sycl::nd_range<1>(sycl::range<1>((size_t)(x_rows * blocks * 32u)),
+                                  sycl::range<1>(32u)),
+                [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+                    sycl_quantize_q8_0_group_slice_rows_kernel(it, xq, xscale, heads, group_dim,
+                                                               blocks, n_groups_total, group0,
+                                                               group_cnt);
+                });
+    });
+}
+
 /* Ported from grouped_q8_0_a_preq_warp8_kernel, rocm/ds4_rocm_q8.cuh:1794-
  * 1831: one row of `low` (a single (token, group, row-in-group) triple) is
  * computed by one sub-group. Each lane owns a strided subset of the
@@ -289,6 +355,37 @@ static int sycl_attention_output_a_stage(sycl::queue &q, float *low_ptr,
     q.wait_and_throw();
     sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim,
                                     rank, n_groups, blocks_a, low_dim, n_tokens);
+    q.wait_and_throw();
+    return 1;
+}
+
+/* As sycl_attention_output_a_stage above, but for the group-sliced,
+ * multi-row shape ds4_gpu_attention_output_low_q8_rows_exact_tensor needs
+ * (see that entry's own comment for why the single-row TP entry's
+ * contiguous-slice trick does not generalise to n_rows > 1). `w_ptr` is
+ * already staged for the SLICED weight range only (group_cnt*rank rows,
+ * not n_groups_total*rank), so sycl_grouped_q8_0_a_preq_launch is called
+ * with n_groups=group_cnt exactly as the single-row entry calls it with
+ * n_groups=group_cnt after its own heads_slice/weight-offset shift -- the
+ * only difference here is the quantise step, which must know the
+ * FULL n_groups_total stride to find each row's slice inside `heads`. */
+static int sycl_attention_output_a_stage_rows_exact(
+        sycl::queue &q, float *low_ptr, const unsigned char *w_ptr, const float *heads_ptr,
+        uint32_t group_dim, uint64_t rank, uint32_t n_groups_total, uint32_t group0,
+        uint32_t group_cnt, uint64_t blocks_a, uint64_t low_dim, uint64_t n_rows) {
+    const uint64_t x_rows = n_rows * (uint64_t)group_cnt;
+    int8_t *xq = sycl::malloc_device<int8_t>((size_t)(x_rows * blocks_a * 32u), q);
+    sycl_device_scratch_guard xq_guard(q, xq);
+    float *xscale = sycl::malloc_device<float>((size_t)(x_rows * blocks_a), q);
+    sycl_device_scratch_guard xscale_guard(q, xscale);
+    if (!xq || !xscale) return 0;
+
+    sycl_quantize_q8_0_group_slice_rows_launch(q, xq, xscale, heads_ptr, group_dim,
+                                               (uint32_t)blocks_a, n_groups_total, group0,
+                                               group_cnt, n_rows);
+    q.wait_and_throw();
+    sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim, rank, group_cnt,
+                                    blocks_a, low_dim, n_rows);
     q.wait_and_throw();
     return 1;
 }
@@ -420,6 +517,80 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
     return 1;
 }
 
+/* The group-sliced, exact-row-count sibling of
+ * ds4_gpu_attention_output_low_q8_tensor above, used by the expert-parallel
+ * session-batch attention-output split (metal_graph_encode_attn_post_
+ * session_batch, ds4.c:65901-66020): a rank owns groups [group0,
+ * group0+group_cnt) of the attention heads across `n_rows` tokens at once,
+ * not just one. ds4_gpu_attention_output_q8_tp_tensor already covers the
+ * single-row case by composition (a heads_slice pointer offset, legal only
+ * because one row's slice is contiguous); this entry is why that
+ * composition does not extend to n_rows > 1, and is ported here as a real
+ * kernel pair instead (sycl_quantize_q8_0_group_slice_rows_kernel plus the
+ * existing grouped preq kernel). Ported from ds4_cuda.cu:18373-18444.
+ *
+ * Return polarity: NONZERO means success, matching
+ * ds4_gpu_attention_output_low_q8_tensor immediately above (same ROCm/CUDA
+ * shape: `return 0` on every rejection, `cuda_ok(...)` on every live path)
+ * and the CUDA source's own validation, which this entry's checks mirror. */
+extern "C" int ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+        ds4_gpu_tensor       *low,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups_total,
+        uint32_t                group0,
+        uint32_t                group_cnt,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_rows) {
+    if (!low || !heads || !model_map || group_dim == 0u || rank == 0u ||
+        n_groups_total == 0u || group_cnt == 0u || group0 > n_groups_total ||
+        group_cnt > n_groups_total - group0 || n_rows == 0u ||
+        group_dim > UINT32_MAX || rank > UINT32_MAX) {
+        return 0;
+    }
+
+    uint64_t low_dim = 0, row_a_bytes = 0, out_a_bytes = 0, a_off_delta = 0, a_offset = 0;
+    uint64_t heads_row_elems = 0;
+    const uint64_t blocks_a = (group_dim + 31u) / 32u;
+    if (!sycl_u64_mul_checked(group_cnt, rank, &low_dim) ||
+        !sycl_u64_mul_checked(blocks_a, 34u, &row_a_bytes) ||
+        !sycl_u64_mul_checked(low_dim, row_a_bytes, &out_a_bytes) ||
+        !sycl_u64_mul_checked(group0, rank, &a_off_delta) ||
+        !sycl_u64_mul_checked(a_off_delta, row_a_bytes, &a_off_delta) ||
+        !sycl_u64_add_checked(out_a_offset, a_off_delta, &a_offset) ||
+        !sycl_model_range_fits(model_size, a_offset, out_a_bytes) ||
+        !sycl_u64_mul_checked(n_groups_total, group_dim, &heads_row_elems) ||
+        !sycl_tensor_has_elems2(heads, n_rows, heads_row_elems, sizeof(float)) ||
+        !sycl_tensor_has_elems2(low, n_rows, low_dim, sizeof(float))) {
+        return 0;
+    }
+    const char *out_a_ptr = sycl_model_range_ptr(model_map, a_offset, out_a_bytes, model_size,
+                                                 "attn_out_a_rows");
+    if (!out_a_ptr) return 0;
+    if (g_devices.empty()) return 0;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(low->device_id);
+        sycl_device_scratch_guard w_guard = sycl_stage_host_bytes(q, out_a_ptr, out_a_bytes);
+        if (!w_guard.p) return 0;
+
+        if (!sycl_attention_output_a_stage_rows_exact(
+                    q, (float *)low->ptr, (const unsigned char *)w_guard.p,
+                    (const float *)heads->ptr, (uint32_t)group_dim, rank, n_groups_total,
+                    group0, group_cnt, blocks_a, low_dim, n_rows)) {
+            return 0;
+        }
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_low_q8_rows_exact failed: %s\n",
+                e.what());
+        return 0;
+    }
+    return 1;
+}
+
 /* Tensor parallelism: the group-sliced attention output pair for
  * a single TP rank, n_tokens == 1 only (ds4_gpu.h's own docstring on this
  * entry). A rank owns groups [group0, group0+group_cnt) of the attention
@@ -433,11 +604,11 @@ extern "C" int ds4_gpu_attention_output_low_q8_tensor(
  * pure composition, not a fused kernel: it builds a heads_slice view
  * (legal as a flat pointer offset only because n_tokens == 1 makes the
  * group0..group0+group_cnt range of a single row contiguous; a
- * multi-row version would need a strided view instead, which is exactly
- * why ds4_gpu_attention_output_low_q8_rows_exact_tensor -- the batched
- * n_rows sibling of this entry, used by the multi-session verify-batch
- * path -- is NOT implemented here: it has no single-row shortcut)
- * and calls ds4_gpu_attention_output_low_q8_tensor then
+ * multi-row version needs a strided kernel instead, which is exactly why
+ * ds4_gpu_attention_output_low_q8_rows_exact_tensor below -- the batched
+ * n_rows sibling of this entry, used by the expert-parallel session-batch
+ * attention-output split -- is a real kernel pair rather than composition;
+ * see its own comment) and calls ds4_gpu_attention_output_low_q8_tensor then
  * ds4_gpu_matmul_q8_0_kslice_rows_tensor. This port is a literal,
  * line-for-line translation of that composition, both callees already
  * implemented in this backend. Validation ported from

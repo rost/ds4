@@ -507,6 +507,119 @@ static int test_attention_output_q8_tp(void) {
     return 0;
 }
 
+/* Expert-parallel decode's session-batch attention-output split:
+ * ds4_gpu_attention_output_low_q8_rows_exact_tensor, the multi-row sibling
+ * of ds4_gpu_attention_output_q8_tp_tensor's single-row group slice above.
+ * N_ROWS = 4 (multiple independent tokens), GROUP0/GROUP_CNT a genuinely
+ * uneven, non-zero-based slice of N_GROUPS_TOTAL, same shape discipline as
+ * test_attention_output_q8_tp. The oracle calls oracle_grouped_out_low
+ * once per row against that row's own group-sliced `heads` and `out_a`
+ * sub-range: this is exactly the property a naive port could get wrong
+ * (addressing every row's slice at a fixed group_cnt-wide stride instead
+ * of the correct n_groups_total-wide stride), so the fixture's per-row
+ * data is numerically distinct (see fill_activation_row's row-dependent
+ * seed) precisely so that mistake produces a visibly wrong row instead of
+ * a coincidentally matching one. */
+static int test_attention_output_low_q8_rows_exact(void) {
+    enum {
+        GROUP_DIM = 37, RANK = 5, N_GROUPS_TOTAL = 6, GROUP0 = 2, GROUP_CNT = 3, N_ROWS = 4
+    };
+    const uint32_t blocks_a = (GROUP_DIM + 31u) / 32u;
+    const uint64_t row_a_bytes = (uint64_t)blocks_a * 34u;
+    const uint64_t out_a_bytes = (uint64_t)N_GROUPS_TOTAL * RANK * row_a_bytes;
+    const uint64_t out_a_off = 24;
+    const uint64_t model_size = out_a_off + out_a_bytes;
+
+    unsigned char *model = (unsigned char *)calloc(1, (size_t)model_size);
+    float heads[N_ROWS * N_GROUPS_TOTAL * GROUP_DIM];
+    CHECK(model != NULL, "attention_output_low_q8_rows_exact: host alloc");
+    unsigned char *out_a = model + out_a_off;
+
+    for (uint32_t g = 0; g < N_GROUPS_TOTAL; g++) {
+        for (uint32_t r = 0; r < RANK; r++) {
+            encode_q8_0_row(out_a + ((size_t)g * RANK + r) * row_a_bytes, GROUP_DIM,
+                            g * 13u + r + 2u);
+        }
+    }
+    for (uint32_t t = 0; t < N_ROWS; t++) {
+        for (uint32_t g = 0; g < N_GROUPS_TOTAL; g++) {
+            fill_activation_row(heads + ((size_t)t * N_GROUPS_TOTAL + g) * GROUP_DIM, GROUP_DIM,
+                                t * 20u + g + 1u);
+        }
+    }
+
+    float want_low[N_ROWS * GROUP_CNT * RANK];
+    for (uint32_t t = 0; t < N_ROWS; t++) {
+        oracle_grouped_out_low(want_low + (size_t)t * GROUP_CNT * RANK,
+                               heads + ((size_t)t * N_GROUPS_TOTAL + GROUP0) * GROUP_DIM,
+                               out_a + (size_t)GROUP0 * RANK * row_a_bytes, GROUP_CNT, GROUP_DIM,
+                               RANK);
+    }
+
+    ds4_gpu_tensor *theads = ds4_gpu_tensor_alloc(sizeof(heads));
+    ds4_gpu_tensor *tlow = ds4_gpu_tensor_alloc(sizeof(want_low));
+    CHECK(theads && tlow, "attention_output_low_q8_rows_exact: alloc");
+    CHECK(ds4_gpu_tensor_write(theads, 0, heads, sizeof(heads)) != 0,
+          "attention_output_low_q8_rows_exact: write heads");
+
+    CHECK(ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+              tlow, model, model_size, out_a_off, GROUP_DIM, RANK, N_GROUPS_TOTAL, GROUP0,
+              GROUP_CNT, theads, N_ROWS) != 0,
+          "attention_output_low_q8_rows_exact: call");
+
+    float got_low[N_ROWS * GROUP_CNT * RANK];
+    CHECK(ds4_gpu_tensor_read(tlow, 0, got_low, sizeof(got_low)) != 0,
+          "attention_output_low_q8_rows_exact: read low");
+    for (uint32_t i = 0; i < N_ROWS * GROUP_CNT * RANK; i++) {
+        CHECK_CLOSE(got_low[i], want_low[i], 1e-2,
+                    "attention_output_low_q8_rows_exact: low mismatch");
+    }
+
+    /* n_rows == 1 must agree with ds4_gpu_attention_output_q8_tp_tensor's
+     * own A-stage (ds4_gpu_attention_output_low_q8_tensor), the entry this
+     * one generalises: same slice, same weights, same single row. */
+    ds4_gpu_tensor *tlow1 = ds4_gpu_tensor_alloc((uint64_t)GROUP_CNT * RANK * sizeof(float));
+    CHECK(tlow1, "attention_output_low_q8_rows_exact: single-row alloc");
+    CHECK(ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+              tlow1, model, model_size, out_a_off, GROUP_DIM, RANK, N_GROUPS_TOTAL, GROUP0,
+              GROUP_CNT, theads, 1u) != 0,
+          "attention_output_low_q8_rows_exact: n_rows=1 call");
+    float got_low1[GROUP_CNT * RANK];
+    CHECK(ds4_gpu_tensor_read(tlow1, 0, got_low1, sizeof(got_low1)) != 0,
+          "attention_output_low_q8_rows_exact: read n_rows=1 low");
+    for (uint32_t i = 0; i < GROUP_CNT * RANK; i++) {
+        CHECK_CLOSE(got_low1[i], want_low[i], 1e-2,
+                    "attention_output_low_q8_rows_exact: n_rows=1 must match row 0 of n_rows=4");
+    }
+    ds4_gpu_tensor_free(tlow1);
+
+    /* Validation, mirrored from ds4_gpu_attention_output_q8_tp_tensor's own
+     * checks above plus the n_rows guard this entry adds. */
+    CHECK(ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+              tlow, model, model_size, out_a_off, GROUP_DIM, RANK, N_GROUPS_TOTAL,
+              N_GROUPS_TOTAL + 1u, GROUP_CNT, theads, N_ROWS) == 0,
+          "attention_output_low_q8_rows_exact: group0 beyond n_groups_total must be rejected");
+    CHECK(ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+              tlow, model, model_size, out_a_off, GROUP_DIM, RANK, N_GROUPS_TOTAL, GROUP0,
+              N_GROUPS_TOTAL - GROUP0 + 1u, theads, N_ROWS) == 0,
+          "attention_output_low_q8_rows_exact: group_cnt exceeding remaining groups must be "
+          "rejected");
+    CHECK(ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+              tlow, model, model_size, out_a_off, GROUP_DIM, RANK, N_GROUPS_TOTAL, GROUP0,
+              GROUP_CNT, theads, 0u) == 0,
+          "attention_output_low_q8_rows_exact: zero n_rows must be rejected");
+    CHECK(ds4_gpu_attention_output_low_q8_rows_exact_tensor(
+              NULL, model, model_size, out_a_off, GROUP_DIM, RANK, N_GROUPS_TOTAL, GROUP0,
+              GROUP_CNT, theads, N_ROWS) == 0,
+          "attention_output_low_q8_rows_exact: null low must be rejected");
+
+    ds4_gpu_tensor_free(theads);
+    ds4_gpu_tensor_free(tlow);
+    free(model);
+    fprintf(stderr, "  test_attention_output_low_q8_rows_exact OK\n");
+    return 0;
+}
+
 /* Contention-scale regression test for the A-stage's own internal ordering:
  * sycl_attention_output_a_stage (ds4_sycl_attention_output.hpp) submits the
  * quantise kernel and the grouped preq dot-product kernel back to back on
@@ -1195,6 +1308,7 @@ int main(void) {
     if (test_grouped_q8_0_a_preq() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_low_q8() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_q8_tp() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_attention_output_low_q8_rows_exact() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_a_stage_contention() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_q8_batch() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_attention_output_q8_batch_f16() != 0) { ds4_gpu_cleanup(); return 1; }

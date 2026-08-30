@@ -54,7 +54,6 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_set_attn_head_split)
 
 /* int returns. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_noncausal_raw_batch_heads_tensor)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_output_low_q8_rows_exact_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_build_derived_artifacts)
 /* Entry-specific convention, not the usual nonzero-means-success family
