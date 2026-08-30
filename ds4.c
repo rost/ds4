@@ -58167,8 +58167,20 @@ static void ds4_test_tw_layer_to_weights(
  * synthetic-weight allocation failure, graph allocation failure, the
  * encode itself failing, or the final readback failing.  A mismatched
  * out_logits_floats returns 0 without writing out_logits, so a caller
- * cannot mistake a size mismatch for a zeroed-but-successful read. */
-int ds4_test_graph_full_token_encode(int token, float *out_logits, uint64_t out_logits_floats) {
+ * cannot mistake a size mismatch for a zeroed-but-successful read.
+ *
+ * cache_model: when true, the whole synthetic model buffer is
+ * handed to ds4_gpu_cache_model_range before the graph runs, so every
+ * weight range every kernel below reads resolves to the device-resident
+ * cache instead of the host mmap staging path -- the SAME code path a
+ * real engine open takes (ds4.c's accelerator_cache_model_tensors), just
+ * invoked directly since this hook builds no real ds4_engine. The public
+ * wrapper below always passes false, preserving every existing caller's
+ * behaviour exactly; ds4_test_graph_full_token_encode_cached passes true,
+ * so a test can compare the two and require bit-identical logits. */
+static int ds4_test_graph_full_token_encode_impl(int token, float *out_logits,
+                                                  uint64_t out_logits_floats,
+                                                  bool cache_model) {
     const ds4_shape saved_shape = g_ds4_shape;
 
     g_ds4_shape = (ds4_shape){
@@ -58231,6 +58243,19 @@ int ds4_test_graph_full_token_encode(int token, float *out_logits, uint64_t out_
     model.map  = tw.buf;
     model.size = tw.buf_size;
 
+    if (cache_model) {
+        /* Whole-buffer range: small enough (a handful of MiB for this
+         * DS4_TW_N_LAYER-layer synthetic shape) to fit comfortably under
+         * any real device's ds4_gpu_tier_free_vram budget, so this is
+         * expected to actually cache, not decline. A caller comparing
+         * on-vs-off output does not need to check the return value here:
+         * per ds4_gpu_cache_model_range's own contract, a decline still
+         * returns success and the run falls back to identical staged
+         * behaviour, so either outcome is a valid comparison target. */
+        (void)ds4_gpu_cache_model_range(model.map, model.size, 0, model.size,
+                                        "test-full-token-cache");
+    }
+
     ds4_tensor token_embd_t, output_hc_base_t, output_hc_fn_t,
                output_hc_scale_t, output_norm_t, output_t;
     ds4_test_tw_to_tensor(&token_embd_t, &tw.token_embd);
@@ -58279,6 +58304,23 @@ int ds4_test_graph_full_token_encode(int token, float *out_logits, uint64_t out_
     ds4_test_free_flash_layer_weights(&tw);
     g_ds4_shape = saved_shape;
     return ok ? 1 : 0;
+}
+
+int ds4_test_graph_full_token_encode(int token, float *out_logits, uint64_t out_logits_floats) {
+    return ds4_test_graph_full_token_encode_impl(token, out_logits, out_logits_floats,
+                                                 /*cache_model=*/false);
+}
+
+/* Identical to ds4_test_graph_full_token_encode above except the
+ * synthetic model is cached onto the device first (see
+ * ds4_test_graph_full_token_encode_impl's own comment). Lets a test
+ * assert bit-identical logits with the model-range cache exercised versus
+ * not, on the exact same real decode path (metal_graph_eval_token_raw_swa)
+ * every other full-token test on this backend already trusts. */
+int ds4_test_graph_full_token_encode_cached(int token, float *out_logits,
+                                            uint64_t out_logits_floats) {
+    return ds4_test_graph_full_token_encode_impl(token, out_logits, out_logits_floats,
+                                                 /*cache_model=*/true);
 }
 
 /* Prefill, a batch of tokens at once, through the engine's real

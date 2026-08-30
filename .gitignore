@@ -57,6 +57,7 @@
 /tests/test_sycl_prefill_batch
 /tests/test_sycl_gguf_load
 /tests/test_sycl_placement
+/tests/test_sycl_model_cache
 *.o
 *.dSYM/
 __pycache__/

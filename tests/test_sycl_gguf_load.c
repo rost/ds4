@@ -85,6 +85,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CHECK(cond, msg)                                                    \
@@ -523,6 +524,19 @@ static int ablation_attempt(const char *path) {
     return 9;
 }
 
+/* sycl/ds4_sycl_common.hpp test/report-only hook; not part of
+ * the ABI. Cumulative bytes actually copied host-to-device by
+ * sycl_stage_host_bytes, the chokepoint essentially all host-to-device
+ * weight traffic in this backend passes through. */
+extern uint64_t ds4_sycl_test_stage_host_bytes_total(void);
+extern void     ds4_sycl_test_stage_host_bytes_reset(void);
+
+static double now_secs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1.0e9;
+}
+
 int main(int argc, char **argv) {
     if (argc >= 3 && strcmp(argv[1], "--ablation-attempt") == 0) {
         return ablation_attempt(argv[2]);
@@ -540,12 +554,37 @@ int main(int argc, char **argv) {
     CHECK(file_size(path) > 0, "generated GGUF file is empty or missing");
 
     /* ---- Baseline: the real ds4_engine_open path, for the first time on
-     * this backend driven by real offsets from a real file. */
+     * this backend driven by real offsets from a real file.
+     *
+     * ds4_gpu_init explicitly first: ds4_gpu_tier_free_vram reports 0 with
+     * no device initialised (sycl/ds4_sycl_placement.hpp), so reading it
+     * before any init call would record a false "0 free" baseline instead
+     * of the tier's real headroom, making the after-open reading look
+     * smaller by comparison for the wrong reason. ds4_gpu_init is
+     * idempotent (ds4_sycl.cpp: `if (g_initialised) return 1`), so calling
+     * it again inside ds4_engine_open below is a no-op. */
+    CHECK(ds4_gpu_init() != 0, "ds4_gpu_init for the free-VRAM baseline");
+    const uint64_t free_vram_before_open = ds4_gpu_tier_free_vram(0);
+
     ds4_engine_options opt = make_opt(path);
     ds4_engine *e = NULL;
     int rc = ds4_engine_open(&e, &opt);
     CHECK(rc == 0, "ds4_engine_open failed on the generated real GGUF file");
     fprintf(stderr, "  ds4_engine_open OK (layer %u, real Flash shape)\n", LOAD_LAYER);
+
+    /* Proves the model-range cache actually committed real VRAM
+     * for this ~1.83 GiB real GGUF layer, on the real ds4_engine_open path
+     * (accelerator_cache_model_tensors), not just the synthetic-model test
+     * hooks in tests/test_sycl_full_token.c. Per design-spec 6w this is a
+     * side-channel check (the shared VRAM ledger), not a logits
+     * comparison: the whole point of this cache is that on-vs-off
+     * produces identical output, so identical output alone would prove
+     * nothing about whether caching happened. */
+    const uint64_t free_vram_after_open = ds4_gpu_tier_free_vram(0);
+    CHECK(free_vram_after_open < free_vram_before_open,
+          "ds4_gpu_tier_free_vram did not drop after engine_open: the "
+          "model-range cache did not commit any VRAM for this real GGUF "
+          "file, so the run below cannot be exercising the cached path");
 
     ds4_session *s = NULL;
     CHECK(ds4_session_create(&s, e, opt.context_size) == 0,
@@ -585,12 +624,101 @@ int main(int argc, char **argv) {
     CHECK(any_different, "layer-slice output is identical to its input -- no real computation ran");
     fprintf(stderr, "  ds4_session_eval_layer_slice OK (real weight bytes staged and read back)\n");
 
+    /* Measurement: steady-state per-layer bytes staged and
+     * wall-clock, with the model-range cache already installed (this
+     * session's engine_open already ran it above, so this loop measures
+     * decode after the one-time cache-install cost, not blended with it).
+     * This is ONE real Flash layer's routed-expert-heavy weight set
+     * (~1.83 GiB of tensors); a full decode token touches all
+     * DS4_N_LAYER layers, so the report scales this by that count rather
+     * than claiming this number is already a whole token. */
+    {
+        const int repeats = 5;
+        ds4_sycl_test_stage_host_bytes_reset();
+        const double t0 = now_secs();
+        for (int r = 0; r < repeats; r++) {
+            char err2[256];
+            err2[0] = '\0';
+            /* pos0 increments per repeat: the session tracks an expected
+             * next KV position, so replaying pos0=0 more than once
+             * against the same live session (unlike the single-call
+             * correctness check above, which only ever ran once) fails
+             * with a KV position mismatch rather than measuring anything
+             * useful. */
+            int rc2 = ds4_session_eval_layer_slice(s, tokens, 1, /*pos0=*/(uint32_t)(r + 1),
+                                                   LOAD_LAYER, LOAD_LAYER,
+                                                   input_hc, output_hc,
+                                                   /*output_logits=*/false, NULL,
+                                                   err2, sizeof(err2));
+            CHECK(rc2 == 0, err2[0] ? err2 : "measurement eval failed");
+        }
+        const double t1 = now_secs();
+        const uint64_t bytes_per_call = ds4_sycl_test_stage_host_bytes_total() / (uint64_t)repeats;
+        fprintf(stderr,
+                "  measurement (cache ON, real 1.83 GiB layer, %d repeats): "
+                "%.3f ms/layer-eval, %llu bytes staged/layer-eval\n",
+                repeats, (t1 - t0) * 1000.0 / repeats, (unsigned long long)bytes_per_call);
+    }
+
     free(input_hc);
     free(output_hc);
     ds4_session_free(s);
     ds4_engine_close(e);
     ds4_gpu_cleanup();
     fprintf(stderr, "  teardown OK\n");
+
+    /* Measurement, cache OFF: DS4_CUDA_DIRECT_MODEL makes
+     * accelerator_cache_model_tensors (ds4.c) return immediately without
+     * ever calling ds4_gpu_cache_model_range, matching CUDA's own escape
+     * hatch for this exact env var. Reopens the same generated file on a
+     * fresh engine/session so this is a genuine independent run, not a
+     * second pass reusing state the first run already warmed. */
+    {
+        CHECK(setenv("DS4_CUDA_DIRECT_MODEL", "1", 1) == 0, "setenv failed");
+        ds4_engine_options opt2 = make_opt(path);
+        ds4_engine *e2 = NULL;
+        CHECK(ds4_engine_open(&e2, &opt2) == 0,
+              "ds4_engine_open failed for the cache-OFF measurement run");
+        ds4_session *s2 = NULL;
+        CHECK(ds4_session_create(&s2, e2, opt2.context_size) == 0,
+              "ds4_session_create failed for the cache-OFF measurement run");
+
+        float *input_hc2 = (float *)malloc(hc_dim * sizeof(float));
+        float *output_hc2 = (float *)calloc((size_t)hc_dim, sizeof(float));
+        CHECK(input_hc2 != NULL && output_hc2 != NULL, "out of memory (cache-OFF run)");
+        for (uint64_t i = 0; i < hc_dim; i++) input_hc2[i] = fill_val((uint32_t)i, 99u);
+
+        const int repeats = 5;
+        ds4_sycl_test_stage_host_bytes_reset();
+        const double t0 = now_secs();
+        for (int r = 0; r < repeats; r++) {
+            char err2[256];
+            err2[0] = '\0';
+            /* This session is fresh (no prior eval call), so position
+             * starts at 0 here, unlike the cache-ON loop above which
+             * continues from the single correctness-check call already
+             * made against its session at pos 0. */
+            int rc2 = ds4_session_eval_layer_slice(s2, tokens, 1, /*pos0=*/(uint32_t)r,
+                                                   LOAD_LAYER, LOAD_LAYER,
+                                                   input_hc2, output_hc2,
+                                                   /*output_logits=*/false, NULL,
+                                                   err2, sizeof(err2));
+            CHECK(rc2 == 0, err2[0] ? err2 : "cache-OFF measurement eval failed");
+        }
+        const double t1 = now_secs();
+        const uint64_t bytes_per_call = ds4_sycl_test_stage_host_bytes_total() / (uint64_t)repeats;
+        fprintf(stderr,
+                "  measurement (cache OFF, real 1.83 GiB layer, %d repeats): "
+                "%.3f ms/layer-eval, %llu bytes staged/layer-eval\n",
+                repeats, (t1 - t0) * 1000.0 / repeats, (unsigned long long)bytes_per_call);
+
+        free(input_hc2);
+        free(output_hc2);
+        ds4_session_free(s2);
+        ds4_engine_close(e2);
+        ds4_gpu_cleanup();
+        CHECK(unsetenv("DS4_CUDA_DIRECT_MODEL") == 0, "unsetenv failed");
+    }
 
     /* ---- Ablation: corrupt layer 3's first tensor's rel_offset so its
      * absolute file offset falls past the end of the file, confirm the
