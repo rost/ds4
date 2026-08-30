@@ -58990,7 +58990,13 @@ static int ds4_engine_open_internal(ds4_engine **out,
     }
     if (e->backend == DS4_BACKEND_METAL) {
 #ifndef __APPLE__
+#ifdef DS4_ROCM_BUILD
+        fprintf(stderr, "ds4: Metal backend requested but this build is linked with ROCm, not Metal\n");
+#elif defined(DS4_SYCL_BUILD)
+        fprintf(stderr, "ds4: Metal backend requested but this build is linked with SYCL, not Metal\n");
+#else
         fprintf(stderr, "ds4: Metal backend requested but this build is linked with CUDA, not Metal\n");
+#endif
         ds4_engine_close(e);
         *out = NULL;
         return 1;
