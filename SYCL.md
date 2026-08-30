@@ -40,7 +40,7 @@ mmq tier, which is the shape this port follows.
 ```
   ds4_sycl.cpp  (571 lines)          ds4_sycl_unavailable.cpp  (243 lines)
   +--------------------------+       +------------------------------+
-  | device + queue discovery |       | 90 stubs for entries this    |
+  | device + queue discovery |       | 64 stubs for entries this    |
   | g_devices, g_current_tier|       | backend does not implement   |
   |                          |       |                              |
   | tensor ABI:              |       | SYCL_UNAVAILABLE_NONZERO_OK  |
@@ -99,8 +99,8 @@ explicit at each line instead of hiding it behind a shared `return 0`.
   ds4_sycl_moe_launch.hpp     712   routed MoE dispatcher
 ```
 
-Roughly 190 ABI entries are implemented; 90 remain stubbed (87 via the macros
-plus 3 hand-written). A stub reachability audit
+Roughly 240 ABI entries are implemented; 64 remain stubbed (62 via the macros
+plus 2 hand-written). A stub reachability audit
 (`ds4-sycl-stub-reachability-v2.md`) traced every one of them outward through
 its enclosing preprocessor and runtime gates and found **none reachable with
 consequence on the ordinary Flash decode path**, single-session or batched.
