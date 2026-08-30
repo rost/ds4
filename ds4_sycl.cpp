@@ -204,6 +204,13 @@ static void sycl_readback_teardown(void);
  * from a test proving it). */
 static void sycl_placement_teardown_all(void);
 
+/* Defined in sycl/ds4_sycl_model_cache.hpp, included at the end of this
+ * file; forward-declared here for the same reason as
+ * sycl_placement_teardown_all above: the device-resident weight
+ * cache's buffers must be freed through their own still-live queue before
+ * g_devices.clear() destroys it, not after (spec 6g). */
+static void sycl_model_cache_teardown_all(void);
+
 /* Multi-GPU plumbing globals declared extern by ds4_gpu_mgpu.h and read
  * directly by ds4.c.  Before ds4_gpu_init runs (or if it never runs) this
  * exposes a single logical tier with no peers, matching the default
@@ -401,6 +408,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (!g_devices.empty()) sycl_stream_teardown_all();
     sycl_readback_teardown();
     if (!g_devices.empty()) sycl_placement_teardown_all();
+    if (!g_devices.empty()) sycl_model_cache_teardown_all();
     g_devices.clear();
     g_n_gpus       = 0;
     g_current_tier = 0;
@@ -570,31 +578,15 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
     return 1;
 }
 
-/* Reached unconditionally at engine open on the CUDA branch, which SYCL
- * takes, unless DS4_CUDA_DIRECT_MODEL is set (ds4.c:2978, checked at the
- * same line; failure aborts ds4_engine_open at :58746-58756). The caller's
- * own error text calls this cache "optional" ("failed to prepare optional
- * model cache", ds4.c:58749), which matches ROCm's own treatment: its
- * implementation (rocm/ds4_rocm_runtime.cuh:6307) forms a device pointer
- * for the range and then reports whether that range ended up cached.
- *
- * This backend keeps no device-resident model copy: every kernel stages
- * the weight range it needs per call (spec 6l), so there is no cache to
- * build or query here. Forming ROCm's pointer would mean allocating and
- * copying the whole range for no reader, purely to answer a caching
- * question truthfully as "no" -- which would then abort startup, exactly
- * the "optional" trap the caller's own comment warns about. The honest
- * implementation is therefore range validation only, reporting success for
- * any in-bounds range, the same shape already used by
- * ds4_gpu_set_model_map_range and ds4_gpu_cache_q8_f16_range above. */
-extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size,
-                                         uint64_t offset, uint64_t bytes,
-                                         const char *label) {
-    (void)label;
-    if (model_map == nullptr || bytes == 0) return 1;
-    if (offset > model_size || bytes > model_size - offset) return 0;
-    return 1;
-}
+/* ds4_gpu_cache_model_range is implemented for real in
+ * sycl/ds4_sycl_model_cache.hpp (included near the bottom of this file,
+ * after g_devices and ds4_gpu_tier_free_vram exist): this replaced the
+ * range-validation-only stub that used to live here with an actual
+ * device-resident weight cache, once read by nobody
+ * (sycl_model_range_ptr, ds4_sycl_common.hpp, returned a host pointer
+ * unconditionally) and now consulted by it. See that header's comment for
+ * the "optional cache, but a 0 return aborts ds4_engine_open" trap this
+ * entry's return value must keep honouring. */
 
 extern "C" ds4_gpu_tensor *ds4_gpu_tensor_view(const ds4_gpu_tensor *base,
                                                uint64_t offset,
@@ -787,9 +779,17 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
 /* Same scoping reason as the includes above: the resident expert cache
  * entry points reference g_devices and ds4_sycl_current_queue. */
 #include "sycl/ds4_sycl_streaming.hpp"
+/* Same scoping reason as the includes above: defines
+ * sycl_model_cache_resolve (forward-declared in ds4_sycl_common.hpp and
+ * called from sycl_model_range_ptr) and ds4_gpu_cache_model_range for
+ * real. Must come before ds4_sycl_placement.hpp: ds4_gpu_tier_free_vram
+ * there also subtracts this cache's committed bytes
+ * (sycl_model_cache_committed_bytes) from its shared VRAM ledger. */
+#include "sycl/ds4_sycl_model_cache.hpp"
 /* Same scoping reason as the includes above, plus a direct dependency:
  * ds4_gpu_tier_free_vram reads ds4_sycl_streaming.hpp's g_sycl_stream_tier
- * and sycl_stream_vram_ceiling, so this include must come after it. */
+ * and sycl_stream_vram_ceiling, and ds4_sycl_model_cache.hpp's
+ * sycl_model_cache_committed_bytes, so this include must come after both. */
 #include "sycl/ds4_sycl_placement.hpp"
 /* Same scoping reason as the includes above. */
 #include "sycl/ds4_sycl_matmul.hpp"

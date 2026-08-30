@@ -121,6 +121,26 @@ static inline int sycl_model_range_fits(uint64_t model_size, uint64_t offset,
     return offset <= model_size && bytes <= model_size - offset;
 }
 
+/* Defined for real in sycl/ds4_sycl_model_cache.hpp, included well after
+ * this header (which is included before g_devices and g_current_tier
+ * exist -- see ds4_sycl.cpp's own comments on why several headers are
+ * included at the bottom of that file).  A forward-declared static
+ * function defined later in the same translation unit is ordinary C++;
+ * every sycl header file is #include-d directly into ds4_sycl.cpp, so
+ * this and its later definition are one translation unit, the same
+ * pattern ds4_sycl_streaming.hpp's own forward-declared teardown hooks in
+ * ds4_sycl.cpp already use.
+ *
+ * Returns a device pointer valid for at least `bytes` bytes from the
+ * cache maintained for the CURRENT tier when [offset, offset+bytes) is
+ * contained in some range previously cached (via ds4_gpu_cache_model_range)
+ * for this exact `model_map`, sub-ranges included (CUDA's
+ * cuda_model_range_ptr containment logic, ds4_cuda.cu:703); nullptr on a
+ * cache miss, which the caller falls back to today's host-mmap-plus-
+ * per-call-staging behaviour for. */
+static const char *sycl_model_cache_resolve(const void *model_map,
+                                            uint64_t offset, uint64_t bytes);
+
 static inline const char *sycl_model_range_ptr(const void *model_map,
                                                uint64_t offset, uint64_t bytes,
                                                uint64_t model_size,
@@ -131,6 +151,8 @@ static inline const char *sycl_model_range_ptr(const void *model_map,
                 (unsigned long long)bytes);
         return nullptr;
     }
+    const char *cached = sycl_model_cache_resolve(model_map, offset, bytes);
+    if (cached) return cached;
     return (const char *)model_map + offset;
 }
 
@@ -268,7 +290,17 @@ namespace {
 struct sycl_device_scratch_guard {
     sycl::queue &q;
     void        *p;
-    sycl_device_scratch_guard(sycl::queue &queue, void *ptr) : q(queue), p(ptr) {}
+    /* False when `p` is a pointer this guard does not own -- a weight
+     * range the model-range cache (sycl/ds4_sycl_model_cache.hpp) already
+     * made device-resident, passed through by sycl_stage_host_bytes below
+     * instead of staged. Freeing such a pointer here would be exactly the
+     * use-after-free shape spec 6g warns about: the cache, not this call,
+     * owns that memory and frees it exactly once at teardown. Defaults to
+     * true so every pre-existing call site (a real allocation) is
+     * unaffected. */
+    bool         owns;
+    sycl_device_scratch_guard(sycl::queue &queue, void *ptr, bool owns_ptr = true)
+            : q(queue), p(ptr), owns(owns_ptr) {}
     /* Transfers ownership rather than copying it, nulling the source so
      * only one side ever frees.  Needed so sycl_stage_host_bytes below can
      * return a guard by value: the guard must already own the allocation
@@ -277,8 +309,9 @@ struct sycl_device_scratch_guard {
      * requires an accessible move constructor even where the compiler
      * elides the move at runtime. */
     sycl_device_scratch_guard(sycl_device_scratch_guard &&other) noexcept
-            : q(other.q), p(other.p) {
+            : q(other.q), p(other.p), owns(other.owns) {
         other.p = nullptr;
+        other.owns = false;
     }
     ~sycl_device_scratch_guard() {
         /* Destructors are implicitly noexcept: if sycl::free throws while
@@ -287,7 +320,7 @@ struct sycl_device_scratch_guard {
          * std::terminate instead of surfacing a clean failure.  There is
          * no meaningful recovery from a failed free during unwinding, so
          * log and swallow rather than let it propagate. */
-        if (!p) return;
+        if (!p || !owns) return;
         try {
             sycl::free(p, q);
         } catch (const sycl::exception &e) {
@@ -298,6 +331,90 @@ struct sycl_device_scratch_guard {
     sycl_device_scratch_guard(const sycl_device_scratch_guard &) = delete;
     sycl_device_scratch_guard &operator=(const sycl_device_scratch_guard &) = delete;
 };
+
+/* True when `ptr` is already a sycl::usm::alloc::device allocation on
+ * `q`'s context -- e.g. a weight range the model-range cache
+ * (sycl/ds4_sycl_model_cache.hpp) resolved to a cached device pointer,
+ * rather than an ordinary host pointer into the model mmap or a
+ * host-backed test fixture.  get_pointer_type returns
+ * sycl::usm::alloc::unknown for any pointer not allocated as USM in this
+ * context (per the SYCL specification), never device, so this is an exact
+ * test, not a heuristic, and is safe to call on an arbitrary host
+ * pointer. Used by the staging helpers below to skip a redundant
+ * host-to-device copy: the three helpers pass through
+ * when handed a pointer that is already device-resident. */
+static inline bool sycl_ptr_is_device_resident(sycl::queue &q, const void *ptr) {
+    if (!ptr) return false;
+    return sycl::get_pointer_type(ptr, q.get_context()) == sycl::usm::alloc::device;
+}
+
+/* Test/report-only instrumentation: cumulative bytes actually
+ * copied host-to-device by sycl_stage_host_bytes below (never incremented
+ * on its pass-through branch). Since an audit confirmed every
+ * weight-staging call site in this backend funnels through this helper or
+ * through sycl_moe_stage_weights / sycl_moe_stage_selected_experts (both
+ * of which call this helper internally for their own device crossings),
+ * this one counter captures essentially all host-to-device weight
+ * traffic in the backend, letting a test measure real bytes-per-token
+ * with the model-range cache on versus off. Not part of the ABI. */
+static uint64_t g_sycl_stage_host_bytes_total = 0;
+
+extern "C" uint64_t ds4_sycl_test_stage_host_bytes_total(void) {
+    return g_sycl_stage_host_bytes_total;
+}
+extern "C" void ds4_sycl_test_stage_host_bytes_reset(void) {
+    g_sycl_stage_host_bytes_total = 0;
+}
+
+/* Copies `bytes` bytes from `host_src` to the existing device allocation
+ * `dev_dst`, chunked through a reused, bounded, always-resident heap
+ * buffer rather than handed straight to `q.memcpy` as `host_src`.
+ *
+ * `host_src` is typically a pointer into the read-only model mmap: a
+ * file-backed mapping whose pages are faulted in lazily, by the CPU, on
+ * first touch. A queue.memcpy() reading directly from such a pointer asks
+ * the GPU's DMA engine to read host memory that may not be resident yet,
+ * and on this Level Zero stack that read does not block on the page
+ * fault the way an ordinary CPU load would: it silently completes
+ * anyway, with whatever was in the not-yet-faulted page (observed as all
+ * zeros) rather than the file's real contents. Found via real-hardware
+ * testing against a genuine 1.83 GiB GGUF file that no earlier test on
+ * this backend was large enough to reach; reproduced with as little as
+ * ~25 MiB copied from an offset the CPU had never previously touched,
+ * and never reproduced from anonymous (malloc/calloc) host memory, which
+ * has no lazy backing store to race against. This is spec 6l's exact
+ * symptom -- a kernel reading unstaged host memory reads zeros with no
+ * error -- one layer lower: here the "kernel" is the DMA engine driving
+ * this very copy, and the "unstaged" memory is a host page the CPU has
+ * not faulted in. Routing every byte through `stage` first forces each
+ * page through a synchronous CPU memcpy, which faults it in; the GPU
+ * then only ever reads `stage`, always anonymous and always resident.
+ * Chunked so a very large single range (a whole per-layer MoE table, or
+ * a multi-hundred-MiB merged model-cache span) does not double the
+ * caller's peak host memory use by staging it all at once.
+ *
+ * Every direct `queue.memcpy` in this backend whose source can be a
+ * pointer into the model mmap must go through this helper instead: that
+ * is sycl_stage_host_bytes below, ds4_gpu_cache_model_range
+ * (sycl/ds4_sycl_model_cache.hpp) and ds4_gpu_device_cache_tensors
+ * (sycl/ds4_sycl_placement.hpp, the per-device selective cache,
+ * which has the identical shape and was carrying the identical bug,
+ * simply never exercised by a test large enough to reach it before now).
+ * Throws sycl::exception on a failed device copy, exactly like a bare
+ * `queue.memcpy(...).wait_and_throw()` would, so callers keep their
+ * existing try/catch. */
+static inline void sycl_copy_host_to_device_paged_safe(
+        sycl::queue &q, void *dev_dst, const void *host_src, uint64_t bytes) {
+    constexpr uint64_t kChunk = 64ull * 1024ull * 1024ull;
+    std::vector<unsigned char> stage((size_t)(bytes < kChunk ? bytes : kChunk));
+    const unsigned char *src = (const unsigned char *)host_src;
+    unsigned char       *dst = (unsigned char *)dev_dst;
+    for (uint64_t done = 0; done < bytes; done += kChunk) {
+        const uint64_t n = bytes - done < kChunk ? bytes - done : kChunk;
+        memcpy(stage.data(), src + done, (size_t)n);
+        q.memcpy(dst + done, stage.data(), (size_t)n).wait_and_throw();
+    }
+}
 
 /* Stages `bytes` bytes of host memory at `host_ptr` (typically a range
  * inside the read-only model mmap) into fresh device scratch on `q`,
@@ -311,13 +428,30 @@ struct sycl_device_scratch_guard {
  * kernel needs bytes that live in the host mmap.  Per design-spec section
  * 6l, a SYCL kernel cannot dereference that mmap pointer directly: it
  * silently reads zeros and reports success rather than faulting, so this
- * staging is load-bearing correctness code, not an optimisation. */
+ * staging is load-bearing correctness code, not an optimisation.
+ *
+ * When `host_ptr` is already device-resident (the model-range
+ * cache resolved it to a cached device pointer, sycl_model_range_ptr
+ * above), pass through instead: no allocation, no copy, no wait, and the
+ * returned guard does not own the pointer, so it is never freed here --
+ * the cache owns it and frees it exactly once at teardown (spec 6g). This
+ * one check covers every call site that stages a weight range through
+ * this helper without any change at the call site itself.
+ *
+ * When not resident, the copy goes through sycl_copy_host_to_device_
+ * paged_safe above rather than a bare queue.memcpy: see that function's
+ * comment for the mmap-page-fault defect it guards against. */
 static inline sycl_device_scratch_guard sycl_stage_host_bytes(
         sycl::queue &q, const void *host_ptr, uint64_t bytes) {
+    if (sycl_ptr_is_device_resident(q, host_ptr)) {
+        return sycl_device_scratch_guard(q, const_cast<void *>(host_ptr),
+                                         /*owns_ptr=*/false);
+    }
     unsigned char *dptr = sycl::malloc_device<unsigned char>((size_t)bytes, q);
     if (!dptr) return sycl_device_scratch_guard(q, nullptr);
     sycl_device_scratch_guard guard(q, dptr);
-    q.memcpy(dptr, host_ptr, (size_t)bytes).wait_and_throw();
+    sycl_copy_host_to_device_paged_safe(q, dptr, host_ptr, bytes);
+    g_sycl_stage_host_bytes_total += bytes;
     return guard;
 }
 

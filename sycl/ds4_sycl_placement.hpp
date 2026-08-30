@@ -134,6 +134,11 @@ extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
     if ((size_t)logical_tier < g_sycl_stream_tier.size()) {
         committed += g_sycl_stream_tier[(size_t)logical_tier].resident_bytes;
     }
+    /* The device-resident model-weight cache
+     * (sycl/ds4_sycl_model_cache.hpp) draws from this same ledger: without
+     * this, that cache and this one could each believe they have the
+     * tier's full headroom and together over-commit it. */
+    committed += sycl_model_cache_committed_bytes(logical_tier);
     return ceiling > committed ? ceiling - committed : 0;
 }
 
@@ -236,8 +241,14 @@ extern "C" int ds4_gpu_device_cache_tensors(int                    device_id,
         for (int i = 0; i < n_ranges; i++) {
             if (ranges[i].target_device != device_id || ranges[i].bytes == 0) continue;
             unsigned char *dev_ptr = new_base + write_off;
-            q.memcpy(dev_ptr, host_base + ranges[i].source_offset,
-                     (size_t)ranges[i].bytes).wait_and_throw();
+            /* host_base is the registered model mmap (ds4_gpu_register_
+             * model_map_no_copy): see sycl_copy_host_to_device_paged_safe's
+             * comment (ds4_sycl_common.hpp) for why a bare queue.memcpy
+             * from it is unsafe on this stack and must not be reused here
+             * even though this cache predates the model-range cache. */
+            sycl_copy_host_to_device_paged_safe(q, dev_ptr,
+                                                host_base + ranges[i].source_offset,
+                                                ranges[i].bytes);
             c.ranges.push_back({ranges[i].source_offset, ranges[i].bytes, dev_ptr});
             write_off += ranges[i].bytes;
         }
