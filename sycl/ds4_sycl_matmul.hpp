@@ -262,7 +262,14 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
  * for one Q8_0-quantised weight table, row-major out_dim rows of row_bytes
  * bytes each (blocks of 32 values, 34 bytes per block; see
  * sycl_q8_0_dequant in ds4_sycl_common.hpp).  One work-item per
- * (token, out_row) pair, covering every n_tok with no shape gating. */
+ * (token, out_row) pair, covering every n_tok with no shape gating.
+ *
+ * This scalar form is kept only as the fallback
+ * sycl_q8_0_matmul_general uses when a row is too wide for the tiled
+ * kernel's local-memory activation stage below (see that kernel's own
+ * comment); every call this backend's dense weight shapes actually reach
+ * takes the tiled path instead, which measured faster on the real
+ * layer-eval. */
 static sycl::event sycl_q8_0_matmul_launch(sycl::queue &q, float *out,
                                     const unsigned char *w, const float *x,
                                     uint32_t in_dim, uint32_t out_dim,
@@ -278,6 +285,89 @@ static sycl::event sycl_q8_0_matmul_launch(sycl::queue &q, float *out,
             sum += xr[k] * sycl_q8_0_dequant(wr, k);
         }
         out[gid] = sum;
+    });
+}
+
+/* Tiled Q8_0 dense matmul: replaces
+ * sycl_q8_0_matmul_launch's one-work-item-per-output-element shape, which
+ * profiling showed dominating this backend's real per-layer
+ * kernel time (matmul_q8_0 ranked #1 in that measurement).
+ * That kernel has a single work-item serially walk the whole in_dim for
+ * one output element; this one instead gives every output row a
+ * kSubgroup-wide sub-group to split the row across, reducing with a
+ * shuffle (sycl_subgroup_sum, ds4_sycl_common.hpp), and stages the
+ * token's activation row into local memory once per work-group so every
+ * output row the group computes reads it from local memory instead of
+ * global. Mirrors the shape of ds4_sycl_moe.hpp's Q4_K tile kernels
+ * (e.g. sycl_moe_q4k_gate_up_mid_tile8): local-memory activation staging
+ * plus a sub-group cooperative reduction, one work-group per output tile,
+ * matching the established pattern for quantised-weight tile kernels.
+ *
+ * kSubgroup is 16, already in kRequiredSubGroupWidths
+ * (ds4_sycl_common.hpp), so ds4_gpu_init's device-capability guard already
+ * checks it; no change needed there.
+ *
+ * The activation row is staged in full (in_dim floats) rather than in a
+ * bounded sub-tile: every dense Q8_0 weight table in the DeepSeek V4
+ * Flash/Pro shapes has in_dim <= 4096 (16 KiB), comfortably inside Arc's
+ * local-memory budget, so this is not a partial-tile scheme. The caller
+ * (sycl_q8_0_matmul_general) checks the row fits the device's actual
+ * reported local-memory size before choosing this kernel over the scalar
+ * fallback above, so an unexpectedly wide in_dim degrades to a working
+ * (if slower) kernel instead of an oversized local_accessor allocation
+ * failing at submission time. */
+static constexpr int      kQ8_0TileSubgroup     = 16;
+static constexpr uint32_t kQ8_0TileGroupSize    = 256u;
+static constexpr uint32_t kQ8_0TileRowsPerGroup =
+        kQ8_0TileGroupSize / (uint32_t)kQ8_0TileSubgroup;
+
+static sycl::event sycl_q8_0_matmul_tiled_launch(sycl::queue &q, float *out,
+                                    const unsigned char *w, const float *x,
+                                    uint32_t in_dim, uint32_t out_dim,
+                                    uint32_t n_tok, uint64_t row_bytes) {
+    const uint32_t row_blocks =
+            (out_dim + kQ8_0TileRowsPerGroup - 1u) / kQ8_0TileRowsPerGroup;
+    return q.submit([&](sycl::handler &h) {
+        sycl::local_accessor<float, 1> x_local(sycl::range<1>(in_dim), h);
+        h.parallel_for(
+                sycl::nd_range<2>(
+                        sycl::range<2>((size_t)row_blocks * kQ8_0TileGroupSize, n_tok),
+                        sycl::range<2>(kQ8_0TileGroupSize, 1u)),
+                [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kQ8_0TileSubgroup)]] {
+                    const uint32_t tok = (uint32_t)it.get_group(1);
+                    const uint32_t lid = (uint32_t)it.get_local_id(0);
+                    const uint32_t group_size = (uint32_t)it.get_local_range(0);
+
+                    /* Stage this token's activation row once; every lane
+                     * in the work-group participates in this strided
+                     * fill regardless of which output row it will later
+                     * compute, so every element up to in_dim is written
+                     * by some lane before the barrier (spec 6b: an idle
+                     * lane must never be the reason a local-memory slot
+                     * goes unwritten). */
+                    const float *xr = x + (uint64_t)tok * in_dim;
+                    for (uint32_t i = lid; i < in_dim; i += group_size) {
+                        x_local[i] = xr[i];
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    const sycl::sub_group sg = it.get_sub_group();
+                    const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                    const uint32_t row_in_group = lid / (uint32_t)kQ8_0TileSubgroup;
+                    const uint32_t row = (uint32_t)it.get_group(0) * kQ8_0TileRowsPerGroup
+                                        + row_in_group;
+                    if (row >= out_dim) return;
+
+                    const unsigned char *wr = w + (uint64_t)row * row_bytes;
+                    float sum = 0.0f;
+                    for (uint32_t k = lane; k < in_dim; k += (uint32_t)kQ8_0TileSubgroup) {
+                        sum += x_local[k] * sycl_q8_0_dequant(wr, k);
+                    }
+                    sum = sycl_subgroup_sum<kQ8_0TileSubgroup>(sg, sum);
+                    if (lane == 0u) {
+                        out[(uint64_t)tok * out_dim + row] = sum;
+                    }
+                });
     });
 }
 
@@ -346,12 +436,28 @@ static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
         unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
 
-        sycl::event _ds4_prof_ev69 = sycl_q8_0_matmul_launch(
-                q, (float *)out->ptr, dw, (const float *)x->ptr,
-                (uint32_t)in_dim, (uint32_t)out_dim,
-                (uint32_t)n_tok, row_bytes);
+        /* The tiled kernel stages one in_dim-wide activation row into
+         * local memory per work-group; fall back to the scalar kernel
+         * (no local memory needed) rather than risk an oversized
+         * local_accessor allocation on a device or shape this margin does
+         * not anticipate. 4096 bytes of headroom for whatever else the
+         * runtime reserves per work-group, checked against this specific
+         * device rather than assumed, since local memory size is not
+         * uniform across every SYCL device this backend might run on. */
+        const uint64_t x_local_bytes = (uint64_t)in_dim * sizeof(float);
+        const uint64_t local_mem_size =
+                (uint64_t)q.get_device().get_info<sycl::info::device::local_mem_size>();
+        const bool use_tiled = x_local_bytes + 4096u <= local_mem_size;
+
+        sycl::event ev = use_tiled
+                ? sycl_q8_0_matmul_tiled_launch(
+                        q, (float *)out->ptr, dw, (const float *)x->ptr,
+                        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, row_bytes)
+                : sycl_q8_0_matmul_launch(
+                        q, (float *)out->ptr, dw, (const float *)x->ptr,
+                        (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, row_bytes);
         q.wait_and_throw();
-        ds4_sycl_profile_record_named("matmul_q8_0", _ds4_prof_ev69);
+        ds4_sycl_profile_record_named("matmul_q8_0", ev);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0 failed: %s\n", e.what());
         return 0;
