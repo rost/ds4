@@ -56,16 +56,59 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_set_attn_head_split)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attention_noncausal_raw_batch_heads_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_attn_q_b_f16_head_rms_rope_tail_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_build_derived_artifacts)
-/* Entry-specific convention, not the usual nonzero-means-success family
- * (see ds4_gpu.h). -1 matches both ROCm's own stub (ds4_rocm_compat.cu)
- * and ds4.c's CPU-only fallback definitions of these same two functions,
- * which also return -1:
+/* Decode graph capture: investigated, deliberately left disabled.
+ *
+ * sycl_ext_oneapi_graph itself is fine on this stack. A standalone probe
+ * against 2025.3 DPC++ and this A770's Level Zero driver confirmed: the
+ * device reports aspect::ext_oneapi_limited_graph (full ext_oneapi_graph
+ * is not reported; limited graph only lacks executable-graph update,
+ * which this design never needed anyway since an invalidated graph is
+ * rebuilt from scratch, not patched); a plain kernel, a chain of two
+ * kernels linked by an explicit sycl::event dependency (this backend's
+ * out-of-order-queue pattern, spec 6t), and a oneMKL
+ * oneapi::mkl::blas::gemm call all capture, finalize and replay with
+ * output bit-identical to the eager run; and destroying a finalized graph
+ * and recording a fresh one on the same queue (modelling invalidate then
+ * re-capture) works cleanly, with the queue running eager work correctly
+ * in between.
+ *
+ * What kills it is this backend's own kernel-launch shape, not the
+ * extension: every entry point in the sycl/ headers that touches a quantised
+ * weight stages it from the host mmap into a fresh sycl::malloc_device
+ * scratch buffer, waits for that staging copy, launches its kernel(s),
+ * then waits again before returning so the RAII sycl_device_scratch_guard
+ * can free the scratch (this exists because ds4_gpu_device_cache_tensors
+ * is itself still stubbed for SYCL below, so nothing device-resident
+ * survives between calls to be reused). The same probe confirmed that
+ * calling wait()/wait_and_throw() on an event or queue while the queue is
+ * in graph-recording mode throws sycl::exception synchronously ("wait
+ * method cannot be used for an event associated with a command graph").
+ * Both decode islands' real work (island 0: norm + QKV projection; island
+ * 1: attention-output projection through FFN/MoE) runs entirely through
+ * these wait-per-call helpers, so recording either one would throw on the
+ * first kernel it tried to capture. Fixing that means replacing the
+ * synchronous stage/wait/free pattern across every sycl/ header's kernel
+ * launcher with device-resident weight caching plus graph-safe dependency
+ * chaining (or the explicit graph-node-construction API) -- a rewrite of
+ * the whole kernel surface, not something the three entries below can
+ * carry, and out of scope here.
+ *
+ * Not the usual nonzero-means-success family either (see ds4_gpu.h). -1
+ * matches both ROCm's own stub (ds4_rocm_compat.cu) and ds4.c's CPU-only
+ * fallback definitions of these same two functions, which also return -1:
  *   ds4_gpu_decode_graph_begin: 1 = replayed, 0 = capturing, -1 = run
  *     eagerly. -1 here means "no graph support, always run eagerly".
  *   ds4_gpu_decode_graph_end: 0 = capture committed and launched,
  *     -1 = capture failed (caller must re-encode the island eagerly).
  *     Returning the macro's usual 0 here would falsely report a
- *     committed capture. */
+ *     committed capture.
+ * ds4_gpu_decode_graphs_supported stubs to 0 (its own false value: this
+ * entry's convention is nonzero-means-supported), which keeps every
+ * decode island on the eager path ds4.c:21976 already documents as
+ * byte-identical to before. With supported() permanently false, nothing
+ * ever reaches capture, so ds4_gpu_decode_graphs_invalidate and
+ * ds4_gpu_decode_graph_abort (below, with the other void-returning
+ * stubs) have nothing to invalidate and are correct as plain no-ops. */
 extern "C" int ds4_gpu_decode_graph_begin(...) { return -1; }
 extern "C" int ds4_gpu_decode_graph_end(...) { return -1; }
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_decode_graphs_supported)
