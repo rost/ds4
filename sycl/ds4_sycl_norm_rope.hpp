@@ -92,7 +92,13 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out,
                     }
                 });
         });
-        q.wait_and_throw();
+        /* No trailing wait. out and x are both device tensors
+         * with no host read and no staged scratch to free here, so the
+         * in_order queue (ds4_sycl.cpp) is enough to order this kernel
+         * against whatever reads `out` next on this same tier's queue; a
+         * real completion signal is only needed at ds4_gpu_synchronize /
+         * ds4_gpu_end_commands or a host readback, neither of which this
+         * entry is. */
         ds4_sycl_profile_record_named("rms_norm_plain_rows", _ds4_prof_ev130);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rms_norm_plain failed: %s\n",
@@ -180,6 +186,13 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(
                     }
                 });
         });
+        /* Wait kept. dw_guard may own a freshly staged scratch
+         * allocation (sycl_stage_host_bytes, not a cached device-resident
+         * pass-through), which its destructor frees on the host the
+         * moment this function returns; in_order only orders queue
+         * commands against each other, never a host-side sycl::free
+         * against a kernel still in flight, so removing this wait would
+         * be spec 6g's use-after-free on every uncached call. */
         q.wait_and_throw();
         ds4_sycl_profile_record_named("rms_norm_weight_rows", _ds4_prof_ev131);
     } catch (const sycl::exception &e) {
@@ -328,6 +341,9 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
                     }
                 });
         });
+        /* Wait kept, same reasoning as
+         * ds4_gpu_rms_norm_weight_rows_tensor above -- dqw_guard and
+         * dkvw_guard can each own scratch this function frees on return. */
         sq.wait_and_throw();
         ds4_sycl_profile_record_named("dsv4_qkv_rms_norm_rows", _ds4_prof_ev132);
     } catch (const sycl::exception &e) {
@@ -536,6 +552,9 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
                     }
                 });
         });
+        /* Wait kept, same reasoning as
+         * ds4_gpu_rms_norm_weight_rows_tensor above -- dqw_guard and
+         * dkvw_guard can each own scratch this function frees on return. */
         sq.wait_and_throw();
         ds4_sycl_profile_record_named("dsv4_qkv_rms_norm_rows_kv_rope", _ds4_prof_ev133);
     } catch (const sycl::exception &e) {
@@ -596,7 +615,9 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok,
                     }
                 });
         });
-        q.wait_and_throw();
+        /* No trailing wait, same reasoning as
+         * ds4_gpu_rms_norm_plain_rows_tensor above -- in-place on a device
+         * tensor, no staged scratch, no host read. */
         ds4_sycl_profile_record_named("head_rms_norm", _ds4_prof_ev134);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "head_rms_norm failed: %s\n",
@@ -723,7 +744,9 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(
                     }
                 });
         });
-        q.wait_and_throw();
+        /* No trailing wait, same reasoning as
+         * ds4_gpu_rms_norm_plain_rows_tensor above -- in-place on a device
+         * tensor, no staged scratch, no host read. */
         ds4_sycl_profile_record_named("head_rms_norm_rope_tail", _ds4_prof_ev135);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -829,7 +852,9 @@ static int sycl_rope_tail_stride_tensor(
                     tail[i + 1] = x0 * s + x1 * c;
                 });
         });
-        q.wait_and_throw();
+        /* No trailing wait, same reasoning as
+         * ds4_gpu_rms_norm_plain_rows_tensor above -- in-place on a device
+         * tensor, no staged scratch, no host read. */
         ds4_sycl_profile_record_named("rope_tail_stride", _ds4_prof_ev136);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rope_tail failed: %s\n",
@@ -971,6 +996,9 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
                     tail[i + 1] = x0 * s + x1 * c;
                 });
         });
+        /* Wait kept, same reasoning as
+         * ds4_gpu_rms_norm_weight_rows_tensor above -- pos_guard can own
+         * scratch this function frees on return. */
         q.wait_and_throw();
         ds4_sycl_profile_record_named("rope_tail_decode_rows", _ds4_prof_ev137);
     } catch (const sycl::exception &e) {
