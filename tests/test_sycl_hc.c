@@ -1402,6 +1402,219 @@ static int test_shared_down_hc_expand_q8_0(void) {
     return 0;
 }
 
+/* ds4_gpu_shared_down_hc_expand_add_q8_0_tensor, the second-add
+ * sibling of test_shared_down_hc_expand_q8_0 above. Differential only
+ * (matching that test's own differential section): the fused entry's
+ * block_v is raw_dot + routed_out + routed_add, so composing the same
+ * three terms by hand (matmul into scratch, ds4_gpu_add_tensor for the sum,
+ * then the existing unfused ds4_gpu_hc_expand_add_split_tensor) must
+ * reproduce the fused entry's output exactly. */
+static int test_shared_down_hc_expand_add_q8_0(void) {
+    enum { IN_DIM = 20 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)N_HC_EXPAND_EMBD * row_bytes;
+
+    unsigned char weights[N_HC_EXPAND_EMBD * 34];
+    float x[IN_DIM];
+    float routed_out[N_HC_EXPAND_EMBD];
+    float routed_add[N_HC_EXPAND_EMBD];
+    float block_want[N_HC_EXPAND_EMBD];
+    float residual[N_HC * N_HC_EXPAND_EMBD];
+    float split[MIX_HC];
+    float hc_want[N_HC * N_HC_EXPAND_EMBD];
+
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        hc_test_encode_q8_0_row(weights + (size_t)o * row_bytes, IN_DIM, o + 1u);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) x[k] = (float)((k * 5u + 1u) % 7u) - 3.0f;
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        routed_out[o] = fill_val(o, o + 2u) * 1.3f;
+        routed_add[o] = fill_val(o, o + 9u) * 0.7f;
+        const float dot = hc_oracle_q8_0_dot(x, weights + (size_t)o * row_bytes, IN_DIM);
+        block_want[o] = dot + routed_out[o] + routed_add[o];
+    }
+    for (int h = 0; h < N_HC; h++) {
+        for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+            residual[h * N_HC_EXPAND_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 1.7f;
+        }
+    }
+    for (int i = 0; i < MIX_HC; i++) split[i] = fill_val(3u, (uint32_t)i + 60) * 0.4f;
+    oracle_hc_post_one(hc_want, block_want, residual, split + N_HC, split + 2 * N_HC,
+                       N_HC_EXPAND_EMBD, N_HC);
+
+    ds4_gpu_tensor *tx      = alloc_write(x, sizeof(x));
+    ds4_gpu_tensor *trouted = alloc_write(routed_out, sizeof(routed_out));
+    ds4_gpu_tensor *tadd    = alloc_write(routed_add, sizeof(routed_add));
+    ds4_gpu_tensor *tres    = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tsplit  = alloc_write(split, sizeof(split));
+    ds4_gpu_tensor *tshared = ds4_gpu_tensor_alloc(sizeof(block_want));
+    ds4_gpu_tensor *tout    = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tx && trouted && tadd && tres && tsplit && tshared && tout,
+          "shared_down_hc_expand_add: alloc failed");
+
+    CHECK(ds4_gpu_shared_down_hc_expand_add_q8_0_tensor(
+              tout, tshared, weights, weight_bytes, 0, IN_DIM, N_HC_EXPAND_EMBD, tx, trouted,
+              tadd, tres, tsplit, N_HC_EXPAND_EMBD, N_HC) != 0,
+          "shared_down_hc_expand_add: call");
+
+    float hc_got[N_HC * N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout, 0, hc_got, sizeof(hc_got)) != 0,
+          "shared_down_hc_expand_add: read out_hc");
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_want[i], 1e-2, "shared_down_hc_expand_add: out_hc mismatch");
+    }
+
+    /* Differential: matmul into scratch, add both terms by hand, then the
+     * existing unfused expand entry. */
+    ds4_gpu_tensor *tshared2 = ds4_gpu_tensor_alloc(sizeof(block_want));
+    ds4_gpu_tensor *tsum     = ds4_gpu_tensor_alloc(sizeof(block_want));
+    ds4_gpu_tensor *tout2    = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tshared2 && tsum && tout2, "shared_down_hc_expand_add: differential alloc failed");
+    CHECK(ds4_gpu_matmul_q8_0_tensor(tshared2, weights, weight_bytes, 0, IN_DIM,
+                                     N_HC_EXPAND_EMBD, tx, 1) != 0,
+          "shared_down_hc_expand_add: differential matmul call");
+    CHECK(ds4_gpu_add_tensor(tsum, trouted, tadd, N_HC_EXPAND_EMBD) != 0,
+          "shared_down_hc_expand_add: differential add call");
+    CHECK(ds4_gpu_hc_expand_add_split_tensor(tout2, tshared2, tsum, tres, tsplit,
+                                             N_HC_EXPAND_EMBD, N_HC) != 0,
+          "shared_down_hc_expand_add: differential expand call");
+    float hc_diff[N_HC * N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout2, 0, hc_diff, sizeof(hc_diff)) != 0,
+          "shared_down_hc_expand_add: differential read");
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_diff[i], 1e-4,
+                    "shared_down_hc_expand_add: fused vs unfused composition mismatch");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(trouted);
+    ds4_gpu_tensor_free(tadd);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tshared);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tshared2);
+    ds4_gpu_tensor_free(tsum);
+    ds4_gpu_tensor_free(tout2);
+    fprintf(stderr, "  test_shared_down_hc_expand_add_q8_0 OK\n");
+    return 0;
+}
+
+/* ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor, whose block_v
+ * is raw_dot(x) plus the SAME owned-packed routed-MoE combine
+ * ds4_gpu_routed_moe_owned_packed_combine_tensor computes (already
+ * correctness-tested against a Q4_K CPU oracle in
+ * tests/test_sycl_moe.c's test_q4k_owned_decode_composes_ownership_with_
+ * compaction). This test does not re-derive that combine's math: it
+ * differentials the fused entry against calling the combine entry
+ * separately and adding its result by hand, the same shape as
+ * test_shared_down_hc_expand_add_q8_0's differential above, which is
+ * exactly what would catch the fusion wiring the two entries' shared
+ * helper (sycl_moe_owned_packed_combine_row) mismatching between call
+ * sites -- home_slots/peer_packed/selected passed in the wrong order, or
+ * expert_split not forwarded -- since that helper's own math is already
+ * covered elsewhere. */
+static int test_shared_down_hc_expand_owned_q8_0(void) {
+    enum { IN_DIM = 20, EXPERT_SPLIT = 3 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)N_HC_EXPAND_EMBD * row_bytes;
+
+    unsigned char weights[N_HC_EXPAND_EMBD * 34];
+    float x[IN_DIM];
+    float home_slots[6 * N_HC_EXPAND_EMBD];
+    float peer_packed[4 * N_HC_EXPAND_EMBD];
+    /* Mix of experts below and at/above EXPERT_SPLIT, matching the shape
+     * test_q4k_owned_decode_composes_ownership_with_compaction's own
+     * fixture uses for the same reason: a boundary the combine's ownership
+     * test must actually discriminate. */
+    const int32_t selected[6] = {0, 4, 1, 5, 2, 3};
+    float residual[N_HC * N_HC_EXPAND_EMBD];
+    float split[MIX_HC];
+    float hc_want[N_HC * N_HC_EXPAND_EMBD];
+
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        hc_test_encode_q8_0_row(weights + (size_t)o * row_bytes, IN_DIM, o + 1u);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) x[k] = (float)((k * 5u + 1u) % 7u) - 3.0f;
+    for (uint32_t i = 0; i < 6u * N_HC_EXPAND_EMBD; i++) home_slots[i] = fill_val(i, i + 5u) * 0.9f;
+    for (uint32_t i = 0; i < 4u * N_HC_EXPAND_EMBD; i++) {
+        peer_packed[i] = fill_val(i + 40u, i + 11u) * 1.1f;
+    }
+    for (int h = 0; h < N_HC; h++) {
+        for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+            residual[h * N_HC_EXPAND_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 1.7f;
+        }
+    }
+    for (int i = 0; i < MIX_HC; i++) split[i] = fill_val(3u, (uint32_t)i + 60) * 0.4f;
+
+    ds4_gpu_tensor *tx      = alloc_write(x, sizeof(x));
+    ds4_gpu_tensor *thome   = alloc_write(home_slots, sizeof(home_slots));
+    ds4_gpu_tensor *tpeer   = alloc_write(peer_packed, sizeof(peer_packed));
+    ds4_gpu_tensor *tsel    = alloc_write(selected, sizeof(selected));
+    ds4_gpu_tensor *tres    = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tsplit  = alloc_write(split, sizeof(split));
+    ds4_gpu_tensor *tshared = ds4_gpu_tensor_alloc((uint64_t)N_HC_EXPAND_EMBD * sizeof(float));
+    ds4_gpu_tensor *tout    = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tx && thome && tpeer && tsel && tres && tsplit && tshared && tout,
+          "shared_down_hc_expand_owned: alloc failed");
+
+    /* Independent combine call, used only to build the oracle below (not
+     * itself the correctness authority for the combine's own math -- see
+     * this test's header comment). */
+    ds4_gpu_tensor *tcombine = ds4_gpu_tensor_alloc((uint64_t)N_HC_EXPAND_EMBD * sizeof(float));
+    CHECK(tcombine, "shared_down_hc_expand_owned: combine alloc");
+    CHECK(ds4_gpu_routed_moe_owned_packed_combine_tensor(tcombine, thome, tpeer, tsel,
+                                                         N_HC_EXPAND_EMBD, EXPERT_SPLIT) != 0,
+          "shared_down_hc_expand_owned: independent combine call");
+    float combine_want[N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tcombine, 0, combine_want, sizeof(combine_want)) != 0,
+          "shared_down_hc_expand_owned: read combine");
+
+    float block_want[N_HC_EXPAND_EMBD];
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        const float dot = hc_oracle_q8_0_dot(x, weights + (size_t)o * row_bytes, IN_DIM);
+        block_want[o] = dot + combine_want[o];
+    }
+    oracle_hc_post_one(hc_want, block_want, residual, split + N_HC, split + 2 * N_HC,
+                       N_HC_EXPAND_EMBD, N_HC);
+
+    CHECK(ds4_gpu_shared_down_hc_expand_owned_q8_0_tensor(
+              tout, tshared, weights, weight_bytes, 0, IN_DIM, N_HC_EXPAND_EMBD, tx, thome, tpeer,
+              tsel, EXPERT_SPLIT, tres, tsplit, N_HC_EXPAND_EMBD, N_HC) != 0,
+          "shared_down_hc_expand_owned: call");
+
+    float hc_got[N_HC * N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout, 0, hc_got, sizeof(hc_got)) != 0,
+          "shared_down_hc_expand_owned: read out_hc");
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_want[i], 1e-2, "shared_down_hc_expand_owned: out_hc mismatch");
+    }
+
+    float shared_got[N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tshared, 0, shared_got, sizeof(shared_got)) != 0,
+          "shared_down_hc_expand_owned: read shared_out");
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        const float dot = hc_oracle_q8_0_dot(x, weights + (size_t)o * row_bytes, IN_DIM);
+        CHECK_CLOSE(shared_got[o], dot, 1e-2,
+                    "shared_down_hc_expand_owned: shared_out must be the raw pre-combine "
+                    "matmul result");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(thome);
+    ds4_gpu_tensor_free(tpeer);
+    ds4_gpu_tensor_free(tsel);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tshared);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tcombine);
+    fprintf(stderr, "  test_shared_down_hc_expand_owned_q8_0 OK\n");
+    return 0;
+}
+
 int main(void) {
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_repeat_hc() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1422,6 +1635,8 @@ int main(void) {
     if (test_matmul_q8_0_hc_expand() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_kslice_hc_expand_add() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_shared_down_hc_expand_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_shared_down_hc_expand_add_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_shared_down_hc_expand_owned_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_hc OK\n");
     return 0;
