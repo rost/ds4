@@ -2811,6 +2811,69 @@ extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_tensor(
     }
 }
 
+/* Tensor parallelism: TP row-range attention prefill. Reached
+ * only when tp_row_split_attn is true, which requires g->tp_world == 2
+ * (ds4.c:28148-28153). Checked directly against ds4_cuda.cu:30722-30746:
+ * BOTH of these entries are themselves `(void)every_argument; return 0;`
+ * in ds4_cuda.cu -- CUDA never implements TP row-split attention prefill
+ * either, matching the pattern found across the whole
+ * ds4_gpu_tp_* gate family (see ds4_sycl_mgpu.hpp): tensor-parallel row
+ * splitting for the prefill attention path is Metal-only in practice, not
+ * because a non-Metal implementation would be hard, but because CUDA's
+ * own reference never wired it up (ds4_engine_tp_bind, ds4.c, refuses any
+ * backend other than DS4_BACKEND_METAL, so g->tp_world can never reach 2
+ * on this backend regardless of GPU count).
+ * Faithfully mirroring ds4_cuda.cu's actual behaviour is the correct port
+ * here, not a placeholder: e->backend == DS4_BACKEND_CUDA is true for a
+ * SYCL build, so this is the CUDA branch, and the CUDA branch's own
+ * authoritative behaviour is "always fail". NONZERO means success
+ * (ds4_gpu.h), so `return 0` reports that failure faithfully. */
+extern "C" int ds4_gpu_attention_prefill_raw_heads_range_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        uint32_t                q_row0,
+        uint32_t                n_q,
+        uint32_t                n_kv,
+        uint32_t                window,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset;
+    (void)q; (void)raw_kv; (void)q_row0; (void)n_q; (void)n_kv;
+    (void)window; (void)n_head; (void)head_dim;
+    return 0;
+}
+
+/* As ds4_gpu_attention_prefill_raw_heads_range_tensor above: same
+ * tp_row_split_attn gate, same verified-against-ds4_cuda.cu:30734-30746
+ * always-fails reference behaviour, same reasoning. */
+extern "C" int ds4_gpu_attention_prefill_static_mixed_heads_range_tensor(
+        ds4_gpu_tensor       *heads,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                sinks_offset,
+        const ds4_gpu_tensor *q,
+        const ds4_gpu_tensor *raw_kv,
+        const ds4_gpu_tensor *comp_kv,
+        uint32_t                comp_kv_f16,
+        uint32_t                q_row0,
+        uint32_t                n_q,
+        uint32_t                n_tokens,
+        uint32_t                n_comp,
+        uint32_t                window,
+        uint32_t                ratio,
+        uint32_t                n_head,
+        uint32_t                head_dim) {
+    (void)heads; (void)model_map; (void)model_size; (void)sinks_offset;
+    (void)q; (void)raw_kv; (void)comp_kv; (void)comp_kv_f16;
+    (void)q_row0; (void)n_q; (void)n_tokens; (void)n_comp; (void)window;
+    (void)ratio; (void)n_head; (void)head_dim;
+    return 0;
+}
+
 /* Test-only hook, not part of the ABI: calls
  * sycl_attention_prefill_mixed_cublas_tiled directly with a caller-chosen
  * tile size, bypassing the small-window-static/GEMM/tiled dispatch in
