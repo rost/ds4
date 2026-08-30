@@ -473,6 +473,68 @@ extern "C" int ds4_gpu_hc_expand_tensor(
     return 1;
 }
 
+/* Tensor-parallel ATTN-gate combine: as ds4_gpu_hc_expand_tensor
+ * above, but block_v is block_out[t][d] + block_add[t][d] before the
+ * combine, matching ds4_cuda.cu's ds4_gpu_hc_expand_add_tensor exactly (it
+ * calls the identical hc_expand_kernel with is_add=1, block_add taking the
+ * kernel's second data argument instead of a repeated block_out). ds4.c:
+ * 23625/23629 calls this to fold the two ranks' partial attention outputs
+ * straight into the HC expand without materialising their sum separately
+ * first (see ds4_gpu_add_xdev_tensor in ds4_sycl_mgpu.hpp for the sibling
+ * entry that DOES materialise a cross-rank sum, used on the directional-
+ * steering branch of the same call site). Not gated on tp_world in any
+ * way: the combine math has no TP-specific step, it is only ever called
+ * under TP. Same validation shape and NONZERO-success polarity as
+ * ds4_gpu_hc_expand_tensor. */
+extern "C" int ds4_gpu_hc_expand_add_tensor(
+        ds4_gpu_tensor *out_hc, const ds4_gpu_tensor *block_out, const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc, const ds4_gpu_tensor *post, const ds4_gpu_tensor *comb,
+        uint32_t n_embd, uint32_t n_hc) {
+    uint64_t n_tokens64 = 0, flat_bytes = 0, hc_bytes = 0, post_bytes = 0, comb_bytes = 0, comb_stride = 0;
+    if (!out_hc || !block_out || !block_add || !residual_hc || !post || !comb ||
+        !sycl_hc_hc_token_count(out_hc, n_embd, n_hc, &n_tokens64) ||
+        !sycl_u64_mul3_checked(n_tokens64, n_embd, sizeof(float), &flat_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, (uint64_t)n_hc * n_embd, sizeof(float), &hc_bytes) ||
+        !sycl_u64_mul3_checked(n_tokens64, n_hc, sizeof(float), &post_bytes) ||
+        !sycl_u64_mul_checked(n_hc, n_hc, &comb_stride) || comb_stride > UINT32_MAX ||
+        !sycl_u64_mul3_checked(n_tokens64, comb_stride, sizeof(float), &comb_bytes) ||
+        block_out->bytes < flat_bytes || block_add->bytes < flat_bytes ||
+        residual_hc->bytes < hc_bytes || post->bytes < post_bytes || comb->bytes < comb_bytes) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+    const uint32_t n_tokens = (uint32_t)n_tokens64;
+    const uint32_t hc = n_hc, embd = n_embd, cstride = (uint32_t)comb_stride;
+    const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(out_hc->device_id);
+        float       *ohc = (float *)out_hc->ptr;
+        const float *bo  = (const float *)block_out->ptr;
+        const float *ba  = (const float *)block_add->ptr;
+        const float *res = (const float *)residual_hc->ptr;
+        const float *pp  = (const float *)post->ptr;
+        const float *cp  = (const float *)comb->ptr;
+
+        q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+            const uint64_t gid = gid_id[0];
+            const uint32_t d = (uint32_t)(gid % embd);
+            const uint64_t tmp = gid / embd;
+            const uint32_t dst_hc = (uint32_t)(tmp % hc);
+            const uint64_t t = tmp / hc;
+            const float block_v = bo[t * embd + d] + ba[t * embd + d];
+            const float acc =
+                    sycl_hc_expand_general(block_v, pp, cp, res, embd, hc, hc, cstride, t, dst_hc, d);
+            ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_add failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
 /* Expands using a packed split row (pre | post | comb) rather than
  * separate post/comb tensors.  n_hc == 4 dispatches to the unrolled
  * specialisation (hc_expand4_kernel); any other n_hc falls back to the
@@ -685,6 +747,59 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(
         return 0;
     }
     return 1;
+}
+
+/* Tensor parallelism: fused split-matmul + HC-expand-add. ds4_
+ * cuda.cu's real kernel pair (quantize_q8_0_f32_kernel +
+ * matmul_q8_0_kslice_hc_expand_add_preq_warp8_kernel, ds4_cuda.cu:14924-
+ * 14996) does the k-slice matmul into block_out and the HC combine of
+ * (block_out + block_add) in one launch; this port composes the two
+ * pieces already built above instead of writing a third fused
+ * kernel, the same "compose rather than duplicate" call this file's own
+ * header comment documents for ds4_gpu_shared_down_hc_expand_q8_0_tensor
+ * below. Mathematically identical: block_out is fully written by the
+ * first call (and, per this file's own trailing-wait discipline, is
+ * complete before the second call reads it) before
+ * ds4_gpu_hc_expand_add_split_tensor folds it with block_add.
+ *
+ * Validation ported from ds4_cuda.cu:14924-14943, which additionally
+ * requires out_dim == n_embd (the k-slice matmul's output width must
+ * match the HC expand's per-token width for the composition to be
+ * dimensionally sound; the two composed calls below do not check this
+ * cross-condition on their own, so it is checked explicitly here). The
+ * `n_tok > 65535` grid-dimension artefact is skipped for the same reason
+ * ds4_gpu_matmul_q8_0_kslice_rows_tensor's own port skips it. NONZERO
+ * means success, matching both composed calls and ds4_cuda.cu's own
+ * `cuda_ok(...)` return. */
+extern "C" int ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
+        ds4_gpu_tensor       *out_hc,
+        ds4_gpu_tensor       *block_out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        uint64_t                in_start,
+        uint64_t                in_count,
+        const ds4_gpu_tensor *x,
+        const ds4_gpu_tensor *block_add,
+        const ds4_gpu_tensor *residual_hc,
+        const ds4_gpu_tensor *split,
+        uint32_t                n_embd,
+        uint32_t                n_hc) {
+    if (!out_hc || !block_out || !model_map || !x || !block_add ||
+        !residual_hc || !split || in_dim == 0u || out_dim == 0u ||
+        in_count == 0u || n_embd == 0u || n_hc == 0u ||
+        out_dim != (uint64_t)n_embd) {
+        return 0;
+    }
+    if (!ds4_gpu_matmul_q8_0_kslice_rows_tensor(block_out, model_map, model_size,
+                                                weight_offset, in_dim, out_dim,
+                                                in_start, in_count, x, 1u)) {
+        return 0;
+    }
+    return ds4_gpu_hc_expand_add_split_tensor(out_hc, block_out, block_add,
+                                              residual_hc, split, n_embd, n_hc);
 }
 
 /* As ds4_gpu_hc_expand_add_split_tensor, but block_add is F16: decode then

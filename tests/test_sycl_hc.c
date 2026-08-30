@@ -431,6 +431,89 @@ static int test_hc_expand(void) {
     return 0;
 }
 
+/* Tensor parallelism: ds4_gpu_hc_expand_add_tensor, the ATTN-gate
+ * combine ds4.c:23625/23629 folds the two TP ranks' partial attention
+ * outputs into. Oracle: oracle_hc_post_one fed block_out+block_add as its
+ * block_out argument, matching ds4_cuda.cu's shared hc_expand_kernel
+ * called with is_add=1 (the kernel adds block_add to block_out internally
+ * before the same combine math test_hc_expand above already validates).
+ * Differential against ds4_gpu_hc_expand_tensor with a pre-summed
+ * block_out and an all-zero block_add is the more direct proof that the
+ * "add" step is exactly a sum, not merely that both reach the same oracle
+ * formula. */
+static int test_hc_expand_add(void) {
+    enum { N_TOK = 2, N_EMBD = 8, HC = 3 };
+    float block_out[N_TOK * N_EMBD];
+    float block_add[N_TOK * N_EMBD];
+    float block_sum[N_TOK * N_EMBD];
+    float residual[N_TOK * HC * N_EMBD];
+    float post[N_TOK * HC];
+    float comb[N_TOK * HC * HC];
+    float want[N_TOK * HC * N_EMBD], got[N_TOK * HC * N_EMBD];
+
+    for (int t = 0; t < N_TOK; t++) {
+        for (int i = 0; i < N_EMBD; i++) {
+            block_out[t * N_EMBD + i] = fill_val((uint32_t)t, (uint32_t)i);
+            block_add[t * N_EMBD + i] = fill_val((uint32_t)i, (uint32_t)t + 20u) * 1.3f;
+            block_sum[t * N_EMBD + i] = block_out[t * N_EMBD + i] + block_add[t * N_EMBD + i];
+        }
+        for (int h = 0; h < HC; h++) {
+            post[t * HC + h] = fill_val((uint32_t)t, (uint32_t)h + 50) * 0.4f;
+            for (int i = 0; i < N_EMBD; i++)
+                residual[(t * HC + h) * N_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 2.0f;
+        }
+        for (int i = 0; i < HC * HC; i++) comb[t * HC * HC + i] = fill_val((uint32_t)t, (uint32_t)i + 90) * 0.3f;
+        oracle_hc_post_one(want + (uint64_t)t * HC * N_EMBD, block_sum + t * N_EMBD,
+                           residual + (uint64_t)t * HC * N_EMBD, post + t * HC, comb + t * HC * HC,
+                           N_EMBD, HC);
+    }
+
+    ds4_gpu_tensor *tblock = alloc_write(block_out, sizeof(block_out));
+    ds4_gpu_tensor *tadd   = alloc_write(block_add, sizeof(block_add));
+    ds4_gpu_tensor *tres   = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tpost  = alloc_write(post, sizeof(post));
+    ds4_gpu_tensor *tcomb  = alloc_write(comb, sizeof(comb));
+    ds4_gpu_tensor *tout   = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tblock && tadd && tres && tpost && tcomb && tout, "hc_expand_add: alloc failed");
+
+    CHECK(ds4_gpu_hc_expand_add_tensor(tout, tblock, tadd, tres, tpost, tcomb, N_EMBD, HC) != 0,
+          "hc_expand_add: call");
+    CHECK(ds4_gpu_tensor_read(tout, 0, got, sizeof(got)) != 0, "hc_expand_add: read");
+    for (int i = 0; i < N_TOK * HC * N_EMBD; i++)
+        CHECK_CLOSE(got[i], want[i], 1e-4, "hc_expand_add: value mismatch");
+
+    /* Differential: hc_expand_add(block_out, block_add, ...) must equal
+     * hc_expand(block_out+block_add, ...) -- the "add" is exactly a sum. */
+    ds4_gpu_tensor *tsum = alloc_write(block_sum, sizeof(block_sum));
+    ds4_gpu_tensor *tout_ref = ds4_gpu_tensor_alloc(sizeof(got));
+    CHECK(tsum && tout_ref, "hc_expand_add: differential alloc failed");
+    CHECK(ds4_gpu_hc_expand_tensor(tout_ref, tsum, tres, tpost, tcomb, N_EMBD, HC) != 0,
+          "hc_expand_add: differential call");
+    float got_ref[N_TOK * HC * N_EMBD];
+    CHECK(ds4_gpu_tensor_read(tout_ref, 0, got_ref, sizeof(got_ref)) != 0,
+          "hc_expand_add: differential read");
+    for (int i = 0; i < N_TOK * HC * N_EMBD; i++) {
+        CHECK_CLOSE(got[i], got_ref[i], 1e-4,
+                    "hc_expand_add: diverges from hc_expand(pre-summed block)");
+    }
+
+    CHECK(ds4_gpu_hc_expand_add_tensor(tout, tblock, tadd, tres, tpost, tcomb, 0, HC) == 0,
+          "hc_expand_add: n_embd=0 must fail");
+    CHECK(ds4_gpu_hc_expand_add_tensor(NULL, tblock, tadd, tres, tpost, tcomb, N_EMBD, HC) == 0,
+          "hc_expand_add: null out_hc must fail");
+
+    ds4_gpu_tensor_free(tblock);
+    ds4_gpu_tensor_free(tadd);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tpost);
+    ds4_gpu_tensor_free(tcomb);
+    ds4_gpu_tensor_free(tout);
+    ds4_gpu_tensor_free(tsum);
+    ds4_gpu_tensor_free(tout_ref);
+    fprintf(stderr, "  test_hc_expand_add OK\n");
+    return 0;
+}
+
 /* n_hc == 4: exercises ds4_gpu_hc_expand_split_tensor's specialised
  * (unrolled) path, and differentially cross-checks it against
  * ds4_gpu_hc_expand_tensor's always-general kernel fed the same data via
@@ -1072,6 +1155,126 @@ static int test_matmul_q8_0_hc_expand(void) {
     return 0;
 }
 
+/* As hc_oracle_q8_0_dot above, but restricted to [in_start, in_start+
+ * in_count) of the row addressed in the FULL row's block layout -- the
+ * k-slice matmul's own dequant contract. */
+static float hc_oracle_q8_0_dot_kslice(const float *x_slice, const unsigned char *row,
+                                       uint32_t in_start, uint32_t in_count) {
+    double sum = 0.0;
+    for (uint32_t k = 0; k < in_count; k++) {
+        const uint32_t col = in_start + k;
+        const uint32_t blk = col / 32u;
+        const uint32_t idx = col % 32u;
+        const unsigned char *bp = row + (size_t)blk * 34u;
+        const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+        const float scale = oracle_half_to_float(raw);
+        const signed char qv = (signed char)bp[2 + idx];
+        sum += (double)x_slice[k] * (double)scale * (double)qv;
+    }
+    return (float)sum;
+}
+
+/* Tensor parallelism: ds4_gpu_matmul_q8_0_kslice_hc_expand_add_
+ * tensor, the fused split-matmul-plus-combine built by composing
+ * ds4_gpu_matmul_q8_0_kslice_rows_tensor (ds4_sycl_matmul.hpp) with
+ * ds4_gpu_hc_expand_add_split_tensor (above, already implemented
+ * separately). FULL_IN_DIM = 64, split clean in half at IN_START = 32 so
+ * IN_COUNT = 32 is exactly this rank's usual half; the k-slice contract
+ * itself is already exercised at an uneven split by
+ * test_matmul_q8_0_kslice_rows in test_sycl_matmul.c, so this test's job
+ * is proving the FUSION composes correctly, not re-proving the slice
+ * arithmetic. */
+static int test_matmul_q8_0_kslice_hc_expand_add(void) {
+    enum { FULL_IN_DIM = 64, IN_START = 32, IN_COUNT = 32 };
+    const uint64_t full_blocks = (FULL_IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = full_blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)N_HC_EXPAND_EMBD * row_bytes;
+
+    unsigned char weights[N_HC_EXPAND_EMBD * 68]; /* row_bytes == 2*34 = 68 here */
+    float x_slice[IN_COUNT];
+    float block_add[N_HC_EXPAND_EMBD];
+    float block_want[N_HC_EXPAND_EMBD];
+    float residual[N_HC * N_HC_EXPAND_EMBD];
+    float split[MIX_HC];
+    float hc_want[N_HC * N_HC_EXPAND_EMBD];
+
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        hc_test_encode_q8_0_row(weights + (size_t)o * row_bytes, FULL_IN_DIM, o);
+    }
+    for (uint32_t k = 0; k < IN_COUNT; k++) x_slice[k] = (float)((k * 3u) % 9u) - 4.0f;
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        block_want[o] = hc_oracle_q8_0_dot_kslice(x_slice, weights + (size_t)o * row_bytes,
+                                                  IN_START, IN_COUNT);
+        block_add[o] = fill_val(o, 77u) * 0.6f;
+    }
+    for (int h = 0; h < N_HC; h++) {
+        for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+            residual[h * N_HC_EXPAND_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 3.0f;
+        }
+    }
+    for (int i = 0; i < MIX_HC; i++) split[i] = fill_val(11u, (uint32_t)i + 40) * 0.5f;
+    float block_sum[N_HC_EXPAND_EMBD];
+    for (int i = 0; i < N_HC_EXPAND_EMBD; i++) block_sum[i] = block_want[i] + block_add[i];
+    oracle_hc_post_one(hc_want, block_sum, residual, split + N_HC, split + 2 * N_HC,
+                       N_HC_EXPAND_EMBD, N_HC);
+
+    ds4_gpu_tensor *tx     = alloc_write(x_slice, sizeof(x_slice));
+    ds4_gpu_tensor *tadd   = alloc_write(block_add, sizeof(block_add));
+    ds4_gpu_tensor *tres   = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tsplit = alloc_write(split, sizeof(split));
+    ds4_gpu_tensor *tblock = ds4_gpu_tensor_alloc(sizeof(block_want));
+    ds4_gpu_tensor *tout   = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tx && tadd && tres && tsplit && tblock && tout,
+          "matmul_q8_0_kslice_hc_expand_add: alloc failed");
+
+    CHECK(ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
+              tout, tblock, weights, weight_bytes, 0, FULL_IN_DIM,
+              N_HC_EXPAND_EMBD, IN_START, IN_COUNT, tx, tadd, tres, tsplit,
+              N_HC_EXPAND_EMBD, N_HC) != 0,
+          "matmul_q8_0_kslice_hc_expand_add: call");
+
+    float block_got[N_HC_EXPAND_EMBD], hc_got[N_HC * N_HC_EXPAND_EMBD];
+    CHECK(ds4_gpu_tensor_read(tblock, 0, block_got, sizeof(block_got)) != 0,
+          "matmul_q8_0_kslice_hc_expand_add: read block_out");
+    CHECK(ds4_gpu_tensor_read(tout, 0, hc_got, sizeof(hc_got)) != 0,
+          "matmul_q8_0_kslice_hc_expand_add: read out_hc");
+    for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(block_got[i], block_want[i], 1e-2,
+                    "matmul_q8_0_kslice_hc_expand_add: block_out mismatch");
+    }
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_want[i], 1e-2,
+                    "matmul_q8_0_kslice_hc_expand_add: out_hc mismatch");
+    }
+
+    /* Validation: out_dim must equal n_embd; unaligned in_start/in_count
+     * must be rejected (ported from ds4_cuda.cu:14939-14943). */
+    CHECK(ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
+              tout, tblock, weights, weight_bytes, 0, FULL_IN_DIM,
+              N_HC_EXPAND_EMBD + 1u, IN_START, IN_COUNT, tx, tadd, tres,
+              tsplit, N_HC_EXPAND_EMBD, N_HC) == 0,
+          "matmul_q8_0_kslice_hc_expand_add: out_dim != n_embd must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
+              tout, tblock, weights, weight_bytes, 0, FULL_IN_DIM,
+              N_HC_EXPAND_EMBD, IN_START + 1u, IN_COUNT, tx, tadd, tres,
+              tsplit, N_HC_EXPAND_EMBD, N_HC) == 0,
+          "matmul_q8_0_kslice_hc_expand_add: unaligned in_start must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_kslice_hc_expand_add_tensor(
+              NULL, tblock, weights, weight_bytes, 0, FULL_IN_DIM,
+              N_HC_EXPAND_EMBD, IN_START, IN_COUNT, tx, tadd, tres, tsplit,
+              N_HC_EXPAND_EMBD, N_HC) == 0,
+          "matmul_q8_0_kslice_hc_expand_add: null out_hc must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tadd);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tblock);
+    ds4_gpu_tensor_free(tout);
+    fprintf(stderr, "  test_matmul_q8_0_kslice_hc_expand_add OK\n");
+    return 0;
+}
+
 /* ds4_gpu_shared_down_hc_expand_q8_0_tensor: the same fused family with the
  * routed-expert sum added into the matmul result BEFORE the HC-expand
  * combine (ROCm's has_add branch).  Verified against the composed oracle
@@ -1207,6 +1410,7 @@ int main(void) {
     if (test_hc_weighted_sum() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_weighted_sum_split() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_expand() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_hc_expand_add() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_expand_split_n4_and_differential() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_expand_split_general_fallback() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_expand_split_half() != 0) { ds4_gpu_cleanup(); return 1; }
@@ -1216,6 +1420,7 @@ int main(void) {
     if (test_hc_split_weighted_sum_norm() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_split_weighted_sum_norm_stress() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_hc_expand() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0_kslice_hc_expand_add() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_shared_down_hc_expand_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     ds4_gpu_cleanup();
     fprintf(stderr, "  test_sycl_hc OK\n");
