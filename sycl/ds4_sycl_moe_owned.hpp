@@ -16,13 +16,16 @@
  * staging six instead of 256, just composed with the ownership split
  * instead of applied to the unsplit table.
  *
- * Ported from ds4_cuda.cu:19445-19553 (ownership helpers),
+ * Ported from ds4_cuda.cu:19445-19553 (ownership helpers), :19892-19954,
  * :21062-21123, :21485-21924, :24987-25493 (the owned kernels and ABI
- * entries), restricted to the Q4_K format (gate_type==12, down_type==12):
- * the only one this port implements for the owned decode entry. The
- * combine entries and the batch entry are format-agnostic or delegate to
- * the already-multi-format base dispatcher (sycl_routed_moe_launch,
- * ds4_sycl_moe_launch.hpp) and so are not restricted to Q4_K.
+ * entries). The decode entry implements two formats: Q4_K
+ * (gate_type==12, down_type==12) and the IQ2_XXS/Q2_K "LUT" pair
+ * CUDA uses for decode (gate_type==16, down_type==10) -- Flash's
+ * actual routed-expert format. MXFP4 owned decode is not ported; Flash
+ * does not use it either. The combine entries and the batch entry are
+ * format-agnostic or delegate to the already-multi-format base dispatcher
+ * (sycl_routed_moe_launch, ds4_sycl_moe_launch.hpp) and so were never
+ * restricted to Q4_K.
  *
  * Every entry below is NONZERO-means-success (spec 3a), verified against
  * ds4_gpu.h's declarations and ds4_cuda.cu's own `return 0` / `cuda_ok(...)`
@@ -203,6 +206,67 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
      }).wait_and_throw();
 }
 
+/* moe_gate_up_mid_decode_lut_owned_qwarp32_kernel, ds4_cuda.cu:19892-19954:
+ * the IQ2_XXS/Q2_K ("LUT") owned gate/up, remap-based per the comment
+ * above. CUDA stages the IQ2_XXS grid/signs tables into shared memory when
+ * xq_blocks <= 16 before dotting; this port, like the non-owned decode
+ * dispatcher's sycl_moe_iq2_gate_up_mid_decode (ds4_sycl_moe.hpp), reads
+ * those tables directly through sycl_dev_dot_iq2_xxs_q8_k_block instead,
+ * which is mathematically identical (see that function's own comment for
+ * why this is a bandwidth optimisation CUDA makes, not a different
+ * computation). write_aux (CUDA's optional gate/up debug output, gated on
+ * DS4_CUDA_MOE_WRITE_GATE_UP) has no live caller on this backend, matching
+ * every other decode kernel here that never writes it. */
+static void sycl_moe_lut_gate_up_mid_decode_owned(
+        sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
+        const sycl_block_q8_K *xq, const int32_t *remap, const float *weights,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint32_t xq_blocks,
+        uint32_t expert_mid_dim, float clamp) {
+    const uint32_t row_blocks = (expert_mid_dim + 127u) / 128u;
+    if (row_blocks == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 const uint32_t slot = (uint32_t)it.get_group(1);
+                 const int32_t local = remap[slot];
+                 if (local < 0) return;
+                 const uint32_t expert = (uint32_t)local;
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row_lane = (uint32_t)(it.get_local_id(0) >> 3);
+                 const uint32_t row_block = (uint32_t)it.get_group(0);
+                 for (uint32_t rr = 0; rr < 4u; rr++) {
+                     const uint32_t row = row_block * 128u + row_lane + rr * 32u;
+                     if (row >= expert_mid_dim) continue;
+                     const sycl_block_iq2_xxs *gr = (const sycl_block_iq2_xxs *)
+                             (gate_base + (uint64_t)expert * gate_expert_bytes +
+                              (uint64_t)row * gate_row_bytes);
+                     const sycl_block_iq2_xxs *ur = (const sycl_block_iq2_xxs *)
+                             (up_base + (uint64_t)expert * gate_expert_bytes +
+                              (uint64_t)row * gate_row_bytes);
+                     float gate = 0.0f, up = 0.0f;
+                     for (uint32_t b = lane; b < xq_blocks; b += 8u) {
+                         gate += sycl_dev_dot_iq2_xxs_q8_k_block(gr + b, xq + b);
+                         up += sycl_dev_dot_iq2_xxs_q8_k_block(ur + b, xq + b);
+                     }
+                     gate = sycl_moe_subgroup_sum<8>(sg, gate);
+                     up = sycl_moe_subgroup_sum<8>(sg, up);
+                     if (lane == 0u) {
+                         if (clamp > 1.0e-6f) {
+                             if (gate > clamp) gate = clamp;
+                             if (up > clamp) up = clamp;
+                             if (up < -clamp) up = -clamp;
+                         }
+                         const uint64_t off = (uint64_t)slot * expert_mid_dim + row;
+                         mid_out[off] = (gate / (1.0f + sycl::exp(-gate))) * up * weights[slot];
+                     }
+                 }
+             });
+     }).wait_and_throw();
+}
+
 /* q8_K_quantize_owned_kernel, ds4_cuda.cu:19476-19532, remap-based per the
  * comment above: only quantises the six activation rows this rank owns,
  * leaving the rest of `out` untouched (never read by the down kernels
@@ -303,6 +367,43 @@ static void sycl_moe_q4k_down_owned_slots(
      }).wait_and_throw();
 }
 
+/* moe_down_owned_slots_qwarp32_kernel, ds4_cuda.cu:21485-21515: the Q2_K
+ * ("LUT" pair's down) owned per-slot kernel, remap-based like its Q4_K
+ * sibling above. */
+static void sycl_moe_lut_down_owned_slots(
+        sycl::queue &q, float *down_out, const char *down_base, const sycl_block_q8_K *midq,
+        const int32_t *remap, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t midq_blocks, uint32_t out_dim) {
+    const uint32_t row_blocks = (out_dim + 31u) / 32u;
+    if (row_blocks == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 const uint32_t slot = (uint32_t)it.get_group(1);
+                 const int32_t local = remap[slot];
+                 if (local < 0) return;
+                 const uint32_t expert = (uint32_t)local;
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u +
+                                      (uint32_t)(it.get_local_id(0) >> 3);
+                 if (row >= out_dim) return;
+                 const sycl_block_q2_K *wr = (const sycl_block_q2_K *)
+                         (down_base + (uint64_t)expert * down_expert_bytes +
+                          (uint64_t)row * down_row_bytes);
+                 const sycl_block_q8_K *xqb = midq + (uint64_t)slot * midq_blocks;
+                 float acc = 0.0f;
+                 for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+                     acc += sycl_dev_dot_q2_k_q8_k_block(wr + b, xqb + b);
+                 }
+                 acc = sycl_moe_subgroup_sum<8>(sg, acc);
+                 if (lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
+             });
+     }).wait_and_throw();
+}
+
 /* moe_down_q4K_owned_packed_qwarp32_kernel, ds4_cuda.cu:21755-21813: as
  * above, but packs the (up to) six owned contributions into four slots via
  * sycl_moe_owned_packed_component, pre-summing a group's pair when both its
@@ -359,20 +460,106 @@ static void sycl_moe_q4k_down_owned_packed(
      }).wait_and_throw();
 }
 
-/* ds4_gpu_routed_moe_one_owned_tensor, ds4_cuda.cu:24987-25312, restricted
- * to the Q4_K format (gate_type==12 && down_type==12). IQ2_XXS/Q2_K
- * (CUDA's "LUT" owned path) and MXFP4 owned decode are NOT ported: see the
- * plan report. Both fail cleanly (return 0) rather than risk staging the
- * wrong weights, per spec 3a's "never infer a return convention" and the
- * "getting it wrong ... reads absent weights and returns plausible
- * wrong numbers" warning. */
-static int sycl_routed_moe_one_owned_q4k(
-        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
-        ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset,
-        uint64_t up_offset, uint64_t down_offset, uint64_t gate_expert_bytes,
-        uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes,
-        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
-        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+/* moe_down_owned_packed_qwarp32_kernel, ds4_cuda.cu:21604-21654: the Q2_K
+ * ("LUT" pair's down) owned packed kernel, mirroring
+ * sycl_moe_q4k_down_owned_packed above with a Q2_K weight block and dot. */
+static void sycl_moe_lut_down_owned_packed(
+        sycl::queue &q, float *packed_out, const char *down_base, const sycl_block_q8_K *midq,
+        const int32_t *remap, const int32_t *orig_selected, uint32_t expert_base,
+        uint32_t expert_count, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t midq_blocks, uint32_t out_dim) {
+    const uint32_t row_blocks = (out_dim + 31u) / 32u;
+    if (row_blocks == 0u) return;
+    q.submit([&](sycl::handler &h) {
+         h.parallel_for(
+             sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 4u),
+                               sycl::range<2>(256u, 1u)),
+             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
+                 const uint32_t packed_slot = (uint32_t)it.get_group(1);
+                 bool prefix_pair = false;
+                 const int first_slot = sycl_moe_owned_packed_component(
+                         orig_selected, packed_slot / 2u, packed_slot & 1u, expert_base,
+                         expert_count, &prefix_pair);
+                 sycl::sub_group sg = it.get_sub_group();
+                 const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                 const uint32_t row = (uint32_t)it.get_group(0) * 32u +
+                                      (uint32_t)(it.get_local_id(0) >> 3);
+                 if (row >= out_dim) return;
+                 if (first_slot < 0) {
+                     if (lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = 0.0f;
+                     return;
+                 }
+                 const uint32_t n_slots = prefix_pair ? 2u : 1u;
+                 float packed = 0.0f;
+                 for (uint32_t i = 0; i < n_slots; i++) {
+                     const uint32_t slot = (uint32_t)first_slot + i;
+                     const int32_t local = remap[slot];
+                     if (local < 0) continue;
+                     const uint32_t expert = (uint32_t)local;
+                     const sycl_block_q2_K *wr = (const sycl_block_q2_K *)
+                             (down_base + (uint64_t)expert * down_expert_bytes +
+                              (uint64_t)row * down_row_bytes);
+                     const sycl_block_q8_K *xqb = midq + (uint64_t)slot * midq_blocks;
+                     float acc = 0.0f;
+                     for (uint32_t b = lane; b < midq_blocks; b += 8u) {
+                         acc += sycl_dev_dot_q2_k_q8_k_block(wr + b, xqb + b);
+                     }
+                     acc = sycl_moe_subgroup_sum<8>(sg, acc);
+                     if (lane == 0u) packed = prefix_pair ? packed + acc : acc;
+                 }
+                 if (lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
+             });
+     }).wait_and_throw();
+}
+
+/* Function-pointer bundle selecting one format's owned-decode kernel
+ * triple (gate/up/mid, per-slot down, packed down). Both formats this
+ * backend implements (Q4_K and the IQ2_XXS/Q2_K "LUT" pair) share every
+ * other line of ds4_gpu_routed_moe_one_owned_tensor's decode path --
+ * validation, staging, remap construction, the two scratch-buffer reuses
+ * and the staged-count instrumentation -- so only the three kernels that
+ * actually touch a quantised weight block vary by format. This mirrors
+ * how ds4_cuda.cu keeps ONE ABI entry and branches per kernel launch
+ * (its q4k_path/mxfp4_path bools) rather than duplicating the whole
+ * function per format. */
+struct sycl_moe_owned_decode_kernels {
+    void (*gate_up_mid)(sycl::queue &, float *, const char *, const char *,
+                        const sycl_block_q8_K *, const int32_t *, const float *, uint64_t,
+                        uint64_t, uint32_t, uint32_t, float);
+    void (*down_slots)(sycl::queue &, float *, const char *, const sycl_block_q8_K *,
+                       const int32_t *, uint64_t, uint64_t, uint32_t, uint32_t);
+    void (*down_packed)(sycl::queue &, float *, const char *, const sycl_block_q8_K *,
+                        const int32_t *, const int32_t *, uint32_t, uint32_t, uint64_t, uint64_t,
+                        uint32_t, uint32_t);
+};
+
+static const sycl_moe_owned_decode_kernels sycl_moe_owned_decode_q4k = {
+    sycl_moe_q4k_gate_up_mid_decode_owned,
+    sycl_moe_q4k_down_owned_slots,
+    sycl_moe_q4k_down_owned_packed,
+};
+
+static const sycl_moe_owned_decode_kernels sycl_moe_owned_decode_lut = {
+    sycl_moe_lut_gate_up_mid_decode_owned,
+    sycl_moe_lut_down_owned_slots,
+    sycl_moe_lut_down_owned_packed,
+};
+
+/* ds4_gpu_routed_moe_one_owned_tensor, ds4_cuda.cu:24987-25312. Implements
+ * two formats: Q4_K (gate_type==12 && down_type==12) and the IQ2_XXS/Q2_K
+ * "LUT" pair CUDA uses for decode (gate_type==16 && down_type==10).
+ * MXFP4 owned decode is NOT ported (Flash does not use it). All three fail
+ * cleanly (return 0) rather than risk staging the wrong weights, per spec
+ * 3a's "never infer a return convention" and the "getting it
+ * wrong ... reads absent weights and returns plausible wrong numbers"
+ * warning. */
+static int sycl_routed_moe_one_owned_dispatch(
+        const sycl_moe_owned_decode_kernels *k, ds4_gpu_tensor *out, ds4_gpu_tensor *gate,
+        ds4_gpu_tensor *up, ds4_gpu_tensor *mid, ds4_gpu_tensor *down, const void *model_map,
+        uint64_t model_size, uint64_t gate_offset, uint64_t up_offset, uint64_t down_offset,
+        uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint64_t down_expert_bytes,
+        uint64_t down_row_bytes, uint32_t expert_in_dim, uint32_t expert_mid_dim,
+        uint32_t out_dim, const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
         uint32_t n_total_expert, uint32_t resident_expert_base, uint32_t resident_expert_count,
         float clamp, const ds4_gpu_tensor *x, ds4_gpu_tensor *down_output, bool pack_fixed3) {
     if (!out || !gate || !up || !mid || !down || !model_map || !selected || !weights || !x ||
@@ -488,28 +675,60 @@ static int sycl_routed_moe_one_owned_q4k(
         sycl_block_q8_K *midq = (sycl_block_q8_K *)gate->ptr;
         sycl_moe_q8_k_quantize(q, xq, (const float *)x->ptr, expert_in_dim, 1u);
 
-        sycl_moe_q4k_gate_up_mid_decode_owned(q, (float *)mid->ptr, (const char *)gate_dev,
-                                              (const char *)up_dev, xq, remap,
-                                              (const float *)weights->ptr, gate_expert_bytes,
-                                              gate_row_bytes, xq_blocks, expert_mid_dim, clamp);
+        k->gate_up_mid(q, (float *)mid->ptr, (const char *)gate_dev, (const char *)up_dev, xq,
+                      remap, (const float *)weights->ptr, gate_expert_bytes, gate_row_bytes,
+                      xq_blocks, expert_mid_dim, clamp);
         sycl_moe_q8_k_quantize_owned(q, midq, (const float *)mid->ptr, remap, expert_mid_dim);
 
         float *down_dst = (float *)(down_output ? down_output->ptr : down->ptr);
         if (pack_fixed3) {
-            sycl_moe_q4k_down_owned_packed(q, down_dst, (const char *)down_dev, midq, remap,
-                                           (const int32_t *)selected->ptr, resident_expert_base,
-                                           resident_expert_count, down_expert_bytes,
-                                           down_row_bytes, midq_blocks, out_dim);
+            k->down_packed(q, down_dst, (const char *)down_dev, midq, remap,
+                          (const int32_t *)selected->ptr, resident_expert_base,
+                          resident_expert_count, down_expert_bytes, down_row_bytes, midq_blocks,
+                          out_dim);
         } else {
-            sycl_moe_q4k_down_owned_slots(q, down_dst, (const char *)down_dev, midq, remap,
-                                          down_expert_bytes, down_row_bytes, midq_blocks,
-                                          out_dim);
+            k->down_slots(q, down_dst, (const char *)down_dev, midq, remap, down_expert_bytes,
+                         down_row_bytes, midq_blocks, out_dim);
         }
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_one_owned failed: %s\n", e.what());
         return 0;
     }
     return 1;
+}
+
+static int sycl_routed_moe_one_owned_q4k(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset,
+        uint64_t up_offset, uint64_t down_offset, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t resident_expert_base, uint32_t resident_expert_count,
+        float clamp, const ds4_gpu_tensor *x, ds4_gpu_tensor *down_output, bool pack_fixed3) {
+    return sycl_routed_moe_one_owned_dispatch(
+            &sycl_moe_owned_decode_q4k, out, gate, up, mid, down, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim, out_dim, selected,
+            weights, n_total_expert, resident_expert_base, resident_expert_count, clamp, x,
+            down_output, pack_fixed3);
+}
+
+static int sycl_routed_moe_one_owned_lut(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *gate, ds4_gpu_tensor *up, ds4_gpu_tensor *mid,
+        ds4_gpu_tensor *down, const void *model_map, uint64_t model_size, uint64_t gate_offset,
+        uint64_t up_offset, uint64_t down_offset, uint64_t gate_expert_bytes,
+        uint64_t gate_row_bytes, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        uint32_t expert_in_dim, uint32_t expert_mid_dim, uint32_t out_dim,
+        const ds4_gpu_tensor *selected, const ds4_gpu_tensor *weights,
+        uint32_t n_total_expert, uint32_t resident_expert_base, uint32_t resident_expert_count,
+        float clamp, const ds4_gpu_tensor *x, ds4_gpu_tensor *down_output, bool pack_fixed3) {
+    return sycl_routed_moe_one_owned_dispatch(
+            &sycl_moe_owned_decode_lut, out, gate, up, mid, down, model_map, model_size,
+            gate_offset, up_offset, down_offset, gate_expert_bytes, gate_row_bytes,
+            down_expert_bytes, down_row_bytes, expert_in_dim, expert_mid_dim, out_dim, selected,
+            weights, n_total_expert, resident_expert_base, resident_expert_count, clamp, x,
+            down_output, pack_fixed3);
 }
 
 extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
@@ -533,12 +752,22 @@ extern "C" int ds4_gpu_routed_moe_one_owned_tensor(
      * already makes -- so this parameter changes performance, never
      * correctness, on this backend. Deliberately unread. */
     (void)shared_prequant;
-    if (n_expert != 6u || gate_type != 12u || down_type != 12u) return 0;
-    return sycl_routed_moe_one_owned_q4k(
-            out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset,
-            down_offset, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
-            expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_total_expert,
-            resident_expert_base, resident_expert_count, clamp, x, down_output, pack_fixed3);
+    if (n_expert != 6u) return 0;
+    if (gate_type == 12u && down_type == 12u) {
+        return sycl_routed_moe_one_owned_q4k(
+                out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset,
+                down_offset, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_total_expert,
+                resident_expert_base, resident_expert_count, clamp, x, down_output, pack_fixed3);
+    }
+    if (gate_type == 16u && down_type == 10u) {
+        return sycl_routed_moe_one_owned_lut(
+                out, gate, up, mid, experts, model_map, model_size, gate_offset, up_offset,
+                down_offset, gate_expert_bytes, gate_row_bytes, down_expert_bytes, down_row_bytes,
+                expert_in_dim, expert_mid_dim, out_dim, selected, weights, n_total_expert,
+                resident_expert_base, resident_expert_count, clamp, x, down_output, pack_fixed3);
+    }
+    return 0;
 }
 
 /* ds4_gpu_routed_moe_owned_slots_combine_rows_tensor /

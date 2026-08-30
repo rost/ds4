@@ -2792,6 +2792,110 @@ static int test_iq2_decode_matches_batch_of_one(void) {
                                           RM_IQ2_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES, iq2_fill_model);
 }
 
+/* Mirror of test_q4k_owned_decode_composes_ownership_with_
+ * compaction above, for the IQ2_XXS/Q2_K "LUT" pair -- the format Flash's
+ * routed experts actually use (ds4.c:3122). Same 64-expert table, same
+ * six selected experts straddling the 32-expert ownership boundary, same
+ * three assertions: exact per-rank staged count (not "fewer than the
+ * whole owned half"), and the packed combine of both ranks' outputs must
+ * exactly match a single unsplit ds4_gpu_routed_moe_one_tensor call
+ * against the CPU oracle. See that test's own comment for why both the
+ * staged-count and the final-value checks are needed together. */
+static int test_lut_owned_decode_composes_ownership_with_compaction(void) {
+    rm_model m = rm_build_model_n(RM_OWNED_N_TOTAL_EXPERT, RM_IQ2_BLOCK_BYTES, RM_Q2K_BLOCK_BYTES);
+    iq2_fill_model(&m, RM_OWNED_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+
+    const int32_t sel[RM_OWNED_N_EXPERT_USED] = {2, 40, 9, 55, 17, 33};
+    float w[RM_OWNED_N_EXPERT_USED];
+    for (uint32_t s = 0; s < RM_OWNED_N_EXPERT_USED; s++) w[s] = 0.5f + 0.25f * (float)(s % 3u);
+    float x[RM_EXPERT_IN_DIM];
+    q4k_fill_x_row(x, RM_EXPERT_IN_DIM, /*tok=*/0);
+
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(sizeof(sel));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(sizeof(w));
+    ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor_write(selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(xt, 0, x, sizeof(x));
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *up =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *mid =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *home_down =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *partner_down =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_OUT_DIM * sizeof(float));
+    CHECK(out && gate && up && mid && home_down && partner_down && selected && weights && xt,
+          "lut owned decode: tensor allocation");
+
+    CHECK(ds4_gpu_routed_moe_one_owned_tensor(
+              out, gate, up, mid, home_down, m.model, m.model_size, m.gate_offset,
+              m.up_offset, m.down_offset, 16u, 10u, m.gate_expert_bytes, m.gate_row_bytes,
+              m.down_expert_bytes, m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM,
+              RM_OUT_DIM, selected, weights, RM_OWNED_N_TOTAL_EXPERT, RM_OWNED_N_EXPERT_USED,
+              /*resident_expert_base=*/0u, /*resident_expert_count=*/RM_OWNED_EXPERT_SPLIT, 0.0f,
+              xt, /*down_output=*/NULL, /*pack_fixed3=*/false, /*shared_prequant=*/NULL) != 0,
+          "lut owned decode: home rank call failed");
+    const uint32_t home_unique =
+            rm_owned_count_distinct_on_side(sel, RM_OWNED_N_EXPERT_USED, RM_OWNED_EXPERT_SPLIT, 1);
+    CHECK(ds4_sycl_moe_test_last_staged_expert_count() == home_unique,
+          "lut owned decode: home rank must stage exactly its distinct owned-and-selected experts");
+    CHECK(home_unique > 0 && home_unique < RM_OWNED_EXPERT_SPLIT,
+          "lut owned decode: fixture must actually shrink the home stage");
+
+    CHECK(ds4_gpu_routed_moe_one_owned_tensor(
+              out, gate, up, mid, partner_down, m.model, m.model_size, m.gate_offset,
+              m.up_offset, m.down_offset, 16u, 10u, m.gate_expert_bytes, m.gate_row_bytes,
+              m.down_expert_bytes, m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM,
+              RM_OUT_DIM, selected, weights, RM_OWNED_N_TOTAL_EXPERT, RM_OWNED_N_EXPERT_USED,
+              /*resident_expert_base=*/RM_OWNED_EXPERT_SPLIT,
+              /*resident_expert_count=*/RM_OWNED_N_TOTAL_EXPERT - RM_OWNED_EXPERT_SPLIT, 0.0f, xt,
+              /*down_output=*/NULL, /*pack_fixed3=*/true, /*shared_prequant=*/NULL) != 0,
+          "lut owned decode: partner rank call failed");
+    const uint32_t partner_unique =
+            rm_owned_count_distinct_on_side(sel, RM_OWNED_N_EXPERT_USED, RM_OWNED_EXPERT_SPLIT, 0);
+    CHECK(ds4_sycl_moe_test_last_staged_expert_count() == partner_unique,
+          "lut owned decode: partner rank must stage exactly its distinct owned-and-selected "
+          "experts");
+    CHECK(partner_unique > 0 && partner_unique < RM_OWNED_N_TOTAL_EXPERT - RM_OWNED_EXPERT_SPLIT,
+          "lut owned decode: fixture must actually shrink the partner stage");
+
+    CHECK(ds4_gpu_routed_moe_owned_packed_combine_tensor(out, home_down, partner_down, selected,
+                                                         RM_OUT_DIM, RM_OWNED_EXPERT_SPLIT) != 0,
+          "lut owned decode: packed combine failed");
+
+    float want[RM_OUT_DIM];
+    oracle_moe_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM, RM_IQ2_BLOCK_BYTES,
+                         RM_Q2K_BLOCK_BYTES, RM_OWNED_N_EXPERT_USED, sel, w, x, 0.0f,
+                         oracle_iq2_dot_block, oracle_q2k_dot_block, want);
+    float got[RM_OUT_DIM];
+    ds4_gpu_tensor_read(out, 0, got, sizeof(got));
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], fabs(want[i]) * 1e-3 + 1e-4,
+                    "lut owned decode: combined output must match the unsplit oracle");
+    }
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(home_down);
+    ds4_gpu_tensor_free(partner_down);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(xt);
+    free(m.model);
+    fprintf(stderr,
+            "  test_lut_owned_decode_composes_ownership_with_compaction OK "
+            "(home staged %u, partner staged %u, of %u total)\n",
+            home_unique, partner_unique, (unsigned)RM_OWNED_N_TOTAL_EXPERT);
+    return 0;
+}
+
 /* ---- iq2_iq2_path: gate_type==16, down_type==16 (both IQ2_XXS) -------- */
 
 static int test_iq2iq2_decode(void) {
@@ -3601,6 +3705,7 @@ int main(void) {
     if (test_iq2_batch_large() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_iq2_batch_stress() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_iq2_decode_matches_batch_of_one() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_lut_owned_decode_composes_ownership_with_compaction() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_iq2iq2_decode() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_iq2iq2_batch() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_iq2iq2_decode_matches_batch_of_one() != 0) { ds4_gpu_cleanup(); return 1; }
