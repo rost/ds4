@@ -30,6 +30,7 @@
 extern int  ds4_sycl_stream_test_read_resident(uint32_t layer, int32_t expert,
                                                void *gate_out, void *up_out,
                                                void *down_out);
+extern int  ds4_sycl_device_count(void);
 extern void ds4_sycl_stream_test_reset(void);
 extern int  ds4_sycl_stream_test_read_selected(uint32_t slot, void *gate_out,
                                                void *up_out, void *down_out);
@@ -1028,28 +1029,32 @@ static int test_teardown_frees_every_tier(void) {
 static int test_on_tier_argument_validation(void) {
     ds4_gpu_cleanup();
     CHECK(ds4_gpu_init() != 0, "init for _on(tier) validation");
-    /* Exactly one device is live here: tier 0 is valid, anything else is
-     * out of range. */
+    /* Tier 0 is always valid; the first out-of-range tier is the device
+     * count, not a hardcoded 1.  This test asserted `1` was out of range
+     * until it first ran on a 14-GPU host, where tier 1 is a real device
+     * and every such assertion failed.  Same idiom as test_sycl_smoke.c. */
+    const int past_end = ds4_sycl_device_count();
+    CHECK(past_end >= 1, "no SYCL device enumerated");
     CHECK(ds4_gpu_recommended_working_set_size_on(0) != 0,
           "recommended_working_set_size_on(0) must reflect the real device");
     CHECK(ds4_gpu_recommended_working_set_size_on(-1) == 0,
           "recommended_working_set_size_on(-1) must be 0 (negative tier)");
-    CHECK(ds4_gpu_recommended_working_set_size_on(1) == 0,
-          "recommended_working_set_size_on(1) must be 0 (only one device live)");
+    CHECK(ds4_gpu_recommended_working_set_size_on(past_end) == 0,
+          "recommended_working_set_size_on(past_end) must be 0 (no such device)");
 
     ds4_gpu_set_ssd_streaming(true);
     ds4_gpu_set_streaming_expert_cache_budget_on(0, 5);
     CHECK(ds4_gpu_stream_expert_cache_configured_count_on(0) == 5,
           "configured_count_on(0) must reflect the budget just set");
-    ds4_gpu_set_streaming_expert_cache_budget_on(1, 9);
-    CHECK(ds4_gpu_stream_expert_cache_configured_count_on(1) == 0,
-          "configured_count_on(1) must stay 0: the out-of-range set must not apply");
+    ds4_gpu_set_streaming_expert_cache_budget_on(past_end, 9);
+    CHECK(ds4_gpu_stream_expert_cache_configured_count_on(past_end) == 0,
+          "configured_count_on(past_end) must stay 0: the out-of-range set must not apply");
     CHECK(ds4_gpu_stream_expert_cache_configured_count_on(-1) == 0,
           "configured_count_on(-1) must be 0 (negative tier)");
     CHECK(ds4_gpu_stream_expert_cache_current_count_on(0) == 0,
           "current_count_on(0) must start at 0 before any seed");
-    CHECK(ds4_gpu_stream_expert_cache_current_count_on(1) == 0,
-          "current_count_on(1) must be 0: out of range");
+    CHECK(ds4_gpu_stream_expert_cache_current_count_on(past_end) == 0,
+          "current_count_on(past_end) must be 0: out of range");
 
     /* No-op setter, but must not crash on an out-of-range tier either. */
     ds4_gpu_set_streaming_expert_cache_expert_bytes_on(0, 123);
