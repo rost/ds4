@@ -194,6 +194,16 @@ static void sycl_stream_teardown_all(void);
  * queue it was recorded against. */
 static void sycl_readback_teardown(void);
 
+/* Defined in sycl/ds4_sycl_placement.hpp, included at the end of this
+ * file; forward-declared here for the same reason as
+ * sycl_stream_teardown_all above: the per-device selective weight cache's
+ * slabs must be freed through their own still-live queue before
+ * g_devices.clear() destroys it, not after (spec 6g: a use-after-free
+ * here would be exactly the shape that ablation could not make fail on
+ * this hardware, so correctness has to come from construction order, not
+ * from a test proving it). */
+static void sycl_placement_teardown_all(void);
+
 /* Multi-GPU plumbing globals declared extern by ds4_gpu_mgpu.h and read
  * directly by ds4.c.  Before ds4_gpu_init runs (or if it never runs) this
  * exposes a single logical tier with no peers, matching the default
@@ -390,6 +400,7 @@ extern "C" void ds4_gpu_cleanup(void) {
      * below destroys the queues. */
     if (!g_devices.empty()) sycl_stream_teardown_all();
     sycl_readback_teardown();
+    if (!g_devices.empty()) sycl_placement_teardown_all();
     g_devices.clear();
     g_n_gpus       = 0;
     g_current_tier = 0;
@@ -776,6 +787,10 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
 /* Same scoping reason as the includes above: the resident expert cache
  * entry points reference g_devices and ds4_sycl_current_queue. */
 #include "sycl/ds4_sycl_streaming.hpp"
+/* Same scoping reason as the includes above, plus a direct dependency:
+ * ds4_gpu_tier_free_vram reads ds4_sycl_streaming.hpp's g_sycl_stream_tier
+ * and sycl_stream_vram_ceiling, so this include must come after it. */
+#include "sycl/ds4_sycl_placement.hpp"
 /* Same scoping reason as the includes above. */
 #include "sycl/ds4_sycl_matmul.hpp"
 /* Same scoping reason as the includes above. */

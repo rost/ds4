@@ -1,0 +1,312 @@
+#pragma once
+
+/* Multi-tier placement: the per-device free-VRAM query, the no-copy model
+ * map registration, and the permanent per-device selective weight cache.
+ * Implements the three ds4_gpu_mgpu.h entries this backend needs to place
+ * DeepSeek V4 Flash (roughly 80 GiB) across multiple B60 tiers (24 GiB
+ * each, 336 GiB aggregate): ds4_gpu_tier_free_vram,_register_model_map_
+ * no_copy and _device_cache_tensors. ds4_gpu_device_cache_support_tensors
+ * and ds4_gpu_register_support_map stay stubbed in ds4_sycl_unavailable.cpp:
+ * they are DSpark speculative-decoding support-model entries, out of scope
+ * for baseline Flash.
+ *
+ * Structural reference is ds4_cuda.cu's g_dev_cache / g_cache_ranges /
+ * ds4_gpu_device_cache_tensors (ds4_cuda.cu:3928-4095) and its
+ * ds4_gpu_register_model_map_no_copy (ds4_cuda.cu:3797-3850): same
+ * validate-before-allocate shape, same grow-by-reallocate-and-copy slab,
+ * same sorted range table. Two points genuinely differ, not by oversight:
+ *
+ *   1. CUDA's ds4_gpu_lookup_cache / _strict resolve a cached range back
+ *      to a device pointer for its "_tensor"-suffixed kernel-dispatch
+ *      wrappers (ds4_cuda.cu:4200-4300). SYCL has no such wrappers: every
+ *      "_tensor" entry is permanently stubbed here (see
+ *      ds4_sycl_unavailable.cpp's own comment on
+ *      ds4_gpu_hc_expand_add_tensor and neighbours), because this
+ *      backend's kernels are dispatched directly, not through that
+ *      generic ABI. So nothing in this codebase ever calls
+ *      ds4_gpu_lookup_cache/_strict/_device for SYCL, confirmed by grep
+ *      (ds4.c never calls them directly either), and they are correctly
+ *      absent from both ds4_sycl_unavailable.cpp's stub list and this
+ *      file: implementing them would add dead code. The cache built here
+ *      is real (weights genuinely move to and stay on device), but readers
+ *      are future work: ds4_sycl_streaming.hpp's own header
+ *      comment documents the identical gap for the resident expert cache.
+ *      A test-only accessor below (ds4_sycl_test_placement_read_back)
+ *      exists so this cache's correctness is provable now.
+ *
+ *   2. CUDA's admission check calls cudaMemGetInfo for a live headroom
+ *      reading. Per spec 6p, Level Zero Sysman's free-memory reading does
+ *      not move under real allocation pressure on this driver and is
+ *      degenerate (free == total) on an idle device, so a live query here
+ *      would look dynamic while lying. ds4_gpu_tier_free_vram instead
+ *      starts from the same static ceiling ds4_sycl_streaming.hpp already
+ *      uses (total device memory minus a fixed reserve, sycl_stream_vram_
+ *      ceiling) and subtracts bytes THIS backend has itself committed on
+ *      that tier: the selective cache built here, plus the streaming
+ *      resident expert cache. That number is honest by construction --
+ *      it only ever reports what we did not already spend -- and it
+ *      strictly decreases as either cache admits more, which a number
+ *      that never moves cannot do. A conservative constant that never
+ *      decreases would be worse: the placement planner would believe it
+ *      even after this cache is nearly full. See spec 6p before
+ *      considering a live Sysman upgrade here. */
+
+#include "ds4_sycl_common.hpp"
+
+#include <algorithm>
+#include <vector>
+
+struct sycl_placement_cache_range {
+    uint64_t       source_offset;
+    uint64_t       bytes;
+    unsigned char *device_ptr;
+};
+
+struct sycl_placement_tier_cache {
+    unsigned char                          *base  = nullptr;
+    uint64_t                                bytes = 0;
+    std::vector<sycl_placement_cache_range> ranges;
+};
+
+/* Indexed by logical tier == device_id, matching the convention every
+ * other "_on(tier)"/device_id-taking entry in this backend already uses
+ * (ds4_gpu_tensor_alloc_on, ds4_gpu_copy_xdev: sycl/ds4_sycl_mgpu.hpp).
+ * That convention is only exact when ds4_gpu_init_multi was configured
+ * with an identity --gpu-devices filter (device_indices[i] == i for
+ * every i, the common case and the only one this single-A770 box can
+ * exercise); a non-identity filter would make g_gpu[tier].device_id
+ * diverge from tier, and this file inherits that same pre-existing gap
+ * rather than introducing a new one -- see the report's B60 checklist. */
+static std::vector<sycl_placement_tier_cache> g_placement_tier;
+
+static sycl_placement_tier_cache &sycl_placement_cache_for(int tier) {
+    if ((size_t)tier >= g_placement_tier.size()) {
+        g_placement_tier.resize((size_t)tier + 1);
+    }
+    return g_placement_tier[(size_t)tier];
+}
+
+/* Forward-declared in ds4_sycl.cpp and called from ds4_gpu_cleanup while
+ * every tier's queue is still alive, mirroring sycl_stream_teardown_all's
+ * ordering contract exactly: freeing this cache's slabs AFTER
+ * g_devices.clear() destroys their queues would be a use-after-free of
+ * the allocation context (spec 6g), so this must run BEFORE that clear,
+ * not after. */
+static void sycl_placement_teardown_all(void) {
+    for (size_t t = 0; t < g_placement_tier.size(); t++) {
+        sycl_placement_tier_cache &c = g_placement_tier[t];
+        if (c.base && t < g_devices.size()) {
+            try {
+                ds4_sycl_queue((int)t).wait_and_throw();
+                sycl::free(c.base, ds4_sycl_queue((int)t));
+            } catch (const sycl::exception &e) {
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "placement cache teardown failed: %s\n", e.what());
+            }
+        }
+        c.base = nullptr;
+        c.bytes = 0;
+        c.ranges.clear();
+    }
+}
+
+/* The registered host model map: set only by ds4_gpu_register_model_map_
+ * no_copy below, read only by ds4_gpu_device_cache_tensors. */
+static const void *g_placement_host_base = nullptr;
+static uint64_t    g_placement_host_size = 0;
+
+/* uint64_t return, no failure-value convention to match (there is no
+ * "invalid" bit pattern in a byte count): 0 doubles as "unknown/tier out
+ * of range" and "no headroom left", exactly as CUDA's own implementation
+ * folds a cudaSetDevice failure and a genuinely full device into the same
+ * 0 (ds4_cuda.cu:1245-1253). See this file's header comment for why the
+ * number returned is a self-tracked accounting figure, not a live Sysman
+ * reading. */
+extern "C" uint64_t ds4_gpu_tier_free_vram(int logical_tier) {
+    if (logical_tier < 0 || (size_t)logical_tier >= g_devices.size()) return 0;
+
+    const uint64_t ceiling = sycl_stream_vram_ceiling(ds4_sycl_queue(logical_tier));
+
+    uint64_t committed = 0;
+    if ((size_t)logical_tier < g_placement_tier.size()) {
+        committed += g_placement_tier[(size_t)logical_tier].bytes;
+    }
+    if ((size_t)logical_tier < g_sycl_stream_tier.size()) {
+        committed += g_sycl_stream_tier[(size_t)logical_tier].resident_bytes;
+    }
+    return ceiling > committed ? ceiling - committed : 0;
+}
+
+/* 1 on success, 0 on error, matching ds4_gpu_mgpu.h:214's documented
+ * polarity and confirmed against CUDA's own implementation
+ * (ds4_cuda.cu:3797, "Returns 1 on success, 0 on error"). No device-side
+ * copy: SYCL kernels never dereference the host mmap directly (spec 6l),
+ * so unlike CUDA's cudaHostRegister this entry has nothing to pin --
+ * ds4_gpu_device_cache_tensors below stages every byte through an
+ * explicit device-side slab instead. Re-registering a DIFFERENT model map
+ * (a different pointer or size) releases every tier's existing selective
+ * cache first: its entries are keyed by source_offset into the OLD host
+ * mapping and would silently resolve to the wrong bytes against a new
+ * one, mirroring CUDA's own teardown-on-re-register
+ * (ds4_cuda.cu:3711-3715). */
+extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map,
+                                                   uint64_t    model_size) {
+    if (!model_map || model_size == 0) return 0;
+    if (g_placement_host_base == model_map && g_placement_host_size == model_size) {
+        return 1;
+    }
+
+    /* Same release path ds4_gpu_cleanup uses (queue-drained free, before
+     * any queue could be torn down), reused here rather than duplicated:
+     * a re-register is exactly a targeted teardown of every tier's stale
+     * cache, not a process-wide one. */
+    sycl_placement_teardown_all();
+
+    g_placement_host_base = model_map;
+    g_placement_host_size = model_size;
+    return 1;
+}
+
+/* 0 on success, a distinct positive value on error (see this backend's own
+ * comment in ds4_sycl_unavailable.cpp, cross-checked against
+ * ds4_cuda.cu:3944-4095 and ds4.c:56888/57069's "if (rc != 0) ... failed").
+ * Error codes mirror CUDA's numbering where the same failure exists here:
+ *   1 bad device_id/tier, 2 bad ranges argument, 3 no model map
+ *   registered, 5 allocation or headroom failure, 7 a staging copy threw,
+ *   8/9 a range falls outside the registered host mapping, 10 byte-count
+ *   overflow. CUDA's 4 (cudaSetDevice failure) and 6 (growth d2d copy
+ *   failure reported separately from a general copy failure) have no
+ *   distinct SYCL equivalent: tier validity is folded into code 1, and a
+ *   failed growth copy is folded into code 7 along with every other
+ *   queue-op failure, since both are try/catch around the same submitted
+ *   operations here. */
+extern "C" int ds4_gpu_device_cache_tensors(int                    device_id,
+                                            const ds4_tensor_range *ranges,
+                                            int                     n_ranges) {
+    if (device_id < 0 || (size_t)device_id >= g_devices.size()) return 1;
+    if (n_ranges < 0 || (!ranges && n_ranges > 0)) return 2;
+    if (n_ranges == 0) return 0;
+    if (!g_placement_host_base || g_placement_host_size == 0) return 3;
+
+    /* Validate every range before touching the allocator, so a bad input
+     * cannot partially grow the slab (same ordering as ds4_cuda.cu). */
+    uint64_t want_bytes = 0;
+    for (int i = 0; i < n_ranges; i++) {
+        if (ranges[i].target_device != device_id) continue;
+        const uint64_t off = ranges[i].source_offset;
+        const uint64_t nb  = ranges[i].bytes;
+        if (nb == 0) continue;
+        if (off > g_placement_host_size) return 8;
+        if (nb > g_placement_host_size - off) return 9;
+        if (!sycl_u64_add_checked(want_bytes, nb, &want_bytes)) return 10;
+    }
+    if (want_bytes == 0) return 0;
+
+    const uint64_t free_before = ds4_gpu_tier_free_vram(device_id);
+    if (want_bytes > free_before) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "device cache slab needs %.2f GiB on tier %d but only "
+                "%.2f GiB free; lower --gpu-vram or use --gpu-vram auto on "
+                "a host with more headroom\n",
+                (double)want_bytes / 1073741824.0, device_id,
+                (double)free_before / 1073741824.0);
+        return 5;
+    }
+
+    sycl_placement_tier_cache &c = sycl_placement_cache_for(device_id);
+    sycl::queue               &q = ds4_sycl_queue(device_id);
+    const uint64_t new_bytes = c.bytes + want_bytes;
+
+    unsigned char *new_base = sycl::malloc_device<unsigned char>((size_t)new_bytes, q);
+    if (!new_base) return 5;
+
+    try {
+        const uint64_t old_bytes = c.bytes;
+        if (c.base && old_bytes > 0) {
+            q.memcpy(new_base, c.base, (size_t)old_bytes).wait_and_throw();
+            for (sycl_placement_cache_range &r : c.ranges) {
+                r.device_ptr = new_base + (r.device_ptr - c.base);
+            }
+            sycl::free(c.base, q);
+        }
+        c.base = new_base;
+
+        const unsigned char *host_base = (const unsigned char *)g_placement_host_base;
+        uint64_t write_off = old_bytes;
+        for (int i = 0; i < n_ranges; i++) {
+            if (ranges[i].target_device != device_id || ranges[i].bytes == 0) continue;
+            unsigned char *dev_ptr = new_base + write_off;
+            q.memcpy(dev_ptr, host_base + ranges[i].source_offset,
+                     (size_t)ranges[i].bytes).wait_and_throw();
+            c.ranges.push_back({ranges[i].source_offset, ranges[i].bytes, dev_ptr});
+            write_off += ranges[i].bytes;
+        }
+        c.bytes = new_bytes;
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "device cache install failed: %s\n", e.what());
+        return 7;
+    }
+
+    std::sort(c.ranges.begin(), c.ranges.end(),
+              [](const sycl_placement_cache_range &a,
+                 const sycl_placement_cache_range &b) {
+                  return a.source_offset < b.source_offset;
+              });
+    return 0;
+}
+
+/* Test-only: total bytes committed to tier's selective cache. Not part of
+ * the ABI. */
+extern "C" uint64_t ds4_sycl_test_placement_cache_bytes(int tier) {
+    if (tier < 0 || (size_t)tier >= g_placement_tier.size()) return 0;
+    return g_placement_tier[(size_t)tier].bytes;
+}
+
+/* Test-only: copies `bytes` back from the cached entry covering
+ * [source_offset, source_offset + bytes) on `tier` into `out`, so a real
+ * device round trip can be verified byte-for-byte. Returns 1 on a
+ * covering hit, 0 on a miss or bad argument. Not part of the ABI --
+ * mirrors ds4_sycl_test_zes_free_bytes (sycl/ds4_sycl_mgpu.hpp) and the
+ * streaming module's own test read hooks. */
+extern "C" int ds4_sycl_test_placement_read_back(int tier, uint64_t source_offset,
+                                                 uint64_t bytes, void *out) {
+    if (!out || bytes == 0) return 0;
+    if (tier < 0 || (size_t)tier >= g_placement_tier.size()) return 0;
+    const sycl_placement_tier_cache &c = g_placement_tier[(size_t)tier];
+    for (const sycl_placement_cache_range &r : c.ranges) {
+        if (source_offset < r.source_offset) continue;
+        const uint64_t into = source_offset - r.source_offset;
+        if (into > r.bytes || bytes > r.bytes - into) continue;
+        try {
+            ds4_sycl_queue(tier)
+                .memcpy(out, r.device_ptr + into, (size_t)bytes)
+                .wait_and_throw();
+            return 1;
+        } catch (const sycl::exception &e) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "test placement read-back failed: %s\n", e.what());
+            return 0;
+        }
+    }
+    return 0;
+}
+
+/* Prefill-pipeline pair: a plain engine-wide flag, matching CUDA's own
+ * g_q8_cache_suppressed / ds4_gpu_q8_cache_suppressed / _set_
+ * (ds4_cuda.cu:425, :3638-3644) with no int-return-polarity ambiguity --
+ * ds4_gpu_q8_cache_suppressed returns the flag's own value, not a
+ * success/failure code, and ds4_gpu_set_q8_cache_suppressed is void.
+ * Reachability (ds4-sycl-stub-reachability-v2.md, "Multi-tier placement
+ * only") is gated on ds4.c:34212's metal_graph_build_prefill_stages(...)
+ * && n_stages >= 2, which a single GPU never produces, so this flag has
+ * no observable effect on this backend yet; it becomes load-bearing only
+ * once multi-tier decode pipelining is wired up. */
+static int g_sycl_q8_cache_suppressed = 0;
+
+extern "C" int ds4_gpu_q8_cache_suppressed(void) {
+    return g_sycl_q8_cache_suppressed;
+}
+
+extern "C" void ds4_gpu_set_q8_cache_suppressed(int suppressed) {
+    g_sycl_q8_cache_suppressed = suppressed ? 1 : 0;
+}

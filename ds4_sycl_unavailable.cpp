@@ -5,8 +5,8 @@
  *
  * ds4's GPU ABI is NOT uniform on success polarity: most entries return
  * nonzero for success and 0 for failure, but a minority (notably
- * ds4_gpu_device_cache_tensors and _support_tensors, still stubbed below)
- * return 0 for success and nonzero for failure.  An "unavailable" stub
+ * ds4_gpu_device_cache_support_tensors, still stubbed below) return 0 for
+ * success and nonzero for failure.  An "unavailable" stub
  * must always return ITS OWN entry's failure value, never a bare 0 or 1
  * picked without checking, or it silently reports success.  The two int
  * macros below make that convention explicit at the call site instead of
@@ -55,9 +55,6 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_tp_big_gate_wait)
 struct ds4_gpu_tensor;
 typedef struct ds4_gpu_tensor ds4_gpu_tensor;
 
-/* Return types other than int or void. */
-extern "C" uint64_t ds4_gpu_tier_free_vram(...) { return 0; }
-
 /* void returns. */
 SYCL_UNAVAILABLE_VOID(ds4_gpu_decode_graph_abort)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_decode_graphs_invalidate)
@@ -65,7 +62,6 @@ SYCL_UNAVAILABLE_VOID(ds4_gpu_enable_q8_dequant_gemm)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_model_residency_skip)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_print_memory_report)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_set_glm_model)
-SYCL_UNAVAILABLE_VOID(ds4_gpu_set_q8_cache_suppressed)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_set_quality)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_keepalive_pause)
 SYCL_UNAVAILABLE_VOID(ds4_gpu_tp_set_attn_head_split)
@@ -92,14 +88,14 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_build_derived_artifacts)
 extern "C" int ds4_gpu_decode_graph_begin(...) { return -1; }
 extern "C" int ds4_gpu_decode_graph_end(...) { return -1; }
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_decode_graphs_supported)
-/* ds4_gpu_device_cache_tensors / ds4_gpu_device_cache_support_tensors:
- * 0 means success, a positive value is a distinct error code (see
- * ds4_cuda.cu:3947 and ds4_cuda.cu:4103). ds4.c:56888 and ds4.c:57069
- * both check "if (rc != 0) ... failed". Do not switch these back to
- * SYCL_UNAVAILABLE_NONZERO_OK: that would stub them to 0, which reports
- * a successful cache install when nothing was cached. */
+/* ds4_gpu_device_cache_support_tensors: 0 means success, a positive value
+ * is a distinct error code (see ds4_cuda.cu:4103, ds4.c:57069's
+ * "if (rc != 0) ... failed"). Do not switch this back to
+ * SYCL_UNAVAILABLE_NONZERO_OK: that would stub it to 0, which reports a
+ * successful cache install when nothing was cached. ds4_gpu_device_cache_
+ * tensors itself is implemented in sycl/ds4_sycl_placement.hpp, the same
+ * polarity, real weight residency instead of a stub. */
 SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_device_cache_support_tensors)
-SYCL_UNAVAILABLE_ZERO_OK(ds4_gpu_device_cache_tensors)
 /* ds4_gpu_dspark_markov_argmax_tensor: DSpark speculative-decoding
  * support-model path (DS4_SUPPORT_DSPARK, ds4.c:2532), not part of
  * baseline DeepSeek V4 Flash. Out of scope; stays stubbed. */
@@ -154,8 +150,9 @@ SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_moe_handoff_pack_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_pack_slot_rows_f32_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_preload_q4_expert_tables)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_pro_q4_expert_table_auto_available)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_q8_cache_suppressed)
-SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_register_model_map_no_copy)
+/* ds4_gpu_q8_cache_suppressed / _set_q8_cache_suppressed and
+ * ds4_gpu_register_model_map_no_copy are implemented in
+ * sycl/ds4_sycl_placement.hpp. */
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_register_support_map)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_batch_owned_tensor)
 SYCL_UNAVAILABLE_NONZERO_OK(ds4_gpu_routed_moe_one_owned_tensor)
