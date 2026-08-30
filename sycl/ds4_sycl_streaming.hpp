@@ -676,9 +676,10 @@ static int sycl_stream_resident_seed_experts(
                      gate_expert_bytes);
             q.memcpy(entry.up, (const char *)model_map + up_offset + gate_rel,
                      gate_expert_bytes);
-            q.memcpy(entry.down, (const char *)model_map + down_offset + down_rel,
+            sycl::event _ds4_prof_ev148 = q.memcpy(entry.down, (const char *)model_map + down_offset + down_rel,
                      down_expert_bytes);
             q.wait_and_throw();
+            ds4_sycl_profile_record(_ds4_prof_ev148);
         } catch (const sycl::exception &ex) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming seed upload failed: %s\n",
                     ex.what());
@@ -919,9 +920,10 @@ static int sycl_stream_selected_load(
                      gate_expert_bytes);
             q.memcpy(entry.up, (const char *)model_map + up_offset + gate_rel,
                      gate_expert_bytes);
-            q.memcpy(entry.down, (const char *)model_map + down_offset + down_rel,
+            sycl::event _ds4_prof_ev149 = q.memcpy(entry.down, (const char *)model_map + down_offset + down_rel,
                      down_expert_bytes);
             q.wait_and_throw();
+            ds4_sycl_profile_record(_ds4_prof_ev149);
         } catch (const sycl::exception &ex) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected upload failed: %s\n",
                     ex.what());
@@ -936,6 +938,7 @@ static int sycl_stream_selected_load(
      * rocm/ds4_rocm_runtime.cuh:2966's clock bump inside
      * cuda_stream_selected_compact_mask. */
     try {
+        sycl::event _ds4_prof_ev150;
         for (uint32_t i = 0; i < n_selected; i++) {
             const int idx = sycl_stream_resident_find(
                     st, model_map, layer, selected_ids[i], gate_offset, up_offset,
@@ -950,10 +953,11 @@ static int sycl_stream_selected_load(
                      entry.gate, gate_expert_bytes);
             q.memcpy(st.selected.up + (uint64_t)i * gate_expert_bytes,
                      entry.up, gate_expert_bytes);
-            q.memcpy(st.selected.down + (uint64_t)i * down_expert_bytes,
+            _ds4_prof_ev150 = q.memcpy(st.selected.down + (uint64_t)i * down_expert_bytes,
                      entry.down, down_expert_bytes);
         }
         q.wait_and_throw();
+        if (n_selected > 0) ds4_sycl_profile_record(_ds4_prof_ev150);
     } catch (const sycl::exception &ex) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming selected compact failed: %s\n",
                 ex.what());
@@ -1088,9 +1092,10 @@ static int sycl_stream_batch_selected_prepare(
                      gate_expert_bytes);
             q.memcpy(entry.up, (const char *)model_map + up_offset + gate_rel,
                      gate_expert_bytes);
-            q.memcpy(entry.down, (const char *)model_map + down_offset + down_rel,
+            sycl::event _ds4_prof_ev151 = q.memcpy(entry.down, (const char *)model_map + down_offset + down_rel,
                      down_expert_bytes);
             q.wait_and_throw();
+            ds4_sycl_profile_record(_ds4_prof_ev151);
         } catch (const sycl::exception &ex) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "streaming batch selected upload failed: %s\n",
                     ex.what());
@@ -1287,8 +1292,10 @@ extern "C" int ds4_sycl_stream_test_read_resident(uint32_t layer, int32_t expert
         try {
             if (gate_out) q.memcpy(gate_out, e.gate, e.gate_expert_bytes);
             if (up_out) q.memcpy(up_out, e.up, e.gate_expert_bytes);
-            if (down_out) q.memcpy(down_out, e.down, e.down_expert_bytes);
+            sycl::event _ds4_prof_ev152;
+            if (down_out) _ds4_prof_ev152 = q.memcpy(down_out, e.down, e.down_expert_bytes);
             q.wait_and_throw();
+            if (down_out) ds4_sycl_profile_record(_ds4_prof_ev152);
         } catch (const sycl::exception &ex) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "stream test readback failed: %s\n",
                     ex.what());
@@ -1313,10 +1320,12 @@ extern "C" int ds4_sycl_stream_test_read_selected(uint32_t slot, void *gate_out,
         if (up_out) {
             q.memcpy(up_out, st.selected.up + (uint64_t)slot * gate_bytes, gate_bytes);
         }
+        sycl::event _ds4_prof_ev153;
         if (down_out) {
-            q.memcpy(down_out, st.selected.down + (uint64_t)slot * down_bytes, down_bytes);
+            _ds4_prof_ev153 = q.memcpy(down_out, st.selected.down + (uint64_t)slot * down_bytes, down_bytes);
         }
         q.wait_and_throw();
+        if (down_out) ds4_sycl_profile_record(_ds4_prof_ev153);
     } catch (const sycl::exception &ex) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "stream test selected readback failed: %s\n",
                 ex.what());

@@ -404,7 +404,9 @@ static int sycl_xdev_host_bounce(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
     }
     int ok = 1;
     try {
-        sq.memcpy(host, src->ptr, bytes).wait_and_throw();
+        sycl::event _ds4_prof_ev75 = sq.memcpy(host, src->ptr, bytes);
+        _ds4_prof_ev75.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev75);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_copy_xdev: bounce d2h failed: %s\n",
                 e.what());
@@ -618,10 +620,11 @@ extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor
         float       *o  = (float *)out->ptr;
         const float *pl = (const float *)local->ptr;
         const float *pr = (const float *)rhs->ptr;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+        sycl::event _ds4_prof_ev76 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
             o[i] = pl[i] + pr[i];
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev76);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "add_xdev failed: %s\n", e.what());
         return 0;

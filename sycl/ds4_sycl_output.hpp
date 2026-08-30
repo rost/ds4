@@ -26,10 +26,11 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
         float       *o = (float *)out->ptr;
         const float *pa = (const float *)a->ptr;
         const float *pb = (const float *)b->ptr;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+        sycl::event _ds4_prof_ev138 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
             o[i] = pa[i] + pb[i];
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev138);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "add failed: %s\n", e.what());
         return 0;
@@ -53,10 +54,11 @@ extern "C" int ds4_gpu_add3_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
         const float *pa = (const float *)a->ptr;
         const float *pb = (const float *)b->ptr;
         const float *pc = (const float *)c->ptr;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+        sycl::event _ds4_prof_ev139 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
             o[i] = pa[i] + pb[i] + pc[i];
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev139);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "add3 failed: %s\n", e.what());
         return 0;
@@ -80,7 +82,7 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out,
         float       *o = (float *)out->ptr;
         const float *pg = (const float *)gate->ptr;
         const float *pu = (const float *)up->ptr;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+        sycl::event _ds4_prof_ev140 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
             float g = pg[i];
             float u = pu[i];
             /* Clamp is symmetric on up and one-sided on gate, matching
@@ -93,6 +95,7 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out,
             o[i] = s * u * weight;
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev140);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "swiglu failed: %s\n", e.what());
         return 0;
@@ -139,7 +142,9 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
          * instead, which SYCL performs correctly whichever kind of USM
          * pointer scale_p turns out to be. */
         float scale = 0.0f;
-        q.memcpy(&scale, scale_p, sizeof(float)).wait_and_throw();
+        sycl::event _ds4_prof_ev141 = q.memcpy(&scale, scale_p, sizeof(float));
+        _ds4_prof_ev141.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev141);
 
         sycl_device_scratch_guard dbase_guard = sycl_stage_host_bytes(q, base_p, row_bytes);
         float *dbase = (float *)dbase_guard.p;
@@ -148,7 +153,7 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
         float       *o  = (float *)out->ptr;
         const float *pp = (const float *)pre->ptr;
         const uint32_t hc = n_hc;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+        sycl::event _ds4_prof_ev142 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
             float z = pp[i] * scale + dbase[i % hc];
             /* Unstable sigmoid, matching output_hc_weights_kernel at
              * rocm/ds4_rocm_output.cuh:6-20.  ds4's CPU path uses the
@@ -157,6 +162,7 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
             o[i] = 1.0f / (1.0f + sycl::exp(-z)) + eps;
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev142);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "output_hc_weights failed: %s\n",
                 e.what());
@@ -201,7 +207,7 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
         const float *pd = (const float *)directions->ptr + (size_t)layer * width;
         const uint32_t w = width;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev143 = q.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> partial(sycl::range<1>(wg), h);
             h.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>((size_t)rows * wg),
@@ -230,6 +236,7 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
                 });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev143);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "directional steering failed: %s\n",
                 e.what());

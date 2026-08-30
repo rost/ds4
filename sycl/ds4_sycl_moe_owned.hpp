@@ -163,7 +163,7 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
         uint32_t expert_mid_dim, float clamp) {
     const uint32_t row_blocks = (expert_mid_dim + 127u) / 128u;
     if (row_blocks == 0u) return;
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev118 = q.submit([&](sycl::handler &h) {
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
                                sycl::range<2>(256u, 1u)),
@@ -203,7 +203,9 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
                      }
                  }
              });
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev118.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev118);
 }
 
 /* moe_gate_up_mid_decode_lut_owned_qwarp32_kernel, ds4_cuda.cu:19892-19954:
@@ -224,7 +226,7 @@ static void sycl_moe_lut_gate_up_mid_decode_owned(
         uint32_t expert_mid_dim, float clamp) {
     const uint32_t row_blocks = (expert_mid_dim + 127u) / 128u;
     if (row_blocks == 0u) return;
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev119 = q.submit([&](sycl::handler &h) {
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
                                sycl::range<2>(256u, 1u)),
@@ -264,7 +266,9 @@ static void sycl_moe_lut_gate_up_mid_decode_owned(
                      }
                  }
              });
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev119.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev119);
 }
 
 /* q8_K_quantize_owned_kernel, ds4_cuda.cu:19476-19532, remap-based per the
@@ -275,7 +279,7 @@ static void sycl_moe_q8_k_quantize_owned(sycl::queue &q, sycl_block_q8_K *out, c
                                          const int32_t *remap, uint32_t in_dim) {
     const uint32_t xq_blocks = in_dim / kMoeQK;
     if (xq_blocks == 0u) return;
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev120 = q.submit([&](sycl::handler &h) {
          sycl::local_accessor<float, 1> abs_part(sycl::range<1>(kMoeQK), h);
          sycl::local_accessor<float, 1> val_part(sycl::range<1>(kMoeQK), h);
          h.parallel_for(
@@ -325,7 +329,9 @@ static void sycl_moe_q8_k_quantize_owned(sycl::queue &q, sycl_block_q8_K *out, c
                  }
                  if (tid == 0) yb->d = 1.0f / iscale;
              });
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev120.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev120);
 }
 
 /* moe_down_q4K_owned_slots_qwarp32_kernel, ds4_cuda.cu:21715-21753: writes
@@ -339,7 +345,7 @@ static void sycl_moe_q4k_down_owned_slots(
         uint32_t midq_blocks, uint32_t out_dim) {
     const uint32_t row_blocks = (out_dim + 31u) / 32u;
     if (row_blocks == 0u) return;
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev121 = q.submit([&](sycl::handler &h) {
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
                                sycl::range<2>(256u, 1u)),
@@ -364,7 +370,9 @@ static void sycl_moe_q4k_down_owned_slots(
                  acc = sycl_moe_subgroup_sum<8>(sg, acc);
                  if (lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
              });
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev121.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev121);
 }
 
 /* moe_down_owned_slots_qwarp32_kernel, ds4_cuda.cu:21485-21515: the Q2_K
@@ -376,7 +384,7 @@ static void sycl_moe_lut_down_owned_slots(
         uint32_t midq_blocks, uint32_t out_dim) {
     const uint32_t row_blocks = (out_dim + 31u) / 32u;
     if (row_blocks == 0u) return;
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev122 = q.submit([&](sycl::handler &h) {
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 6u),
                                sycl::range<2>(256u, 1u)),
@@ -401,7 +409,9 @@ static void sycl_moe_lut_down_owned_slots(
                  acc = sycl_moe_subgroup_sum<8>(sg, acc);
                  if (lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
              });
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev122.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev122);
 }
 
 /* moe_down_q4K_owned_packed_qwarp32_kernel, ds4_cuda.cu:21755-21813: as
@@ -418,7 +428,7 @@ static void sycl_moe_q4k_down_owned_packed(
         uint32_t midq_blocks, uint32_t out_dim) {
     const uint32_t row_blocks = (out_dim + 31u) / 32u;
     if (row_blocks == 0u) return;
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev123 = q.submit([&](sycl::handler &h) {
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 4u),
                                sycl::range<2>(256u, 1u)),
@@ -457,7 +467,9 @@ static void sycl_moe_q4k_down_owned_packed(
                  }
                  if (lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
              });
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev123.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev123);
 }
 
 /* moe_down_owned_packed_qwarp32_kernel, ds4_cuda.cu:21604-21654: the Q2_K
@@ -470,7 +482,7 @@ static void sycl_moe_lut_down_owned_packed(
         uint32_t midq_blocks, uint32_t out_dim) {
     const uint32_t row_blocks = (out_dim + 31u) / 32u;
     if (row_blocks == 0u) return;
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev124 = q.submit([&](sycl::handler &h) {
          h.parallel_for(
              sycl::nd_range<2>(sycl::range<2>((size_t)row_blocks * 256u, 4u),
                                sycl::range<2>(256u, 1u)),
@@ -509,7 +521,9 @@ static void sycl_moe_lut_down_owned_packed(
                  }
                  if (lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
              });
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev124.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev124);
 }
 
 /* Function-pointer bundle selecting one format's owned-decode kernel
@@ -604,7 +618,9 @@ static int sycl_routed_moe_one_owned_dispatch(
         sycl::queue &q = ds4_sycl_queue(out->device_id);
 
         int32_t sel_host[6];
-        q.memcpy(sel_host, selected->ptr, sizeof(sel_host)).wait_and_throw();
+        sycl::event _ds4_prof_ev125 = q.memcpy(sel_host, selected->ptr, sizeof(sel_host));
+        _ds4_prof_ev125.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev125);
 
         std::vector<int32_t> unique_ids;
         int32_t remap_host[6];
@@ -805,7 +821,7 @@ extern "C" int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
         const int32_t *sel = (const int32_t *)selected->ptr;
         const uint32_t od = out_dim;
         const uint32_t split = expert_split;
-        q.parallel_for(sycl::range<1>((size_t)row_elems), [=](sycl::id<1> id) {
+        sycl::event _ds4_prof_ev126 = q.parallel_for(sycl::range<1>((size_t)row_elems), [=](sycl::id<1> id) {
              const uint64_t gid = id[0];
              const uint32_t row = (uint32_t)(gid / od);
              const uint32_t col = (uint32_t)(gid - (uint64_t)row * od);
@@ -820,7 +836,9 @@ extern "C" int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
                  acc += src[(uint64_t)slot * od + col];
              }
              out_ptr[gid] = acc;
-         }).wait_and_throw();
+         });
+         _ds4_prof_ev126.wait_and_throw();
+         ds4_sycl_profile_record(_ds4_prof_ev126);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_owned_slots_combine_rows failed: %s\n",
                 e.what());
@@ -859,10 +877,12 @@ extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
         const int32_t *sel = (const int32_t *)selected->ptr;
         const uint32_t od = out_dim;
         const uint32_t split = expert_split;
-        q.parallel_for(sycl::range<1>((size_t)out_dim), [=](sycl::id<1> id) {
+        sycl::event _ds4_prof_ev127 = q.parallel_for(sycl::range<1>((size_t)out_dim), [=](sycl::id<1> id) {
              const uint32_t row = (uint32_t)id[0];
              out_ptr[row] = sycl_moe_owned_packed_combine_row(hs, pp, sel, row, od, split);
-         }).wait_and_throw();
+         });
+         _ds4_prof_ev127.wait_and_throw();
+         ds4_sycl_profile_record(_ds4_prof_ev127);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_owned_packed_combine failed: %s\n",
                 e.what());
@@ -902,7 +922,7 @@ extern "C" int ds4_gpu_moe_handoff_pack_tensor(ds4_gpu_tensor *packed,
         const uint64_t sel_off = (uint64_t)ne * sizeof(float);
         const uint64_t w_off = sel_off + (uint64_t)nx * sizeof(int32_t);
         const uint32_t n = ne > nx ? ne : nx;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
+        sycl::event _ds4_prof_ev128 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> id) {
              const uint32_t i = (uint32_t)id[0];
              if (i < ne) {
                  *(float *)(dst + (uint64_t)i * sizeof(float)) = norm[i];
@@ -911,7 +931,9 @@ extern "C" int ds4_gpu_moe_handoff_pack_tensor(ds4_gpu_tensor *packed,
                  *(int32_t *)(dst + sel_off + (uint64_t)i * sizeof(int32_t)) = sel[i];
                  *(float *)(dst + w_off + (uint64_t)i * sizeof(float)) = w[i];
              }
-         }).wait_and_throw();
+         });
+         _ds4_prof_ev128.wait_and_throw();
+         ds4_sycl_profile_record(_ds4_prof_ev128);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_handoff_pack failed: %s\n", e.what());
         return 0;
@@ -934,7 +956,7 @@ static void sycl_moe_filter_owned_pairs(sycl::queue &q, int32_t *selected, float
                                         uint64_t pair_count, uint32_t n_total_expert,
                                         uint32_t expert_base, uint32_t expert_count) {
     if (pair_count == 0u) return;
-    q.parallel_for(sycl::range<1>((size_t)pair_count), [=](sycl::id<1> id) {
+    sycl::event _ds4_prof_ev129 = q.parallel_for(sycl::range<1>((size_t)pair_count), [=](sycl::id<1> id) {
          const uint64_t pair = id[0];
          const int32_t expert_i = selected[pair];
          if (expert_i >= 0 && (uint32_t)expert_i < n_total_expert &&
@@ -945,7 +967,9 @@ static void sycl_moe_filter_owned_pairs(sycl::queue &q, int32_t *selected, float
              selected[pair] = -1;
              weights[pair] = 0.0f;
          }
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev129.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev129);
 }
 
 /* ds4_gpu_routed_moe_batch_owned_tensor, ds4_cuda.cu:25416-25493: unlike

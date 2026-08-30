@@ -58,7 +58,7 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out,
         const float *px = (const float *)x->ptr;
         const uint32_t width = n;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev130 = q.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> partial(
                     sycl::range<1>(kRmsNormGroup), h);
             h.parallel_for(
@@ -93,6 +93,7 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out,
                 });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev130);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rms_norm_plain failed: %s\n",
                 e.what());
@@ -150,7 +151,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(
         const float *px = (const float *)x->ptr;
         const uint32_t width = n;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev131 = q.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> partial(
                     sycl::range<1>(kRmsNormGroup), h);
             h.parallel_for(
@@ -180,6 +181,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(
                 });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev131);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rms_norm_weight failed: %s\n",
                 e.what());
@@ -293,7 +295,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         const uint32_t q_width  = q_n;
         const uint32_t kv_width = kv_n;
 
-        sq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev132 = sq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> partial(
                     sycl::range<1>(kRmsNormGroup), h);
             h.parallel_for(
@@ -327,6 +329,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
                 });
         });
         sq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev132);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "dsv4_qkv_rms_norm_rows failed: %s\n",
                 e.what());
@@ -437,7 +440,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
         const uint32_t pairs_head  = n_rot / 2u;
         const uint32_t total_pairs = kv_n_head * pairs_head;
 
-        sq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev133 = sq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> partial(
                     sycl::range<1>(kRmsNormGroup), h);
             h.parallel_for(
@@ -534,6 +537,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
                 });
         });
         sq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev133);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "dsv4_qkv_rms_norm_rows_kv_rope failed: %s\n", e.what());
@@ -564,7 +568,7 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok,
         const uint32_t width = head_dim;
         const size_t   rows  = (size_t)rows64;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev134 = q.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> partial(
                     sycl::range<1>(kRmsNormGroup), h);
             h.parallel_for(
@@ -593,6 +597,7 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok,
                 });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev134);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "head_rms_norm failed: %s\n",
                 e.what());
@@ -633,7 +638,7 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(
         float         *px   = (float *)x->ptr;
         const size_t   rows = (size_t)rows64;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev135 = q.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> partial(
                     sycl::range<1>(kRmsNormGroup), h);
             h.parallel_for(
@@ -719,6 +724,7 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(
                 });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev135);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "head_rms_norm_rope_tail failed: %s\n", e.what());
@@ -762,7 +768,7 @@ static int sycl_rope_tail_stride_tensor(
         const size_t group = kRmsNormGroup;
         const size_t grid  = ((size_t)pairs + group - 1) / group * group;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev136 = q.submit([&](sycl::handler &h) {
             h.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(grid),
                                   sycl::range<1>(group)),
@@ -824,6 +830,7 @@ static int sycl_rope_tail_stride_tensor(
                 });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev136);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rope_tail failed: %s\n",
                 e.what());
@@ -905,7 +912,7 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
         const size_t     group = kRmsNormGroup;
         const size_t     grid  = ((size_t)pairs + group - 1) / group * group;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev137 = q.submit([&](sycl::handler &h) {
             h.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>(grid),
                                   sycl::range<1>(group)),
@@ -965,6 +972,7 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
                 });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev137);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rope_tail_decode_rows failed: %s\n",
                 e.what());

@@ -62,8 +62,12 @@ extern "C" int ds4_sycl_test_gemm_batch_smoke(void) {
         sycl_device_scratch_guard b_guard(q, b);
         sycl_device_scratch_guard c_guard(q, c);
 
-        q.memcpy(a, h_kv, sizeof(h_kv)).wait_and_throw();
-        q.memcpy(b, h_q, sizeof(h_q)).wait_and_throw();
+        sycl::event _ds4_prof_ev65 = q.memcpy(a, h_kv, sizeof(h_kv));
+        _ds4_prof_ev65.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev65);
+        sycl::event _ds4_prof_ev66 = q.memcpy(b, h_q, sizeof(h_q));
+        _ds4_prof_ev66.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev66);
 
         sycl::event ev = sycl_gemm_batch_f32(
                 q, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
@@ -75,9 +79,12 @@ extern "C" int ds4_sycl_test_gemm_batch_smoke(void) {
                 c, n_keys, n_keys * n_tokens,
                 n_head);
         ev.wait_and_throw();
+        ds4_sycl_profile_record(ev);
 
         float got[8];
-        q.memcpy(got, c, sizeof(got)).wait_and_throw();
+        sycl::event _ds4_prof_ev67 = q.memcpy(got, c, sizeof(got));
+        _ds4_prof_ev67.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev67);
 
         for (int i = 0; i < 8; i++) {
             const float diff = got[i] - expected[i];
@@ -105,12 +112,16 @@ extern "C" int ds4_sycl_test_gemm_batch_smoke(void) {
  * ROCm additionally special-cases n_tok == 1 with a perf-tuned kernel
  * (rocm/ds4_rocm_matmul.cuh:873-931); one general kernel covering every
  * n_tok is enough for correctness. */
-static void sycl_matmul_f16_launch(sycl::queue &q, float *out,
+/* Returns the launched kernel's event (a measurement-only
+ * change, needed so a caller can feed it to ds4_sycl_profile_record; every
+ * caller either discards it or captures it purely for that purpose, so
+ * this carries no behavioural change). */
+static sycl::event sycl_matmul_f16_launch(sycl::queue &q, float *out,
                                    const uint16_t *w, const float *x,
                                    uint32_t in_dim, uint32_t out_dim,
                                    uint32_t n_tok) {
     const uint64_t n = (uint64_t)n_tok * out_dim;
-    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+    return q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
         const uint32_t o  = (uint32_t)(gid % out_dim);
         const uint32_t t  = (uint32_t)(gid / out_dim);
         const float    *xr = x + (uint64_t)t * in_dim;
@@ -169,9 +180,11 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
         uint16_t *dw = (uint16_t *)dw_guard.p;
         if (!dw) return 0;
 
-        sycl_matmul_f16_launch(q, (float *)out->ptr, dw, (const float *)x->ptr,
-                               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        sycl::event _ds4_prof_ev68 = sycl_matmul_f16_launch(
+                q, (float *)out->ptr, dw, (const float *)x->ptr,
+                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev68);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_f16 failed: %s\n", e.what());
         return 0;
@@ -231,9 +244,11 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
 
         sycl_matmul_f16_launch(q, (float *)out_a->ptr, dwa, (const float *)x->ptr,
                                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
-        sycl_matmul_f16_launch(q, (float *)out_b->ptr, dwb, (const float *)x->ptr,
-                               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        sycl::event _ds4_prof_ev68b = sycl_matmul_f16_launch(
+                q, (float *)out_b->ptr, dwb, (const float *)x->ptr,
+                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev68b);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_f16_pair failed: %s\n", e.what());
         return 0;
@@ -246,12 +261,12 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
  * bytes each (blocks of 32 values, 34 bytes per block; see
  * sycl_q8_0_dequant in ds4_sycl_common.hpp).  One work-item per
  * (token, out_row) pair, covering every n_tok with no shape gating. */
-static void sycl_q8_0_matmul_launch(sycl::queue &q, float *out,
+static sycl::event sycl_q8_0_matmul_launch(sycl::queue &q, float *out,
                                     const unsigned char *w, const float *x,
                                     uint32_t in_dim, uint32_t out_dim,
                                     uint32_t n_tok, uint64_t row_bytes) {
     const uint64_t n = (uint64_t)n_tok * out_dim;
-    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+    return q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
         const uint32_t o  = (uint32_t)(gid % out_dim);
         const uint32_t t  = (uint32_t)(gid / out_dim);
         const float         *xr = x + (uint64_t)t * in_dim;
@@ -329,10 +344,12 @@ static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
         unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
 
-        sycl_q8_0_matmul_launch(q, (float *)out->ptr, dw, (const float *)x->ptr,
-                                (uint32_t)in_dim, (uint32_t)out_dim,
-                                (uint32_t)n_tok, row_bytes);
+        sycl::event _ds4_prof_ev69 = sycl_q8_0_matmul_launch(
+                q, (float *)out->ptr, dw, (const float *)x->ptr,
+                (uint32_t)in_dim, (uint32_t)out_dim,
+                (uint32_t)n_tok, row_bytes);
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev69);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0 failed: %s\n", e.what());
         return 0;
@@ -555,7 +572,7 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         const uint32_t in_start32  = (uint32_t)in_start;
         const uint32_t in_count32  = (uint32_t)in_count;
         const uint64_t n = (uint64_t)n_tok32 * out_dim32;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+        sycl::event _ds4_prof_ev70 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
             const uint32_t o = (uint32_t)(gid % out_dim32);
             const uint32_t t = (uint32_t)(gid / out_dim32);
             const float         *xr = x_ptr + (uint64_t)t * in_count32;
@@ -567,6 +584,7 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
             out_ptr[gid] = sum;
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev70);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0_kslice_rows failed: %s\n", e.what());
         return 0;
@@ -621,11 +639,11 @@ namespace {
  * sycl_q8_0_matmul_general above), so every call redoes the expansion, a
  * documented placeholder like every other per-call weight staging in this
  * file. */
-static void sycl_q8_0_to_f16_launch(sycl::queue &q, sycl::half *out,
+static sycl::event sycl_q8_0_to_f16_launch(sycl::queue &q, sycl::half *out,
                                     const unsigned char *w, uint32_t in_dim,
                                     uint32_t out_dim, uint64_t row_bytes) {
     const uint64_t n = (uint64_t)out_dim * in_dim;
-    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+    return q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
         const uint32_t k = (uint32_t)(gid % in_dim);
         const uint32_t o = (uint32_t)(gid / in_dim);
         const unsigned char *row = w + (uint64_t)o * row_bytes;
@@ -640,9 +658,9 @@ static void sycl_q8_0_to_f16_launch(sycl::queue &q, sycl::half *out,
  * exists for a different call site per spec 6k (this backend's own
  * explicit F16 encoder, used where ds4 stores F16 state directly rather
  * than handing it to a GEMM library's own internal cast). */
-static void sycl_f32_to_f16_launch(sycl::queue &q, sycl::half *out,
+static sycl::event sycl_f32_to_f16_launch(sycl::queue &q, sycl::half *out,
                                    const float *x, uint64_t n) {
-    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+    return q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
         out[gid] = sycl::half(x[gid]);
     });
 }
@@ -711,16 +729,19 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
                 (size_t)(out_dim * in_dim), q);
         if (!w_h) return 0;
         sycl_device_scratch_guard wh_guard(q, w_h);
-        sycl_q8_0_to_f16_launch(q, w_h, dw, (uint32_t)in_dim, (uint32_t)out_dim,
-                                row_bytes);
+        sycl::event _ds4_prof_ev71 = sycl_q8_0_to_f16_launch(
+                q, w_h, dw, (uint32_t)in_dim, (uint32_t)out_dim, row_bytes);
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev71);
 
         sycl::half *x_h = sycl::malloc_device<sycl::half>(
                 (size_t)(n_tok * in_dim), q);
         if (!x_h) return 0;
         sycl_device_scratch_guard xh_guard(q, x_h);
-        sycl_f32_to_f16_launch(q, x_h, (const float *)x->ptr, n_tok * in_dim);
+        sycl::event _ds4_prof_ev71b =
+                sycl_f32_to_f16_launch(q, x_h, (const float *)x->ptr, n_tok * in_dim);
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev71b);
 
         sycl::event ev = sycl_gemm_f16(
                 q, oneapi::mkl::transpose::trans, oneapi::mkl::transpose::nontrans,
@@ -731,6 +752,7 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
                 sycl::half(0.0f),
                 (sycl::half *)out_h->ptr, (int64_t)out_dim);
         ev.wait_and_throw();
+        ds4_sycl_profile_record(ev);
     } catch (const std::exception &e) {
         /* std::exception, not sycl::exception: a bad argument to
          * sycl_gemm_f16 throws oneapi::mkl::invalid_argument synchronously
@@ -784,11 +806,11 @@ namespace {
 /* Mirrors matmul_f32_kernel exactly (rocm/ds4_rocm_common.cuh:288-306): one
  * work-item per (token, out_row) output element, a plain accumulate loop
  * over in_dim. */
-static void sycl_matmul_f32_launch(sycl::queue &q, float *out, const float *w,
+static sycl::event sycl_matmul_f32_launch(sycl::queue &q, float *out, const float *w,
                                    const float *x, uint32_t in_dim,
                                    uint32_t out_dim, uint32_t n_tok) {
     const uint64_t n = (uint64_t)n_tok * out_dim;
-    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+    return q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
         const uint32_t o  = (uint32_t)(gid % out_dim);
         const uint32_t t  = (uint32_t)(gid / out_dim);
         const float *xr = x + (uint64_t)t * in_dim;
@@ -841,9 +863,11 @@ extern "C" int ds4_gpu_matmul_f32_tensor(
         float *dw = (float *)dw_guard.p;
         if (!dw) return 0;
 
-        sycl_matmul_f32_launch(q, (float *)out->ptr, dw, (const float *)x->ptr,
-                               (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
+        sycl::event _ds4_prof_ev72 = sycl_matmul_f32_launch(
+                q, (float *)out->ptr, dw, (const float *)x->ptr,
+                (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev72);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_f32 failed: %s\n", e.what());
         return 0;
@@ -894,13 +918,13 @@ extern "C" int ds4_gpu_matmul_f32_tensor(
  * this could replace but does not, to keep this change scoped to the new
  * entries it actually needs. */
 template <typename Dequant>
-static void sycl_dense_quant_matmul_launch(sycl::queue &q, float *out,
+static sycl::event sycl_dense_quant_matmul_launch(sycl::queue &q, float *out,
                                            const unsigned char *w, const float *x,
                                            uint32_t in_dim, uint32_t out_dim,
                                            uint32_t n_tok, uint64_t row_bytes,
                                            Dequant dequant) {
     const uint64_t n = (uint64_t)n_tok * out_dim;
-    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+    return q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
         const uint32_t o  = (uint32_t)(gid % out_dim);
         const uint32_t t  = (uint32_t)(gid / out_dim);
         const float         *xr = x + (uint64_t)t * in_dim;
@@ -948,11 +972,13 @@ static int sycl_dense_quant_matmul_general(
         unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
 
-        sycl_dense_quant_matmul_launch(q, (float *)out->ptr, dw,
-                                       (const float *)x->ptr, (uint32_t)in_dim,
-                                       (uint32_t)out_dim, (uint32_t)n_tok,
-                                       row_bytes, dequant);
+        sycl::event _ds4_prof_ev73 = sycl_dense_quant_matmul_launch(
+                q, (float *)out->ptr, dw,
+                (const float *)x->ptr, (uint32_t)in_dim,
+                (uint32_t)out_dim, (uint32_t)n_tok,
+                row_bytes, dequant);
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev73);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s matmul failed: %s\n", what, e.what());
         return 0;
@@ -1085,7 +1111,7 @@ static int sycl_dense_quant_matmul_kslice_general(
         const uint32_t k_off32   = (uint32_t)k_off;
         const uint32_t k_cnt32   = (uint32_t)k_cnt;
         const uint32_t out_dim32 = (uint32_t)out_dim;
-        q.parallel_for(sycl::range<1>(out_dim32), [=](sycl::id<1> gid) {
+        sycl::event _ds4_prof_ev74 = q.parallel_for(sycl::range<1>(out_dim32), [=](sycl::id<1> gid) {
              const uint32_t o = (uint32_t)gid[0];
              const unsigned char *wr = dw + (uint64_t)o * row_bytes;
              float sum = 0.0f;
@@ -1093,7 +1119,9 @@ static int sycl_dense_quant_matmul_kslice_general(
                  sum += x_ptr[k] * dequant(wr, k_off32 + k);
              }
              out_ptr[o] = sum;
-         }).wait_and_throw();
+         });
+         _ds4_prof_ev74.wait_and_throw();
+         ds4_sycl_profile_record(_ds4_prof_ev74);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s matmul_kslice failed: %s\n", what, e.what());
         return 0;

@@ -308,8 +308,9 @@ static int sycl_indexer_scores_launch(
         const float *pindex_comp = (const float *)index_comp->ptr;
         const int causal_i = causal ? 1 : 0;
 
+        sycl::event _ds4_prof_ev55;
         if (n_tokens == 1u && head_dim == 128u && n_head == 64u) {
-            dq.submit([&](sycl::handler &h) {
+            _ds4_prof_ev55 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<float, 1> krow(sycl::range<1>(128), h);
                 sycl::local_accessor<float, 1> partial4(sycl::range<1>(4), h);
                 h.parallel_for(
@@ -322,7 +323,7 @@ static int sycl_indexer_scores_launch(
                         });
             });
         } else {
-            dq.submit([&](sycl::handler &h) {
+            _ds4_prof_ev55 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<float, 1> partial(sycl::range<1>(256), h);
                 h.parallel_for(
                         sycl::nd_range<2>(
@@ -337,6 +338,7 @@ static int sycl_indexer_scores_launch(
             });
         }
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev55);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer scores launch failed: %s\n", e.what());
         return 0;
@@ -777,7 +779,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
      * on the same out-of-order queue over raw USM give no automatic
      * ordering between them, so each stage below waits before the next one
      * that depends on it is submitted. */
-    dq.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev56 = dq.submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> vals(sycl::range<1>(kSortN), h);
         sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(kSortN), h);
         uint32_t *out = cur;
@@ -790,6 +792,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
                        });
     });
     dq.wait_and_throw();
+    ds4_sycl_profile_record(_ds4_prof_ev56);
 
     /* Tree levels: fold merge_group consecutive candidate sets together
      * per level until at most merge_group sets remain, matching ROCm's
@@ -802,7 +805,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
         uint32_t *next = cur + (uint64_t)n_tokens * cur_stride;
         const uint32_t prev_stride = cur_stride;
         const uint32_t prev_sets = n_sets;
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev57 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> vals(sycl::range<1>(kSortN), h);
             sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(kSortN), h);
             uint32_t *in = cur;
@@ -817,6 +820,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev57);
         cur = next;
         n_sets = next_sets;
         cur_stride = next_stride;
@@ -824,11 +828,12 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
 
     /* Final merge, one work-group per token, matching ROCm's
      * <<<n_tokens, 1024>>>. */
+    sycl::event _ds4_prof_ev58;
     {
         const uint32_t candidate_count = n_sets * top_k;
         const uint32_t final_stride = cur_stride;
         uint32_t *final_cur = cur;
-        dq.submit([&](sycl::handler &h) {
+        _ds4_prof_ev58 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> vals(sycl::range<1>(kSortN), h);
             sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(kSortN), h);
             h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * kThreads),
@@ -842,6 +847,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
     }
 
     dq.wait_and_throw();
+    ds4_sycl_profile_record(_ds4_prof_ev58);
     return 1;
 }
 
@@ -868,6 +874,7 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
         constexpr uint32_t kThreads = 1024u;
 
         const bool cascade_k = (top_k == 512u || top_k == 1024u || top_k == 2048u);
+        sycl::event _ds4_prof_ev59;
         if (cascade_k && n_comp <= 8192u) {
             if (n_comp <= 1024u) {
                 dq.submit([&](sycl::handler &h) {
@@ -923,7 +930,7 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
                 return 0;
             }
         } else {
-            dq.submit([&](sycl::handler &h) {
+            _ds4_prof_ev59 = dq.submit([&](sycl::handler &h) {
                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens),
                                                  sycl::range<1>(1)),
                                [=](sycl::nd_item<1> it) {
@@ -933,6 +940,7 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
             });
         }
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev59);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer topk launch failed: %s\n", e.what());
         return 0;
@@ -976,7 +984,7 @@ extern "C" int ds4_sycl_test_indexed_topk_sort_512_asc(ds4_gpu_tensor *dst,
         int32_t *pdst = (int32_t *)dst->ptr;
         const int32_t *psrc = (const int32_t *)src->ptr;
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev60 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<int32_t, 1> rows(sycl::range<1>(512), h);
             h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * 512u),
                                              sycl::range<1>(512)),
@@ -986,6 +994,7 @@ extern "C" int ds4_sycl_test_indexed_topk_sort_512_asc(ds4_gpu_tensor *dst,
                            });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev60);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexed topk sort 512 asc failed: %s\n", e.what());
         return 0;
@@ -1050,7 +1059,7 @@ extern "C" int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
         int32_t *pout = (int32_t *)out_idx->ptr;
         const float *plogits = (const float *)logits->ptr;
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev61 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> sm_val(sycl::range<1>(kThreads), h);
             sycl::local_accessor<uint32_t, 1> sm_idx(sycl::range<1>(kThreads), h);
             h.parallel_for(
@@ -1084,6 +1093,7 @@ extern "C" int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev61);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "argmax launch failed: %s\n", e.what());
         return 0;
@@ -1136,7 +1146,7 @@ extern "C" int ds4_gpu_indexer_top1_value_tensor(
         const uint32_t comp = n_comp;
         const uint32_t off = index_offset;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev62 = q.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> sm_val(sycl::range<1>(kThreads), h);
             sycl::local_accessor<uint32_t, 1> sm_idx(sycl::range<1>(kThreads), h);
             h.parallel_for(
@@ -1176,6 +1186,7 @@ extern "C" int ds4_gpu_indexer_top1_value_tensor(
                     });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev62);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer_top1_value launch failed: %s\n", e.what());
         return 0;
@@ -1295,7 +1306,7 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(ds4_gpu_tensor *mask,
         float *pmask = (float *)mask->ptr;
         const uint32_t *ptopk = (const uint32_t *)topk->ptr;
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev63 = dq.submit([&](sycl::handler &h) {
             h.parallel_for(
                     sycl::nd_range<1>(sycl::range<1>((size_t)(groups * kBlock)),
                                       sycl::range<1>(kBlock)),
@@ -1315,6 +1326,7 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(ds4_gpu_tensor *mask,
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev63);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "topk mask launch failed: %s\n", e.what());
         return 0;
@@ -1337,7 +1349,7 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x,
         sycl::queue &dq = ds4_sycl_queue(x->device_id);
         float *px = (float *)x->ptr;
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev64 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> vals(sycl::range<1>(128), h);
             sycl::local_accessor<float, 1> absbuf(sycl::range<1>(128), h);
             h.parallel_for(
@@ -1349,6 +1361,7 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x,
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev64);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer qat launch failed: %s\n", e.what());
         return 0;

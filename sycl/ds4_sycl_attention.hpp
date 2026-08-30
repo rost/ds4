@@ -287,7 +287,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         const uint32_t use_vec4 = (head_dim & 3u) == 0u ? 1u : 0u;
         constexpr uint32_t kBlock = 256u;
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev1 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> scores(sycl::range<1>(rows ? rows : 1u), h);
             sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(kBlock), h);
             h.parallel_for(
@@ -301,6 +301,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev1);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode oldhip fast launch failed: %s\n",
                 e.what());
@@ -779,9 +780,10 @@ static int sycl_attention_decode_batch_launch(
         const float *pmask  = use_comp_mask ? (const float *)comp_mask->ptr : nullptr;
         constexpr uint32_t kBlock = 256u;
 
+        sycl::event _ds4_prof_ev2;
         if (use_online) {
             const uint32_t grid_y = (n_head + 7u) / 8u;
-            dq.submit([&](sycl::handler &h) {
+            _ds4_prof_ev2 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<uint32_t, 1> raw_rows(sycl::range<1>(kRawScoreCap), h);
                 sycl::local_accessor<uint32_t, 1> raw_meta(sycl::range<1>(2), h);
                 sycl::local_accessor<sycl::float4, 1> kv_shared(sycl::range<1>(4u * 128u), h);
@@ -796,7 +798,7 @@ static int sycl_attention_decode_batch_launch(
                         });
             });
         } else {
-            dq.submit([&](sycl::handler &h) {
+            _ds4_prof_ev2 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<float, 1> scores(sycl::range<1>(kScoreCap), h);
                 sycl::local_accessor<uint32_t, 1> raw_rows(sycl::range<1>(kRawScoreCap), h);
                 sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(kBlock), h);
@@ -814,6 +816,7 @@ static int sycl_attention_decode_batch_launch(
             });
         }
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev2);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode batch launch failed: %s\n",
                 e.what());
@@ -1552,7 +1555,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
 
         if (n_tokens == 1u) {
             const uint32_t rows = n_raw + (top_k < n_comp ? top_k : n_comp);
-            dq.submit([&](sycl::handler &h) {
+            sycl::event _ds4_prof_ev3 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<float, 1> scores(sycl::range<1>(rows ? rows : 1u), h);
                 sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(kBlock), h);
                 sycl::local_accessor<uint32_t, 1> comp_rows(sycl::range<1>(kTopkCap), h);
@@ -1569,6 +1572,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                         });
             });
             dq.wait_and_throw();
+            ds4_sycl_profile_record(_ds4_prof_ev3);
             return 1;
         }
 
@@ -1577,7 +1581,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         if (top_k == 512u) {
             sorted_buf = sycl::malloc_device<int32_t>((size_t)n_tokens * 512u, dq);
             if (!sorted_buf) return 0;
-            dq.submit([&](sycl::handler &h) {
+            sycl::event _ds4_prof_ev4 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<int32_t, 1> rows(sycl::range<1>(512), h);
                 h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * 512u),
                                                  sycl::range<1>(512u)),
@@ -1587,13 +1591,14 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                });
             });
             dq.wait_and_throw();
+            ds4_sycl_profile_record(_ds4_prof_ev4);
             psorted = sorted_buf;
         }
         sycl_device_scratch_guard sorted_guard(dq, sorted_buf);
 
         if (head_dim == 512u && top_k <= kTopkCap) {
             const uint32_t grid_y = (n_head + 15u) / 16u;
-            dq.submit([&](sycl::handler &h) {
+            sycl::event _ds4_prof_ev5 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<uint32_t, 1> raw_rows(sycl::range<1>(256), h);
                 sycl::local_accessor<uint32_t, 1> comp_rows(sycl::range<1>(kTopkCap), h);
                 sycl::local_accessor<uint32_t, 1> raw_meta(sycl::range<1>(2), h);
@@ -1611,10 +1616,11 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                         });
             });
             dq.wait_and_throw();
+            ds4_sycl_profile_record(_ds4_prof_ev5);
             return 1;
         }
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev6 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> scores(sycl::range<1>(256u + kTopkCap), h);
             sycl::local_accessor<uint32_t, 1> raw_rows(sycl::range<1>(256), h);
             sycl::local_accessor<uint32_t, 1> comp_rows(sycl::range<1>(kTopkCap), h);
@@ -1633,6 +1639,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev6);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention indexed mixed launch failed: %s\n",
                 e.what());
@@ -1888,7 +1895,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         const uint32_t  use_vec4 = (head_dim & 3u) == 0u ? 1u : 0u;
         constexpr uint32_t kBlock = 256u;
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev7 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> scores(sycl::range<1>(max_score_width), h);
             sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(kBlock), h);
             sycl::local_accessor<uint32_t, 1> comp_rows(sycl::range<1>(kIndexedTopkCap), h);
@@ -1903,6 +1910,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev7);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode rows launch failed: %s\n",
                 e.what());
@@ -2136,7 +2144,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
 
         if (small_window_static) {
             const uint32_t grid_y = (n_head + 7u) / 8u;
-            dq.submit([&](sycl::handler &h) {
+            sycl::event _ds4_prof_ev8 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<sycl::float4, 1> kv_shared(sycl::range<1>(4u * 128u), h);
                 sycl::local_accessor<float, 1> scores(sycl::range<1>(8u * 768u), h);
                 h.parallel_for(
@@ -2149,6 +2157,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                         });
             });
             dq.wait_and_throw();
+            ds4_sycl_profile_record(_ds4_prof_ev8);
             return 1;
         }
 
@@ -2180,8 +2189,9 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                     scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * n_tokens),
                     (int64_t)n_head);
             ev1.wait_and_throw();
+            ds4_sycl_profile_record(ev1);
 
-            dq.submit([&](sycl::handler &h) {
+            sycl::event _ds4_prof_ev9 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(256u), h);
                 h.parallel_for(
                         sycl::nd_range<2>(sycl::range<2>((size_t)n_tokens * 256u, n_head),
@@ -2193,6 +2203,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                         });
             });
             dq.wait_and_throw();
+            ds4_sycl_profile_record(_ds4_prof_ev9);
 
             sycl::event ev2 = sycl_gemm_batch_f32(
                     dq, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
@@ -2204,6 +2215,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                     out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * n_tokens),
                     (int64_t)n_head);
             ev2.wait_and_throw();
+            ds4_sycl_profile_record(ev2);
 
             sycl_attention_prefill_unpack_heads_launch(dq, pheads, out_tmp, n_tokens, n_head,
                                                        head_dim);
@@ -2213,7 +2225,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
 
         if (window == 0u && n_tokens > 256u) return 0;
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev10 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> scores(sycl::range<1>(256u), h);
             sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(128u), h);
             h.parallel_for(
@@ -2226,6 +2238,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev10);
     } catch (const std::exception &e) {
         /* std::exception, not sycl::exception: oneMKL's own exceptions
          * (oneapi::mkl::invalid_argument and siblings, thrown synchronously
@@ -2563,8 +2576,9 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
                 scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * nt),
                 (int64_t)n_head);
         ev1.wait_and_throw();
+        ds4_sycl_profile_record(ev1);
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev11 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(256u), h);
             h.parallel_for(
                     sycl::nd_range<2>(sycl::range<2>((size_t)nt * 256u, n_head),
@@ -2576,6 +2590,7 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev11);
 
         sycl::event ev2 = sycl_gemm_batch_f32(
                 dq, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
@@ -2587,6 +2602,7 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
                 out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * nt),
                 (int64_t)n_head);
         ev2.wait_and_throw();
+        ds4_sycl_profile_record(ev2);
 
         sycl_attention_prefill_unpack_heads_launch(
                 dq, pheads + (uint64_t)t0 * n_head * head_dim, out_tmp, nt, n_head, head_dim);
@@ -2647,7 +2663,7 @@ static int sycl_attention_prefill_mixed_launch(
 
     if (small_window_static) {
         const uint32_t grid_y = (n_head + 7u) / 8u;
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev12 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<sycl::float4, 1> kv_shared(sycl::range<1>(4u * 128u), h);
             sycl::local_accessor<float, 1> scores(sycl::range<1>(8u * 768u), h);
             h.parallel_for(
@@ -2660,6 +2676,7 @@ static int sycl_attention_prefill_mixed_launch(
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev12);
         return 1;
     }
 
@@ -2711,8 +2728,9 @@ static int sycl_attention_prefill_mixed_launch(
                 scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * n_tokens),
                 (int64_t)n_head);
         ev1.wait_and_throw();
+        ds4_sycl_profile_record(ev1);
 
-        dq.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev13 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(256u), h);
             h.parallel_for(
                     sycl::nd_range<2>(sycl::range<2>((size_t)n_tokens * 256u, n_head),
@@ -2724,6 +2742,7 @@ static int sycl_attention_prefill_mixed_launch(
                     });
         });
         dq.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev13);
 
         sycl::event ev2 = sycl_gemm_batch_f32(
                 dq, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
@@ -2735,6 +2754,7 @@ static int sycl_attention_prefill_mixed_launch(
                 out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * n_tokens),
                 (int64_t)n_head);
         ev2.wait_and_throw();
+        ds4_sycl_profile_record(ev2);
 
         sycl_attention_prefill_unpack_heads_launch(dq, pheads, out_tmp, n_tokens, n_head,
                                                    head_dim);
@@ -2752,7 +2772,7 @@ static int sycl_attention_prefill_mixed_launch(
                 n_comp, window);
         return 0;
     }
-    dq.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev14 = dq.submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> scores(sycl::range<1>(kMixedScoreCap), h);
         sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(256u), h);
         h.parallel_for(
@@ -2765,6 +2785,7 @@ static int sycl_attention_prefill_mixed_launch(
                 });
     });
     dq.wait_and_throw();
+    ds4_sycl_profile_record(_ds4_prof_ev14);
     return 1;
 }
 

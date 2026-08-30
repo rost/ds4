@@ -112,7 +112,7 @@ static void sycl_router_select_launch(
     constexpr uint32_t kPerLane = N_EXPERT / kSyclRouterLanes;
     const uint32_t n_groups = (n_tokens + kSyclRouterRowsPerGroup - 1u) / kSyclRouterRowsPerGroup;
 
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev145 = q.submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 2> sprob(
                 sycl::range<2>(kSyclRouterRowsPerGroup, N_EXPERT), h);
 
@@ -265,6 +265,7 @@ static void sycl_router_select_launch(
                 });
     });
     q.wait_and_throw();
+    ds4_sycl_profile_record(_ds4_prof_ev145);
 }
 
 /* Validates the bias/hash table shared by both router entries and resolves

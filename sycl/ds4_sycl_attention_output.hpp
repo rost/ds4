@@ -306,7 +306,7 @@ static void sycl_grouped_q8_0_a_preq_launch(sycl::queue &q, float *low,
                                             uint32_t n_groups, uint64_t blocks,
                                             uint64_t low_dim, uint64_t n_tokens) {
     if (low_dim == 0 || n_tokens == 0) return;
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev15 = q.submit([&](sycl::handler &h) {
         h.parallel_for(
                 sycl::nd_range<1>(
                         sycl::range<1>((size_t)(low_dim * n_tokens * kGroupedQ8ASubgroupWidth)),
@@ -845,9 +845,11 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         }
 
         uint16_t *out_bits = (uint16_t *)out_h->ptr;
-        q.parallel_for(sycl::range<1>((size_t)out_elems), [=](sycl::id<1> gid) {
+        sycl::event _ds4_prof_ev16 = q.parallel_for(sycl::range<1>((size_t)out_elems), [=](sycl::id<1> gid) {
              out_bits[gid[0]] = sycl_f32_to_f16_bits_hip_round(out_f32[gid[0]]);
-         }).wait_and_throw();
+         });
+         _ds4_prof_ev16.wait_and_throw();
+         ds4_sycl_profile_record(_ds4_prof_ev16);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_q8_batch_f16 failed: %s\n",
                 e.what());
@@ -910,7 +912,7 @@ static void sycl_grouped_q4_k_a_launch(sycl::queue &q, float *low,
                                        uint32_t n_groups, uint64_t row_bytes,
                                        uint64_t low_dim, uint64_t n_tokens) {
     if (low_dim == 0 || n_tokens == 0) return;
-    q.parallel_for(sycl::range<1>((size_t)(low_dim * n_tokens)), [=](sycl::id<1> gid) {
+    sycl::event _ds4_prof_ev17 = q.parallel_for(sycl::range<1>((size_t)(low_dim * n_tokens)), [=](sycl::id<1> gid) {
         const uint64_t row = gid[0] % low_dim;
         const uint64_t tok = gid[0] / low_dim;
         const uint64_t group = row / rank;

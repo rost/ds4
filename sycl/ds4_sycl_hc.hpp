@@ -204,12 +204,13 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(
         const uint32_t iters = sinkhorn_iters;
         const float    epsv  = eps;
 
-        q.parallel_for(sycl::range<1>(rows), [=](sycl::id<1> id) {
+        sycl::event _ds4_prof_ev41 = q.parallel_for(sycl::range<1>(rows), [=](sycl::id<1> id) {
             const uint32_t row = (uint32_t)id[0];
             sycl_hc4_split_one(o + (uint64_t)row * 24, m + (uint64_t)row * 24,
                                scale, base, iters, epsv);
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev41);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_sinkhorn failed: %s\n", e.what());
         return 0;
@@ -245,7 +246,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_tensor(
         const uint32_t stride = n_hc;
         const uint64_t n = (uint64_t)embd * n_tokens;
 
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+        sycl::event _ds4_prof_ev42 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
             const uint64_t gid = gid_id[0];
             const uint32_t d = (uint32_t)(gid % embd);
             const uint32_t t = (uint32_t)(gid / embd);
@@ -257,6 +258,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_tensor(
             o[(uint64_t)t * embd + d] = acc;
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev42);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_weighted_sum failed: %s\n", e.what());
         return 0;
@@ -293,7 +295,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(
         const uint32_t embd = n_embd;
         const uint64_t n = (uint64_t)embd * n_tokens;
 
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+        sycl::event _ds4_prof_ev43 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
             const uint64_t gid = gid_id[0];
             const uint32_t d = (uint32_t)(gid % embd);
             const uint32_t t = (uint32_t)(gid / embd);
@@ -305,6 +307,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(
             o[(uint64_t)t * embd + d] = acc;
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev43);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_weighted_sum_split failed: %s\n", e.what());
         return 0;
@@ -331,11 +334,12 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
         const float *r = (const float *)row->ptr;
         const uint32_t embd = n_embd;
 
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+        sycl::event _ds4_prof_ev44 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
             const uint64_t gid = gid_id[0];
             o[gid] = r[gid % embd];
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev44);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "repeat_hc failed: %s\n", e.what());
         return 0;
@@ -367,13 +371,14 @@ extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_
         const uint32_t embd = n_embd;
         const uint64_t hc_row = (uint64_t)n_hc * n_embd;
 
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+        sycl::event _ds4_prof_ev45 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
             const uint64_t gid = gid_id[0];
             const uint64_t tok = gid / hc_row;
             const uint32_t d = (uint32_t)(gid % embd);
             o[gid] = rw[tok * embd + d];
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev45);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "repeat_hc_rows failed: %s\n", e.what());
         return 0;
@@ -460,7 +465,7 @@ extern "C" int ds4_gpu_hc_expand_tensor(
         const float *pp  = (const float *)post->ptr;
         const float *cp  = (const float *)comb->ptr;
 
-        q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+        sycl::event _ds4_prof_ev46 = q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
             const uint64_t gid = gid_id[0];
             const uint32_t d = (uint32_t)(gid % embd);
             const uint64_t tmp = gid / embd;
@@ -472,6 +477,7 @@ extern "C" int ds4_gpu_hc_expand_tensor(
             ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev46);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand failed: %s\n", e.what());
         return 0;
@@ -522,7 +528,7 @@ extern "C" int ds4_gpu_hc_expand_add_tensor(
         const float *pp  = (const float *)post->ptr;
         const float *cp  = (const float *)comb->ptr;
 
-        q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+        sycl::event _ds4_prof_ev47 = q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
             const uint64_t gid = gid_id[0];
             const uint32_t d = (uint32_t)(gid % embd);
             const uint64_t tmp = gid / embd;
@@ -534,6 +540,7 @@ extern "C" int ds4_gpu_hc_expand_add_tensor(
             ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev47);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_add failed: %s\n", e.what());
         return 0;
@@ -571,9 +578,10 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(
         const float *sp0 = (const float *)split->ptr;
         const uint32_t embd = n_embd;
 
+        sycl::event _ds4_prof_ev48;
         if (n_hc == 4u) {
             const uint64_t n = (uint64_t)n_tokens * n_embd;
-            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+            _ds4_prof_ev48 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
                 const uint64_t gid = gid_id[0];
                 const uint32_t d = (uint32_t)(gid % embd);
                 const uint64_t t = gid / embd;
@@ -592,7 +600,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(
             const float   *post = sp0 + hc;
             const float   *comb = sp0 + 2u * hc;
             const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-            q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+            _ds4_prof_ev48 = q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
                 const uint64_t gid = gid_id[0];
                 const uint32_t d = (uint32_t)(gid % embd);
                 const uint64_t tmp = gid / embd;
@@ -605,6 +613,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(
             });
         }
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev48);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_split failed: %s\n", e.what());
         return 0;
@@ -644,9 +653,10 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(
         const float    *sp0 = (const float *)split->ptr;
         const uint32_t  embd = n_embd;
 
+        sycl::event _ds4_prof_ev49;
         if (n_hc == 4u) {
             const uint64_t n = (uint64_t)n_tokens * n_embd;
-            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+            _ds4_prof_ev49 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
                 const uint64_t gid = gid_id[0];
                 const uint32_t d = (uint32_t)(gid % embd);
                 const uint64_t t = gid / embd;
@@ -665,7 +675,7 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(
             const float   *post = sp0 + hc;
             const float   *comb = sp0 + 2u * hc;
             const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-            q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+            _ds4_prof_ev49 = q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
                 const uint64_t gid = gid_id[0];
                 const uint32_t d = (uint32_t)(gid % embd);
                 const uint64_t tmp = gid / embd;
@@ -678,6 +688,7 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(
             });
         }
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev49);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_split_half failed: %s\n", e.what());
         return 0;
@@ -714,9 +725,10 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(
         const float *sp0 = (const float *)split->ptr;
         const uint32_t embd = n_embd;
 
+        sycl::event _ds4_prof_ev50;
         if (n_hc == 4u) {
             const uint64_t n = (uint64_t)n_tokens * n_embd;
-            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+            _ds4_prof_ev50 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
                 const uint64_t gid = gid_id[0];
                 const uint32_t d = (uint32_t)(gid % embd);
                 const uint64_t t = gid / embd;
@@ -735,7 +747,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(
             const float   *post = sp0 + hc;
             const float   *comb = sp0 + 2u * hc;
             const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-            q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+            _ds4_prof_ev50 = q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
                 const uint64_t gid = gid_id[0];
                 const uint32_t d = (uint32_t)(gid % embd);
                 const uint64_t tmp = gid / embd;
@@ -748,6 +760,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(
             });
         }
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev50);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_add_split failed: %s\n", e.what());
         return 0;
@@ -840,9 +853,10 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
         const float    *sp0 = (const float *)split->ptr;
         const uint32_t  embd = n_embd;
 
+        sycl::event _ds4_prof_ev51;
         if (n_hc == 4u) {
             const uint64_t n = (uint64_t)n_tokens * n_embd;
-            q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
+            _ds4_prof_ev51 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid_id) {
                 const uint64_t gid = gid_id[0];
                 const uint32_t d = (uint32_t)(gid % embd);
                 const uint64_t t = gid / embd;
@@ -861,7 +875,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
             const float   *post = sp0 + hc;
             const float   *comb = sp0 + 2u * hc;
             const uint64_t n_elem = (uint64_t)n_tokens * n_hc * n_embd;
-            q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
+            _ds4_prof_ev51 = q.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> gid_id) {
                 const uint64_t gid = gid_id[0];
                 const uint32_t d = (uint32_t)(gid % embd);
                 const uint64_t tmp = gid / embd;
@@ -875,6 +889,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
             });
         }
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev51);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_add_split_half_add failed: %s\n", e.what());
         return 0;
@@ -992,7 +1007,7 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
         const uint64_t rbytes = row_bytes;
         const bool has_add = block_add != nullptr;
 
-        q.parallel_for(sycl::range<1>(out_d), [=](sycl::id<1> gid_id) {
+        sycl::event _ds4_prof_ev52 = q.parallel_for(sycl::range<1>(out_d), [=](sycl::id<1> gid_id) {
             const uint32_t d = (uint32_t)gid_id[0];
             const unsigned char *wr = dw + (uint64_t)d * rbytes;
             float acc = 0.0f;
@@ -1016,6 +1031,7 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
             }
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev52);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s failed: %s\n",
                 label ? label : "matmul_q8_0_hc_expand", e.what());
@@ -1199,7 +1215,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
         const uint32_t iters = sinkhorn_iters;
         const float    epsv  = eps;
 
-        q.parallel_for(
+        sycl::event _ds4_prof_ev53 = q.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>((size_t)rows * kSyclHcRowGroup),
                                   sycl::range<1>(kSyclHcRowGroup)),
                 [=](sycl::nd_item<1> it) {
@@ -1227,6 +1243,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
                     }
                 });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev53);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_weighted_sum failed: %s\n", e.what());
         return 0;
@@ -1307,7 +1324,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         const float    epsv      = eps;
         const float    norm_epsv = norm_eps;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev54 = q.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> partial(sycl::range<1>(kSyclHcRowGroup), h);
             h.parallel_for(
                     sycl::nd_range<1>(sycl::range<1>((size_t)rows * kSyclHcRowGroup),
@@ -1342,6 +1359,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                     });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev54);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_weighted_sum_norm failed: %s\n", e.what());
         return 0;

@@ -56,13 +56,14 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(
 
         float         *o = (float *)out_hc->ptr;
         const uint32_t e_stride = n_embd;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+        sycl::event _ds4_prof_ev33 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
             const size_t e = gid % e_stride;
             /* Broadcast: e cycles over [0,n_embd) as gid advances, so
              * every one of the n_hc rows receives the same values. */
             o[gid] = (float)sycl::bit_cast<sycl::half>(drow[e]);
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev33);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_token_hc failed: %s\n",
                 e.what());
@@ -114,11 +115,12 @@ static int ds4_sycl_embed_token_hc_q8_0(ds4_gpu_tensor *out_hc,
 
         float         *o = (float *)out_hc->ptr;
         const uint32_t e_stride = n_embd;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+        sycl::event _ds4_prof_ev34 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
             const size_t e = gid % e_stride;
             o[gid] = sycl_q8_0_dequant(drow, (uint32_t)e);
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev34);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_token_hc_q8_0 failed: %s\n",
                 e.what());
@@ -196,7 +198,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
         const uint32_t  e_stride = n_embd;
         const uint32_t  hc       = n_hc;
         const uint32_t  vocab    = n_vocab;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+        sycl::event _ds4_prof_ev35 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
             const size_t d   = gid % e_stride;
             const size_t t   = (gid / e_stride) / hc;
             int32_t      raw_tok = tok[t];
@@ -205,6 +207,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
             o[gid] = (float)sycl::bit_cast<sycl::half>(dtab[(size_t)tk * e_stride + d]);
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev35);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_tokens_hc failed: %s\n",
                 e.what());
@@ -260,7 +263,7 @@ static int ds4_sycl_embed_tokens_hc_q8_0(ds4_gpu_tensor *out_hc,
         const uint32_t  hc       = n_hc;
         const uint32_t  vocab    = n_vocab;
         const uint64_t  rb       = row_bytes;
-        q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+        sycl::event _ds4_prof_ev36 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
             const size_t d   = gid % e_stride;
             const size_t t   = (gid / e_stride) / hc;
             int32_t      raw_tok = tok[t];
@@ -269,6 +272,7 @@ static int ds4_sycl_embed_tokens_hc_q8_0(ds4_gpu_tensor *out_hc,
             o[gid] = sycl_q8_0_dequant(dtab + (size_t)tk * rb, (uint32_t)d);
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev36);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_tokens_hc_q8_0 failed: %s\n",
                 e.what());

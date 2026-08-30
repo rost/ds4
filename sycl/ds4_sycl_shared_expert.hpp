@@ -100,7 +100,7 @@ static void sycl_shared_gate_up_swiglu_q8_0_rows_w32(
     const uint32_t n_groups = (out_dim + kRowsPerBlock - 1u) / kRowsPerBlock;
     const size_t local_size = (size_t)kRowsPerBlock * 32u;
 
-    q.submit([&](sycl::handler &h) {
+    sycl::event _ds4_prof_ev146 = q.submit([&](sycl::handler &h) {
         h.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>((size_t)n_groups * local_size),
                                   sycl::range<1>(local_size)),
@@ -604,7 +604,7 @@ static int sycl_shared_gate_up_swiglu_q8_0_batch(
         float *pmid = (float *)mid->ptr;
         const float *px = (const float *)x->ptr;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev147 = q.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> shx(sycl::range<1>(shmem_floats),
                                                h);
             h.parallel_for(
@@ -705,6 +705,7 @@ static int sycl_shared_gate_up_swiglu_q8_0_batch(
                     });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev147);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "shared gate/up fused q8 batch launch failed: %s\n",

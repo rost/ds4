@@ -133,7 +133,7 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x,
         float         *px    = (float *)x->ptr;
         const uint32_t width = head_dim;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev37 = q.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> scratch(sycl::range<1>(kFp8KvGroup), h);
             h.parallel_for(
                 sycl::nd_range<2>(
@@ -173,6 +173,7 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x,
                 });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev37);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "dsv4_fp8_kv_quantize failed: %s\n",
                 e.what());
@@ -230,12 +231,13 @@ extern "C" int ds4_sycl_test_sycl_half_encode_bits(float f, uint16_t *out_bits) 
         uint16_t *dout = sycl::malloc_shared<uint16_t>(1, q);
         sycl_device_scratch_guard guard(q, dout);
         if (!dout) return 0;
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev38 = q.submit([&](sycl::handler &h) {
             h.single_task([=]() {
                 dout[0] = sycl::bit_cast<uint16_t>((sycl::half)f);
             });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev38);
         *out_bits = dout[0];
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "sycl_half_encode_bits probe failed: %s\n",
@@ -306,12 +308,13 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache,
         float         *praw = (float *)raw_cache->ptr;
         const float   *pkv  = (const float *)kv->ptr;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev39 = q.submit([&](sycl::handler &h) {
             h.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> gid_id) {
                 sycl_store_raw_kv_batch_kernel(gid_id, praw, pkv, raw_cap, pos0, head_dim);
             });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev39);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "store_raw_kv_batch failed: %s\n",
                 e.what());
@@ -417,7 +420,7 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
         const uint32_t   width = head_dim;
         const uint64_t   n     = (uint64_t)n_rows * width;
 
-        q.submit([&](sycl::handler &h) {
+        sycl::event _ds4_prof_ev40 = q.submit([&](sycl::handler &h) {
             h.parallel_for(sycl::range<1>((size_t)n), [=](sycl::id<1> gid_id) {
                 const uint64_t  gid = gid_id[0];
                 const uint32_t  d   = (uint32_t)(gid % width);
@@ -431,6 +434,7 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
             });
         });
         q.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev40);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "kv_fp8_store_raw_decode_rows failed: %s\n", e.what());

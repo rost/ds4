@@ -228,7 +228,9 @@ extern "C" int ds4_gpu_device_cache_tensors(int                    device_id,
     try {
         const uint64_t old_bytes = c.bytes;
         if (c.base && old_bytes > 0) {
-            q.memcpy(new_base, c.base, (size_t)old_bytes).wait_and_throw();
+            sycl::event _ds4_prof_ev144 = q.memcpy(new_base, c.base, (size_t)old_bytes);
+            _ds4_prof_ev144.wait_and_throw();
+            ds4_sycl_profile_record(_ds4_prof_ev144);
             for (sycl_placement_cache_range &r : c.ranges) {
                 r.device_ptr = new_base + (r.device_ptr - c.base);
             }
