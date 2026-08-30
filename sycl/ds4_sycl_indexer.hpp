@@ -1096,6 +1096,162 @@ extern "C" int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
  * baseline DeepSeek V4 Flash's own forward pass. Left stubbed in
  * ds4_sycl_unavailable.cpp; see this file's header comment. */
 
+/* Tensor parallelism: per-token top1 over one rank's OWN
+ * n_comp-wide slice of indexer scores, with index_offset added to the
+ * winning index so the two ranks' picks are directly comparable once
+ * exchanged (this rank's local index i becomes global index
+ * index_offset + i). Same one-work-group-per-token block reduction as
+ * ds4_gpu_argmax_tensor above, generalised to n_tokens groups and reusing
+ * this file's own sycl_topk_score_better -- the identical ascending-index
+ * tie-break as ds4_cuda.cu's topk_score_better (`av > bv || (av == bv &&
+ * ai < bi)`), verified against ds4_cuda.cu:13086-13088 directly rather
+ * than assumed from the sibling entries in this file. Ported from
+ * indexer_top1_value_kernel, ds4_cuda.cu:13219-13266: values[t] is the
+ * LOCAL best score (no offset), selected[t] is index_offset + local best
+ * index, matching ds4_cuda.cu:13263-13265 exactly.
+ *
+ * Validation ported from ds4_cuda.cu:14349-14354. NONZERO means success,
+ * matching ds4_gpu.h and ds4_cuda.cu's own `cuda_ok(...)` return. */
+extern "C" int ds4_gpu_indexer_top1_value_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *values,
+        const ds4_gpu_tensor *scores,
+        uint32_t                n_comp,
+        uint32_t                n_tokens,
+        uint32_t                index_offset) {
+    if (!selected || !values || !scores || n_comp == 0u || n_tokens == 0u ||
+        !sycl_tensor_has_elems2(scores, n_tokens, n_comp, sizeof(float)) ||
+        !sycl_tensor_has_elems(selected, n_tokens, sizeof(uint32_t)) ||
+        !sycl_tensor_has_f32(values, n_tokens)) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+
+    constexpr uint32_t kThreads = 1024u;
+    try {
+        sycl::queue &q = ds4_sycl_queue(selected->device_id);
+        uint32_t    *psel = (uint32_t *)selected->ptr;
+        float       *pval = (float *)values->ptr;
+        const float *pscores = (const float *)scores->ptr;
+        const uint32_t comp = n_comp;
+        const uint32_t off = index_offset;
+
+        q.submit([&](sycl::handler &h) {
+            sycl::local_accessor<float, 1> sm_val(sycl::range<1>(kThreads), h);
+            sycl::local_accessor<uint32_t, 1> sm_idx(sycl::range<1>(kThreads), h);
+            h.parallel_for(
+                    sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * kThreads),
+                                      sycl::range<1>(kThreads)),
+                    [=](sycl::nd_item<1> it) {
+                        const uint32_t tid = (uint32_t)it.get_local_id(0);
+                        const uint64_t t = it.get_group(0);
+                        const float *row = pscores + t * comp;
+                        float local_v = -INFINITY;
+                        uint32_t local_i = 0;
+                        for (uint32_t i = tid; i < comp; i += kThreads) {
+                            const float v = row[i];
+                            if (sycl_topk_score_better(v, off + i, local_v, off + local_i)) {
+                                local_v = v;
+                                local_i = i;
+                            }
+                        }
+                        sm_val[tid] = local_v;
+                        sm_idx[tid] = local_i;
+                        it.barrier(sycl::access::fence_space::local_space);
+                        for (uint32_t s = kThreads / 2u; s > 0u; s >>= 1u) {
+                            if (tid < s) {
+                                const float vr = sm_val[tid + s];
+                                const uint32_t ir = sm_idx[tid + s];
+                                if (sycl_topk_score_better(vr, off + ir, sm_val[tid], off + sm_idx[tid])) {
+                                    sm_val[tid] = vr;
+                                    sm_idx[tid] = ir;
+                                }
+                            }
+                            it.barrier(sycl::access::fence_space::local_space);
+                        }
+                        if (tid == 0u) {
+                            psel[t] = off + sm_idx[0];
+                            pval[t] = sm_val[0];
+                        }
+                    });
+        });
+        q.wait_and_throw();
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer_top1_value launch failed: %s\n", e.what());
+        return 0;
+    }
+    return 1;
+}
+
+/* Tensor parallelism: the vocab-split output head. Each rank
+ * computes the Q8_0 dense matmul over its OWN half of the vocabulary
+ * (weight_offset/out_dim already restricted to that half by the caller,
+ * ds4.c:25382/25414 region) and reduces straight to its own top1 without
+ * ever materialising the full out_dim logits row to the caller -- only to
+ * an internal scratch buffer, matching ds4_cuda.cu's own
+ * best_key/xq/xscale scratch, which is also never exposed past this
+ * entry. ds4_cuda.cu's real kernel pair (quantize_q8_0_f32_kernel +
+ * matmul_q8_0_top1_preq_warp8_kernel + matmul_q8_0_top1_unpack_kernel,
+ * ds4_cuda.cu:14784-14857) fuses the matmul and the argmax into one
+ * atomic-packed-key reduction; this port composes sycl_q8_0_matmul_general
+ * (ds4_sycl_matmul.hpp, already implemented for the plain Q8_0 dense
+ * matmul) with ds4_gpu_indexer_top1_value_tensor above instead of writing
+ * a second top1 reduction, the same "compose rather than duplicate" choice
+ * already made for the kslice+HC-expand fusion in
+ * ds4_sycl_hc.hpp.
+ *
+ * Deliberate divergence, documented rather than silently accepted: CUDA's
+ * atomic packed-key max has no serialised tie-break (multiple thread
+ * blocks race on atomicMax; ds4_cuda.cu never documents which of two
+ * exactly-tied logits wins), whereas ds4_gpu_indexer_top1_value_tensor's
+ * tree reduction gives a deterministic ascending-index tie-break. Exact
+ * float ties between two different vocabulary rows are exceedingly rare
+ * on real weights, and this port picks the more useful, deterministic
+ * behaviour rather than reproducing an unspecified race. Every tensor
+ * involved (x, selected, values) is assumed to share one device, the same
+ * assumption ds4_gpu_indexer_top1_value_tensor itself makes and the only
+ * shape this call site (single-token decode) ever produces.
+ *
+ * Validation ported from ds4_cuda.cu:14794-14808 (minus the CUDA-specific
+ * temp-buffer layout, replaced by a single sycl::malloc_device<float>
+ * scratch of out_dim elements, freed via sycl_device_scratch_guard).
+ * NONZERO means success. */
+extern "C" int ds4_gpu_matmul_q8_0_top1_tensor(
+        ds4_gpu_tensor       *selected,
+        ds4_gpu_tensor       *values,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t                index_offset) {
+    if (!selected || !values || !x || !model_map || in_dim == 0u ||
+        out_dim == 0u || out_dim > UINT32_MAX) {
+        return 0;
+    }
+    if (g_devices.empty()) return 0;
+    const int device_id = x->device_id >= 0 ? x->device_id : g_current_tier;
+
+    try {
+        sycl::queue &q = ds4_sycl_queue(device_id);
+        float *scratch = sycl::malloc_device<float>((size_t)out_dim, q);
+        if (!scratch) return 0;
+        sycl_device_scratch_guard scratch_guard(q, scratch);
+        ds4_gpu_tensor logits = {scratch, out_dim * sizeof(float), 0, device_id};
+
+        if (!sycl_q8_0_matmul_general(&logits, model_map, model_size, weight_offset,
+                                      in_dim, out_dim, x, 1u)) {
+            return 0;
+        }
+        return ds4_gpu_indexer_top1_value_tensor(selected, values, &logits,
+                                                 (uint32_t)out_dim, 1u, index_offset);
+    } catch (const sycl::exception &e) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0_top1 failed: %s\n", e.what());
+        return 0;
+    }
+}
+
 /* Top-k selection over indexer scores: single-block bitonic kernels for
  * n_comp <= 8192, the tree-merge path for n_comp > 8192, both only for
  * top_k in {512, 1024, 2048}, and the brute-force fallback for every

@@ -511,6 +511,281 @@ static int test_argmax_zero_and_null_rejections(void) {
     return 0;
 }
 
+/* ---- Tensor parallelism: top1 tests --------------------------
+ *
+ * ds4_gpu_indexer_top1_value_tensor and ds4_gpu_matmul_q8_0_top1_tensor
+ * are both per-rank local reductions: they never need a second GPU to
+ * exercise correctly, only the cross-rank GATHER of their two results
+ * (not part of this backend's ABI -- ds4.c does that host-side after
+ * reading both ranks' selected/values back) is the part a single A770
+ * cannot exercise. Every test below is a full, non-vacuous proof of this
+ * entry's own contract. */
+
+static int32_t oracle_top1_index(const float *row, uint32_t n_comp, uint32_t index_offset,
+                                 float *out_val) {
+    float best_v = -INFINITY;
+    uint32_t best_gi = 0;
+    for (uint32_t i = 0; i < n_comp; i++) {
+        const uint32_t gi = index_offset + i;
+        /* Matches sycl_topk_score_better / ds4_cuda.cu's topk_score_better:
+         * strictly greater wins; on an exact tie the lower GLOBAL index
+         * wins, so index_offset must be included in the comparison, not
+         * just in the value written out. */
+        if (row[i] > best_v || (row[i] == best_v && gi < best_gi)) {
+            best_v = row[i];
+            best_gi = gi;
+        }
+    }
+    if (out_val) *out_val = best_v;
+    return (int32_t)best_gi;
+}
+
+static int run_indexer_top1_case(const char *name, uint32_t n_comp, uint32_t index_offset,
+                                 uint32_t seed, int has_tie, uint32_t tie_a, uint32_t tie_b,
+                                 float tie_val) {
+    float *row = (float *)malloc((size_t)n_comp * sizeof(float));
+    CHECK(row != NULL, "indexer_top1: host alloc");
+    for (uint32_t i = 0; i < n_comp; i++) {
+        uint32_t h = (i * 2654435761u + seed * 97u) ^ (i << 4);
+        row[i] = (float)((int32_t)(h % 20001) - 10000) * 0.0001f;
+    }
+    if (has_tie) {
+        row[tie_a] = tie_val;
+        row[tie_b] = tie_val;
+    }
+    float want_val = 0.0f;
+    int32_t want_idx = oracle_top1_index(row, n_comp, index_offset, &want_val);
+
+    ds4_gpu_tensor *tscores = ds4_gpu_tensor_alloc((uint64_t)n_comp * sizeof(float));
+    ds4_gpu_tensor *tsel = ds4_gpu_tensor_alloc(sizeof(uint32_t));
+    ds4_gpu_tensor *tval = ds4_gpu_tensor_alloc(sizeof(float));
+    CHECK(tscores && tsel && tval, "indexer_top1: alloc");
+    CHECK(ds4_gpu_tensor_write(tscores, 0, row, (uint64_t)n_comp * sizeof(float)) != 0,
+          "indexer_top1: write");
+    CHECK(ds4_gpu_indexer_top1_value_tensor(tsel, tval, tscores, n_comp, 1u, index_offset) != 0,
+          "indexer_top1: call");
+    uint32_t got_idx = 0;
+    float got_val = 0.0f;
+    CHECK(ds4_gpu_tensor_read(tsel, 0, &got_idx, sizeof(got_idx)) != 0, "indexer_top1: read sel");
+    CHECK(ds4_gpu_tensor_read(tval, 0, &got_val, sizeof(got_val)) != 0, "indexer_top1: read val");
+    if ((int32_t)got_idx != want_idx || got_val != want_val) {
+        fprintf(stderr, "FAIL: %s: got idx=%u val=%.6f want idx=%d val=%.6f\n", name, got_idx,
+                (double)got_val, want_idx, (double)want_val);
+        free(row);
+        return 1;
+    }
+    ds4_gpu_tensor_free(tscores);
+    ds4_gpu_tensor_free(tsel);
+    ds4_gpu_tensor_free(tval);
+    free(row);
+    fprintf(stderr, "  %s OK\n", name);
+    return 0;
+}
+
+static int test_indexer_top1_no_tie(void) {
+    return run_indexer_top1_case("test_indexer_top1_no_tie", 1500, 0, 5, 0, 0, 0, 0.0f);
+}
+
+/* index_offset nonzero: this rank's local index i must become global
+ * index index_offset + i in the written selection, and the tie-break
+ * itself must compare on the GLOBAL index (see oracle_top1_index), not
+ * the local one -- the whole reason index_offset exists is so two ranks'
+ * picks are directly comparable once exchanged. */
+static int test_indexer_top1_with_offset(void) {
+    return run_indexer_top1_case("test_indexer_top1_with_offset", 1500, 4096u, 6, 0, 0, 0, 0.0f);
+}
+
+/* Adversarial per spec 6i, same reasoning as test_argmax_tie_small_xor/
+ * test_argmax_tie_large_xor above: a small-XOR tie (indices 3 and 2) and a
+ * large-XOR tie (indices 700 and 3), tested with a nonzero index_offset so
+ * the tie is broken on the GLOBAL index, not the local one. */
+static int test_indexer_top1_tie_small_xor(void) {
+    return run_indexer_top1_case("test_indexer_top1_tie_small_xor", 1500, 4096u, 12, 1, 3, 2,
+                                 500.0f);
+}
+
+static int test_indexer_top1_tie_large_xor(void) {
+    return run_indexer_top1_case("test_indexer_top1_tie_large_xor", 1500, 4096u, 18, 1, 700, 3,
+                                 500.0f);
+}
+
+/* Multi-token: every token's row must be reduced independently -- a
+ * kernel that let one token's data leak into another's block would still
+ * pass every single-token case above. */
+static int test_indexer_top1_multi_token(void) {
+    enum { N_TOK = 5, N_COMP = 777 };
+    float scores[N_TOK * N_COMP];
+    int32_t want_idx[N_TOK];
+    float want_val[N_TOK];
+    for (int t = 0; t < N_TOK; t++) {
+        for (int i = 0; i < N_COMP; i++) {
+            uint32_t h = ((uint32_t)i * 2654435761u + (uint32_t)t * 999331u) ^ ((uint32_t)i << 3);
+            scores[t * N_COMP + i] = (float)((int32_t)(h % 20001) - 10000) * 0.0001f;
+        }
+        want_idx[t] = oracle_top1_index(scores + t * N_COMP, N_COMP, 0u, &want_val[t]);
+    }
+
+    ds4_gpu_tensor *tscores = ds4_gpu_tensor_alloc(sizeof(scores));
+    ds4_gpu_tensor *tsel = ds4_gpu_tensor_alloc(N_TOK * sizeof(uint32_t));
+    ds4_gpu_tensor *tval = ds4_gpu_tensor_alloc(N_TOK * sizeof(float));
+    CHECK(tscores && tsel && tval, "indexer_top1_multi_token: alloc");
+    CHECK(ds4_gpu_tensor_write(tscores, 0, scores, sizeof(scores)) != 0,
+          "indexer_top1_multi_token: write");
+    CHECK(ds4_gpu_indexer_top1_value_tensor(tsel, tval, tscores, N_COMP, N_TOK, 0u) != 0,
+          "indexer_top1_multi_token: call");
+    uint32_t got_idx[N_TOK];
+    float got_val[N_TOK];
+    CHECK(ds4_gpu_tensor_read(tsel, 0, got_idx, sizeof(got_idx)) != 0,
+          "indexer_top1_multi_token: read sel");
+    CHECK(ds4_gpu_tensor_read(tval, 0, got_val, sizeof(got_val)) != 0,
+          "indexer_top1_multi_token: read val");
+    for (int t = 0; t < N_TOK; t++) {
+        CHECK((int32_t)got_idx[t] == want_idx[t], "indexer_top1_multi_token: index mismatch");
+        CHECK(got_val[t] == want_val[t], "indexer_top1_multi_token: value mismatch");
+    }
+    ds4_gpu_tensor_free(tscores);
+    ds4_gpu_tensor_free(tsel);
+    ds4_gpu_tensor_free(tval);
+    fprintf(stderr, "  test_indexer_top1_multi_token OK\n");
+    return 0;
+}
+
+static int test_indexer_top1_rejections(void) {
+    ds4_gpu_tensor *tscores = ds4_gpu_tensor_alloc(16 * sizeof(float));
+    ds4_gpu_tensor *tsel = ds4_gpu_tensor_alloc(sizeof(uint32_t));
+    ds4_gpu_tensor *tval = ds4_gpu_tensor_alloc(sizeof(float));
+    CHECK(tscores && tsel && tval, "indexer_top1_rejections: alloc");
+    CHECK(ds4_gpu_indexer_top1_value_tensor(tsel, tval, tscores, 0u, 1u, 0u) == 0,
+          "indexer_top1_rejections: zero n_comp");
+    CHECK(ds4_gpu_indexer_top1_value_tensor(tsel, tval, tscores, 16u, 0u, 0u) == 0,
+          "indexer_top1_rejections: zero n_tokens");
+    CHECK(ds4_gpu_indexer_top1_value_tensor(NULL, tval, tscores, 16u, 1u, 0u) == 0,
+          "indexer_top1_rejections: null selected");
+    CHECK(ds4_gpu_indexer_top1_value_tensor(tsel, NULL, tscores, 16u, 1u, 0u) == 0,
+          "indexer_top1_rejections: null values");
+    CHECK(ds4_gpu_indexer_top1_value_tensor(tsel, tval, NULL, 16u, 1u, 0u) == 0,
+          "indexer_top1_rejections: null scores");
+    CHECK(ds4_gpu_indexer_top1_value_tensor(tsel, tval, tscores, 32u, 1u, 0u) == 0,
+          "indexer_top1_rejections: undersized scores for n_comp");
+    ds4_gpu_tensor_free(tscores);
+    ds4_gpu_tensor_free(tsel);
+    ds4_gpu_tensor_free(tval);
+    fprintf(stderr, "  test_indexer_top1_rejections OK\n");
+    return 0;
+}
+
+/* ds4_gpu_matmul_q8_0_top1_tensor: the vocab-split output head. Composes
+ * a Q8_0 dense matmul (already proven correct by test_sycl_matmul.c) with
+ * the top1 reduction just proven above, so this test's job is proving the
+ * COMPOSITION -- weight staging into the right scratch shape, in_dim/
+ * out_dim threaded through correctly, index_offset applied at the right
+ * point -- not re-proving either half in isolation. */
+static void top1_encode_q8_0_row(unsigned char *row, uint32_t in_dim, uint32_t o) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        unsigned char *bp = row + (size_t)blk * 34u;
+        /* Scale varies by output row so different rows are not
+         * numerically degenerate copies of each other. */
+        const float scale_f = 0.02f * (float)(o + blk + 1u);
+        uint32_t bits;
+        memcpy(&bits, &scale_f, sizeof(bits));
+        const uint32_t sign = (bits >> 16) & 0x8000u;
+        const int32_t  exp  = (int32_t)((bits >> 23) & 0xFFu) - 127 + 15;
+        const uint32_t mant = bits & 0x7FFFFFu;
+        const uint16_t braw = (uint16_t)(sign | ((uint32_t)exp << 10) | (mant >> 13));
+        bp[0] = (unsigned char)(braw & 0xFFu);
+        bp[1] = (unsigned char)((braw >> 8) & 0xFFu);
+        for (uint32_t idx = 0; idx < 32u; idx++) {
+            const uint32_t k = blk * 32u + idx;
+            const int qv = (k < in_dim) ? (int)(((o + 1u) * (k + 7u)) % 13u) - 6 : 0;
+            bp[2 + idx] = (unsigned char)(signed char)qv;
+        }
+    }
+}
+
+static float top1_dequant(const unsigned char *row, uint32_t col) {
+    const uint32_t blk = col / 32u;
+    const uint32_t idx = col % 32u;
+    const unsigned char *bp = row + (size_t)blk * 34u;
+    const uint16_t raw = (uint16_t)(bp[0] | ((uint16_t)bp[1] << 8));
+    uint32_t sign = (uint32_t)(raw & 0x8000u) << 16;
+    uint32_t exp  = (uint32_t)(raw >> 10) & 0x1Fu;
+    uint32_t mant = (uint32_t)raw & 0x3FFu;
+    uint32_t bits = sign | ((exp - 15u + 127u) << 23) | (mant << 13);
+    float scale;
+    memcpy(&scale, &bits, sizeof(scale));
+    const signed char qv = (signed char)bp[2 + idx];
+    return scale * (float)qv;
+}
+
+static int test_matmul_q8_0_top1(void) {
+    enum { IN_DIM = 41, OUT_DIM = 200 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)OUT_DIM * row_bytes;
+    const uint32_t index_offset = 8192u;
+
+    unsigned char *weights = (unsigned char *)malloc((size_t)weight_bytes);
+    float x[IN_DIM];
+    CHECK(weights != NULL, "matmul_q8_0_top1: host alloc");
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        top1_encode_q8_0_row(weights + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) x[k] = (float)((k * 3u) % 11u) - 5.0f;
+
+    float want_val = -INFINITY;
+    uint32_t want_local = 0;
+    for (uint32_t o = 0; o < OUT_DIM; o++) {
+        double sum = 0.0;
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            sum += (double)x[k] * (double)top1_dequant(weights + (size_t)o * row_bytes, k);
+        }
+        const float v = (float)sum;
+        const uint32_t gi = index_offset + o;
+        const uint32_t best_gi = index_offset + want_local;
+        if (v > want_val || (v == want_val && gi < best_gi)) {
+            want_val = v;
+            want_local = o;
+        }
+    }
+
+    ds4_gpu_tensor *tx = ds4_gpu_tensor_alloc(sizeof(x));
+    ds4_gpu_tensor *tsel = ds4_gpu_tensor_alloc(sizeof(uint32_t));
+    ds4_gpu_tensor *tval = ds4_gpu_tensor_alloc(sizeof(float));
+    CHECK(tx && tsel && tval, "matmul_q8_0_top1: alloc");
+    CHECK(ds4_gpu_tensor_write(tx, 0, x, sizeof(x)) != 0, "matmul_q8_0_top1: write x");
+
+    CHECK(ds4_gpu_matmul_q8_0_top1_tensor(tsel, tval, weights, weight_bytes, 0, IN_DIM, OUT_DIM,
+                                          tx, index_offset) != 0,
+          "matmul_q8_0_top1: call");
+    uint32_t got_idx = 0;
+    float got_val = 0.0f;
+    CHECK(ds4_gpu_tensor_read(tsel, 0, &got_idx, sizeof(got_idx)) != 0,
+          "matmul_q8_0_top1: read sel");
+    CHECK(ds4_gpu_tensor_read(tval, 0, &got_val, sizeof(got_val)) != 0,
+          "matmul_q8_0_top1: read val");
+    CHECK(got_idx == index_offset + want_local, "matmul_q8_0_top1: index mismatch");
+    CHECK_CLOSE(got_val, want_val, 1e-2, "matmul_q8_0_top1: value mismatch");
+
+    /* Validation. */
+    CHECK(ds4_gpu_matmul_q8_0_top1_tensor(tsel, tval, weights, weight_bytes, 0, 0, OUT_DIM, tx,
+                                          index_offset) == 0,
+          "matmul_q8_0_top1: zero in_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_top1_tensor(tsel, tval, weights, weight_bytes, 0, IN_DIM, 0, tx,
+                                          index_offset) == 0,
+          "matmul_q8_0_top1: zero out_dim must be rejected");
+    CHECK(ds4_gpu_matmul_q8_0_top1_tensor(tsel, tval, weights, weight_bytes, weight_bytes, IN_DIM,
+                                          OUT_DIM, tx, index_offset) == 0,
+          "matmul_q8_0_top1: out-of-range weight offset must be rejected");
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tsel);
+    ds4_gpu_tensor_free(tval);
+    free(weights);
+    fprintf(stderr, "  test_matmul_q8_0_top1 OK\n");
+    return 0;
+}
+
 /* ---- Mask tests -------------------------------------------------------- */
 
 static int test_mask_matches_selected_and_rejects_out_of_range(void) {
@@ -949,6 +1224,14 @@ int main(void) {
     failures += test_argmax_tie_small_xor();
     failures += test_argmax_tie_large_xor();
     failures += test_argmax_zero_and_null_rejections();
+
+    failures += test_indexer_top1_no_tie();
+    failures += test_indexer_top1_with_offset();
+    failures += test_indexer_top1_tie_small_xor();
+    failures += test_indexer_top1_tie_large_xor();
+    failures += test_indexer_top1_multi_token();
+    failures += test_indexer_top1_rejections();
+    failures += test_matmul_q8_0_top1();
 
     failures += test_mask_matches_selected_and_rejects_out_of_range();
     failures += test_mask_rejections();
