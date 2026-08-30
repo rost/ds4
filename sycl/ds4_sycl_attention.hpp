@@ -301,7 +301,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev1);
+        ds4_sycl_profile_record_named("attn_decode_mixed_one_fast_oldhip", _ds4_prof_ev1);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode oldhip fast launch failed: %s\n",
                 e.what());
@@ -816,7 +816,7 @@ static int sycl_attention_decode_batch_launch(
             });
         }
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev2);
+        ds4_sycl_profile_record_named("attn_decode_mixed_batch", _ds4_prof_ev2);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode batch launch failed: %s\n",
                 e.what());
@@ -1572,7 +1572,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                         });
             });
             dq.wait_and_throw();
-            ds4_sycl_profile_record(_ds4_prof_ev3);
+            ds4_sycl_profile_record_named("attn_decode_indexed_mixed_one_fast_oldhip", _ds4_prof_ev3);
             return 1;
         }
 
@@ -1591,7 +1591,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                                });
             });
             dq.wait_and_throw();
-            ds4_sycl_profile_record(_ds4_prof_ev4);
+            ds4_sycl_profile_record_named("indexer_topk_sort_512_asc", _ds4_prof_ev4);
             psorted = sorted_buf;
         }
         sycl_device_scratch_guard sorted_guard(dq, sorted_buf);
@@ -1616,7 +1616,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                         });
             });
             dq.wait_and_throw();
-            ds4_sycl_profile_record(_ds4_prof_ev5);
+            ds4_sycl_profile_record_named("attn_indexed_mixed_heads8_online", _ds4_prof_ev5);
             return 1;
         }
 
@@ -1639,7 +1639,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev6);
+        ds4_sycl_profile_record_named("attn_indexed_mixed", _ds4_prof_ev6);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention indexed mixed launch failed: %s\n",
                 e.what());
@@ -1910,7 +1910,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev7);
+        ds4_sycl_profile_record_named("attn_decode_rows_rope", _ds4_prof_ev7);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode rows launch failed: %s\n",
                 e.what());
@@ -1988,7 +1988,7 @@ static void sycl_attention_prefill_unpack_heads_launch(
     /* Every caller drains this launch with its own dq.wait_and_throw()
      * immediately after, so this event only needs to reach the profiler,
      * not be waited here too. */
-    ds4_sycl_profile_record(ev);
+    ds4_sycl_profile_record_named("attn_prefill_unpack_heads", ev);
 }
 
 /* attention_prefill_raw_kernel, attention.cuh:86-141: the scalar fallback,
@@ -2161,7 +2161,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                         });
             });
             dq.wait_and_throw();
-            ds4_sycl_profile_record(_ds4_prof_ev8);
+            ds4_sycl_profile_record_named("attn_static_mixed_heads8_online", _ds4_prof_ev8);
             return 1;
         }
 
@@ -2193,7 +2193,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                     scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * n_tokens),
                     (int64_t)n_head);
             ev1.wait_and_throw();
-            ds4_sycl_profile_record(ev1);
+            ds4_sycl_profile_record_named("attn_prefill_raw_qk_gemm", ev1);
 
             sycl::event _ds4_prof_ev9 = dq.submit([&](sycl::handler &h) {
                 sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(256u), h);
@@ -2207,7 +2207,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                         });
             });
             dq.wait_and_throw();
-            ds4_sycl_profile_record(_ds4_prof_ev9);
+            ds4_sycl_profile_record_named("attn_prefill_raw_softmax", _ds4_prof_ev9);
 
             sycl::event ev2 = sycl_gemm_batch_f32(
                     dq, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
@@ -2219,7 +2219,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                     out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * n_tokens),
                     (int64_t)n_head);
             ev2.wait_and_throw();
-            ds4_sycl_profile_record(ev2);
+            ds4_sycl_profile_record_named("attn_prefill_raw_av_gemm", ev2);
 
             sycl_attention_prefill_unpack_heads_launch(dq, pheads, out_tmp, n_tokens, n_head,
                                                        head_dim);
@@ -2242,7 +2242,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev10);
+        ds4_sycl_profile_record_named("attn_prefill_raw_scalar", _ds4_prof_ev10);
     } catch (const std::exception &e) {
         /* std::exception, not sycl::exception: oneMKL's own exceptions
          * (oneapi::mkl::invalid_argument and siblings, thrown synchronously
@@ -2580,7 +2580,7 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
                 scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * nt),
                 (int64_t)n_head);
         ev1.wait_and_throw();
-        ds4_sycl_profile_record(ev1);
+        ds4_sycl_profile_record_named("attn_prefill_mixed_qk_gemm", ev1);
 
         sycl::event _ds4_prof_ev11 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(256u), h);
@@ -2594,7 +2594,7 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev11);
+        ds4_sycl_profile_record_named("attn_prefill_mixed_softmax_tile", _ds4_prof_ev11);
 
         sycl::event ev2 = sycl_gemm_batch_f32(
                 dq, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
@@ -2606,7 +2606,7 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
                 out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * nt),
                 (int64_t)n_head);
         ev2.wait_and_throw();
-        ds4_sycl_profile_record(ev2);
+        ds4_sycl_profile_record_named("attn_prefill_mixed_av_gemm", ev2);
 
         sycl_attention_prefill_unpack_heads_launch(
                 dq, pheads + (uint64_t)t0 * n_head * head_dim, out_tmp, nt, n_head, head_dim);
@@ -2680,7 +2680,7 @@ static int sycl_attention_prefill_mixed_launch(
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev12);
+        ds4_sycl_profile_record_named("attn_static_mixed_heads8_online", _ds4_prof_ev12);
         return 1;
     }
 
@@ -2732,7 +2732,7 @@ static int sycl_attention_prefill_mixed_launch(
                 scores, (int64_t)n_keys, (int64_t)((uint64_t)n_keys * n_tokens),
                 (int64_t)n_head);
         ev1.wait_and_throw();
-        ds4_sycl_profile_record(ev1);
+        ds4_sycl_profile_record_named("attn_prefill_mixed_qk_gemm", ev1);
 
         sycl::event _ds4_prof_ev13 = dq.submit([&](sycl::handler &h) {
             sycl::local_accessor<float, 1> reduce_scratch(sycl::range<1>(256u), h);
@@ -2746,7 +2746,7 @@ static int sycl_attention_prefill_mixed_launch(
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev13);
+        ds4_sycl_profile_record_named("attn_prefill_mixed_softmax", _ds4_prof_ev13);
 
         sycl::event ev2 = sycl_gemm_batch_f32(
                 dq, oneapi::mkl::transpose::nontrans, oneapi::mkl::transpose::nontrans,
@@ -2758,7 +2758,7 @@ static int sycl_attention_prefill_mixed_launch(
                 out_tmp, (int64_t)head_dim, (int64_t)((uint64_t)head_dim * n_tokens),
                 (int64_t)n_head);
         ev2.wait_and_throw();
-        ds4_sycl_profile_record(ev2);
+        ds4_sycl_profile_record_named("attn_prefill_mixed_av_gemm", ev2);
 
         sycl_attention_prefill_unpack_heads_launch(dq, pheads, out_tmp, n_tokens, n_head,
                                                    head_dim);
@@ -2789,7 +2789,7 @@ static int sycl_attention_prefill_mixed_launch(
                 });
     });
     dq.wait_and_throw();
-    ds4_sycl_profile_record(_ds4_prof_ev14);
+    ds4_sycl_profile_record_named("attn_prefill_mixed_scalar", _ds4_prof_ev14);
     return 1;
 }
 

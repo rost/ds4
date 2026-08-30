@@ -851,7 +851,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
              out_bits[gid[0]] = sycl_f32_to_f16_bits_hip_round(out_f32[gid[0]]);
          });
          _ds4_prof_ev16.wait_and_throw();
-         ds4_sycl_profile_record(_ds4_prof_ev16);
+         ds4_sycl_profile_record_named("attn_output_test_quantize_q8_0_rows", _ds4_prof_ev16);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_q8_batch_f16 failed: %s\n",
                 e.what());

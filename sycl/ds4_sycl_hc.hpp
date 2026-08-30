@@ -210,7 +210,7 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(
                                scale, base, iters, epsv);
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev41);
+        ds4_sycl_profile_record_named("hc_split_sinkhorn", _ds4_prof_ev41);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_sinkhorn failed: %s\n", e.what());
         return 0;
@@ -258,7 +258,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_tensor(
             o[(uint64_t)t * embd + d] = acc;
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev42);
+        ds4_sycl_profile_record_named("hc_weighted_sum", _ds4_prof_ev42);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_weighted_sum failed: %s\n", e.what());
         return 0;
@@ -307,7 +307,7 @@ extern "C" int ds4_gpu_hc_weighted_sum_split_tensor(
             o[(uint64_t)t * embd + d] = acc;
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev43);
+        ds4_sycl_profile_record_named("hc_weighted_sum_split", _ds4_prof_ev43);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_weighted_sum_split failed: %s\n", e.what());
         return 0;
@@ -339,7 +339,7 @@ extern "C" int ds4_gpu_repeat_hc_tensor(ds4_gpu_tensor *out, const ds4_gpu_tenso
             o[gid] = r[gid % embd];
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev44);
+        ds4_sycl_profile_record_named("repeat_hc", _ds4_prof_ev44);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "repeat_hc failed: %s\n", e.what());
         return 0;
@@ -378,7 +378,7 @@ extern "C" int ds4_gpu_repeat_hc_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_
             o[gid] = rw[tok * embd + d];
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev45);
+        ds4_sycl_profile_record_named("repeat_hc_rows", _ds4_prof_ev45);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "repeat_hc_rows failed: %s\n", e.what());
         return 0;
@@ -477,7 +477,7 @@ extern "C" int ds4_gpu_hc_expand_tensor(
             ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev46);
+        ds4_sycl_profile_record_named("hc_expand", _ds4_prof_ev46);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand failed: %s\n", e.what());
         return 0;
@@ -540,7 +540,7 @@ extern "C" int ds4_gpu_hc_expand_add_tensor(
             ohc[t * hc * embd + (uint64_t)dst_hc * embd + d] = acc;
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev47);
+        ds4_sycl_profile_record_named("hc_expand_add", _ds4_prof_ev47);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_add failed: %s\n", e.what());
         return 0;
@@ -613,7 +613,7 @@ extern "C" int ds4_gpu_hc_expand_split_tensor(
             });
         }
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev48);
+        ds4_sycl_profile_record_named("hc_expand_split", _ds4_prof_ev48);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_split failed: %s\n", e.what());
         return 0;
@@ -688,7 +688,7 @@ extern "C" int ds4_gpu_hc_expand_split_half_tensor(
             });
         }
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev49);
+        ds4_sycl_profile_record_named("hc_expand_split_half", _ds4_prof_ev49);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_split_half failed: %s\n", e.what());
         return 0;
@@ -760,7 +760,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_tensor(
             });
         }
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev50);
+        ds4_sycl_profile_record_named("hc_expand_add_split", _ds4_prof_ev50);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_add_split failed: %s\n", e.what());
         return 0;
@@ -889,7 +889,7 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
             });
         }
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev51);
+        ds4_sycl_profile_record_named("hc_expand_add_split_half_add", _ds4_prof_ev51);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_expand_add_split_half_add failed: %s\n", e.what());
         return 0;
@@ -1031,7 +1031,7 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
             }
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev52);
+        ds4_sycl_profile_record_named("matmul_q8_0_hc_expand_labeled", _ds4_prof_ev52);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s failed: %s\n",
                 label ? label : "matmul_q8_0_hc_expand", e.what());
@@ -1243,7 +1243,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
                     }
                 });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev53);
+        ds4_sycl_profile_record_named("hc_split_weighted_sum", _ds4_prof_ev53);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_weighted_sum failed: %s\n", e.what());
         return 0;
@@ -1359,7 +1359,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
                     });
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev54);
+        ds4_sycl_profile_record_named("hc_split_weighted_sum_norm", _ds4_prof_ev54);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_weighted_sum_norm failed: %s\n", e.what());
         return 0;

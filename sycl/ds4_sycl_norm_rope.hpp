@@ -93,7 +93,7 @@ extern "C" int ds4_gpu_rms_norm_plain_rows_tensor(ds4_gpu_tensor *out,
                 });
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev130);
+        ds4_sycl_profile_record_named("rms_norm_plain_rows", _ds4_prof_ev130);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rms_norm_plain failed: %s\n",
                 e.what());
@@ -181,7 +181,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(
                 });
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev131);
+        ds4_sycl_profile_record_named("rms_norm_weight_rows", _ds4_prof_ev131);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rms_norm_weight failed: %s\n",
                 e.what());
@@ -329,7 +329,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
                 });
         });
         sq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev132);
+        ds4_sycl_profile_record_named("dsv4_qkv_rms_norm_rows", _ds4_prof_ev132);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "dsv4_qkv_rms_norm_rows failed: %s\n",
                 e.what());
@@ -537,7 +537,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
                 });
         });
         sq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev133);
+        ds4_sycl_profile_record_named("dsv4_qkv_rms_norm_rows_kv_rope", _ds4_prof_ev133);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "dsv4_qkv_rms_norm_rows_kv_rope failed: %s\n", e.what());
@@ -597,7 +597,7 @@ extern "C" int ds4_gpu_head_rms_norm_tensor(ds4_gpu_tensor *x, uint32_t n_tok,
                 });
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev134);
+        ds4_sycl_profile_record_named("head_rms_norm", _ds4_prof_ev134);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "head_rms_norm failed: %s\n",
                 e.what());
@@ -724,7 +724,7 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(
                 });
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev135);
+        ds4_sycl_profile_record_named("head_rms_norm_rope_tail", _ds4_prof_ev135);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "head_rms_norm_rope_tail failed: %s\n", e.what());
@@ -830,7 +830,7 @@ static int sycl_rope_tail_stride_tensor(
                 });
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev136);
+        ds4_sycl_profile_record_named("rope_tail_stride", _ds4_prof_ev136);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rope_tail failed: %s\n",
                 e.what());
@@ -972,7 +972,7 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
                 });
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev137);
+        ds4_sycl_profile_record_named("rope_tail_decode_rows", _ds4_prof_ev137);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rope_tail_decode_rows failed: %s\n",
                 e.what());

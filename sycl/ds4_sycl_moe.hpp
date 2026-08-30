@@ -59,7 +59,7 @@ static void sycl_moe_count_sorted_pairs(sycl::queue &q, const int32_t *selected,
          ref.fetch_add(1u);
      });
      _ds4_prof_ev77.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev77);
+     ds4_sycl_profile_record_named("moe_count_sorted_pairs", _ds4_prof_ev77);
 }
 
 /* moe_prefix_sorted_pairs_kernel, moe.cuh:1266-1279: a single-work-item
@@ -82,7 +82,7 @@ static void sycl_moe_prefix_sorted_pairs(sycl::queue &q, uint32_t *offsets,
          offsets[n_total_expert] = sum;
      });
      _ds4_prof_ev157.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev157);
+     ds4_sycl_profile_record_named("moe_prefix_sorted_pairs", _ds4_prof_ev157);
 }
 
 /* moe_scatter_sorted_pairs_deterministic_kernel, moe.cuh:1301-1316: one
@@ -105,7 +105,7 @@ static void sycl_moe_scatter_sorted_pairs_deterministic(
          }
      });
      _ds4_prof_ev78.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev78);
+     ds4_sycl_profile_record_named("moe_scatter_sorted_pairs", _ds4_prof_ev78);
 }
 
 /* moe_build_expert_tile_offsets_kernel, moe.cuh:1327-1340: single-work-item
@@ -123,7 +123,7 @@ static void sycl_moe_build_expert_tile_offsets(
          *tile_total = sum;
      });
      _ds4_prof_ev158.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev158);
+     ds4_sycl_profile_record_named("moe_build_expert_tile_offsets", _ds4_prof_ev158);
 }
 
 /* moe_build_expert_tiles_kernel, moe.cuh:1342-1350: one work-item per
@@ -143,7 +143,7 @@ static void sycl_moe_build_expert_tiles(
          }
      });
      _ds4_prof_ev79.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev79);
+     ds4_sycl_profile_record_named("moe_build_expert_tiles", _ds4_prof_ev79);
 }
 
 /* Combined scratch layout for one sorted-pairs-plus-tiles build: counts,
@@ -234,11 +234,11 @@ static bool sycl_moe_build_sorted_pairs(sycl::queue &q, const int32_t *d_selecte
     if (poison_for_test) {
         sycl::event _ds4_prof_ev80 = q.memset(scratch, 0xAB, (size_t)scratch_bytes);
         _ds4_prof_ev80.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev80);
+        ds4_sycl_profile_record_named("moe_build_sorted_pairs_poison_memset", _ds4_prof_ev80);
     }
     sycl::event _ds4_prof_ev81 = q.memset(counts, 0, (size_t)counts_bytes);
     _ds4_prof_ev81.wait_and_throw();
-    ds4_sycl_profile_record(_ds4_prof_ev81);
+    ds4_sycl_profile_record_named("moe_build_sorted_pairs_reset_counts", _ds4_prof_ev81);
     sycl_moe_count_sorted_pairs(q, d_selected, counts, pair_count, n_total_expert);
     sycl_moe_prefix_sorted_pairs(q, offsets, cursors, counts, n_total_expert);
     sycl_moe_scatter_sorted_pairs_deterministic(q, sorted_pairs, offsets,
@@ -344,7 +344,7 @@ static void sycl_moe_q8_k_quantize(sycl::queue &q, sycl_block_q8_K *out,
              });
      });
      _ds4_prof_ev82.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev82);
+     ds4_sycl_profile_record_named("moe_q8_k_quantize", _ds4_prof_ev82);
 }
 
 /* ---- Sub-group reductions -------------------------------------------
@@ -388,7 +388,7 @@ static void sycl_moe_sum(sycl::queue &q, float *out, const float *down,
          out[gid] = acc;
      });
      _ds4_prof_ev83.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev83);
+     ds4_sycl_profile_record_named("moe_sum", _ds4_prof_ev83);
 }
 
 static void sycl_moe_sum_f16(sycl::queue &q, float *out, const uint16_t *down_h,
@@ -406,7 +406,7 @@ static void sycl_moe_sum_f16(sycl::queue &q, float *out, const uint16_t *down_h,
          out[gid] = acc;
      });
      _ds4_prof_ev84.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev84);
+     ds4_sycl_profile_record_named("moe_sum_f16", _ds4_prof_ev84);
 }
 
 static void sycl_moe_sum_f16x2(sycl::queue &q, float *out, const uint16_t *down_h,
@@ -429,7 +429,7 @@ static void sycl_moe_sum_f16x2(sycl::queue &q, float *out, const uint16_t *down_
          out[out_off + 1u] = acc1;
      });
      _ds4_prof_ev85.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev85);
+     ds4_sycl_profile_record_named("moe_sum_f16x2", _ds4_prof_ev85);
 }
 
 /* Test-only: exercises sycl_moe_subgroup_sum<N> as a real N-wide
@@ -453,7 +453,7 @@ static void sycl_moe_test_subgroup_sum8(sycl::queue &q, const float *in,
              });
      });
      _ds4_prof_ev86.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev86);
+     ds4_sycl_profile_record_named("moe_test_subgroup_sum8", _ds4_prof_ev86);
 }
 
 static void sycl_moe_test_subgroup_sum16(sycl::queue &q, const float *in,
@@ -472,7 +472,7 @@ static void sycl_moe_test_subgroup_sum16(sycl::queue &q, const float *in,
              });
      });
      _ds4_prof_ev87.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev87);
+     ds4_sycl_profile_record_named("moe_test_subgroup_sum16", _ds4_prof_ev87);
 }
 
 /* ---- Q4_K ------------------------------------------------------------
@@ -617,7 +617,7 @@ static void sycl_moe_q4k_gate_up_mid_decode(
              });
      });
      _ds4_prof_ev88.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev88);
+     ds4_sycl_profile_record_named("moe_q4k_gate_up_mid_decode", _ds4_prof_ev88);
 }
 
 /* moe_gate_up_mid_q4K_expert_tile8_row32_kernel, moe.cuh:2021-2098:
@@ -704,7 +704,7 @@ static void sycl_moe_q4k_gate_up_mid_tile8(
              });
      });
      _ds4_prof_ev89.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev89);
+     ds4_sycl_profile_record_named("moe_q4k_gate_up_mid_tile8", _ds4_prof_ev89);
 }
 
 /* moe_down_q4K_sum6_qwarp32_kernel, moe.cuh:3075-3099: n_tokens == 1
@@ -746,7 +746,7 @@ static void sycl_moe_q4k_down_sum6(
              });
      });
      _ds4_prof_ev90.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev90);
+     ds4_sycl_profile_record_named("moe_q4k_down_sum6", _ds4_prof_ev90);
 }
 
 /* moe_down_q4K_qwarp32_kernel, moe.cuh:3162-3187: 1 < n_tokens < 32,
@@ -784,7 +784,7 @@ static void sycl_moe_q4k_down_untiled(
              });
      });
      _ds4_prof_ev91.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev91);
+     ds4_sycl_profile_record_named("moe_q4k_down_untiled", _ds4_prof_ev91);
 }
 
 /* moe_down_q4K_expert_tile8_row32_kernel, moe.cuh:3276-3330: n_tokens >=
@@ -851,7 +851,7 @@ static void sycl_moe_q4k_down_tile8(
              });
      });
      _ds4_prof_ev92.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev92);
+     ds4_sycl_profile_record_named("moe_q4k_down_tile8", _ds4_prof_ev92);
 }
 
 /* ---- IQ2_XXS ----------------------------------------------------------
@@ -1137,7 +1137,7 @@ static void sycl_moe_iq2_gate_up_mid_decode(
              });
      });
      _ds4_prof_ev93.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev93);
+     ds4_sycl_profile_record_named("moe_iq2_gate_up_mid_decode", _ds4_prof_ev93);
 }
 
 /* moe_gate_up_mid_expert_tile8_row32_kernel, moe.cuh:1545-1638: n_tokens >
@@ -1240,7 +1240,7 @@ static void sycl_moe_iq2_gate_up_mid_tile8(
              });
      });
      _ds4_prof_ev94.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev94);
+     ds4_sycl_profile_record_named("moe_iq2_gate_up_mid_tile8", _ds4_prof_ev94);
 }
 
 /* ---- Q2_K --------------------------------------------------------------
@@ -1441,7 +1441,7 @@ static void sycl_moe_q2k_down_direct(
              });
      });
      _ds4_prof_ev95.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev95);
+     ds4_sycl_profile_record_named("moe_q2k_down_direct", _ds4_prof_ev95);
 }
 
 /* moe_down_iq2_sum_qwarp32_batch_kernel, moe.cuh:3001-3036: iq2_iq2_path's
@@ -1484,7 +1484,7 @@ static void sycl_moe_iq2_down_direct(
              });
      });
      _ds4_prof_ev96.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev96);
+     ds4_sycl_profile_record_named("moe_iq2_down_direct", _ds4_prof_ev96);
 }
 
 /* moe_gate_up_mid_q2K_decode_q8_qwarp32_kernel, moe.cuh:2849-2907:
@@ -1581,7 +1581,7 @@ static void sycl_moe_q2k_gate_up_mid_decode(
              });
      });
      _ds4_prof_ev97.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev97);
+     ds4_sycl_profile_record_named("moe_q2k_gate_up_mid_decode", _ds4_prof_ev97);
 }
 
 /* ---- MXFP4 -------------------------------------------------------------
@@ -1709,7 +1709,7 @@ static void sycl_moe_mxfp4_gate_up_mid_decode(
              });
      });
      _ds4_prof_ev98.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev98);
+     ds4_sycl_profile_record_named("moe_mxfp4_gate_up_mid_decode", _ds4_prof_ev98);
 }
 
 /* moe_down_mxfp4_sum6_qwarp32_kernel<Batch>, rocm/ds4_rocm_moe.cuh:
@@ -1763,7 +1763,7 @@ static void sycl_moe_mxfp4_down_sum6(
              });
      });
      _ds4_prof_ev99.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev99);
+     ds4_sycl_profile_record_named("moe_mxfp4_down_sum6", _ds4_prof_ev99);
 }
 
 /* dev_dot_mxfp4_q8_K_block8, rocm/ds4_rocm_moe.cuh:524-546: the same
@@ -1880,7 +1880,7 @@ static void sycl_moe_mxfp4_gate_up_mid_tile8(
              });
      });
      _ds4_prof_ev100.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev100);
+     ds4_sycl_profile_record_named("moe_mxfp4_gate_up_mid_tile8", _ds4_prof_ev100);
 }
 
 /* moe_down_mxfp4_expert_tile8_row32_kernel, rocm/ds4_rocm_moe.cuh:
@@ -1955,7 +1955,7 @@ static void sycl_moe_mxfp4_down_tile8(
              });
      });
      _ds4_prof_ev101.wait_and_throw();
-     ds4_sycl_profile_record(_ds4_prof_ev101);
+     ds4_sycl_profile_record_named("moe_mxfp4_down_tile8", _ds4_prof_ev101);
 }
 
 }  // namespace
@@ -2018,7 +2018,7 @@ extern "C" int ds4_sycl_moe_test_sort(const int32_t *selected, uint32_t pair_cou
                      (size_t)res.tile_capacity * sizeof(uint32_t));
         }
         q.wait_and_throw();
-        if (tile_starts_out) ds4_sycl_profile_record(_ds4_prof_ev102);
+        if (tile_starts_out) ds4_sycl_profile_record_named("moe_test_sort_setup", _ds4_prof_ev102);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_sort failed: %s\n", e.what());
@@ -2061,11 +2061,11 @@ extern "C" int ds4_sycl_moe_test_q8_k_quantize(const float *x, uint32_t in_dim,
 
         sycl::event _ds4_prof_ev103 = q.memcpy(d_x, x, (size_t)x_bytes);
         _ds4_prof_ev103.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev103);
+        ds4_sycl_profile_record_named("moe_test_q8k_quantize_setup", _ds4_prof_ev103);
         sycl_moe_q8_k_quantize(q, d_out, d_x, in_dim, n_rows);
         sycl::event _ds4_prof_ev104 = q.memcpy(out_bytes, d_out, (size_t)out_elem_bytes);
         _ds4_prof_ev104.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev104);
+        ds4_sycl_profile_record_named("moe_test_q8k_quantize_setup", _ds4_prof_ev104);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_q8_k_quantize failed: %s\n",
@@ -2091,7 +2091,7 @@ extern "C" int ds4_sycl_moe_test_subgroup_sum(int width, const float *in,
         sycl_device_scratch_guard out_guard(q, d_out);
         sycl::event _ds4_prof_ev105 = q.memcpy(d_in, in, n_in * sizeof(float));
         _ds4_prof_ev105.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev105);
+        ds4_sycl_profile_record_named("moe_test_subgroup_sum_setup", _ds4_prof_ev105);
         if (width == 8) {
             sycl_moe_test_subgroup_sum8(q, d_in, n_groups, d_out);
         } else {
@@ -2099,7 +2099,7 @@ extern "C" int ds4_sycl_moe_test_subgroup_sum(int width, const float *in,
         }
         sycl::event _ds4_prof_ev106 = q.memcpy(out, d_out, (size_t)n_groups * sizeof(float));
         _ds4_prof_ev106.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev106);
+        ds4_sycl_profile_record_named("moe_test_subgroup_sum_setup", _ds4_prof_ev106);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_subgroup_sum failed: %s\n",
@@ -2135,7 +2135,7 @@ extern "C" int ds4_sycl_moe_test_sum(int mode, const void *down, uint32_t out_di
         sycl_device_scratch_guard out_guard(q, d_out);
         sycl::event _ds4_prof_ev107 = q.memcpy(d_down, down, n_down * elem_size);
         _ds4_prof_ev107.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev107);
+        ds4_sycl_profile_record_named("moe_test_sum_setup", _ds4_prof_ev107);
         if (mode == 0) {
             sycl_moe_sum(q, d_out, (const float *)d_down, out_dim, n_expert, n_tokens);
         } else if (mode == 1) {
@@ -2147,7 +2147,7 @@ extern "C" int ds4_sycl_moe_test_sum(int mode, const void *down, uint32_t out_di
         }
         sycl::event _ds4_prof_ev108 = q.memcpy(out, d_out, n_out * sizeof(float));
         _ds4_prof_ev108.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev108);
+        ds4_sycl_profile_record_named("moe_test_sum_setup", _ds4_prof_ev108);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_sum failed: %s\n", e.what());
@@ -2203,14 +2203,14 @@ extern "C" int ds4_sycl_moe_test_q2k_down_direct(
         q.memcpy(d_midq, midq_bytes, (size_t)midq_bytes_total);
         sycl::event _ds4_prof_ev109 = q.memcpy(d_sel, selected, (size_t)sel_bytes);
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev109);
+        ds4_sycl_profile_record_named("moe_test_q2k_down_direct_setup", _ds4_prof_ev109);
 
         sycl_moe_q2k_down_direct(q, d_out, (const char *)d_down, (const sycl_block_q8_K *)d_midq,
                                  d_sel, down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
                                  n_expert, n_tokens);
         sycl::event _ds4_prof_ev110 = q.memcpy(out, d_out, (size_t)out_bytes);
         _ds4_prof_ev110.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev110);
+        ds4_sycl_profile_record_named("moe_test_q2k_down_direct_setup", _ds4_prof_ev110);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_q2k_down_direct failed: %s\n", e.what());
@@ -2277,7 +2277,7 @@ extern "C" int ds4_sycl_moe_test_mxfp4_gate_up_mid_decode(
         q.memcpy(sel_dev, selected, (size_t)sel_bytes);
         sycl::event _ds4_prof_ev111 = q.memcpy(w_dev, weights, (size_t)w_bytes);
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev111);
+        ds4_sycl_profile_record_named("moe_test_mxfp4_gate_up_mid_decode_setup", _ds4_prof_ev111);
 
         sycl_moe_q8_k_quantize(q, xq_dev, x_dev, in_dim, n_tokens);
         sycl_moe_mxfp4_gate_up_mid_decode(q, mid_dev, (const char *)gate_dev, (const char *)up_dev,
@@ -2285,7 +2285,7 @@ extern "C" int ds4_sycl_moe_test_mxfp4_gate_up_mid_decode(
                                           xq_blocks, mid_dim, n_expert, (uint32_t)pair_count, clamp);
         sycl::event _ds4_prof_ev112 = q.memcpy(mid_out, mid_dev, (size_t)mid_bytes);
         _ds4_prof_ev112.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev112);
+        ds4_sycl_profile_record_named("moe_test_mxfp4_gate_up_mid_decode_setup", _ds4_prof_ev112);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_mxfp4_gate_up_mid_decode failed: %s\n",
@@ -2341,7 +2341,7 @@ extern "C" int ds4_sycl_moe_test_mxfp4_down_sum6(
         q.memcpy(mid_dev, mid, (size_t)mid_bytes);
         sycl::event _ds4_prof_ev113 = q.memcpy(sel_dev, selected, (size_t)sel_bytes);
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev113);
+        ds4_sycl_profile_record_named("moe_test_mxfp4_down_sum6_setup", _ds4_prof_ev113);
 
         sycl_moe_q8_k_quantize(q, midq_dev, mid_dev, mid_dim, (uint32_t)pair_count);
         sycl_moe_mxfp4_down_sum6(q, out_dev, (const char *)down_dev, midq_dev, sel_dev,
@@ -2349,7 +2349,7 @@ extern "C" int ds4_sycl_moe_test_mxfp4_down_sum6(
                                  n_expert, n_tokens);
         sycl::event _ds4_prof_ev114 = q.memcpy(out, out_dev, (size_t)out_bytes);
         _ds4_prof_ev114.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev114);
+        ds4_sycl_profile_record_named("moe_test_mxfp4_down_sum6_setup", _ds4_prof_ev114);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_mxfp4_down_sum6 failed: %s\n", e.what());
@@ -2402,14 +2402,14 @@ extern "C" int ds4_sycl_moe_test_iq2_down_direct(
         q.memcpy(d_midq, midq_bytes, (size_t)midq_bytes_total);
         sycl::event _ds4_prof_ev115 = q.memcpy(d_sel, selected, (size_t)sel_bytes);
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev115);
+        ds4_sycl_profile_record_named("moe_test_iq2_down_direct_setup", _ds4_prof_ev115);
 
         sycl_moe_iq2_down_direct(q, d_out, (const char *)d_down, (const sycl_block_q8_K *)d_midq,
                                  d_sel, down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
                                  n_expert, n_tokens);
         sycl::event _ds4_prof_ev116 = q.memcpy(out, d_out, (size_t)out_bytes);
         _ds4_prof_ev116.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev116);
+        ds4_sycl_profile_record_named("moe_test_iq2_down_direct_setup", _ds4_prof_ev116);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_test_iq2_down_direct failed: %s\n", e.what());

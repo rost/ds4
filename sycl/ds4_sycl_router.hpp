@@ -265,7 +265,7 @@ static void sycl_router_select_launch(
                 });
     });
     q.wait_and_throw();
-    ds4_sycl_profile_record(_ds4_prof_ev145);
+    ds4_sycl_profile_record_named("router_select", _ds4_prof_ev145);
 }
 
 /* Validates the bias/hash table shared by both router entries and resolves

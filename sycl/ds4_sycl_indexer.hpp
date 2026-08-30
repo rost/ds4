@@ -338,7 +338,10 @@ static int sycl_indexer_scores_launch(
             });
         }
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev55);
+        ds4_sycl_profile_record_named(
+                (n_tokens == 1u && head_dim == 128u && n_head == 64u)
+                        ? "indexer_scores_direct" : "indexer_scores_general",
+                _ds4_prof_ev55);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer scores launch failed: %s\n", e.what());
         return 0;
@@ -792,7 +795,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
                        });
     });
     dq.wait_and_throw();
-    ds4_sycl_profile_record(_ds4_prof_ev56);
+    ds4_sycl_profile_record_named("indexer_topk_chunk_pow2", _ds4_prof_ev56);
 
     /* Tree levels: fold merge_group consecutive candidate sets together
      * per level until at most merge_group sets remain, matching ROCm's
@@ -820,7 +823,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev57);
+        ds4_sycl_profile_record_named("indexer_topk_tree_merge_pow2", _ds4_prof_ev57);
         cur = next;
         n_sets = next_sets;
         cur_stride = next_stride;
@@ -847,7 +850,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
     }
 
     dq.wait_and_throw();
-    ds4_sycl_profile_record(_ds4_prof_ev58);
+    ds4_sycl_profile_record_named("indexer_topk_merge_pow2_final", _ds4_prof_ev58);
     return 1;
 }
 
@@ -874,10 +877,24 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
         constexpr uint32_t kThreads = 1024u;
 
         const bool cascade_k = (top_k == 512u || top_k == 1024u || top_k == 2048u);
+        /* Every branch below now captures its own event and is
+         * recorded under its own name. Previously the four pow2 branches
+         * called dq.submit(...) without capturing the returned event at
+         * all, so the single ds4_sycl_profile_record(_ds4_prof_ev59) call
+         * after the if/else chain recorded a default-constructed, never-
+         * submitted event whenever one of those branches ran: get_
+         * profiling_info threw, was swallowed by that function's own
+         * try/catch, and the time these kernels actually took was not
+         * counted anywhere, not even in the unnamed aggregate total. The
+         * cascade_k-and-n_comp>8192 tree path is unaffected: it delegates
+         * to sycl_indexer_topk_tree_launch, which records its own three
+         * named stages internally, so _ds4_prof_ev59_name deliberately
+         * stays null on that branch and no redundant call is made. */
         sycl::event _ds4_prof_ev59;
+        const char *_ds4_prof_ev59_name = nullptr;
         if (cascade_k && n_comp <= 8192u) {
             if (n_comp <= 1024u) {
-                dq.submit([&](sycl::handler &h) {
+                _ds4_prof_ev59 = dq.submit([&](sycl::handler &h) {
                     sycl::local_accessor<float, 1> vals(sycl::range<1>(1024), h);
                     sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(1024), h);
                     h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * kThreads),
@@ -888,8 +905,9 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
                                                n_tokens, top_k);
                                    });
                 });
+                _ds4_prof_ev59_name = "indexer_topk_pow2_1024";
             } else if (n_comp <= 2048u) {
-                dq.submit([&](sycl::handler &h) {
+                _ds4_prof_ev59 = dq.submit([&](sycl::handler &h) {
                     sycl::local_accessor<float, 1> vals(sycl::range<1>(2048), h);
                     sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(2048), h);
                     h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * kThreads),
@@ -900,8 +918,9 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
                                                n_tokens, top_k);
                                    });
                 });
+                _ds4_prof_ev59_name = "indexer_topk_pow2_2048";
             } else if (n_comp <= 4096u) {
-                dq.submit([&](sycl::handler &h) {
+                _ds4_prof_ev59 = dq.submit([&](sycl::handler &h) {
                     sycl::local_accessor<float, 1> vals(sycl::range<1>(4096), h);
                     sycl::local_accessor<uint32_t, 1> idxs(sycl::range<1>(4096), h);
                     h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * kThreads),
@@ -912,8 +931,9 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
                                                n_tokens, top_k);
                                    });
                 });
+                _ds4_prof_ev59_name = "indexer_topk_pow2_4096";
             } else {
-                dq.submit([&](sycl::handler &h) {
+                _ds4_prof_ev59 = dq.submit([&](sycl::handler &h) {
                     sycl::local_accessor<float, 1> vals(sycl::range<1>(8192), h);
                     sycl::local_accessor<uint16_t, 1> idxs(sycl::range<1>(8192), h);
                     h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * kThreads),
@@ -924,6 +944,7 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
                                                n_tokens, top_k);
                                    });
                 });
+                _ds4_prof_ev59_name = "indexer_topk_pow2_8192_u16";
             }
         } else if (cascade_k) {
             if (!sycl_indexer_topk_tree_launch(dq, psel, pscores, n_comp, n_tokens, top_k)) {
@@ -938,9 +959,14 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
                                                             n_tokens, top_k);
                                });
             });
+            _ds4_prof_ev59_name = "indexer_topk_brute_force";
         }
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev59);
+        if (_ds4_prof_ev59_name) {
+            ds4_sycl_profile_record_named(_ds4_prof_ev59_name, _ds4_prof_ev59);
+        } else {
+            ds4_sycl_profile_record(_ds4_prof_ev59);
+        }
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer topk launch failed: %s\n", e.what());
         return 0;
@@ -994,7 +1020,7 @@ extern "C" int ds4_sycl_test_indexed_topk_sort_512_asc(ds4_gpu_tensor *dst,
                            });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev60);
+        ds4_sycl_profile_record_named("indexer_test_topk_sort_512_asc", _ds4_prof_ev60);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexed topk sort 512 asc failed: %s\n", e.what());
         return 0;
@@ -1093,7 +1119,7 @@ extern "C" int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev61);
+        ds4_sycl_profile_record_named("indexer_argmax", _ds4_prof_ev61);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "argmax launch failed: %s\n", e.what());
         return 0;
@@ -1186,7 +1212,7 @@ extern "C" int ds4_gpu_indexer_top1_value_tensor(
                     });
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev62);
+        ds4_sycl_profile_record_named("indexer_top1_value", _ds4_prof_ev62);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer_top1_value launch failed: %s\n", e.what());
         return 0;
@@ -1326,7 +1352,7 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(ds4_gpu_tensor *mask,
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev63);
+        ds4_sycl_profile_record_named("indexer_topk_mask", _ds4_prof_ev63);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "topk mask launch failed: %s\n", e.what());
         return 0;
@@ -1361,7 +1387,7 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x,
                     });
         });
         dq.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev64);
+        ds4_sycl_profile_record_named("indexer_qat_hadamard_fp4", _ds4_prof_ev64);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer qat launch failed: %s\n", e.what());
         return 0;

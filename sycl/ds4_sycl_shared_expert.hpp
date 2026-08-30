@@ -706,7 +706,7 @@ static int sycl_shared_gate_up_swiglu_q8_0_batch(
                     });
         });
         q.wait_and_throw();
-        ds4_sycl_profile_record(_ds4_prof_ev147);
+        ds4_sycl_profile_record_named("shared_gate_up_swiglu_q8_0_batch", _ds4_prof_ev147);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "shared gate/up fused q8 batch launch failed: %s\n",

@@ -417,13 +417,24 @@ extern "C" void ds4_sycl_test_profile_enable(int enable) {
  * the call sites being ranked pass a name; every other
  * call site keeps calling the unnamed ds4_sycl_profile_record above,
  * which still counts toward the aggregate total the existing gguf-load
- * measurement already reports. */
+ * measurement already reports.
+ *
+ * A later pass raised the cap from 16 to 160: naming every remaining
+ * kernel in MoE routing and expert compute, the router, the indexer, hc,
+ * norm/rope, the compressor, attention decode/output, the shared expert
+ * and fp8 KV added on the order of 100 more distinct bucket names on top
+ * of the matmul family named above, comfortably exceeding the old cap.
+ * Past the cap a bucket is silently dropped (see the check below), which
+ * would quietly re-introduce exactly the "counted in the total but not
+ * named" gap this instrumentation exists to close, so the cap must stay
+ * above the real distinct-name count rather than be raised just enough to
+ * fit today's count exactly. */
 struct sycl_profile_bucket {
     const char *name;
     uint64_t    ns;
     uint64_t    count;
 };
-static constexpr int kSyclProfileMaxBuckets = 16;
+static constexpr int kSyclProfileMaxBuckets = 160;
 static sycl_profile_bucket g_sycl_profile_buckets[kSyclProfileMaxBuckets];
 static int g_sycl_profile_bucket_count = 0;
 

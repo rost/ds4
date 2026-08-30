@@ -452,7 +452,7 @@ static bool sycl_moe_build_expert_compaction(sycl::queue &q, const int32_t *sel_
     std::vector<int32_t> sel_host((size_t)pair_count);
     sycl::event _ds4_prof_ev117 = q.memcpy(sel_host.data(), sel_dev, (size_t)pair_count * sizeof(int32_t));
     _ds4_prof_ev117.wait_and_throw();
-    ds4_sycl_profile_record(_ds4_prof_ev117);
+    ds4_sycl_profile_record_named("moe_build_expert_compaction_readback", _ds4_prof_ev117);
 
     std::vector<int32_t> id_to_slot((size_t)n_total_expert, -1);
     unique_ids->clear();
