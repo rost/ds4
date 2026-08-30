@@ -596,9 +596,17 @@ static int test_probe_auto_success(void) {
     CHECK(ds4_gpu_args_probe_auto_cuda(NULL, 0, &cfg, 12345, errbuf,
                                        sizeof(errbuf)) == 0,
           "probe_auto success (0 = success)");
-    CHECK(cfg.n_gpus == 1, "probe_auto n_gpus on a one-device box");
-    CHECK(cfg.device_indices[0] == 0, "probe_auto device_indices[0]");
-    CHECK(cfg.vram_bytes[0] > 0, "probe_auto vram_bytes[0] positive");
+    /* probe_auto enumerates the real hardware, so assert its contract --
+     * every device it found, in index order, each with positive VRAM --
+     * rather than a fixed count.  This asserted n_gpus == 1 until it first
+     * ran on a 14-GPU host.  Note ds4_sycl_device_count() is NOT the right
+     * comparison either: it reports the currently initialised tiers, which
+     * the tests above have already set to something unrelated. */
+    CHECK(cfg.n_gpus >= 1, "probe_auto must report at least one device");
+    for (int i = 0; i < cfg.n_gpus; i++) {
+        CHECK(cfg.device_indices[i] == i, "probe_auto device_indices in order");
+        CHECK(cfg.vram_bytes[i] > 0, "probe_auto vram_bytes positive");
+    }
     CHECK(cfg.safety_margin_bytes == 12345, "probe_auto safety_margin_bytes passthrough");
     return 0;
 }
