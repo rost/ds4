@@ -13049,6 +13049,8 @@ static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     if (!strcmp(s, "metal")) return DS4_BACKEND_METAL;
 #ifdef DS4_ROCM_BUILD
     if (!strcmp(s, "rocm")) return DS4_BACKEND_CUDA;
+#elif defined(DS4_SYCL_BUILD)
+    if (!strcmp(s, "sycl")) return DS4_BACKEND_CUDA;
 #else
     if (!strcmp(s, "cuda")) return DS4_BACKEND_CUDA;
 #endif
@@ -13056,6 +13058,8 @@ static ds4_backend parse_backend_arg(const char *s, const char *arg) {
     server_log(DS4_LOG_DEFAULT, "ds4-server: invalid %s value: %s", arg, s);
 #ifdef DS4_ROCM_BUILD
     server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, rocm, cpu");
+#elif defined(DS4_SYCL_BUILD)
+    server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, sycl, cpu");
 #else
     server_log(DS4_LOG_DEFAULT, "ds4-server: valid server backends are: metal, cuda, cpu");
 #endif
@@ -13246,6 +13250,9 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.backend = DS4_BACKEND_METAL;
 #ifdef DS4_ROCM_BUILD
         } else if (!strcmp(arg, "--rocm")) {
+            c.engine.backend = DS4_BACKEND_CUDA;
+#elif defined(DS4_SYCL_BUILD)
+        } else if (!strcmp(arg, "--sycl")) {
             c.engine.backend = DS4_BACKEND_CUDA;
 #else
         } else if (!strcmp(arg, "--cuda")) {

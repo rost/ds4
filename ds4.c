@@ -49348,6 +49348,8 @@ const char *ds4_backend_name(ds4_backend backend) {
     case DS4_BACKEND_CUDA:
 #ifdef DS4_ROCM_BUILD
         return "rocm";
+#elif defined(DS4_SYCL_BUILD)
+        return "sycl";
 #else
         return "cuda";
 #endif
