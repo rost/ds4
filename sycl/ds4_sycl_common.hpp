@@ -53,7 +53,7 @@ static inline int sycl_u64_mul3_checked(uint64_t a, uint64_t b, uint64_t c,
 }
 
 /* Every [[sycl::reqd_sub_group_size(N)]] width this backend's kernels
- * require, enumerated directly from sycl/*.hpp (2026-08-29): width 8
+ * require, enumerated directly from the sycl headers (2026-08-29): width 8
  * appears 15 times (ds4_sycl_moe.hpp x12, ds4_sycl_attention.hpp x2,
  * ds4_sycl_attention_output.hpp x1 via kGroupedQ8ASubgroupWidth), width 16
  * appears 2 times (ds4_sycl_moe.hpp), width 32 appears 11 times

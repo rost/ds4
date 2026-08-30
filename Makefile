@@ -79,7 +79,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-gemm-batch-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl test-sycl-streaming test-sycl-matmul test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-kernels test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output test-sycl-readback test-sycl-subgroup-guard test-sycl-full-layer test-sycl-gguf-load
+.PHONY: all help clean test test-rocm test-metal-session-batch test-mxfp4-cuda test-mxfp4-rocm test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm sycl test-sycl-smoke test-sycl-gemm-batch-smoke test-sycl-session-smoke test-sycl-output test-sycl-embedding test-sycl-norm-rope test-sycl-compressor test-sycl test-sycl-streaming test-sycl-matmul test-sycl-router test-sycl-fp8-kv test-sycl-shared-expert test-sycl-kernels test-sycl-moe test-sycl-hc test-sycl-mgpu test-sycl-indexer test-sycl-attention test-sycl-attention-output test-sycl-readback test-sycl-subgroup-guard test-sycl-full-layer test-sycl-gguf-load test-sycl-full-token test-sycl-prefill-batch test-sycl-placement
 
 ifeq ($(UNAME_S),Darwin)
 .PHONY: metal-decode-schedule-bench metal-prefill-variant-bench check-mxfp4-half-lut
