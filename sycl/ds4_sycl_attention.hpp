@@ -1978,13 +1978,17 @@ static void sycl_attention_prefill_unpack_heads_launch(
         sycl::queue &q, float *heads, const float *tmp,
         uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
     const uint64_t n = (uint64_t)n_tokens * n_head * head_dim;
-    q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
+    sycl::event ev = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
         const uint32_t d  = (uint32_t)(gid % head_dim);
         const uint64_t qi = gid / head_dim;
         const uint32_t h  = (uint32_t)(qi % n_head);
         const uint32_t t  = (uint32_t)(qi / n_head);
         heads[gid] = tmp[((uint64_t)h * n_tokens + t) * head_dim + d];
     });
+    /* Every caller drains this launch with its own dq.wait_and_throw()
+     * immediately after, so this event only needs to reach the profiler,
+     * not be waited here too. */
+    ds4_sycl_profile_record(ev);
 }
 
 /* attention_prefill_raw_kernel, attention.cuh:86-141: the scalar fallback,

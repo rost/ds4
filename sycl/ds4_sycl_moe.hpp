@@ -72,7 +72,7 @@ static void sycl_moe_count_sorted_pairs(sycl::queue &q, const int32_t *selected,
 static void sycl_moe_prefix_sorted_pairs(sycl::queue &q, uint32_t *offsets,
                                          uint32_t *cursors, const uint32_t *counts,
                                          uint32_t n_total_expert) {
-    q.single_task([=]() {
+    sycl::event _ds4_prof_ev157 = q.single_task([=]() {
          uint32_t sum = 0;
          for (uint32_t e = 0; e < n_total_expert; e++) {
              offsets[e] = sum;
@@ -80,7 +80,9 @@ static void sycl_moe_prefix_sorted_pairs(sycl::queue &q, uint32_t *offsets,
              sum += counts[e];
          }
          offsets[n_total_expert] = sum;
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev157.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev157);
 }
 
 /* moe_scatter_sorted_pairs_deterministic_kernel, moe.cuh:1301-1316: one
@@ -111,7 +113,7 @@ static void sycl_moe_scatter_sorted_pairs_deterministic(
 static void sycl_moe_build_expert_tile_offsets(
         sycl::queue &q, uint32_t *tile_offsets, uint32_t *tile_total,
         const uint32_t *counts, uint32_t block_m, uint32_t n_total_expert) {
-    q.single_task([=]() {
+    sycl::event _ds4_prof_ev158 = q.single_task([=]() {
          uint32_t sum = 0;
          for (uint32_t e = 0; e < n_total_expert; e++) {
              tile_offsets[e] = sum;
@@ -119,7 +121,9 @@ static void sycl_moe_build_expert_tile_offsets(
          }
          tile_offsets[n_total_expert] = sum;
          *tile_total = sum;
-     }).wait_and_throw();
+     });
+     _ds4_prof_ev158.wait_and_throw();
+     ds4_sycl_profile_record(_ds4_prof_ev158);
 }
 
 /* moe_build_expert_tiles_kernel, moe.cuh:1342-1350: one work-item per

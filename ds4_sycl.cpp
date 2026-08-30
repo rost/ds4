@@ -739,8 +739,10 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
 
     try {
         sycl::queue &q = ds4_sycl_queue(dst_tier);
-        q.memcpy((char *)dst->ptr + dst_offset,
-                 (const char *)src->ptr + src_offset, bytes).wait_and_throw();
+        sycl::event _ds4_prof_ev159 = q.memcpy((char *)dst->ptr + dst_offset,
+                 (const char *)src->ptr + src_offset, bytes);
+        _ds4_prof_ev159.wait_and_throw();
+        ds4_sycl_profile_record(_ds4_prof_ev159);
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_copy failed: %s\n", e.what());
