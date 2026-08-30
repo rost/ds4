@@ -663,6 +663,55 @@ extern const char *ds4_sycl_test_profile_bucket_name(uint64_t i);
 extern uint64_t    ds4_sycl_test_profile_bucket_ns(uint64_t i);
 extern uint64_t    ds4_sycl_test_profile_bucket_calls(uint64_t i);
 
+/* Rank the named kernel-family buckets by device time, so
+ * the most expensive kernel is identified from a real measurement before
+ * any of them is rewritten. Simple insertion sort: at most kSyclProfileMaxBuckets
+ * entries. Factored out so its three call sites (the original
+ * single-decode ranking, plus the prefill-batch-size and ratio-4
+ * rankings) cannot drift apart.
+ *
+ * The array size below must track ds4_sycl_common.hpp's
+ * kSyclProfileMaxBuckets (160, raised from 16), not just
+ * the bucket count this run happens to fill. The two are duplicated rather
+ * than shared because this file is plain C compiled without that C++-only
+ * header; if that cap is raised again without updating this
+ * literal, the print loop below silently truncates the ranking instead of
+ * failing loudly, so keep this comment as the tripwire. */
+static void print_kernel_ranking(const char *label, int repeats) {
+    const uint64_t nb = ds4_sycl_test_profile_bucket_count();
+    enum { kMaxBuckets = 160 };
+    const char *names[kMaxBuckets];
+    double ms[kMaxBuckets];
+    uint64_t calls[kMaxBuckets];
+    uint64_t n = nb < kMaxBuckets ? nb : kMaxBuckets;
+    for (uint64_t i = 0; i < n; i++) {
+        names[i] = ds4_sycl_test_profile_bucket_name(i);
+        ms[i] = (double)ds4_sycl_test_profile_bucket_ns(i) / 1.0e6 / repeats;
+        calls[i] = ds4_sycl_test_profile_bucket_calls(i) / (uint64_t)repeats;
+    }
+    for (uint64_t i = 1; i < n; i++) {
+        const char *nm = names[i];
+        double mv = ms[i];
+        uint64_t cv = calls[i];
+        int64_t j = (int64_t)i - 1;
+        while (j >= 0 && ms[j] < mv) {
+            names[j + 1] = names[j];
+            ms[j + 1] = ms[j];
+            calls[j + 1] = calls[j];
+            j--;
+        }
+        names[j + 1] = nm;
+        ms[j + 1] = mv;
+        calls[j + 1] = cv;
+    }
+    fprintf(stderr, "  %s (%d repeats):\n", label, repeats);
+    for (uint64_t i = 0; i < n; i++) {
+        fprintf(stderr, "    %2llu. %-40s %8.4f ms/eval (%llu calls/eval)\n",
+                (unsigned long long)(i + 1), names[i], ms[i],
+                (unsigned long long)calls[i]);
+    }
+}
+
 static double now_secs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -824,54 +873,7 @@ int main(int argc, char **argv) {
                 "%.3f ms/layer-eval, %llu bytes staged/layer-eval\n",
                 repeats, total_ms / repeats, (unsigned long long)bytes_per_call);
 
-        /* Rank the named kernel-family buckets by device time, so the
-         * most expensive dense-matmul kernel is identified from a real
-         * measurement before any of them is rewritten. Simple insertion
-         * sort: at most kSyclProfileMaxBuckets entries.
-         *
-         * The array size below must track ds4_sycl_
-         * common.hpp's kSyclProfileMaxBuckets (160, raised
-         * from 16), not just the bucket count this run happens to fill.
-         * The two are duplicated rather than shared because this file is
-         * plain C compiled without that C++-only header; if a future plan
-         * raises the cap again without updating this literal, the print
-         * loop below silently truncates the ranking instead of failing
-         * loudly, so keep this comment as the tripwire. */
-        {
-            const uint64_t nb = ds4_sycl_test_profile_bucket_count();
-            enum { kMaxBuckets = 160 };
-            const char *names[kMaxBuckets];
-            double ms[kMaxBuckets];
-            uint64_t calls[kMaxBuckets];
-            uint64_t n = nb < kMaxBuckets ? nb : kMaxBuckets;
-            for (uint64_t i = 0; i < n; i++) {
-                names[i] = ds4_sycl_test_profile_bucket_name(i);
-                ms[i] = (double)ds4_sycl_test_profile_bucket_ns(i) / 1.0e6 / repeats;
-                calls[i] = ds4_sycl_test_profile_bucket_calls(i) / (uint64_t)repeats;
-            }
-            for (uint64_t i = 1; i < n; i++) {
-                const char *nm = names[i];
-                double mv = ms[i];
-                uint64_t cv = calls[i];
-                int64_t j = (int64_t)i - 1;
-                while (j >= 0 && ms[j] < mv) {
-                    names[j + 1] = names[j];
-                    ms[j + 1] = ms[j];
-                    calls[j + 1] = calls[j];
-                    j--;
-                }
-                names[j + 1] = nm;
-                ms[j + 1] = mv;
-                calls[j + 1] = cv;
-            }
-            fprintf(stderr, "  per-kernel-family ranking (cache ON, %d repeats):\n",
-                    repeats);
-            for (uint64_t i = 0; i < n; i++) {
-                fprintf(stderr, "    %2llu. %-40s %8.4f ms/layer-eval (%llu calls/layer-eval)\n",
-                        (unsigned long long)(i + 1), names[i], ms[i],
-                        (unsigned long long)calls[i]);
-            }
-        }
+        print_kernel_ranking("per-kernel-family ranking (cache ON)", repeats);
     }
 
     free(input_hc);
