@@ -35,6 +35,21 @@
 
 namespace {
 
+/* Set at the end of every successful owned decode dispatch to how many
+ * device allocations that call still owns as it returns.
+ *
+ * Test-only instrumentation in the same shape as
+ * g_sycl_moe_last_staged_expert_count (ds4_sycl_moe_launch.hpp), and for
+ * the same reason: the property it pins is invisible in the numeric
+ * output. Owning nothing is exactly the condition under which
+ * sycl_scratch_release_wait does not drain, so a zero here is what proves
+ * the entry returned with its kernels still in flight and the paired rank
+ * therefore free to overlap it. Re-introducing an owned scratch buffer --
+ * the 24-byte device remap this entry used to allocate, say -- would
+ * silently re-serialise the two ranks while every oracle comparison kept
+ * passing, so it is a counter that has to catch it. */
+static uint32_t g_sycl_moe_owned_decode_owned_scratch = 0;
+
 /* moe_owned_local_expert, ds4_cuda.cu:19445-19455: true iff the GLOBAL
  * expert id `expert` falls in [expert_base, expert_base+expert_count),
  * writing the LOCAL (expert_base-relative) id when so. Used only where
@@ -149,16 +164,36 @@ static inline float sycl_moe_owned_packed_combine_row(const float *home_slots,
  * All three kernels below take `remap`, NOT expert_base/expert_count: the
  * caller (sycl_routed_moe_one_owned_q4k) has already read the six selected
  * ids back to host, decided which are owned, deduplicated the owned ids,
- * and staged only that distinct set to device (reusing
- * sycl_moe_stage_selected_experts from ds4_sycl_moe_launch.hpp). `remap[i]`
- * is that staged table's local index for slot i, or -1 if slot i is not
- * owned by this rank. This keeps compaction and ownership as one
- * composed decision made once on the host, rather than two separate
- * device-side checks. */
+ * and, when the weights are not already device-resident, staged only that
+ * distinct set to device (reusing sycl_moe_stage_selected_experts from
+ * ds4_sycl_moe_launch.hpp). `remap.local[i]` is the weight table's index
+ * for slot i, or -1 if slot i is not owned by this rank. This keeps
+ * compaction and ownership as one composed decision made once on the
+ * host, rather than two separate device-side checks.
+ *
+ * It travels BY VALUE, as a kernel argument, not through a device buffer.
+ * Six int32 cost 24 bytes of the kernel argument budget, and on the path
+ * that matters -- an expert-parallel decode, where the placement cache has
+ * already made all three weight tables device-resident -- that 24-byte
+ * buffer was the only allocation the dispatch still owned. Owning it meant
+ * the dispatch had to drain its queue before returning so the guard could
+ * free it, and that drain is precisely what kept the two ranks from
+ * running at the same time: ds4.c issues the partner tier's owned decode
+ * and then the home tier's back to back with no synchronisation of its
+ * own, so a drain inside the first one delays submitting the second until
+ * the first has finished. Measured on an 8-GPU DeepSeek V4 Flash run,
+ * strictly sequential ranks made --cuda-tensor-parallel decode SLOWER than
+ * no split at all (2.78 t/s against 4.34 t/s) even though prefill, which
+ * has enough work in flight to overlap regardless, was 2.1x faster (3.62
+ * to 7.45 t/s). Passing the remap by value removes the allocation, its
+ * host-to-device copy, and the drain that protected it together. */
+struct sycl_moe_owned_remap {
+    int32_t local[6];
+};
 
 static void sycl_moe_q4k_gate_up_mid_decode_owned(
         sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
-        const sycl_block_q8_K *xq, const int32_t *remap, const float *weights,
+        const sycl_block_q8_K *xq, sycl_moe_owned_remap remap, const float *weights,
         uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint32_t xq_blocks,
         uint32_t expert_mid_dim, float clamp) {
     const uint32_t row_blocks = (expert_mid_dim + 127u) / 128u;
@@ -169,7 +204,7 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
                                sycl::range<2>(256u, 1u)),
              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
-                 const int32_t local = remap[slot];
+                 const int32_t local = remap.local[slot];
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
@@ -205,7 +240,12 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
                  }
              });
      });
-     sycl_batch_wait(_ds4_prof_ev118);
+     /* No wait: q is in_order (ds4_sycl.cpp), so whatever the caller
+      * submits next is already ordered behind this kernel, and nothing
+      * this kernel reads is scratch this launcher has to keep alive.
+      * Draining here would also stall the OTHER expert-parallel rank,
+      * whose kernels ds4.c submits to a different tier's queue right
+      * after this one returns -- see sycl_moe_owned_remap above. */
      ds4_sycl_profile_record(_ds4_prof_ev118);
 }
 
@@ -222,7 +262,7 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
  * every other decode kernel here that never writes it. */
 static void sycl_moe_lut_gate_up_mid_decode_owned(
         sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
-        const sycl_block_q8_K *xq, const int32_t *remap, const float *weights,
+        const sycl_block_q8_K *xq, sycl_moe_owned_remap remap, const float *weights,
         uint64_t gate_expert_bytes, uint64_t gate_row_bytes, uint32_t xq_blocks,
         uint32_t expert_mid_dim, float clamp) {
     const uint32_t row_blocks = (expert_mid_dim + 127u) / 128u;
@@ -233,7 +273,7 @@ static void sycl_moe_lut_gate_up_mid_decode_owned(
                                sycl::range<2>(256u, 1u)),
              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
-                 const int32_t local = remap[slot];
+                 const int32_t local = remap.local[slot];
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
@@ -269,7 +309,7 @@ static void sycl_moe_lut_gate_up_mid_decode_owned(
                  }
              });
      });
-     sycl_batch_wait(_ds4_prof_ev119);
+     /* No wait, same reasoning as sycl_moe_q4k_gate_up_mid_decode_owned. */
      ds4_sycl_profile_record(_ds4_prof_ev119);
 }
 
@@ -278,7 +318,7 @@ static void sycl_moe_lut_gate_up_mid_decode_owned(
  * leaving the rest of `out` untouched (never read by the down kernels
  * below, which apply the identical remap check before reading). */
 static void sycl_moe_q8_k_quantize_owned(sycl::queue &q, sycl_block_q8_K *out, const float *x,
-                                         const int32_t *remap, uint32_t in_dim) {
+                                         sycl_moe_owned_remap remap, uint32_t in_dim) {
     const uint32_t xq_blocks = in_dim / kMoeQK;
     if (xq_blocks == 0u) return;
     sycl::event _ds4_prof_ev120 = q.submit([&](sycl::handler &h) {
@@ -289,7 +329,7 @@ static void sycl_moe_q8_k_quantize_owned(sycl::queue &q, sycl_block_q8_K *out, c
                                sycl::range<2>(kMoeQK, 1)),
              [=](sycl::nd_item<2> it) {
                  const uint32_t row = (uint32_t)it.get_group(1);
-                 if (remap[row] < 0) return;
+                 if (remap.local[row] < 0) return;
                  const uint32_t b = (uint32_t)it.get_group(0);
                  const uint32_t tid = (uint32_t)it.get_local_id(0);
                  const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * kMoeQK;
@@ -332,7 +372,7 @@ static void sycl_moe_q8_k_quantize_owned(sycl::queue &q, sycl_block_q8_K *out, c
                  if (tid == 0) yb->d = 1.0f / iscale;
              });
      });
-     sycl_batch_wait(_ds4_prof_ev120);
+     /* No wait, same reasoning as sycl_moe_q4k_gate_up_mid_decode_owned. */
      ds4_sycl_profile_record(_ds4_prof_ev120);
 }
 
@@ -343,7 +383,7 @@ static void sycl_moe_q8_k_quantize_owned(sycl::queue &q, sycl_block_q8_K *out, c
  * slot -- see sycl_moe_owned_slots_combine_rows below). */
 static void sycl_moe_q4k_down_owned_slots(
         sycl::queue &q, float *down_out, const char *down_base, const sycl_block_q8_K *midq,
-        const int32_t *remap, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        sycl_moe_owned_remap remap, uint64_t down_expert_bytes, uint64_t down_row_bytes,
         uint32_t midq_blocks, uint32_t out_dim) {
     const uint32_t row_blocks = (out_dim + 31u) / 32u;
     if (row_blocks == 0u) return;
@@ -353,7 +393,7 @@ static void sycl_moe_q4k_down_owned_slots(
                                sycl::range<2>(256u, 1u)),
              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
-                 const int32_t local = remap[slot];
+                 const int32_t local = remap.local[slot];
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
@@ -374,7 +414,7 @@ static void sycl_moe_q4k_down_owned_slots(
                  if (row_ok && lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
              });
      });
-     sycl_batch_wait(_ds4_prof_ev121);
+     /* No wait, same reasoning as sycl_moe_q4k_gate_up_mid_decode_owned. */
      ds4_sycl_profile_record(_ds4_prof_ev121);
 }
 
@@ -383,7 +423,7 @@ static void sycl_moe_q4k_down_owned_slots(
  * sibling above. */
 static void sycl_moe_lut_down_owned_slots(
         sycl::queue &q, float *down_out, const char *down_base, const sycl_block_q8_K *midq,
-        const int32_t *remap, uint64_t down_expert_bytes, uint64_t down_row_bytes,
+        sycl_moe_owned_remap remap, uint64_t down_expert_bytes, uint64_t down_row_bytes,
         uint32_t midq_blocks, uint32_t out_dim) {
     const uint32_t row_blocks = (out_dim + 31u) / 32u;
     if (row_blocks == 0u) return;
@@ -393,7 +433,7 @@ static void sycl_moe_lut_down_owned_slots(
                                sycl::range<2>(256u, 1u)),
              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
-                 const int32_t local = remap[slot];
+                 const int32_t local = remap.local[slot];
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
@@ -414,7 +454,7 @@ static void sycl_moe_lut_down_owned_slots(
                  if (row_ok && lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
              });
      });
-     sycl_batch_wait(_ds4_prof_ev122);
+     /* No wait, same reasoning as sycl_moe_q4k_gate_up_mid_decode_owned. */
      ds4_sycl_profile_record(_ds4_prof_ev122);
 }
 
@@ -427,7 +467,7 @@ static void sycl_moe_lut_down_owned_slots(
  * which only addresses the locally staged/compacted weight table. */
 static void sycl_moe_q4k_down_owned_packed(
         sycl::queue &q, float *packed_out, const char *down_base, const sycl_block_q8_K *midq,
-        const int32_t *remap, const int32_t *orig_selected, uint32_t expert_base,
+        sycl_moe_owned_remap remap, const int32_t *orig_selected, uint32_t expert_base,
         uint32_t expert_count, uint64_t down_expert_bytes, uint64_t down_row_bytes,
         uint32_t midq_blocks, uint32_t out_dim) {
     const uint32_t row_blocks = (out_dim + 31u) / 32u;
@@ -456,7 +496,7 @@ static void sycl_moe_q4k_down_owned_packed(
                  float packed = 0.0f;
                  for (uint32_t i = 0; i < n_slots; i++) {
                      const uint32_t slot = (uint32_t)first_slot + i;
-                     const int32_t local = remap[slot];
+                     const int32_t local = remap.local[slot];
                      if (local < 0) continue;
                      const uint32_t expert = (uint32_t)local;
                      const sycl_block_q4_K *wr = (const sycl_block_q4_K *)
@@ -473,7 +513,7 @@ static void sycl_moe_q4k_down_owned_packed(
                  if (row_ok && lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
              });
      });
-     sycl_batch_wait(_ds4_prof_ev123);
+     /* No wait, same reasoning as sycl_moe_q4k_gate_up_mid_decode_owned. */
      ds4_sycl_profile_record(_ds4_prof_ev123);
 }
 
@@ -482,7 +522,7 @@ static void sycl_moe_q4k_down_owned_packed(
  * sycl_moe_q4k_down_owned_packed above with a Q2_K weight block and dot. */
 static void sycl_moe_lut_down_owned_packed(
         sycl::queue &q, float *packed_out, const char *down_base, const sycl_block_q8_K *midq,
-        const int32_t *remap, const int32_t *orig_selected, uint32_t expert_base,
+        sycl_moe_owned_remap remap, const int32_t *orig_selected, uint32_t expert_base,
         uint32_t expert_count, uint64_t down_expert_bytes, uint64_t down_row_bytes,
         uint32_t midq_blocks, uint32_t out_dim) {
     const uint32_t row_blocks = (out_dim + 31u) / 32u;
@@ -511,7 +551,7 @@ static void sycl_moe_lut_down_owned_packed(
                  float packed = 0.0f;
                  for (uint32_t i = 0; i < n_slots; i++) {
                      const uint32_t slot = (uint32_t)first_slot + i;
-                     const int32_t local = remap[slot];
+                     const int32_t local = remap.local[slot];
                      if (local < 0) continue;
                      const uint32_t expert = (uint32_t)local;
                      const sycl_block_q2_K *wr = (const sycl_block_q2_K *)
@@ -528,7 +568,7 @@ static void sycl_moe_lut_down_owned_packed(
                  if (row_ok && lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
              });
      });
-     sycl_batch_wait(_ds4_prof_ev124);
+     /* No wait, same reasoning as sycl_moe_q4k_gate_up_mid_decode_owned. */
      ds4_sycl_profile_record(_ds4_prof_ev124);
 }
 
@@ -544,13 +584,13 @@ static void sycl_moe_lut_down_owned_packed(
  * function per format. */
 struct sycl_moe_owned_decode_kernels {
     void (*gate_up_mid)(sycl::queue &, float *, const char *, const char *,
-                        const sycl_block_q8_K *, const int32_t *, const float *, uint64_t,
+                        const sycl_block_q8_K *, sycl_moe_owned_remap, const float *, uint64_t,
                         uint64_t, uint32_t, uint32_t, float);
     void (*down_slots)(sycl::queue &, float *, const char *, const sycl_block_q8_K *,
-                       const int32_t *, uint64_t, uint64_t, uint32_t, uint32_t);
+                       sycl_moe_owned_remap, uint64_t, uint64_t, uint32_t, uint32_t);
     void (*down_packed)(sycl::queue &, float *, const char *, const sycl_block_q8_K *,
-                        const int32_t *, const int32_t *, uint32_t, uint32_t, uint64_t, uint64_t,
-                        uint32_t, uint32_t);
+                        sycl_moe_owned_remap, const int32_t *, uint32_t, uint32_t, uint64_t,
+                        uint64_t, uint32_t, uint32_t);
 };
 
 static const sycl_moe_owned_decode_kernels sycl_moe_owned_decode_q4k = {
@@ -695,56 +735,41 @@ static int sycl_routed_moe_one_owned_dispatch(
                                   sycl_ptr_is_device_resident(q, up_w) ||
                                   sycl_ptr_is_device_resident(q, down_w);
 
-        void *gate_dev = nullptr, *up_dev = nullptr, *down_dev = nullptr, *remap_dev = nullptr;
+        void *gate_dev = nullptr, *up_dev = nullptr, *down_dev = nullptr;
         bool gate_owned = true, up_owned = true, down_owned = true;
-        int32_t remap_host[6];
+        sycl_moe_owned_remap remap;
         const uint32_t unique_count = (uint32_t)unique_ids.size();
         if (any_resident) {
-            for (uint32_t slot = 0; slot < 6u; slot++) remap_host[slot] = local_of_slot[slot];
+            for (uint32_t slot = 0; slot < 6u; slot++) remap.local[slot] = local_of_slot[slot];
             if (!sycl_moe_stage_weights(q, gate_w, up_w, down_w, gate_bytes, down_bytes,
                                         &gate_dev, &up_dev, &down_dev,
                                         &gate_owned, &up_owned, &down_owned)) {
                 return 0;
             }
-            /* Through sycl_stage_host_bytes, not a bare q.memcpy: the
-             * copy it performs completes before it returns, which is what
-             * lets remap_host stay a plain stack array here. The same
-             * reason sycl_moe_stage_selected_experts stages its own
-             * remap and its packed tables out of function-local
-             * std::vectors. */
-            sycl_device_scratch_guard staged_remap =
-                    sycl_stage_host_bytes(q, remap_host, sizeof(remap_host));
-            if (!staged_remap.p) {
-                if (gate_owned) sycl::free(gate_dev, q);
-                if (up_owned) sycl::free(up_dev, q);
-                if (down_owned) sycl::free(down_dev, q);
-                return 0;
-            }
-            remap_dev = staged_remap.p;
-            staged_remap.p = nullptr;
         } else {
             for (uint32_t slot = 0; slot < 6u; slot++) {
-                remap_host[slot] = -1;
+                remap.local[slot] = -1;
                 if (local_of_slot[slot] < 0) continue;
                 for (size_t i = 0; i < unique_ids.size(); i++) {
                     if (unique_ids[i] == local_of_slot[slot]) {
-                        remap_host[slot] = (int32_t)i;
+                        remap.local[slot] = (int32_t)i;
                         break;
                     }
                 }
             }
+            /* No device remap out-parameter: this entry's kernels take the
+             * remap by value (sycl_moe_owned_remap), so the only thing it
+             * needs staged is the packed weight table. */
             if (!sycl_moe_stage_selected_experts(q, gate_w, up_w, down_w, unique_ids.data(),
                                                  unique_count, gate_expert_bytes,
-                                                 down_expert_bytes, remap_host, 6u, &gate_dev,
-                                                 &up_dev, &down_dev, &remap_dev)) {
+                                                 down_expert_bytes, nullptr, 0u, &gate_dev,
+                                                 &up_dev, &down_dev, nullptr)) {
                 return 0;
             }
         }
         sycl_device_scratch_guard gate_guard(q, gate_dev, gate_owned);
         sycl_device_scratch_guard up_guard(q, up_dev, up_owned);
         sycl_device_scratch_guard down_guard(q, down_dev, down_owned);
-        sycl_device_scratch_guard remap_guard(q, remap_dev);
-        const int32_t *remap = (const int32_t *)remap_dev;
 
         /* Same test-only counters sycl_routed_moe_launch updates
          * (ds4_sycl_moe_launch.hpp), read back by
@@ -792,6 +817,17 @@ static int sycl_routed_moe_one_owned_dispatch(
             k->down_slots(q, down_dst, (const char *)down_dev, midq, remap, down_expert_bytes,
                          down_row_bytes, midq_blocks, out_dim);
         }
+        /* The only reason left to drain: the compaction path's packed
+         * weight tables are this function's own allocations, and the
+         * guards above free them on return. The resident path -- the one a
+         * real --cuda-tensor-parallel decode takes on every routed layer --
+         * gets all three back as non-owning pass-throughs and so returns
+         * with the kernels still in flight, which is what lets the partner
+         * tier's half of this layer overlap the home tier's. */
+        g_sycl_moe_owned_decode_owned_scratch = (uint32_t)gate_guard.frees() +
+                                                (uint32_t)up_guard.frees() +
+                                                (uint32_t)down_guard.frees();
+        sycl_scratch_release_wait(q, gate_guard, up_guard, down_guard);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_one_owned failed: %s\n", e.what());
         return 0;
@@ -923,7 +959,10 @@ extern "C" int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
              }
              out_ptr[gid] = acc;
          });
-         sycl_batch_wait(_ds4_prof_ev126);
+         /* No wait: the caller's next command on this in_order queue is
+          * already ordered behind this combine, and the peer half of
+          * `peer_slots` was delivered by ds4_gpu_tensor_copy_xdev, which
+          * submits its copy on THIS queue and so is ordered ahead of it. */
          ds4_sycl_profile_record(_ds4_prof_ev126);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_owned_slots_combine_rows failed: %s\n",
@@ -967,7 +1006,7 @@ extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
              const uint32_t row = (uint32_t)id[0];
              out_ptr[row] = sycl_moe_owned_packed_combine_row(hs, pp, sel, row, od, split);
          });
-         sycl_batch_wait(_ds4_prof_ev127);
+         /* No wait, same reasoning as the per-slot combine above. */
          ds4_sycl_profile_record(_ds4_prof_ev127);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_owned_packed_combine failed: %s\n",
@@ -1018,7 +1057,10 @@ extern "C" int ds4_gpu_moe_handoff_pack_tensor(ds4_gpu_tensor *packed,
                  *(float *)(dst + w_off + (uint64_t)i * sizeof(float)) = w[i];
              }
          });
-         sycl_batch_wait(_ds4_prof_ev128);
+         /* No wait: the cross-device copy that reads `packed` next is
+          * ds4_gpu_tensor_copy_xdev, which opens with a barrier on the
+          * SOURCE queue (this one) precisely so a still-pending producer
+          * like this kernel is ordered ahead of the copy. */
          ds4_sycl_profile_record(_ds4_prof_ev128);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_handoff_pack failed: %s\n", e.what());
@@ -1054,7 +1096,9 @@ static void sycl_moe_filter_owned_pairs(sycl::queue &q, int32_t *selected, float
              weights[pair] = 0.0f;
          }
      });
-     sycl_batch_wait(_ds4_prof_ev129);
+     /* No wait: sycl_routed_moe_launch below reads `selected` back on this
+      * same in_order queue, so its readback is ordered behind this
+      * rewrite. */
      ds4_sycl_profile_record(_ds4_prof_ev129);
 }
 
@@ -1119,3 +1163,11 @@ extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
 }
 
 }  // namespace
+
+/* Test-only instrumentation: how many device allocations the most
+ * recently completed owned decode dispatch still owned as it returned,
+ * which is 0 exactly when it returned without draining its queue. See
+ * g_sycl_moe_owned_decode_owned_scratch above. */
+extern "C" uint32_t ds4_sycl_moe_test_owned_decode_owned_scratch(void) {
+    return g_sycl_moe_owned_decode_owned_scratch;
+}

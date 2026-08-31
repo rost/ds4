@@ -98,6 +98,7 @@ extern int ds4_sycl_moe_test_iq2_down_direct(
  * 6w), so these are what the distinguishing test below reads. */
 extern uint32_t ds4_sycl_moe_test_last_staged_expert_count(void);
 extern uint64_t ds4_sycl_moe_test_last_staged_bytes(void);
+extern uint32_t ds4_sycl_moe_test_owned_decode_owned_scratch(void);
 
 enum { Q8_K_BLOCK_BYTES = 292 };
 
@@ -1769,6 +1770,12 @@ static int test_q4k_owned_decode_composes_ownership_with_compaction(void) {
           "owned decode: home rank must stage exactly its distinct owned-and-selected experts");
     CHECK(home_unique > 0 && home_unique < RM_OWNED_EXPERT_SPLIT,
           "owned decode: fixture must actually shrink the home stage");
+    /* The other half of the resident test's zero: compaction really does
+     * hand this dispatch three buffers of its own to free, so the counter
+     * that proves the resident path owns nothing is measuring something
+     * that varies rather than reading back a constant. */
+    CHECK(ds4_sycl_moe_test_owned_decode_owned_scratch() == 3,
+          "owned decode: compaction path must own the gate/up/down tables it staged");
 
     CHECK(ds4_gpu_routed_moe_one_owned_tensor(
               out, gate, up, mid, partner_down, m.model, m.model_size, m.gate_offset,
@@ -1894,6 +1901,13 @@ static int test_q4k_owned_decode_uses_resident_weights_directly(void) {
           "owned resident: home rank must stage nothing when its owned experts are resident");
     CHECK(ds4_sycl_moe_test_last_staged_bytes() == 0,
           "owned resident: home rank must move no weight bytes to the device");
+    /* The property the resident path exists for: owning no scratch is
+     * what lets the dispatch return with its kernels still in flight, so
+     * the paired rank's kernels can run at the same time on the other
+     * tier. A drain here would be invisible to every oracle check below
+     * and would cost the whole expert-parallel decode win. */
+    CHECK(ds4_sycl_moe_test_owned_decode_owned_scratch() == 0,
+          "owned resident: home rank must return owning no scratch, so it need not drain");
 
     CHECK(ds4_gpu_routed_moe_one_owned_tensor(
               out, gate, up, mid, partner_down, resident_map, m.model_size, m.gate_offset,
@@ -1908,6 +1922,8 @@ static int test_q4k_owned_decode_uses_resident_weights_directly(void) {
           "owned resident: partner rank must stage nothing when its owned experts are resident");
     CHECK(ds4_sycl_moe_test_last_staged_bytes() == 0,
           "owned resident: partner rank must move no weight bytes to the device");
+    CHECK(ds4_sycl_moe_test_owned_decode_owned_scratch() == 0,
+          "owned resident: partner rank must return owning no scratch, so it need not drain");
 
     CHECK(ds4_gpu_routed_moe_owned_packed_combine_tensor(out, home_down, partner_down, selected,
                                                          RM_OUT_DIM, RM_OWNED_EXPERT_SPLIT) != 0,

@@ -484,6 +484,14 @@ static bool sycl_moe_build_expert_compaction(sycl::queue &q, const int32_t *sel_
  * `unique_ids` (packed contiguously, in that order) into three fresh
  * device buffers, plus the pair-indexed `remap` array into a fourth.
  *
+ * `sel_dev` is optional: pass null (and then `remap_host`/`pair_count` are
+ * unread) when the caller carries its remap into the kernels by value
+ * rather than through device memory, as the owned decode entry does with
+ * sycl_moe_owned_remap (sycl/ds4_sycl_moe_owned.hpp). Skipping the fourth
+ * allocation there is not a micro-optimisation: it is the last device
+ * buffer that entry owned, and owning one at all forces the drain that
+ * would keep the two expert-parallel ranks from running at the same time.
+ *
  * The per-expert rows are gathered into contiguous host staging buffers
  * first (one std::memcpy per expert per matrix, at host RAM bandwidth,
  * not PCIe), then each matrix crosses to the device in a single
@@ -504,7 +512,8 @@ static bool sycl_moe_stage_selected_experts(
         const int32_t *unique_ids, uint32_t unique_count, uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes, const int32_t *remap_host, uint32_t pair_count,
         void **gate_dev, void **up_dev, void **down_dev, void **sel_dev) {
-    *gate_dev = *up_dev = *down_dev = *sel_dev = nullptr;
+    *gate_dev = *up_dev = *down_dev = nullptr;
+    if (sel_dev) *sel_dev = nullptr;
 
     /* This function's whole design is a HOST-side gather (std::memcpy
      * below, not a SYCL queue op) of scattered per-expert rows out of
@@ -533,7 +542,7 @@ static bool sycl_moe_stage_selected_experts(
     uint64_t gate_bytes = 0, down_bytes = 0, sel_bytes = 0;
     if (!sycl_u64_mul_checked(unique_count, gate_expert_bytes, &gate_bytes) ||
         !sycl_u64_mul_checked(unique_count, down_expert_bytes, &down_bytes) ||
-        !sycl_u64_mul_checked(pair_count, (uint32_t)sizeof(int32_t), &sel_bytes)) {
+        (sel_dev && !sycl_u64_mul_checked(pair_count, (uint32_t)sizeof(int32_t), &sel_bytes))) {
         return false;
     }
 
@@ -553,8 +562,10 @@ static bool sycl_moe_stage_selected_experts(
     sycl_device_scratch_guard gate_guard = sycl_stage_host_bytes(q, gate_stage.data(), gate_bytes);
     sycl_device_scratch_guard up_guard = sycl_stage_host_bytes(q, up_stage.data(), gate_bytes);
     sycl_device_scratch_guard down_guard = sycl_stage_host_bytes(q, down_stage.data(), down_bytes);
-    sycl_device_scratch_guard sel_guard = sycl_stage_host_bytes(q, remap_host, sel_bytes);
-    if (!gate_guard.p || !up_guard.p || !down_guard.p || !sel_guard.p) {
+    sycl_device_scratch_guard sel_guard =
+            sel_dev ? sycl_stage_host_bytes(q, remap_host, sel_bytes)
+                    : sycl_device_scratch_guard(q, nullptr);
+    if (!gate_guard.p || !up_guard.p || !down_guard.p || (sel_dev && !sel_guard.p)) {
         return false;
     }
     /* Ownership transfers to the caller's own guards from here: null the
@@ -563,7 +574,7 @@ static bool sycl_moe_stage_selected_experts(
     *gate_dev = gate_guard.p;
     *up_dev = up_guard.p;
     *down_dev = down_guard.p;
-    *sel_dev = sel_guard.p;
+    if (sel_dev) *sel_dev = sel_guard.p;
     gate_guard.p = up_guard.p = down_guard.p = sel_guard.p = nullptr;
     return true;
 }
