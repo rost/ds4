@@ -100,21 +100,34 @@ extern "C" int ds4_gpu_end_commands(void) {
     return ds4_sycl_wait_current_tier("end commands");
 }
 
+/* A split inside one token, not the end of the token's work: ds4.c calls
+ * this between layers to get the prefix executing while it encodes the
+ * rest (metal_graph_encode_decode_token_raw_swa), then keeps encoding into
+ * the same begin/end pair. Ending the capture here and leaving it ended
+ * would hand the driver only the layers before the first split and submit
+ * every later kernel one at a time, so recording reopens on whichever tier
+ * is current for the commands that follow. */
 extern "C" int ds4_gpu_flush_commands(void) {
-    return ds4_sycl_wait_current_tier("flush");
+    const bool was_recording = g_sycl_graph_batch.recording();
+    if (!ds4_sycl_wait_current_tier("flush")) return 0;
+    if (was_recording) {
+        (void)g_sycl_graph_batch.resume(ds4_sycl_current_queue());
+    }
+    return 1;
 }
 
 /* ROCm delegates to flush_commands (rocm/ds4_rocm_runtime.cuh:6052:
  * `return ds4_gpu_flush_commands();`); CUDA instead returns a bare 1 with
  * the comment "CUDA kernels are already queued in stream order, nothing to
- * split" (ds4_cuda.cu:26462-26465). That CUDA-specific reasoning is exactly
- * what spec 6t says does not hold here: this backend's queues are
- * out-of-order and carry no automatic dependency tracking between separate
- * submit() calls, so "already in order" is not a safe assumption to copy.
- * Follow ROCm's shape instead (spec 6e: ROCm is the structural reference,
- * not CUDA, except where multi-GPU is the explicit documented exception),
- * which is also the conservative reading of an entry named "flush an
- * encoder" when this backend has no encoder to flush: wait for real. */
+ * split" (ds4_cuda.cu:26462-26465). Follow ROCm's shape (spec 6e: ROCm is
+ * the structural reference, not CUDA, except where multi-GPU is the
+ * explicit documented exception), which is also the conservative reading
+ * of an entry named "flush an encoder" when this backend has no encoder to
+ * flush: wait for real. Ordering is not the reason -- every tier's queue is
+ * in_order, so CUDA's "already in stream order" does hold here too -- but
+ * spec 6t's point stands: in_order orders device commands against each
+ * other and says nothing to the host, and callers of this entry are asking
+ * the host to be told when the device is done. */
 extern "C" int ds4_gpu_flush_encoder(void) {
     return ds4_gpu_flush_commands();
 }

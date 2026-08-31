@@ -116,45 +116,27 @@ public:
     uint64_t total_nodes() const { return total_nodes_; }
     uint64_t last_node_count() const { return last_node_count_; }
 
-    /* Begins recording `q`. A batch already in progress is flushed first
-     * rather than nested: the graph extension has no notion of a nested
-     * recording, and flushing preserves the ordering the caller asked for.
-     * Returns false only when recording could not be started, in which
-     * case the caller proceeds un-captured, which is always valid. */
+    /* Begins a new batch on `q`, zeroing the diagnostics so they describe
+     * this batch. Returns false only when recording could not be started,
+     * in which case the caller proceeds un-captured, which is always
+     * valid. */
     bool begin(sycl::queue &q) {
-        if (!armed_) return false;
-        if (recording()) {
-            if (!flush()) return false;
-        }
-        if (!q.get_device().has(sycl::aspect::ext_oneapi_limited_graph) &&
-            !q.get_device().has(sycl::aspect::ext_oneapi_graph)) {
-            /* Disarm rather than retry per token: device capability does
-             * not change within a process, so one report is enough. */
-            armed_ = false;
-            fprintf(stderr, DS4_GPU_LOG_PREFIX
-                    "command-graph capture unavailable on this device, disabled\n");
-            return false;
-        }
-        if (!warm_blas(q)) {
-            armed_ = false;
-            return false;
-        }
-        try {
-            graph_.emplace(q.get_context(), q.get_device());
-            graph_->begin_recording(q);
-            q_ = &q;
-            submissions_ = 0;
-            total_nodes_ = 0;
-            return true;
-        } catch (const sycl::exception &e) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX
-                    "command-graph recording failed to start: %s\n", e.what());
-            graph_.reset();
-            q_ = nullptr;
-            armed_ = false;
-            return false;
-        }
+        if (!open(q)) return false;
+        submissions_ = 0;
+        total_nodes_ = 0;
+        last_node_count_ = 0;
+        return true;
     }
+
+    /* Reopens recording after the batch was drained mid-token by
+     * ds4_gpu_flush_commands. Distinct from begin() only in keeping the
+     * diagnostics running, because the split flush is a division inside
+     * one token's batch and not the start of a new one -- ds4.c splits a
+     * decode token into two or three command buffers
+     * (metal_graph_encode_decode_token_raw_swa) and only the first would
+     * ever be captured if a split ended capture for the rest of the
+     * token. */
+    bool resume(sycl::queue &q) { return open(q); }
 
     /* Ends the batch: submits whatever is still recorded and waits for it.
      * Safe to call with no batch in progress, which is what makes it usable
@@ -219,6 +201,43 @@ public:
     }
 
 private:
+    /* Starts recording `q`, whether for a fresh batch or a resumed one. A
+     * recording already in progress is flushed first rather than nested:
+     * the graph extension has no notion of a nested recording, and
+     * flushing preserves the ordering the caller asked for. */
+    bool open(sycl::queue &q) {
+        if (!armed_) return false;
+        if (recording()) {
+            if (!flush()) return false;
+        }
+        if (!q.get_device().has(sycl::aspect::ext_oneapi_limited_graph) &&
+            !q.get_device().has(sycl::aspect::ext_oneapi_graph)) {
+            /* Disarm rather than retry per token: device capability does
+             * not change within a process, so one report is enough. */
+            armed_ = false;
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "command-graph capture unavailable on this device, disabled\n");
+            return false;
+        }
+        if (!warm_blas(q)) {
+            armed_ = false;
+            return false;
+        }
+        try {
+            graph_.emplace(q.get_context(), q.get_device());
+            graph_->begin_recording(q);
+            q_ = &q;
+            return true;
+        } catch (const sycl::exception &e) {
+            fprintf(stderr, DS4_GPU_LOG_PREFIX
+                    "command-graph recording failed to start: %s\n", e.what());
+            graph_.reset();
+            q_ = nullptr;
+            armed_ = false;
+            return false;
+        }
+    }
+
     /* oneMKL's first BLAS call in a process performs a lazy initialization
      * that waits on its own event internally. A wait is illegal on a queue
      * in the recording state, so if that first call happens inside a
