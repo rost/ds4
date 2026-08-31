@@ -527,6 +527,31 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tenso
                 sycl_batch_wait(dq.memcpy(dst->ptr, src->ptr, bytes));
                 return 1;
             }
+            /* While a command graph is recording, the barrier pair below
+             * is not available: a graph belongs to one device, so an
+             * event from the recording queue is rejected as a dependency
+             * for another device's queue ("Cannot submit to a queue with
+             * a dependency from a graph that is associated with a
+             * different device"), and this entry would fall through to
+             * the host bounce for every cross-tier handoff. Measured on a
+             * real 8-GPU Flash run, that fallback is what made a captured
+             * decode slower than an uncaptured one.
+             *
+             * Issue the plain destination-queue copy instead. That is
+             * exactly what this entry did before it gained the barriers,
+             * so it is no weaker than what the cross-device path has
+             * always relied on: destination ordering comes from the
+             * destination queue being in_order, and the source-side
+             * hazard the second barrier closes was equally open then.
+             * Suspending the recording instead was tried and measured
+             * far worse (prefill 9.93 t/s down to 3.70 t/s), because
+             * prefill crosses tiers often enough that ending and
+             * restarting a graph per crossing costs more than the capture
+             * saves. */
+            if (sycl_graph_batch_recording()) {
+                dq.memcpy(dst->ptr, src->ptr, bytes);
+                return 1;
+            }
             sycl::event src_ready = sq.ext_oneapi_submit_barrier();
             sycl::event copied = dq.submit([&](sycl::handler &h) {
                 h.depends_on(src_ready);
@@ -604,6 +629,27 @@ extern "C" int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier)
     const int sd = src->device_id >= 0 ? src->device_id : g_current_tier;
     if (sd == dst_tier) return 1;
     try {
+        /* Same graph-affinity constraint ds4_gpu_tensor_copy_xdev above
+         * documents: an event from a queue recording into a command graph
+         * cannot be a dependency for another device's queue.
+         *
+         * Unlike that entry, there is nothing here but the ordering. This
+         * entry exists so a kernel on `dst_tier` can read `src`'s memory
+         * directly without copying it, so reporting success without
+         * establishing the ordering would hand the caller a peer read of
+         * data that may not be written yet: a silent wrong answer, which
+         * is the one outcome worse than a failure. Fail instead, which is
+         * what a captured run does today anyway, and say why once. */
+        if (sycl_graph_batch_recording()) {
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                fprintf(stderr, DS4_GPU_LOG_PREFIX
+                        "cross-device ordering cannot be recorded into a command "
+                        "graph; run this placement without DS4_SYCL_GRAPH\n");
+            }
+            return 0;
+        }
         sycl::event ready = ds4_sycl_queue(sd).ext_oneapi_submit_barrier();
         ds4_sycl_queue(dst_tier).ext_oneapi_submit_barrier({ready});
         return 1;
