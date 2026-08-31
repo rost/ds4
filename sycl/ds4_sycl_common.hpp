@@ -233,12 +233,16 @@ static inline float sycl_q8_0_dequant(const unsigned char *row, uint32_t col) {
  * a local_accessor -- so the same helper serves kernels that read the
  * activation row from global memory and kernels that stage it in local
  * memory. */
+static inline float sycl_q8_0_block_scale(const unsigned char *bp) {
+    uint16_t raw;
+    __builtin_memcpy(&raw, bp, sizeof(raw));
+    return (float)sycl::bit_cast<sycl::half>(raw);
+}
+
 template <typename XAcc>
 static inline float sycl_q8_0_block_dot(const unsigned char *bp, const XAcc &xs,
                                         uint32_t base, uint32_t n) {
-    uint16_t raw;
-    __builtin_memcpy(&raw, bp, sizeof(raw));
-    const float scale = (float)sycl::bit_cast<sycl::half>(raw);
+    const float scale = sycl_q8_0_block_scale(bp);
     float acc = 0.0f;
     if (n == 32u) {
         signed char qv[32];
@@ -250,6 +254,32 @@ static inline float sycl_q8_0_block_dot(const unsigned char *bp, const XAcc &xs,
         }
     }
     return scale * acc;
+}
+
+/* The all-integer counterpart of sycl_q8_0_block_dot, for the callers
+ * whose activations are already quantised to int8 against a per-block
+ * scale of their own: the dot product of one Q8_0 block's codes against
+ * `n` of those, left unscaled so the caller applies both scales once.
+ * Same reason for the wide copies as sycl_q8_0_block_dot above -- the
+ * loop is otherwise 64 single-byte loads per block -- and same
+ * __builtin_memcpy rather than a reinterpret cast, since a Q8_0 block
+ * starts at 34*b and is only 2-byte aligned.  Widening the loads does not
+ * move a single result: the products and their sum are exact in int, and
+ * the order is unchanged. */
+static inline int sycl_q8_0_block_dot_i8(const unsigned char *bp,
+                                         const int8_t *xq, uint32_t n) {
+    int dot = 0;
+    if (n == 32u) {
+        int8_t qv[32], xv[32];
+        __builtin_memcpy(qv, bp + 2, sizeof(qv));
+        __builtin_memcpy(xv, xq, sizeof(xv));
+        for (uint32_t i = 0; i < 32u; i++) dot += (int)qv[i] * (int)xv[i];
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            dot += (int)(signed char)bp[2 + i] * (int)xq[i];
+        }
+    }
+    return dot;
 }
 
 /* Q4_K row layout: cuda_block_q4_K, ds4_rocm.cu:72-77 (also the routed-MoE's
