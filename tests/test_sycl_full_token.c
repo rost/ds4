@@ -110,6 +110,19 @@ extern int ds4_sycl_moe_test_last_used_resident_weights(void);
 extern uint64_t ds4_sycl_test_stage_host_bytes_total(void);
 extern void     ds4_sycl_test_stage_host_bytes_reset(void);
 
+/* sycl/ds4_sycl_graph.hpp test-only hooks; not part of the ABI. Capture
+ * records the token's commands into a SYCL command graph instead of
+ * submitting them one at a time, and _submissions / _total_nodes report
+ * how many separate graphs the token actually needed and how many commands
+ * went into them. Their ratio is the average run of commands capture
+ * managed to group, which is what decides whether capture can pay for
+ * itself: a graph costs more to finalize than it saves unless the run is
+ * long enough. */
+extern void     ds4_sycl_test_graph_enable(int enable);
+extern int      ds4_sycl_test_graph_available(void);
+extern uint64_t ds4_sycl_test_graph_submissions(void);
+extern uint64_t ds4_sycl_test_graph_total_nodes(void);
+
 static double now_secs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -231,6 +244,74 @@ static int check_determinism(ds4_test_full_token_encode_fn encode_fn,
         }
     }
     return 1;
+}
+
+/* Command-graph capture, on the real per-token decode path.
+ *
+ * Two things are being established, and only the first is an assertion.
+ *
+ * Correctness: recording a token's commands into a graph and submitting
+ * the graph must produce EXACTLY the logits the un-captured path produced.
+ * Capture changes when commands run, not what they compute, so anything
+ * other than a bit-identical match means the capture machinery reordered
+ * or dropped work -- most plausibly a scratch buffer freed before the
+ * graph that reads it ran, which is precisely what the batch's deferred
+ * frees exist to prevent.
+ *
+ * Viability: the report below, which is deliberately NOT an assertion
+ * because it measures the backend's current shape rather than a
+ * requirement of it. Capture only pays when a long run of commands can be
+ * recorded between two host synchronisations, and every wait in the
+ * captured region cuts the run short. Measured on an Arc A770, a graph
+ * needs roughly 16 commands before it beats submitting them directly, and
+ * roughly 64 before it wins by 2x. So a mean run well under that is the
+ * direct, quantitative reason capture stays off by default, and the number
+ * to re-check after the per-call weight staging that forces most of those
+ * waits stops happening. */
+static int measure_graph_capture(const float *baseline) {
+    if (!ds4_sycl_test_graph_available()) {
+        fprintf(stderr,
+                "  command-graph capture unavailable on this device, skipped\n");
+        return 0;
+    }
+
+    ds4_sycl_test_graph_enable(1);
+    float logits_graph[DS4_TW_N_VOCAB];
+    memset(logits_graph, 0, sizeof(logits_graph));
+    const int ok = ds4_test_graph_full_token_encode(/*token=*/3, logits_graph,
+                                                     DS4_TW_N_VOCAB);
+    const uint64_t submissions = ds4_sycl_test_graph_submissions();
+    const uint64_t nodes = ds4_sycl_test_graph_total_nodes();
+
+    const int repeats = 10;
+    const double t0 = now_secs();
+    for (int r = 0; r < repeats; r++) {
+        float logits[DS4_TW_N_VOCAB];
+        (void)ds4_test_graph_full_token_encode(/*token=*/3, logits, DS4_TW_N_VOCAB);
+    }
+    const double t1 = now_secs();
+    ds4_sycl_test_graph_enable(0);
+
+    CHECK(ok != 0, "the full-token encode failed with command-graph capture on");
+    CHECK(submissions > 0,
+          "command-graph capture was enabled but the token produced no graph "
+          "submissions at all -- the batch never recorded anything, so the "
+          "logits comparison below would pass vacuously");
+    CHECK(memcmp(logits_graph, baseline, sizeof(logits_graph)) == 0,
+          "command-graph capture changed the logits: recording commands into "
+          "a graph must not change what they compute, and a mismatch here is "
+          "most likely device scratch freed before the graph reading it ran");
+
+    fprintf(stderr,
+            "  command-graph capture OK (logits bit-identical to the "
+            "un-captured path)\n"
+            "    %llu graph submissions/token, %llu recorded commands/token, "
+            "mean run %.1f commands\n"
+            "    %.3f ms/token captured (compare the uncached figure above)\n",
+            (unsigned long long)submissions, (unsigned long long)nodes,
+            submissions ? (double)nodes / (double)submissions : 0.0,
+            (t1 - t0) * 1000.0 / repeats);
+    return 0;
 }
 
 int main(void) {
@@ -376,6 +457,8 @@ int main(void) {
             DS4_FULL_TOKEN_DETERMINISM_REPEATS);
 
     if (measure_bytes_and_time(10)) return 1;
+
+    if (measure_graph_capture(logits_a)) return 1;
 
     ds4_gpu_cleanup();
     return 0;
