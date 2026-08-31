@@ -43,6 +43,13 @@ extern int ds4_sycl_test_xdev_bounce_calls(void);
 extern int ds4_sycl_test_peer_bytecheck(int tier, int corrupt,
                                          int inject_compare_bug, int vary_pattern);
 
+/* Test-only: the physical-device-id to logical-tier translation every ABI
+ * entry that speaks physical ids goes through (sycl_tier_for_device_id,
+ * sycl/ds4_sycl_mgpu.hpp). Reads only g_gpu[0..g_n_gpus), so a
+ * --gpu-devices ordering naming more cards than this box has can still be
+ * exercised for real by populating that table directly. */
+extern int ds4_sycl_test_tier_for_device_id(int device_id);
+
 #define CHECK(cond, msg)                                                    \
     do {                                                                    \
         if (!(cond)) {                                                      \
@@ -190,6 +197,86 @@ static int test_tensor_alloc_on_invalid(void) {
 
     ds4_gpu_cleanup();
     return 0;
+}
+
+/* ---- physical device id -> logical tier -------------------------------- */
+
+/* The two are equal only when --gpu-devices is contiguous from zero, and
+ * the ordering ds4's expert-parallel path wants is deliberately not:
+ * --cuda-tensor-parallel pairs tier i with tier i + n_gpus/2, so the
+ * tested CUDA topology is --gpu-devices 0,2,4,6,1,3,5,7 (README.md).
+ * Under that ordering physical device 2 is tier 1, not tier 2, and
+ * conflating them made ds4_gpu_device_cache_tensors stage a tier's
+ * weights through another tier's queue and into another tier's cache
+ * slab.
+ *
+ * The mapping is a pure lookup over g_gpu[0..g_n_gpus), both of which
+ * ds4_gpu_mgpu.h exports, so this runs for real on this one-GPU box
+ * rather than skipping: it drives the same function the ABI boundary
+ * calls, against the exact eight-card table a B60 host would build.
+ * g_gpu and g_n_gpus are restored afterwards so later tests still see the
+ * uninitialised defaults they expect. */
+static int test_tier_for_device_id_non_contiguous(void) {
+    ds4_gpu_cleanup();
+
+    ds4_gpu_ctx saved_gpu[DS4_MAX_GPUS];
+    const int   saved_n = g_n_gpus;
+    memcpy(saved_gpu, g_gpu, sizeof(saved_gpu));
+
+    const int order[8] = {0, 2, 4, 6, 1, 3, 5, 7};
+    g_n_gpus = 8;
+    for (int t = 0; t < 8; t++) g_gpu[t].device_id = order[t];
+
+    int rc = 0;
+    for (int t = 0; t < 8 && rc == 0; t++) {
+        if (ds4_sycl_test_tier_for_device_id(order[t]) != t) {
+            fprintf(stderr, "FAIL: device %d must resolve to tier %d, got %d\n",
+                    order[t], t, ds4_sycl_test_tier_for_device_id(order[t]));
+            rc = 1;
+        }
+    }
+    /* The conflation this guards against, stated directly. */
+    if (rc == 0 && ds4_sycl_test_tier_for_device_id(2) == 2) {
+        fprintf(stderr, "FAIL: device 2 resolved to tier 2 (identity), not tier 1\n");
+        rc = 1;
+    }
+    /* A card outside the configured list has no tier, and must not fall
+     * back to an identity match. */
+    if (rc == 0 && ds4_sycl_test_tier_for_device_id(8) != -1) {
+        fprintf(stderr, "FAIL: an unconfigured device must resolve to -1\n");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_sycl_test_tier_for_device_id(-1) != -1) {
+        fprintf(stderr, "FAIL: a negative device id must resolve to -1\n");
+        rc = 1;
+    }
+
+    /* A gap in the middle: only the four cards actually named resolve. */
+    if (rc == 0) {
+        const int sparse[4] = {3, 9, 1, 12};
+        g_n_gpus = 4;
+        for (int t = 0; t < 4; t++) g_gpu[t].device_id = sparse[t];
+        for (int t = 0; t < 4 && rc == 0; t++) {
+            if (ds4_sycl_test_tier_for_device_id(sparse[t]) != t) {
+                fprintf(stderr, "FAIL: sparse device %d must resolve to tier %d\n",
+                        sparse[t], t);
+                rc = 1;
+            }
+        }
+        if (rc == 0 && ds4_sycl_test_tier_for_device_id(0) != -1) {
+            fprintf(stderr, "FAIL: device 0 is not in the sparse list; must be -1\n");
+            rc = 1;
+        }
+        if (rc == 0 && ds4_sycl_test_tier_for_device_id(2) != -1) {
+            fprintf(stderr, "FAIL: device 2 is not in the sparse list; must be -1\n");
+            rc = 1;
+        }
+    }
+
+    memcpy(g_gpu, saved_gpu, sizeof(saved_gpu));
+    g_n_gpus = saved_n;
+    if (rc == 0) fprintf(stderr, "  test_tier_for_device_id_non_contiguous OK\n");
+    return rc;
 }
 
 /* ---- multi-device path: skip cleanly on this box ----------------------- */
@@ -704,6 +791,7 @@ int main(void) {
     if (test_set_current_device()) return 1;
     if (test_tensor_alloc_on_tier0()) return 1;
     if (test_tensor_alloc_on_invalid()) return 1;
+    if (test_tier_for_device_id_non_contiguous()) return 1;
     if (test_init_multi_n2_or_skip()) return 1;
     if (test_copy_xdev_same_device()) return 1;
     if (test_copy_xdev_default_and_ordered_same_device()) return 1;

@@ -299,6 +299,47 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     }
 }
 
+/* Maps a PHYSICAL device id -- the value the operator passed in
+ * --gpu-devices, which ds4_gpu_init_multi above stores in
+ * g_gpu[tier].device_id -- to the LOGICAL tier that owns it, or -1 when
+ * no configured tier does. The two coincide only when the device list is
+ * contiguous from zero, so every ABI entry that CUDA defines in terms of
+ * a physical id must come through here before touching anything
+ * tier-indexed. ds4_gpu_device_cache_tensors (ds4_cuda.cu:3944) is the
+ * only such entry this backend implements; ds4_gpu_lookup_cache_strict's
+ * expected_device (ds4_gpu_mgpu.h:216-228) is the same convention and is
+ * cited so a future implementation of it starts here rather than
+ * rediscovering the mismatch.
+ *
+ * CUDA needs no such helper because a physical id is directly usable
+ * there: it hands device_id straight to cudaSetDevice and indexes its
+ * per-device slabs by it (g_dev_cache[device_id], ds4_cuda.cu:3973,
+ * :3977). SYCL has no physical device-id space at all -- ds4_sycl_queue
+ * takes a tier -- so the translation has to happen somewhere, and doing
+ * it once at each boundary keeps every index inside this backend a tier.
+ *
+ * Pure lookup over the configured tier table: it answers "which tier was
+ * this card assigned to", never "is that tier usable". Callers bounds-
+ * check the returned tier against g_devices themselves, the same
+ * separation ds4_gpu_set_current_device_fenced's own reverse scan uses
+ * on CUDA (ds4_cuda.cu:3897-3899). */
+static int sycl_tier_for_device_id(int device_id) {
+    if (device_id < 0) return -1;
+    const int n_tiers = g_n_gpus < DS4_MAX_GPUS ? g_n_gpus : DS4_MAX_GPUS;
+    for (int t = 0; t < n_tiers; t++) {
+        if (g_gpu[t].device_id == device_id) return t;
+    }
+    return -1;
+}
+
+/* Test-only: exposes the physical-to-logical translation directly so a
+ * non-contiguous --gpu-devices ordering can be exercised on a box with
+ * fewer devices than the ordering names. Not part of the ABI (not
+ * declared in ds4_gpu.h or ds4_gpu_mgpu.h). */
+extern "C" int ds4_sycl_test_tier_for_device_id(int device_id) {
+    return sycl_tier_for_device_id(device_id);
+}
+
 /* Real tier switch: 0 means success (the minority convention; see spec 3a
  * and ds4_gpu_mgpu.h:199-200). An out-of-range tier is rejected and
  * g_current_tier is left untouched, matching CUDA's own

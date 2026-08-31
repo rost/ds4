@@ -68,15 +68,18 @@ struct sycl_placement_tier_cache {
     std::vector<sycl_placement_cache_range> ranges;
 };
 
-/* Indexed by logical tier == device_id, matching the convention every
- * other "_on(tier)"/device_id-taking entry in this backend already uses
- * (ds4_gpu_tensor_alloc_on, ds4_gpu_copy_xdev: sycl/ds4_sycl_mgpu.hpp).
- * That convention is only exact when ds4_gpu_init_multi was configured
- * with an identity --gpu-devices filter (device_indices[i] == i for
- * every i, the common case and the only one this single-A770 box can
- * exercise); a non-identity filter would make g_gpu[tier].device_id
- * diverge from tier, and this file inherits that same pre-existing gap
- * rather than introducing a new one -- see the report's B60 checklist. */
+/* Indexed by LOGICAL tier, parallel to g_devices, like every other
+ * per-tier table in this backend (g_sycl_stream_tier,
+ * g_sycl_model_cache_tier) and like the "_on(tier)" entries that feed
+ * them (ds4_gpu_tensor_alloc_on, sycl/ds4_sycl_mgpu.hpp). It is NOT
+ * indexed by the physical device id the operator passed in --gpu-devices:
+ * ds4_gpu_device_cache_tensors below receives one of those and translates
+ * it with sycl_tier_for_device_id (sycl/ds4_sycl_mgpu.hpp) before
+ * touching this table, so a non-contiguous ordering such as
+ * --gpu-devices 0,2,4,6,1,3,5,7 resolves to the tier that actually owns
+ * the card. CUDA can index its own slabs by the physical id directly
+ * (g_dev_cache[device_id], ds4_cuda.cu:3973) because cudaSetDevice takes
+ * one; SYCL has no such id space, only tiers. */
 static std::vector<sycl_placement_tier_cache> g_placement_tier;
 
 static sycl_placement_tier_cache &sycl_placement_cache_for(int tier) {
@@ -113,6 +116,7 @@ static void sycl_placement_teardown_all(void) {
 /* The registered host model map: set only by ds4_gpu_register_model_map_
  * no_copy below, read only by ds4_gpu_device_cache_tensors. */
 static const void *g_placement_host_base = nullptr;
+static uint64_t    g_placement_host_size = 0;
 
 /* Resolves a model-mmap range to the device copy ds4_gpu_device_cache_
  * tensors already installed on the current tier, or nullptr.
@@ -144,7 +148,6 @@ static const char *sycl_placement_cache_resolve(const void *model_map,
     }
     return nullptr;
 }
-static uint64_t    g_placement_host_size = 0;
 
 /* uint64_t return, no failure-value convention to match (there is no
  * "invalid" bit pattern in a byte count): 0 doubles as "unknown/tier out
@@ -219,7 +222,24 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map,
 extern "C" int ds4_gpu_device_cache_tensors(int                    device_id,
                                             const ds4_tensor_range *ranges,
                                             int                     n_ranges) {
-    if (device_id < 0 || (size_t)device_id >= g_devices.size()) return 1;
+    /* device_id, and every ranges[i].target_device, are PHYSICAL device
+     * ids -- the values the operator passed in --gpu-devices -- not
+     * logical tiers. ds4.c:57024 passes g_gpu[d].device_id and
+     * ds4.c:57197 stamps that same value into target_device, and CUDA
+     * reads both the same way: it validates device_id against
+     * DS4_MAX_GPUS rather than g_n_gpus, indexes g_dev_cache by it and
+     * hands it straight to cudaSetDevice (ds4_cuda.cu:3947, :3973,
+     * :3977).
+     *
+     * Nothing inside this backend is addressable by a physical id, so
+     * translate once here and keep every index below a tier. Treating the
+     * two as interchangeable was only ever correct for a device list
+     * contiguous from zero; with --gpu-devices 0,2,4,6,1,3,5,7 -- the
+     * ordering --cuda-tensor-parallel wants, since it pairs tier i with
+     * tier i + n_gpus/2 -- it selected the wrong queue and the wrong
+     * cache slab, staging each tier's weights onto another tier's card. */
+    const int tier = sycl_tier_for_device_id(device_id);
+    if (tier < 0 || (size_t)tier >= g_devices.size()) return 1;
     if (n_ranges < 0 || (!ranges && n_ranges > 0)) return 2;
     if (n_ranges == 0) return 0;
     if (!g_placement_host_base || g_placement_host_size == 0) return 3;
@@ -228,6 +248,7 @@ extern "C" int ds4_gpu_device_cache_tensors(int                    device_id,
      * cannot partially grow the slab (same ordering as ds4_cuda.cu). */
     uint64_t want_bytes = 0;
     for (int i = 0; i < n_ranges; i++) {
+        /* Physical against physical, matching ds4_cuda.cu:3959. */
         if (ranges[i].target_device != device_id) continue;
         const uint64_t off = ranges[i].source_offset;
         const uint64_t nb  = ranges[i].bytes;
@@ -238,19 +259,19 @@ extern "C" int ds4_gpu_device_cache_tensors(int                    device_id,
     }
     if (want_bytes == 0) return 0;
 
-    const uint64_t free_before = ds4_gpu_tier_free_vram(device_id);
+    const uint64_t free_before = ds4_gpu_tier_free_vram(tier);
     if (want_bytes > free_before) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "device cache slab needs %.2f GiB on tier %d but only "
-                "%.2f GiB free; lower --gpu-vram or use --gpu-vram auto on "
-                "a host with more headroom\n",
-                (double)want_bytes / 1073741824.0, device_id,
+                "device cache slab needs %.2f GiB on tier %d (device %d) but "
+                "only %.2f GiB free; lower --gpu-vram or use --gpu-vram auto "
+                "on a host with more headroom\n",
+                (double)want_bytes / 1073741824.0, tier, device_id,
                 (double)free_before / 1073741824.0);
         return 5;
     }
 
-    sycl_placement_tier_cache &c = sycl_placement_cache_for(device_id);
-    sycl::queue               &q = ds4_sycl_queue(device_id);
+    sycl_placement_tier_cache &c = sycl_placement_cache_for(tier);
+    sycl::queue               &q = ds4_sycl_queue(tier);
     const uint64_t new_bytes = c.bytes + want_bytes;
 
     unsigned char *new_base = sycl::malloc_device<unsigned char>((size_t)new_bytes, q);

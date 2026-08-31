@@ -531,7 +531,7 @@ tests/test_sycl_moe: tests/test_sycl_moe.o ds4_sycl.o ds4_sycl_unavailable.o
 test-sycl-moe: tests/test_sycl_moe
 	./tests/test_sycl_moe
 
-tests/test_sycl_mgpu.o: tests/test_sycl_mgpu.c ds4_gpu.h ds4_gpu_mgpu.h
+tests/test_sycl_mgpu.o: tests/test_sycl_mgpu.c ds4_gpu.h ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
 
 tests/test_sycl_mgpu: tests/test_sycl_mgpu.o ds4_sycl.o ds4_sycl_unavailable.o
@@ -654,7 +654,7 @@ test-sycl-readback: tests/test_sycl_readback
 # placement.c uses, so it can prove engine_classify_multi_tier accepts a
 # config built from a real ds4_gpu_tier_free_vram reading rather than
 # refusing it. Same link line as tests/test_sycl_session_smoke.
-tests/test_sycl_placement.o: tests/test_sycl_placement.c ds4_gpu.h ds4_gpu_mgpu.h
+tests/test_sycl_placement.o: tests/test_sycl_placement.c ds4_gpu.h ds4_gpu_args.h ds4_gpu_mgpu.h
 	$(CC) $(CFLAGS) $(SYCL_HOST_CFLAGS) -DDS4_SYCL_BUILD -I. -c -o $@ $<
 
 tests/test_sycl_placement: tests/test_sycl_placement.o ds4_sycl_test_hooks.o ds4_sycl.o ds4_sycl_unavailable.o ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_layer_pack.o

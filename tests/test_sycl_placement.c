@@ -7,9 +7,11 @@
  * decision made from a real second tier's free-VRAM reading. Every test
  * below either runs for real against the one available tier (tier_free_vram,
  * the selective cache's admission/growth/eviction, the classify-acceptance
- * proof) or validates argument handling and bounds independent of device
- * count. See the report for the exact list of what remains untestable
- * until a second real device exists.
+ * proof, and the physical-device-id to logical-tier translation, which one
+ * tier holding a non-zero physical id is enough to exercise) or validates
+ * argument handling and bounds independent of device count. See the report
+ * for the exact list of what remains untestable until a second real device
+ * exists.
  *
  * Deliberately self-contained: no shared harness header, matching
  * tests/test_sycl_mgpu.c and tests/test_sycl_fp8_kv.c. Needs no model
@@ -18,6 +20,7 @@
  * tests/test_engine_mgpu_placement.c uses. */
 
 #include "ds4_gpu.h"
+#include "ds4_gpu_args.h"
 #include "ds4_gpu_mgpu.h"
 
 #include <stdint.h>
@@ -41,6 +44,22 @@ extern int      ds4_sycl_test_model_range_is_cached(const void *model_map,
 extern uint64_t ds4_sycl_test_placement_cache_bytes(int tier);
 extern int      ds4_sycl_test_placement_read_back(int tier, uint64_t source_offset,
                                                    uint64_t bytes, void *out);
+extern int      ds4_sycl_test_tier_for_device_id(int device_id);
+
+/* How many GPUs the machine actually has: ds4_gpu_init is a single-device
+ * shim, so ds4_sycl_device_count after it always reports 1. Same probe
+ * tests/test_sycl_mgpu.c uses, and the same enumeration --gpu-vram auto
+ * itself performs, so it sees what a real multi-GPU startup would. */
+static int physical_device_count(void) {
+    ds4_gpu_config cfg;
+    char errbuf[256];
+    memset(&cfg, 0, sizeof(cfg));
+    errbuf[0] = '\0';
+    if (ds4_gpu_args_probe_auto_cuda(NULL, 0, &cfg, 0, errbuf, sizeof(errbuf)) != 0) {
+        return 0;
+    }
+    return cfg.n_gpus;
+}
 
 /* DS4_TEST_HOOKS entry points defined in ds4.c, matching the declarations
  * in tests/test_engine_mgpu_placement.c. */
@@ -340,6 +359,149 @@ static int test_device_cache_tensors_headroom_refusal(void) {
     return 0;
 }
 
+/* ---- non-contiguous --gpu-devices --------------------------------------- */
+
+/* ds4_gpu_device_cache_tensors takes a PHYSICAL device id, the value the
+ * operator passed in --gpu-devices, and so does every ranges[i].
+ * target_device (ds4.c:57024, ds4.c:57197; CUDA reads both the same way,
+ * ds4_cuda.cu:3947-3977). Everything inside the SYCL backend is addressed
+ * by LOGICAL tier instead, and the entry used to treat the two as the
+ * same integer -- correct only for a device list contiguous from zero.
+ *
+ * This box has one GPU, so a genuine multi-card ordering cannot be
+ * initialised here. What CAN be exercised for real is the case that
+ * actually broke: a configured tier whose physical id is not its tier
+ * index. Reassigning g_gpu[0].device_id after init is exactly the state
+ * `--gpu-devices 6` on a 14-card host leaves behind -- one tier, holding
+ * a card whose physical id is 6 -- and nothing else in this backend reads
+ * g_gpu[].device_id, so the one real device still backs tier 0.
+ *
+ * Before the fix this test failed twice over: device 6 was rejected as
+ * out of range, and had it been accepted the slab would have been
+ * installed in g_placement_tier[6] behind ds4_sycl_queue(6). */
+static int test_device_cache_tensors_physical_id_is_not_tier(void) {
+    ds4_gpu_cleanup();
+    CHECK(ds4_gpu_init() != 0, "ds4_gpu_init for physical-id translation");
+
+    const int saved_device_id = g_gpu[0].device_id;
+    g_gpu[0].device_id = 6;
+
+    int rc = 0;
+    unsigned char host[2048];
+    for (unsigned i = 0; i < sizeof(host); i++) host[i] = (unsigned char)(i * 53u + 7u);
+
+    if (ds4_gpu_register_model_map_no_copy(host, sizeof(host)) == 0) {
+        fprintf(stderr, "FAIL: register_model_map_no_copy for physical-id test\n");
+        rc = 1;
+    }
+
+    ds4_tensor_range r;
+    r.source_offset = 0;
+    r.bytes = 1024;
+    r.target_device = 6;
+
+    /* Tier 0's index is no longer a device this run configured. */
+    if (rc == 0 && ds4_gpu_device_cache_tensors(0, &r, 1) == 0) {
+        fprintf(stderr, "FAIL: an unconfigured physical device id must be refused\n");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_sycl_test_tier_for_device_id(6) != 0) {
+        fprintf(stderr, "FAIL: physical device 6 must resolve to tier 0\n");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_gpu_device_cache_tensors(6, &r, 1) != 0) {
+        fprintf(stderr, "FAIL: the configured physical device id must be accepted\n");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_sycl_test_placement_cache_bytes(0) != 1024) {
+        fprintf(stderr, "FAIL: the slab must be installed on tier 0, not slot 6\n");
+        rc = 1;
+    }
+    if (rc == 0 && ds4_sycl_test_placement_cache_bytes(6) != 0) {
+        fprintf(stderr, "FAIL: nothing may be installed in the physical id's slot\n");
+        rc = 1;
+    }
+
+    /* The bytes really are on tier 0's device, not merely accounted there. */
+    unsigned char readback[1024];
+    memset(readback, 0, sizeof(readback));
+    if (rc == 0 && ds4_sycl_test_placement_read_back(0, 0, 1024, readback) != 1) {
+        fprintf(stderr, "FAIL: read-back from tier 0 must hit the installed range\n");
+        rc = 1;
+    }
+    if (rc == 0 && memcmp(readback, host, sizeof(readback)) != 0) {
+        fprintf(stderr, "FAIL: tier 0's copy must match the host bytes exactly\n");
+        rc = 1;
+    }
+    /* And weight resolution, which keys off the CURRENT tier, finds them. */
+    if (rc == 0 && ds4_sycl_test_model_range_is_cached(host, sizeof(host), 0, 1024) != 1) {
+        fprintf(stderr, "FAIL: the installed range must resolve as device-resident\n");
+        rc = 1;
+    }
+
+    g_gpu[0].device_id = saved_device_id;
+    ds4_gpu_cleanup();
+    if (rc == 0) {
+        fprintf(stderr, "  test_device_cache_tensors_physical_id_is_not_tier OK\n");
+    }
+    return rc;
+}
+
+/* The same claim against a genuinely multi-card, genuinely non-contiguous
+ * ordering: --gpu-devices 1,0 makes tier 0 hold physical device 1 and
+ * tier 1 hold physical device 0, so a range stamped target_device=0 must
+ * be installed on tier 1. Needs two real devices; skips cleanly on this
+ * A770 rather than faking the coverage. First thing to check on the
+ * 14-card B60 host, ideally widened there to the full
+ * --gpu-devices 0,2,4,6,1,3,5,7 topology --cuda-tensor-parallel wants. */
+static int test_device_cache_tensors_non_contiguous_devices_or_skip(void) {
+    const int have = physical_device_count();
+    if (have < 2) {
+        fprintf(stderr, "skip: non-contiguous device list wanted 2 GPUs, have %d "
+                        "(verify this case on the B60 machine)\n", have);
+        return 0;
+    }
+    ds4_gpu_cleanup();
+
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus = 2;
+    cfg.device_indices[0] = 1;
+    cfg.device_indices[1] = 0;
+    CHECK(ds4_gpu_init_multi(&cfg) != 0, "init_multi with a reversed device list");
+    CHECK(g_gpu[0].device_id == 1, "tier 0 holds physical device 1");
+    CHECK(g_gpu[1].device_id == 0, "tier 1 holds physical device 0");
+    CHECK(ds4_sycl_test_tier_for_device_id(0) == 1, "physical device 0 is tier 1");
+    CHECK(ds4_sycl_test_tier_for_device_id(1) == 0, "physical device 1 is tier 0");
+
+    unsigned char host[2048];
+    for (unsigned i = 0; i < sizeof(host); i++) host[i] = (unsigned char)(i * 29u + 3u);
+    CHECK(ds4_gpu_register_model_map_no_copy(host, sizeof(host)) != 0,
+          "register for the reversed device list");
+
+    ds4_tensor_range r;
+    r.source_offset = 512;
+    r.bytes = 1024;
+    r.target_device = 0; /* physical device 0, which is tier 1 */
+    CHECK(ds4_gpu_device_cache_tensors(0, &r, 1) == 0,
+          "physical device 0's ranges are admitted");
+    CHECK(ds4_sycl_test_placement_cache_bytes(1) == 1024,
+          "they are installed on tier 1, the tier that owns physical device 0");
+    CHECK(ds4_sycl_test_placement_cache_bytes(0) == 0,
+          "tier 0 must not have received another tier's weights");
+
+    unsigned char readback[1024];
+    memset(readback, 0, sizeof(readback));
+    CHECK(ds4_sycl_test_placement_read_back(1, 512, 1024, readback) == 1,
+          "read-back from tier 1 hits the installed range");
+    CHECK(memcmp(readback, host + 512, sizeof(readback)) == 0,
+          "tier 1's copy matches the host bytes exactly");
+
+    ds4_gpu_cleanup();
+    fprintf(stderr, "  test_device_cache_tensors_non_contiguous_devices OK\n");
+    return 0;
+}
+
 /* ---- ds4_gpu_q8_cache_suppressed pair ------------------------------------ */
 
 static int test_q8_cache_suppressed(void) {
@@ -432,6 +594,8 @@ int main(void) {
     if (test_device_cache_tensors_admission_and_readback()) return 1;
     if (test_register_model_map_no_copy_evicts_old_cache()) return 1;
     if (test_device_cache_tensors_headroom_refusal()) return 1;
+    if (test_device_cache_tensors_physical_id_is_not_tier()) return 1;
+    if (test_device_cache_tensors_non_contiguous_devices_or_skip()) return 1;
     if (test_q8_cache_suppressed()) return 1;
     if (test_classify_accepts_tier_free_vram_config()) return 1;
     fprintf(stderr, "test_sycl_placement: all tests passed\n");

@@ -507,10 +507,20 @@ Ordered by how likely each is to bite on first contact with real hardware.
   particular has never run off-diagonal; it exists because CUDA's peer-access
   reporting lied on real hardware, and the target cards are two dies behind a
   PCIe switch.
-* **`device_id` is treated as a direct index into `g_devices`** throughout this
-  backend, which is only correct when `device_indices[i] == i` for every tier. A
-  non-contiguous `--gpu-devices` filter would target the wrong physical card.
-  **Use a contiguous device list until this is fixed.**
+* **Physical device ids and logical tiers are two different index spaces**, and
+  the backend translates between them at the one ABI boundary that speaks
+  physical ids. `--gpu-devices` values live in `g_gpu[tier].device_id`;
+  everything inside this backend (`g_devices`, the queues, every per-tier cache)
+  is addressed by tier. `ds4_gpu_device_cache_tensors` and its ranges'
+  `target_device` carry physical ids, matching CUDA, and now go through
+  `sycl_tier_for_device_id` before anything tier-indexed is touched. A
+  non-contiguous list is therefore correct, including
+  `--gpu-devices 0,2,4,6,1,3,5,7`, the ordering `--cuda-tensor-parallel` wants
+  since it pairs tier `i` with tier `i + n_gpus/2`. It previously staged each
+  tier's weights through another tier's queue and into another tier's cache
+  slab. What has run on real hardware here is the one-tier, non-zero-physical-id
+  case (`tests/test_sycl_placement.c`); the genuinely multi-card ordering is
+  asserted by a test that skips on a single-GPU box.
 * **`--gpu-vram auto` cannot be trusted on Intel.** It reads Level Zero Sysman,
   which on this driver reports total memory as free. Pass explicit per-device
   budgets. `ds4_gpu_tier_free_vram` deliberately does not use that query.
