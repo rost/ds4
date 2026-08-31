@@ -362,11 +362,14 @@ static int sycl_attention_output_a_stage(sycl::queue &q, float *low_ptr,
      * is therefore redundant and removed; ev_p's own wait below (needed
      * regardless, since xq_guard/xscale_guard free their scratch when
      * this function returns) already covers everything submitted to q
-     * before it, ev_q included. */
+     * before it, ev_q included. Keeping xq/xscale alive is that drain's
+     * only purpose, so it goes through sycl_scratch_release_wait: a
+     * recording batch defers those frees itself and needs no wait at
+     * all. */
     ds4_sycl_profile_record_named("attn_output_quantize_q8_0_rows", ev_q);
     sycl::event ev_p = sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim,
                                     rank, n_groups, blocks_a, low_dim, n_tokens);
-    sycl_batch_wait(q);
+    sycl_scratch_release_wait(q, xq_guard, xscale_guard);
     ds4_sycl_profile_record_named("attn_output_grouped_q8_0_a_preq", ev_p);
     return 1;
 }

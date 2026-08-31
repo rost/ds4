@@ -409,6 +409,30 @@ static inline bool sycl_any_scratch_frees(const Guards &...guards) {
     return (... || guards.frees());
 }
 
+/* The drain a kernel entry performs purely so its own scratch guards can
+ * free safely when it returns.
+ *
+ * Distinct from sycl_batch_wait below: that one stands in for a wait the
+ * caller genuinely needs, and delivers it under capture by flushing the
+ * batch. This one carries no such meaning. Its only job is to keep staged
+ * scratch alive until the kernels reading it have finished, and a
+ * recording batch already guarantees exactly that by deferring the free
+ * past the submission that reads it (sycl/ds4_sycl_graph.hpp), so under
+ * capture there is nothing left to wait for.
+ *
+ * That distinction is what makes capture worth anything on a
+ * cache-resident decode, where these are most of the waits that remain:
+ * flushing at every one of them chops a token into dozens of graphs a
+ * handful of commands long, and a graph that short costs more to finalize
+ * than the submissions it saves. With capture off this is exactly the
+ * guarded drain it replaces. */
+template <typename... Guards>
+static inline void sycl_scratch_release_wait(sycl::queue &q, const Guards &...guards) {
+    if (sycl_graph_batch_recording()) return;
+    if (!sycl_any_scratch_frees(guards...)) return;
+    q.wait_and_throw();
+}
+
 /* The wait a kernel entry performs before scratch guards free under it.
  *
  * With capture off this is exactly the wait_and_throw it replaces. With a

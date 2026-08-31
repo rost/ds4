@@ -258,16 +258,23 @@ static int check_determinism(ds4_test_full_token_encode_fn encode_fn,
  * graph that reads it ran, which is precisely what the batch's deferred
  * frees exist to prevent.
  *
- * Viability: the report below, which is deliberately NOT an assertion
- * because it measures the backend's current shape rather than a
- * requirement of it. Capture only pays when a long run of commands can be
- * recorded between two host synchronisations, and every wait in the
+ * Viability: capture only pays when a long run of commands can be
+ * recorded between two host synchronisations, and every flush inside the
  * captured region cuts the run short. Measured on an Arc A770, a graph
  * needs roughly 16 commands before it beats submitting them directly, and
- * roughly 64 before it wins by 2x. So a mean run well under that is the
- * direct, quantitative reason capture stays off by default, and the number
- * to re-check after the per-call weight staging that forces most of those
- * waits stops happening. */
+ * roughly 64 before it wins by 2x.
+ *
+ * The mean run is therefore asserted, not just reported. Both ways this
+ * has been broken so far were silent: a mid-token split flush that ended
+ * capture left every layer after the first split un-captured (mean run
+ * 1.3), and routing a drain taken only so a scratch guard can free
+ * through the batch flushed on nearly every kernel entry (mean run 5.3).
+ * Neither changed the logits, so the correctness assertion above passed
+ * in both cases and only this number moved. The floor is well under the
+ * value the fixed synthetic shape actually produces, since submissions
+ * and node counts are exact counts rather than timings and do not vary
+ * between runs; it exists to catch a collapse back to a handful of
+ * commands per graph, not to pin the current figure. */
 static int measure_graph_capture(const float *baseline) {
     if (!ds4_sycl_test_graph_available()) {
         fprintf(stderr,
@@ -301,6 +308,12 @@ static int measure_graph_capture(const float *baseline) {
           "command-graph capture changed the logits: recording commands into "
           "a graph must not change what they compute, and a mismatch here is "
           "most likely device scratch freed before the graph reading it ran");
+    const double mean_run = (double)nodes / (double)submissions;
+    CHECK(mean_run >= 10.0,
+          "command-graph capture fragmented the token into graphs too short "
+          "to be worth recording: something inside the captured region is "
+          "flushing the batch that should not, so most of the token is being "
+          "submitted a command at a time after all");
 
     fprintf(stderr,
             "  command-graph capture OK (logits bit-identical to the "
@@ -309,7 +322,7 @@ static int measure_graph_capture(const float *baseline) {
             "mean run %.1f commands\n"
             "    %.3f ms/token captured (compare the uncached figure above)\n",
             (unsigned long long)submissions, (unsigned long long)nodes,
-            submissions ? (double)nodes / (double)submissions : 0.0,
+            mean_run,
             (t1 - t0) * 1000.0 / repeats);
     return 0;
 }

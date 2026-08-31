@@ -189,7 +189,9 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
          * finished; ev.wait_and_throw() below is the one wait this
          * function needs, since it runs before dw_guard/wf32_guard free
          * their scratch at scope exit and it also covers everything
-         * submitted to q before it, ev_cvt included. */
+         * submitted to q before it, ev_cvt included. Keeping that scratch
+         * alive is the drain's whole purpose, which is why it goes through
+         * sycl_scratch_release_wait and not sycl_batch_wait. */
         ds4_sycl_profile_record_named("matmul_f16_convert", ev_cvt);
 
         /* out (n_tok x out_dim row-major) as column-major is (out_dim x
@@ -215,7 +217,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
                  * confirmed empirically here too). */
                 (float *)out->ptr, (int64_t)out_dim, (int64_t)out_dim * (int64_t)n_tok,
                 1);
-        sycl_batch_wait(ev);
+        sycl_scratch_release_wait(q, dw_guard, wf32_guard);
         ds4_sycl_profile_record_named("matmul_f16", ev);
     } catch (const std::exception &e) {
         /* std::exception, not sycl::exception: oneapi::mkl::invalid_argument
@@ -536,7 +538,7 @@ static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
         /* The only reason to wait is dw_guard's free; when the weight
          * range came back device-resident there is nothing to free, and q
          * is in_order so the caller's next kernel is ordered anyway. */
-        if (sycl_any_scratch_frees(dw_guard)) sycl_batch_wait(q);
+        sycl_scratch_release_wait(q, dw_guard);
         ds4_sycl_profile_record_named("matmul_q8_0", ev);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0 failed: %s\n", e.what());

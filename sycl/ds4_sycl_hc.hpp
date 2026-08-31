@@ -1160,7 +1160,7 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
             });
         }
         /* Wait only for dw_guard's free, as in sycl_q8_0_matmul_general. */
-        if (sycl_any_scratch_frees(dw_guard)) sycl_batch_wait(q);
+        sycl_scratch_release_wait(q, dw_guard);
         ds4_sycl_profile_record_named("matmul_q8_0_hc_expand_labeled", _ds4_prof_ev52);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s failed: %s\n",
@@ -1493,9 +1493,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         });
         /* Wait only for the scratch guards' frees, as in
          * sycl_q8_0_matmul_general. */
-        if (sycl_any_scratch_frees(scale_guard, base_guard, norm_w_guard)) {
-            sycl_batch_wait(q);
-        }
+        sycl_scratch_release_wait(q, scale_guard, base_guard, norm_w_guard);
         ds4_sycl_profile_record_named("hc_split_weighted_sum_norm", _ds4_prof_ev54);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_weighted_sum_norm failed: %s\n", e.what());

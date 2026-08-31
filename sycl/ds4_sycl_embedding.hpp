@@ -64,7 +64,7 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(
         });
         /* Wait only for drow_guard's free, as in
          * sycl_q8_0_matmul_general. */
-        if (sycl_any_scratch_frees(drow_guard)) sycl_batch_wait(q);
+        sycl_scratch_release_wait(q, drow_guard);
         ds4_sycl_profile_record(_ds4_prof_ev33);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_token_hc failed: %s\n",

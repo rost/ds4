@@ -403,7 +403,7 @@ extern "C" int ds4_gpu_router_select_tensor(
                     active_n_expert_used, active_scale,
                     (has_bias && !hash_mode) ? 1 : 0, hash_mode ? 1 : 0);
         }
-        if (sycl_any_scratch_frees(scratch_guard)) sycl_batch_wait(q);
+        sycl_scratch_release_wait(q, scratch_guard);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "router_select launch failed: %s\n", e.what());
         return 0;
@@ -498,7 +498,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(
                     active_n_expert_used, active_scale,
                     (has_bias && !hash_mode) ? 1 : 0, hash_mode ? 1 : 0);
         }
-        if (sycl_any_scratch_frees(scratch_guard)) sycl_batch_wait(q);
+        sycl_scratch_release_wait(q, scratch_guard);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "router_select_batch launch failed: %s\n", e.what());
         return 0;
