@@ -343,7 +343,9 @@ static void sycl_moe_q8_k_quantize(sycl::queue &q, sycl_block_q8_K *out,
                  if (tid == 0) yb->d = 1.0f / iscale;
              });
      });
-     sycl_batch_wait(_ds4_prof_ev82);
+     /* No wait: q is in_order (ds4_sycl.cpp), so the down kernel that
+      * reads `out` cannot start before this one finishes, and nothing
+      * here is staged scratch this function has to keep alive. */
      ds4_sycl_profile_record_named("moe_q8_k_quantize", _ds4_prof_ev82);
 }
 
@@ -1173,7 +1175,7 @@ static void sycl_moe_iq2_gate_up_mid_decode(
                  }
              });
      });
-     sycl_batch_wait(_ds4_prof_ev93);
+     /* No wait, same reasoning as sycl_moe_q8_k_quantize above. */
      ds4_sycl_profile_record_named("moe_iq2_gate_up_mid_decode", _ds4_prof_ev93);
 }
 
@@ -1479,7 +1481,7 @@ static void sycl_moe_q2k_down_direct(
                  if (row_ok && lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
              });
      });
-     sycl_batch_wait(_ds4_prof_ev95);
+     /* No wait, same reasoning as sycl_moe_q8_k_quantize above. */
      ds4_sycl_profile_record_named("moe_q2k_down_direct", _ds4_prof_ev95);
 }
 

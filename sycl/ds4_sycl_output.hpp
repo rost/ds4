@@ -94,7 +94,9 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out,
             float s = g / (1.0f + sycl::exp(-g));
             o[i] = s * u * weight;
         });
-        sycl_batch_wait(q);
+        /* No wait: q is in_order (ds4_sycl.cpp), so the consumer of
+         * `out` is already ordered behind this kernel, and no staged
+         * scratch is waiting to be freed here. */
         ds4_sycl_profile_record(_ds4_prof_ev140);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "swiglu failed: %s\n", e.what());

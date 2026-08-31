@@ -172,7 +172,10 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x,
                     }
                 });
         });
-        sycl_batch_wait(q);
+        /* No wait: q is in_order (ds4_sycl.cpp), so whatever reads the
+         * quantised cache next is already ordered behind this kernel, and
+         * nothing here is host-staged scratch to keep alive. A kernel
+         * failure now reaches the async handler instead of this catch. */
         ds4_sycl_profile_record_named("dsv4_fp8_kv_quantize", _ds4_prof_ev37);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "dsv4_fp8_kv_quantize failed: %s\n",
@@ -313,7 +316,8 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache,
                 sycl_store_raw_kv_batch_kernel(gid_id, praw, pkv, raw_cap, pos0, head_dim);
             });
         });
-        sycl_batch_wait(q);
+        /* No wait, same reasoning as ds4_gpu_dsv4_fp8_kv_quantize_tensor
+         * above. */
         ds4_sycl_profile_record_named("store_raw_kv_batch", _ds4_prof_ev39);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "store_raw_kv_batch failed: %s\n",
