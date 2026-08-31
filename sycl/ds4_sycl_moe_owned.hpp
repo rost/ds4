@@ -50,12 +50,32 @@ namespace {
  * passing, so it is a counter that has to catch it. */
 static uint32_t g_sycl_moe_owned_decode_owned_scratch = 0;
 
+/* Set on every owned decode dispatch to how many device-to-host readbacks
+ * that call performed.
+ *
+ * It must be 0 on the resident path. A readback there is not a small cost
+ * to be traded off: the queue is in_order, so a device-to-host memcpy
+ * drains everything already submitted to that tier, the previous layer's
+ * kernels included. At two ranks times 43 routed layers that is 86 full
+ * pipeline drains per token which the unsplit baseline never performs,
+ * because sycl_routed_moe_launch skips its own compaction readback
+ * entirely when the weights are resident. On a 14-GPU B60 box across 8
+ * GPUs on real DeepSeek V4 Flash that asymmetry was the whole
+ * expert-parallel decode regression, 4.35 t/s unsplit against 2.79 t/s
+ * split. Nothing about it shows up in an oracle comparison, so a counter
+ * is the only thing that can stop it coming back. */
+static uint32_t g_sycl_moe_owned_decode_readbacks = 0;
+
 /* moe_owned_local_expert, ds4_cuda.cu:19445-19455: true iff the GLOBAL
  * expert id `expert` falls in [expert_base, expert_base+expert_count),
- * writing the LOCAL (expert_base-relative) id when so. Used only where
- * ownership must be tested against the ORIGINAL selected array (packing
- * and the packed combine); the owned decode kernels below use a simpler
- * host-built remap instead (see sycl_routed_moe_one_owned_q4k below). */
+ * writing the LOCAL (expert_base-relative) id when so. The single
+ * definition of what this rank owns, deliberately shared by all three
+ * places that need it rather than restated: the packing helper and the
+ * packed combine below, the host loop that builds a compacted table in
+ * sycl_routed_moe_one_owned_dispatch, and sycl_moe_owned_remap's own
+ * device-side resolution, which runs this predicate inside every owned
+ * decode kernel. Being callable from device code is why it stays a plain
+ * inline function over scalars. */
 static inline bool sycl_moe_owned_local_expert(int32_t expert, uint32_t expert_base,
                                                uint32_t expert_count,
                                                uint32_t *local_expert) {
@@ -161,35 +181,92 @@ static inline float sycl_moe_owned_packed_combine_row(const float *home_slots,
 
 /* ---- Decode owned Q4_K kernels ----------------------------------------
  *
- * All three kernels below take `remap`, NOT expert_base/expert_count: the
- * caller (sycl_routed_moe_one_owned_q4k) has already read the six selected
- * ids back to host, decided which are owned, deduplicated the owned ids,
- * and, when the weights are not already device-resident, staged only that
- * distinct set to device (reusing sycl_moe_stage_selected_experts from
- * ds4_sycl_moe_launch.hpp). `remap.local[i]` is the weight table's index
- * for slot i, or -1 if slot i is not owned by this rank. This keeps
- * compaction and ownership as one composed decision made once on the
- * host, rather than two separate device-side checks.
+ * All three kernels below take `remap`, NOT expert_base/expert_count
+ * directly: it is `sycl_moe_owned_remap` below, which answers the one
+ * question every owned kernel asks per slot, "which row of the weight
+ * table this launch was handed does slot i read, or is slot i not mine",
+ * without the kernel needing to know which of the two ways that table was
+ * built. It travels BY VALUE as a kernel argument, never through a device
+ * buffer, so the dispatch owns no scratch on its account. */
+
+/* Slot-to-weight-table-row resolution for the owned decode kernels.
  *
- * It travels BY VALUE, as a kernel argument, not through a device buffer.
- * Six int32 cost 24 bytes of the kernel argument budget, and on the path
- * that matters -- an expert-parallel decode, where the placement cache has
- * already made all three weight tables device-resident -- that 24-byte
- * buffer was the only allocation the dispatch still owned. Owning it meant
- * the dispatch had to drain its queue before returning so the guard could
- * free it, and that drain is precisely what kept the two ranks from
- * running at the same time: ds4.c issues the partner tier's owned decode
- * and then the home tier's back to back with no synchronisation of its
- * own, so a drain inside the first one delays submitting the second until
- * the first has finished. Measured on an 8-GPU DeepSeek V4 Flash run,
- * strictly sequential ranks made --cuda-tensor-parallel decode SLOWER than
- * no split at all (2.78 t/s against 4.34 t/s) even though prefill, which
- * has enough work in flight to overlap regardless, was 2.1x faster (3.62
- * to 7.45 t/s). Passing the remap by value removes the allocation, its
- * host-to-device copy, and the drain that protected it together. */
+ * Two addressings exist because there are two ways the weight table this
+ * rank reads can come to be, and they are deliberately kept apart rather
+ * than collapsed into one array of six ints:
+ *
+ *   Resident. The placement cache has already made this rank's whole
+ *   owned half device-resident, so the table holds every expert of that
+ *   half at its expert_base-relative id. The row is then a pure function
+ *   of data the device already has: a range test on `selected`. Nothing
+ *   about it needs the host, which is the entire point -- see
+ *   sycl_moe_owned_remap_resident below.
+ *
+ *   Compacted. The weights had to cross to the device, so only the
+ *   DISTINCT owned experts were staged, packed contiguously. The row is a
+ *   position in that packed table, which only the host that built the
+ *   table knows, so those six positions ride along by value.
+ *
+ * `selected` non-null selects the first, and is the discriminant purely
+ * because the resident path is the one that has a device pointer to
+ * derive from. Both answers mean the same thing to a kernel, so the
+ * decision lives in local_of_slot() alone and no kernel repeats it. */
 struct sycl_moe_owned_remap {
-    int32_t local[6];
+    /* Device pointer to the six ORIGINAL global selected ids, or null on
+     * the compacted path. */
+    const int32_t *selected;
+    uint32_t expert_base;
+    uint32_t expert_count;
+    /* Packed-table positions, read only when `selected` is null. */
+    int32_t packed[6];
+
+    /* This rank's row for `slot`, or -1 when the peer owns that slot.
+     * Shares sycl_moe_owned_local_expert with the host and with
+     * sycl_moe_owned_packed_component, so the resident path's device-side
+     * ownership test and the packed kernels' own test cannot drift apart:
+     * both are that one predicate. */
+    int32_t local_of_slot(uint32_t slot) const {
+        if (!selected) return packed[slot];
+        uint32_t local = 0;
+        if (!sycl_moe_owned_local_expert(selected[slot], expert_base, expert_count, &local)) {
+            return -1;
+        }
+        return (int32_t)local;
+    }
 };
+
+/* The resident carrier: no host involvement at all, which is what lets
+ * sycl_routed_moe_one_owned_dispatch return without a single host round
+ * trip on the path a real --cuda-tensor-parallel decode takes.
+ *
+ * The readback this replaces was NOT a cheap six-int fetch. On an
+ * in_order queue a device-to-host memcpy drains everything already
+ * submitted to that tier, including the previous layer's kernels, so it
+ * cost a full pipeline drain per rank per routed layer: 2 ranks times 43
+ * routed layers is 86 drains per token that the unsplit baseline never
+ * performs, since sycl_routed_moe_launch skips its own compaction
+ * readback outright when the weights are resident. Measured on a 14-GPU
+ * B60 box across 8 GPUs on real DeepSeek V4 Flash, that gap was the whole
+ * regression: 4.35 t/s unsplit against 2.79 t/s expert-parallel, about
+ * 128 ms per token over 86 drains, near enough 1.5 ms each. */
+static inline sycl_moe_owned_remap sycl_moe_owned_remap_resident(const int32_t *selected,
+                                                                 uint32_t expert_base,
+                                                                 uint32_t expert_count) {
+    sycl_moe_owned_remap r{};
+    r.selected = selected;
+    r.expert_base = expert_base;
+    r.expert_count = expert_count;
+    return r;
+}
+
+/* The compacted carrier: `packed[i]` is slot i's position in the packed
+ * table the host just staged, or -1 when the peer owns slot i. */
+static inline sycl_moe_owned_remap sycl_moe_owned_remap_packed(const int32_t (&packed)[6]) {
+    sycl_moe_owned_remap r{};
+    r.selected = nullptr;
+    for (uint32_t slot = 0; slot < 6u; slot++) r.packed[slot] = packed[slot];
+    return r;
+}
 
 static void sycl_moe_q4k_gate_up_mid_decode_owned(
         sycl::queue &q, float *mid_out, const char *gate_base, const char *up_base,
@@ -204,7 +281,7 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
                                sycl::range<2>(256u, 1u)),
              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
-                 const int32_t local = remap.local[slot];
+                 const int32_t local = remap.local_of_slot(slot);
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
@@ -243,9 +320,14 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
      /* No wait: q is in_order (ds4_sycl.cpp), so whatever the caller
       * submits next is already ordered behind this kernel, and nothing
       * this kernel reads is scratch this launcher has to keep alive.
-      * Draining here would also stall the OTHER expert-parallel rank,
+      * Draining here would also hold up the OTHER expert-parallel rank,
       * whose kernels ds4.c submits to a different tier's queue right
-      * after this one returns -- see sycl_moe_owned_remap above. */
+      * after this one returns. Worth being exact about how much that
+      * costs, since it is easy to overstate: removing these drains alone
+      * moved 8-GPU decode from 2.78 to 2.79 t/s, which is nothing. The
+      * drains were real but they were never the regression. The
+      * device-to-host readback this entry used to perform was, and it is
+      * gone too -- see sycl_moe_owned_remap_resident. */
      ds4_sycl_profile_record(_ds4_prof_ev118);
 }
 
@@ -273,7 +355,7 @@ static void sycl_moe_lut_gate_up_mid_decode_owned(
                                sycl::range<2>(256u, 1u)),
              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
-                 const int32_t local = remap.local[slot];
+                 const int32_t local = remap.local_of_slot(slot);
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
@@ -329,7 +411,7 @@ static void sycl_moe_q8_k_quantize_owned(sycl::queue &q, sycl_block_q8_K *out, c
                                sycl::range<2>(kMoeQK, 1)),
              [=](sycl::nd_item<2> it) {
                  const uint32_t row = (uint32_t)it.get_group(1);
-                 if (remap.local[row] < 0) return;
+                 if (remap.local_of_slot(row) < 0) return;
                  const uint32_t b = (uint32_t)it.get_group(0);
                  const uint32_t tid = (uint32_t)it.get_local_id(0);
                  const float *xr = x + (uint64_t)row * in_dim + (uint64_t)b * kMoeQK;
@@ -393,7 +475,7 @@ static void sycl_moe_q4k_down_owned_slots(
                                sycl::range<2>(256u, 1u)),
              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
-                 const int32_t local = remap.local[slot];
+                 const int32_t local = remap.local_of_slot(slot);
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
@@ -433,7 +515,7 @@ static void sycl_moe_lut_down_owned_slots(
                                sycl::range<2>(256u, 1u)),
              [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
                  const uint32_t slot = (uint32_t)it.get_group(1);
-                 const int32_t local = remap.local[slot];
+                 const int32_t local = remap.local_of_slot(slot);
                  if (local < 0) return;
                  const uint32_t expert = (uint32_t)local;
                  sycl::sub_group sg = it.get_sub_group();
@@ -496,7 +578,7 @@ static void sycl_moe_q4k_down_owned_packed(
                  float packed = 0.0f;
                  for (uint32_t i = 0; i < n_slots; i++) {
                      const uint32_t slot = (uint32_t)first_slot + i;
-                     const int32_t local = remap.local[slot];
+                     const int32_t local = remap.local_of_slot(slot);
                      if (local < 0) continue;
                      const uint32_t expert = (uint32_t)local;
                      const sycl_block_q4_K *wr = (const sycl_block_q4_K *)
@@ -551,7 +633,7 @@ static void sycl_moe_lut_down_owned_packed(
                  float packed = 0.0f;
                  for (uint32_t i = 0; i < n_slots; i++) {
                      const uint32_t slot = (uint32_t)first_slot + i;
-                     const int32_t local = remap.local[slot];
+                     const int32_t local = remap.local_of_slot(slot);
                      if (local < 0) continue;
                      const uint32_t expert = (uint32_t)local;
                      const sycl_block_q2_K *wr = (const sycl_block_q2_K *)
@@ -662,40 +744,7 @@ static int sycl_routed_moe_one_owned_dispatch(
     if (g_devices.empty()) return 0;
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
-
-        int32_t sel_host[6];
-        sycl::event _ds4_prof_ev125 = q.memcpy(sel_host, selected->ptr, sizeof(sel_host));
-        sycl_batch_wait(_ds4_prof_ev125);
-        ds4_sycl_profile_record(_ds4_prof_ev125);
-
-        /* Ownership first, independently of how the weights will be
-         * addressed: `local_of_slot` is this rank's expert_base-relative
-         * id for each of the six slots, or -1 for a slot the peer owns.
-         * `unique_ids` is the distinct set of those locals, which is what
-         * compaction would stage. */
-        std::vector<int32_t> unique_ids;
-        int32_t local_of_slot[6];
-        for (uint32_t slot = 0; slot < 6u; slot++) {
-            uint32_t local = 0;
-            if (!sycl_moe_owned_local_expert(sel_host[slot], resident_expert_base,
-                                             resident_expert_count, &local)) {
-                local_of_slot[slot] = -1;
-                continue;
-            }
-            local_of_slot[slot] = (int32_t)local;
-            bool seen = false;
-            for (size_t i = 0; i < unique_ids.size(); i++) {
-                if (unique_ids[i] == (int32_t)local) { seen = true; break; }
-            }
-            if (!seen) unique_ids.push_back((int32_t)local);
-        }
-        if (unique_ids.empty()) {
-            /* Nothing this rank owns among the six selected experts: no
-             * kernel needs to run, and every down slot stays untouched,
-             * exactly matching CUDA's per-thread ownership check leaving
-             * every slot's writer idle. */
-            return 1;
-        }
+        g_sycl_moe_owned_decode_readbacks = 0;
 
         const char *gate_w = sycl_model_range_ptr(model_map, gate_offset + gate_shift,
                                                   gate_bytes, model_size, "moe_owned_gate");
@@ -730,7 +779,13 @@ static int sycl_routed_moe_one_owned_dispatch(
          * A partial residency (one or two of the three cached) takes the
          * same local-id addressing and lets sycl_stage_host_bytes stage
          * only the pointers that are not resident yet, mirroring
-         * sycl_routed_moe_launch's own three-way dispatch. */
+         * sycl_routed_moe_launch's own three-way dispatch.
+         *
+         * This decision is made BEFORE anything looks at `selected`, and
+         * that ordering is the point rather than a tidiness preference:
+         * only the compacted path may read the selected ids back to the
+         * host, so the resident path must never be downstream of a
+         * readback it does not need. */
         const bool any_resident = sycl_ptr_is_device_resident(q, gate_w) ||
                                   sycl_ptr_is_device_resident(q, up_w) ||
                                   sycl_ptr_is_device_resident(q, down_w);
@@ -738,25 +793,80 @@ static int sycl_routed_moe_one_owned_dispatch(
         void *gate_dev = nullptr, *up_dev = nullptr, *down_dev = nullptr;
         bool gate_owned = true, up_owned = true, down_owned = true;
         sycl_moe_owned_remap remap;
-        const uint32_t unique_count = (uint32_t)unique_ids.size();
+        uint32_t unique_count = 0;
         if (any_resident) {
-            for (uint32_t slot = 0; slot < 6u; slot++) remap.local[slot] = local_of_slot[slot];
+            /* No readback: every kernel derives its own slot's local id
+             * from `selected` on the device (sycl_moe_owned_remap_resident).
+             * There is deliberately no "does this rank own any of the six"
+             * early-out here either, because answering it is exactly the
+             * host round trip being removed. Launching regardless is not a
+             * wasted correctness risk: each kernel's own per-slot check
+             * leaves an unowned slot's output untouched, which is the same
+             * state the early-out produced, and the packed down kernel
+             * writes an explicit 0.0f for a packed component with no owned
+             * source rather than relying on the launch being skipped. */
+            remap = sycl_moe_owned_remap_resident((const int32_t *)selected->ptr,
+                                                  resident_expert_base, resident_expert_count);
             if (!sycl_moe_stage_weights(q, gate_w, up_w, down_w, gate_bytes, down_bytes,
                                         &gate_dev, &up_dev, &down_dev,
                                         &gate_owned, &up_owned, &down_owned)) {
                 return 0;
             }
         } else {
+            /* Compaction genuinely needs the ids on the host: it has to
+             * know the DISTINCT owned experts before it can gather and
+             * stage a packed table of exactly those. This readback pays
+             * for itself against the host memcpy of whole experts that
+             * follows it, and unlike the resident path it is not on any
+             * steady-state decode. */
+            int32_t sel_host[6];
+            sycl::event _ds4_prof_ev125 = q.memcpy(sel_host, selected->ptr, sizeof(sel_host));
+            sycl_batch_wait(_ds4_prof_ev125);
+            ds4_sycl_profile_record(_ds4_prof_ev125);
+            g_sycl_moe_owned_decode_readbacks++;
+
+            /* `local_of_slot` is this rank's expert_base-relative id for
+             * each of the six slots, or -1 for a slot the peer owns;
+             * `unique_ids` is the distinct set of those locals, which is
+             * what gets staged. */
+            std::vector<int32_t> unique_ids;
+            int32_t local_of_slot[6];
             for (uint32_t slot = 0; slot < 6u; slot++) {
-                remap.local[slot] = -1;
+                uint32_t local = 0;
+                if (!sycl_moe_owned_local_expert(sel_host[slot], resident_expert_base,
+                                                 resident_expert_count, &local)) {
+                    local_of_slot[slot] = -1;
+                    continue;
+                }
+                local_of_slot[slot] = (int32_t)local;
+                bool seen = false;
+                for (size_t i = 0; i < unique_ids.size(); i++) {
+                    if (unique_ids[i] == (int32_t)local) { seen = true; break; }
+                }
+                if (!seen) unique_ids.push_back((int32_t)local);
+            }
+            if (unique_ids.empty()) {
+                /* Nothing this rank owns among the six selected experts,
+                 * and here the host already knows it: there is no packed
+                 * table to build, so skipping the launches is free rather
+                 * than something to pay a round trip for. */
+                g_sycl_moe_owned_decode_owned_scratch = 0;
+                return 1;
+            }
+            unique_count = (uint32_t)unique_ids.size();
+
+            int32_t packed_of_slot[6];
+            for (uint32_t slot = 0; slot < 6u; slot++) {
+                packed_of_slot[slot] = -1;
                 if (local_of_slot[slot] < 0) continue;
                 for (size_t i = 0; i < unique_ids.size(); i++) {
                     if (unique_ids[i] == local_of_slot[slot]) {
-                        remap.local[slot] = (int32_t)i;
+                        packed_of_slot[slot] = (int32_t)i;
                         break;
                     }
                 }
             }
+            remap = sycl_moe_owned_remap_packed(packed_of_slot);
             /* No device remap out-parameter: this entry's kernels take the
              * remap by value (sycl_moe_owned_remap), so the only thing it
              * needs staged is the packed weight table. */
@@ -1170,4 +1280,11 @@ extern "C" int ds4_gpu_routed_moe_batch_owned_tensor(
  * g_sycl_moe_owned_decode_owned_scratch above. */
 extern "C" uint32_t ds4_sycl_moe_test_owned_decode_owned_scratch(void) {
     return g_sycl_moe_owned_decode_owned_scratch;
+}
+
+/* Test-only instrumentation: how many device-to-host readbacks the most
+ * recently completed owned decode dispatch performed, which must be 0 on
+ * the resident path. See g_sycl_moe_owned_decode_readbacks above. */
+extern "C" uint32_t ds4_sycl_moe_test_owned_decode_readbacks(void) {
+    return g_sycl_moe_owned_decode_readbacks;
 }

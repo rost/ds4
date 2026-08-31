@@ -99,6 +99,7 @@ extern int ds4_sycl_moe_test_iq2_down_direct(
 extern uint32_t ds4_sycl_moe_test_last_staged_expert_count(void);
 extern uint64_t ds4_sycl_moe_test_last_staged_bytes(void);
 extern uint32_t ds4_sycl_moe_test_owned_decode_owned_scratch(void);
+extern uint32_t ds4_sycl_moe_test_owned_decode_readbacks(void);
 
 enum { Q8_K_BLOCK_BYTES = 292 };
 
@@ -1776,6 +1777,12 @@ static int test_q4k_owned_decode_composes_ownership_with_compaction(void) {
      * that varies rather than reading back a constant. */
     CHECK(ds4_sycl_moe_test_owned_decode_owned_scratch() == 3,
           "owned decode: compaction path must own the gate/up/down tables it staged");
+    /* Pins the counter to something that varies: compaction legitimately
+     * reads the selected ids back, since it cannot know the distinct
+     * owned experts to pack without them. Only the resident path must be
+     * readback-free. */
+    CHECK(ds4_sycl_moe_test_owned_decode_readbacks() == 1,
+          "owned decode: compaction path reads the selected ids back exactly once");
 
     CHECK(ds4_gpu_routed_moe_one_owned_tensor(
               out, gate, up, mid, partner_down, m.model, m.model_size, m.gate_offset,
@@ -1908,6 +1915,13 @@ static int test_q4k_owned_decode_uses_resident_weights_directly(void) {
      * and would cost the whole expert-parallel decode win. */
     CHECK(ds4_sycl_moe_test_owned_decode_owned_scratch() == 0,
           "owned resident: home rank must return owning no scratch, so it need not drain");
+    /* The readback this replaced was not a six-int fetch: on an in_order
+     * queue it drained the whole tier, previous layers included, twice
+     * per routed layer. That is what made expert-parallel decode slower
+     * than no split at all on the B60 box (2.79 t/s against 4.35 t/s),
+     * and nothing in the oracle comparison below can see it. */
+    CHECK(ds4_sycl_moe_test_owned_decode_readbacks() == 0,
+          "owned resident: home rank must perform no device-to-host readback");
 
     CHECK(ds4_gpu_routed_moe_one_owned_tensor(
               out, gate, up, mid, partner_down, resident_map, m.model_size, m.gate_offset,
@@ -1924,6 +1938,8 @@ static int test_q4k_owned_decode_uses_resident_weights_directly(void) {
           "owned resident: partner rank must move no weight bytes to the device");
     CHECK(ds4_sycl_moe_test_owned_decode_owned_scratch() == 0,
           "owned resident: partner rank must return owning no scratch, so it need not drain");
+    CHECK(ds4_sycl_moe_test_owned_decode_readbacks() == 0,
+          "owned resident: partner rank must perform no device-to-host readback");
 
     CHECK(ds4_gpu_routed_moe_owned_packed_combine_tensor(out, home_down, partner_down, selected,
                                                          RM_OUT_DIM, RM_OWNED_EXPERT_SPLIT) != 0,
