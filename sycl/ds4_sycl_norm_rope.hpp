@@ -186,14 +186,19 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(
                     }
                 });
         });
-        /* Wait kept. dw_guard may own a freshly staged scratch
-         * allocation (sycl_stage_host_bytes, not a cached device-resident
-         * pass-through), which its destructor frees on the host the
-         * moment this function returns; in_order only orders queue
-         * commands against each other, never a host-side sycl::free
-         * against a kernel still in flight, so removing this wait would
-         * be spec 6g's use-after-free on every uncached call. */
-        sycl_batch_wait(q);
+        /* Wait kept, but only for what actually needs it. dw_guard may
+         * own a freshly staged scratch allocation (sycl_stage_host_bytes,
+         * not a cached device-resident pass-through), which its
+         * destructor frees on the host the moment this function returns;
+         * in_order only orders queue commands against each other, never a
+         * host-side sycl::free against a kernel still in flight, so
+         * dropping the wait outright would be spec 6g's use-after-free on
+         * every uncached call. Keeping that scratch alive is its only
+         * job, which is what sycl_scratch_release_wait expresses: nothing
+         * at all when the range was already resident, and nothing under
+         * capture either, since a recording batch defers the free past
+         * the submission itself. */
+        sycl_scratch_release_wait(q, dw_guard);
         ds4_sycl_profile_record_named("rms_norm_weight_rows", _ds4_prof_ev131);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rms_norm_weight failed: %s\n",
