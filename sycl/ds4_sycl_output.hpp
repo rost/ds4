@@ -29,7 +29,7 @@ extern "C" int ds4_gpu_add_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
         sycl::event _ds4_prof_ev138 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
             o[i] = pa[i] + pb[i];
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev138);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "add failed: %s\n", e.what());
@@ -57,7 +57,7 @@ extern "C" int ds4_gpu_add3_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *a,
         sycl::event _ds4_prof_ev139 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
             o[i] = pa[i] + pb[i] + pc[i];
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev139);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "add3 failed: %s\n", e.what());
@@ -94,7 +94,7 @@ extern "C" int ds4_gpu_swiglu_tensor(ds4_gpu_tensor *out,
             float s = g / (1.0f + sycl::exp(-g));
             o[i] = s * u * weight;
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev140);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "swiglu failed: %s\n", e.what());
@@ -143,7 +143,7 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
          * pointer scale_p turns out to be. */
         float scale = 0.0f;
         sycl::event _ds4_prof_ev141 = q.memcpy(&scale, scale_p, sizeof(float));
-        _ds4_prof_ev141.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev141);
         ds4_sycl_profile_record(_ds4_prof_ev141);
 
         sycl_device_scratch_guard dbase_guard = sycl_stage_host_bytes(q, base_p, row_bytes);
@@ -161,7 +161,7 @@ extern "C" int ds4_gpu_output_hc_weights_tensor(
              * z, which bounded activations do not reach. */
             o[i] = 1.0f / (1.0f + sycl::exp(-z)) + eps;
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev142);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "output_hc_weights failed: %s\n",
@@ -235,7 +235,7 @@ extern "C" int ds4_gpu_directional_steering_project_tensor(
                     }
                 });
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev143);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "directional steering failed: %s\n",

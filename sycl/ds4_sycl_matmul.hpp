@@ -63,10 +63,10 @@ extern "C" int ds4_sycl_test_gemm_batch_smoke(void) {
         sycl_device_scratch_guard c_guard(q, c);
 
         sycl::event _ds4_prof_ev65 = q.memcpy(a, h_kv, sizeof(h_kv));
-        _ds4_prof_ev65.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev65);
         ds4_sycl_profile_record(_ds4_prof_ev65);
         sycl::event _ds4_prof_ev66 = q.memcpy(b, h_q, sizeof(h_q));
-        _ds4_prof_ev66.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev66);
         ds4_sycl_profile_record(_ds4_prof_ev66);
 
         sycl::event ev = sycl_gemm_batch_f32(
@@ -78,12 +78,12 @@ extern "C" int ds4_sycl_test_gemm_batch_smoke(void) {
                 0.0f,
                 c, n_keys, n_keys * n_tokens,
                 n_head);
-        ev.wait_and_throw();
+        sycl_batch_wait(ev);
         ds4_sycl_profile_record(ev);
 
         float got[8];
         sycl::event _ds4_prof_ev67 = q.memcpy(got, c, sizeof(got));
-        _ds4_prof_ev67.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev67);
         ds4_sycl_profile_record(_ds4_prof_ev67);
 
         for (int i = 0; i < 8; i++) {
@@ -215,7 +215,7 @@ extern "C" int ds4_gpu_matmul_f16_tensor(
                  * confirmed empirically here too). */
                 (float *)out->ptr, (int64_t)out_dim, (int64_t)out_dim * (int64_t)n_tok,
                 1);
-        ev.wait_and_throw();
+        sycl_batch_wait(ev);
         ds4_sycl_profile_record_named("matmul_f16", ev);
     } catch (const std::exception &e) {
         /* std::exception, not sycl::exception: oneapi::mkl::invalid_argument
@@ -323,7 +323,7 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
          * dwa_guard/dwb_guard/wa32_guard/wb32_guard free their scratch at
          * scope exit, and it covers everything submitted to q before it,
          * ev_a and both converts included. */
-        ev_b.wait_and_throw();
+        sycl_batch_wait(ev_b);
         ds4_sycl_profile_record_named("matmul_f16", ev_a);
         ds4_sycl_profile_record_named("matmul_f16", ev_b);
     } catch (const std::exception &e) {
@@ -535,7 +535,7 @@ static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
                         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, row_bytes);
         /* Wait kept -- this function's only kernel, and dw_guard
          * may own scratch this function frees on return. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("matmul_q8_0", ev);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0 failed: %s\n", e.what());
@@ -772,7 +772,7 @@ extern "C" int ds4_gpu_matmul_q8_0_kslice_rows_tensor(
         });
         /* Wait kept -- this function's only kernel, and dw_guard
          * may own scratch this function frees on return. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev70);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0_kslice_rows failed: %s\n", e.what());
@@ -951,7 +951,7 @@ extern "C" int ds4_gpu_matmul_q8_0_f16_out_tensor(
         /* Wait kept -- covers both converts above plus this GEMM,
          * and dw_guard/wh_guard/xh_guard may each own scratch this
          * function frees on return. */
-        ev.wait_and_throw();
+        sycl_batch_wait(ev);
         ds4_sycl_profile_record(ev);
     } catch (const std::exception &e) {
         /* std::exception, not sycl::exception: a bad argument to
@@ -1075,7 +1075,7 @@ extern "C" int ds4_gpu_matmul_f32_tensor(
                 (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok);
         /* Wait kept -- this function's only kernel, and dw_guard
          * may own scratch this function frees on return. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("matmul_f32", _ds4_prof_ev72);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_f32 failed: %s\n", e.what());
@@ -1188,7 +1188,7 @@ static int sycl_dense_quant_matmul_general(
                 row_bytes, dequant);
         /* Wait kept -- this function's only kernel, and dw_guard
          * may own scratch this function frees on return. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named(what, _ds4_prof_ev73);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s matmul failed: %s\n", what, e.what());
@@ -1333,7 +1333,7 @@ static int sycl_dense_quant_matmul_kslice_general(
          });
          /* Wait kept -- this function's only kernel, and dw_guard
           * may own scratch this function frees on return. */
-         _ds4_prof_ev74.wait_and_throw();
+         sycl_batch_wait(_ds4_prof_ev74);
          ds4_sycl_profile_record(_ds4_prof_ev74);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s matmul_kslice failed: %s\n", what, e.what());

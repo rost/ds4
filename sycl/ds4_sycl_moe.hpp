@@ -58,7 +58,7 @@ static void sycl_moe_count_sorted_pairs(sycl::queue &q, const int32_t *selected,
              ref(counts[(uint32_t)expert_i]);
          ref.fetch_add(1u);
      });
-     _ds4_prof_ev77.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev77);
      ds4_sycl_profile_record_named("moe_count_sorted_pairs", _ds4_prof_ev77);
 }
 
@@ -81,7 +81,7 @@ static void sycl_moe_prefix_sorted_pairs(sycl::queue &q, uint32_t *offsets,
          }
          offsets[n_total_expert] = sum;
      });
-     _ds4_prof_ev157.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev157);
      ds4_sycl_profile_record_named("moe_prefix_sorted_pairs", _ds4_prof_ev157);
 }
 
@@ -104,7 +104,7 @@ static void sycl_moe_scatter_sorted_pairs_deterministic(
              if ((uint32_t)expert_i == expert) sorted_pairs[pos++] = pair;
          }
      });
-     _ds4_prof_ev78.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev78);
      ds4_sycl_profile_record_named("moe_scatter_sorted_pairs", _ds4_prof_ev78);
 }
 
@@ -122,7 +122,7 @@ static void sycl_moe_build_expert_tile_offsets(
          tile_offsets[n_total_expert] = sum;
          *tile_total = sum;
      });
-     _ds4_prof_ev158.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev158);
      ds4_sycl_profile_record_named("moe_build_expert_tile_offsets", _ds4_prof_ev158);
 }
 
@@ -142,7 +142,7 @@ static void sycl_moe_build_expert_tiles(
              tile_starts[off + t] = t * block_m;
          }
      });
-     _ds4_prof_ev79.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev79);
      ds4_sycl_profile_record_named("moe_build_expert_tiles", _ds4_prof_ev79);
 }
 
@@ -233,11 +233,11 @@ static bool sycl_moe_build_sorted_pairs(sycl::queue &q, const int32_t *d_selecte
      * dispatcher reads back is one of this function's own kernels wrote. */
     if (poison_for_test) {
         sycl::event _ds4_prof_ev80 = q.memset(scratch, 0xAB, (size_t)scratch_bytes);
-        _ds4_prof_ev80.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev80);
         ds4_sycl_profile_record_named("moe_build_sorted_pairs_poison_memset", _ds4_prof_ev80);
     }
     sycl::event _ds4_prof_ev81 = q.memset(counts, 0, (size_t)counts_bytes);
-    _ds4_prof_ev81.wait_and_throw();
+    sycl_batch_wait(_ds4_prof_ev81);
     ds4_sycl_profile_record_named("moe_build_sorted_pairs_reset_counts", _ds4_prof_ev81);
     sycl_moe_count_sorted_pairs(q, d_selected, counts, pair_count, n_total_expert);
     sycl_moe_prefix_sorted_pairs(q, offsets, cursors, counts, n_total_expert);
@@ -343,7 +343,7 @@ static void sycl_moe_q8_k_quantize(sycl::queue &q, sycl_block_q8_K *out,
                  if (tid == 0) yb->d = 1.0f / iscale;
              });
      });
-     _ds4_prof_ev82.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev82);
      ds4_sycl_profile_record_named("moe_q8_k_quantize", _ds4_prof_ev82);
 }
 
@@ -409,7 +409,7 @@ static void sycl_moe_sum(sycl::queue &q, float *out, const float *down,
          }
          out[gid] = acc;
      });
-     _ds4_prof_ev83.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev83);
      ds4_sycl_profile_record_named("moe_sum", _ds4_prof_ev83);
 }
 
@@ -427,7 +427,7 @@ static void sycl_moe_sum_f16(sycl::queue &q, float *out, const uint16_t *down_h,
          }
          out[gid] = acc;
      });
-     _ds4_prof_ev84.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev84);
      ds4_sycl_profile_record_named("moe_sum_f16", _ds4_prof_ev84);
 }
 
@@ -450,7 +450,7 @@ static void sycl_moe_sum_f16x2(sycl::queue &q, float *out, const uint16_t *down_
          out[out_off] = acc0;
          out[out_off + 1u] = acc1;
      });
-     _ds4_prof_ev85.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev85);
      ds4_sycl_profile_record_named("moe_sum_f16x2", _ds4_prof_ev85);
 }
 
@@ -483,7 +483,7 @@ static void sycl_moe_test_subgroup_sum8(sycl::queue &q, const float *in,
                  if (lane == 0u && active) out[gid] = v;
              });
      });
-     _ds4_prof_ev86.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev86);
      ds4_sycl_profile_record_named("moe_test_subgroup_sum8", _ds4_prof_ev86);
 }
 
@@ -502,7 +502,7 @@ static void sycl_moe_test_subgroup_sum16(sycl::queue &q, const float *in,
                  if (lane == 0u) out[gid] = v;
              });
      });
-     _ds4_prof_ev87.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev87);
      ds4_sycl_profile_record_named("moe_test_subgroup_sum16", _ds4_prof_ev87);
 }
 
@@ -648,7 +648,7 @@ static void sycl_moe_q4k_gate_up_mid_decode(
                  }
              });
      });
-     _ds4_prof_ev88.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev88);
      ds4_sycl_profile_record_named("moe_q4k_gate_up_mid_decode", _ds4_prof_ev88);
 }
 
@@ -736,7 +736,7 @@ static void sycl_moe_q4k_gate_up_mid_tile8(
                  }
              });
      });
-     _ds4_prof_ev89.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev89);
      ds4_sycl_profile_record_named("moe_q4k_gate_up_mid_tile8", _ds4_prof_ev89);
 }
 
@@ -779,7 +779,7 @@ static void sycl_moe_q4k_down_sum6(
                  if (row_ok && lane == 0u) out[row] = total;
              });
      });
-     _ds4_prof_ev90.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev90);
      ds4_sycl_profile_record_named("moe_q4k_down_sum6", _ds4_prof_ev90);
 }
 
@@ -818,7 +818,7 @@ static void sycl_moe_q4k_down_untiled(
                  if (row_ok && lane == 0u) down_out[(uint64_t)pair * out_dim + row] = acc;
              });
      });
-     _ds4_prof_ev91.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev91);
      ds4_sycl_profile_record_named("moe_q4k_down_untiled", _ds4_prof_ev91);
 }
 
@@ -886,7 +886,7 @@ static void sycl_moe_q4k_down_tile8(
                  }
              });
      });
-     _ds4_prof_ev92.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev92);
      ds4_sycl_profile_record_named("moe_q4k_down_tile8", _ds4_prof_ev92);
 }
 
@@ -1173,7 +1173,7 @@ static void sycl_moe_iq2_gate_up_mid_decode(
                  }
              });
      });
-     _ds4_prof_ev93.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev93);
      ds4_sycl_profile_record_named("moe_iq2_gate_up_mid_decode", _ds4_prof_ev93);
 }
 
@@ -1277,7 +1277,7 @@ static void sycl_moe_iq2_gate_up_mid_tile8(
                  }
              });
      });
-     _ds4_prof_ev94.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev94);
      ds4_sycl_profile_record_named("moe_iq2_gate_up_mid_tile8", _ds4_prof_ev94);
 }
 
@@ -1479,7 +1479,7 @@ static void sycl_moe_q2k_down_direct(
                  if (row_ok && lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
              });
      });
-     _ds4_prof_ev95.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev95);
      ds4_sycl_profile_record_named("moe_q2k_down_direct", _ds4_prof_ev95);
 }
 
@@ -1523,7 +1523,7 @@ static void sycl_moe_iq2_down_direct(
                  if (row_ok && lane == 0u) out[(uint64_t)tok * out_dim + row] = total;
              });
      });
-     _ds4_prof_ev96.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev96);
      ds4_sycl_profile_record_named("moe_iq2_down_direct", _ds4_prof_ev96);
 }
 
@@ -1620,7 +1620,7 @@ static void sycl_moe_q2k_gate_up_mid_decode(
                  }
              });
      });
-     _ds4_prof_ev97.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev97);
      ds4_sycl_profile_record_named("moe_q2k_gate_up_mid_decode", _ds4_prof_ev97);
 }
 
@@ -1748,7 +1748,7 @@ static void sycl_moe_mxfp4_gate_up_mid_decode(
                  }
              });
      });
-     _ds4_prof_ev98.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev98);
      ds4_sycl_profile_record_named("moe_mxfp4_gate_up_mid_decode", _ds4_prof_ev98);
 }
 
@@ -1802,7 +1802,7 @@ static void sycl_moe_mxfp4_down_sum6(
                  if (lane == 0u) token_out[row] = total;
              });
      });
-     _ds4_prof_ev99.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev99);
      ds4_sycl_profile_record_named("moe_mxfp4_down_sum6", _ds4_prof_ev99);
 }
 
@@ -1920,7 +1920,7 @@ static void sycl_moe_mxfp4_gate_up_mid_tile8(
                  }
              });
      });
-     _ds4_prof_ev100.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev100);
      ds4_sycl_profile_record_named("moe_mxfp4_gate_up_mid_tile8", _ds4_prof_ev100);
 }
 
@@ -1996,7 +1996,7 @@ static void sycl_moe_mxfp4_down_tile8(
                  }
              });
      });
-     _ds4_prof_ev101.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev101);
      ds4_sycl_profile_record_named("moe_mxfp4_down_tile8", _ds4_prof_ev101);
 }
 
@@ -2028,8 +2028,7 @@ extern "C" int ds4_sycl_moe_test_sort(const int32_t *selected, uint32_t pair_cou
         if (!d_selected && pair_count != 0u) return 0;
         sycl_device_scratch_guard sel_guard(q, d_selected);
         if (pair_count != 0u) {
-            q.memcpy(d_selected, selected, (size_t)pair_count * sizeof(int32_t))
-                    .wait_and_throw();
+            sycl_batch_wait(q.memcpy(d_selected, selected, (size_t)pair_count * sizeof(int32_t)));
         }
 
         void *scratch = nullptr;
@@ -2059,7 +2058,7 @@ extern "C" int ds4_sycl_moe_test_sort(const int32_t *selected, uint32_t pair_cou
             _ds4_prof_ev102 = q.memcpy(tile_starts_out, res.tile_starts,
                      (size_t)res.tile_capacity * sizeof(uint32_t));
         }
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         if (tile_starts_out) ds4_sycl_profile_record_named("moe_test_sort_setup", _ds4_prof_ev102);
         return 1;
     } catch (const sycl::exception &e) {
@@ -2102,11 +2101,11 @@ extern "C" int ds4_sycl_moe_test_q8_k_quantize(const float *x, uint32_t in_dim,
         sycl_device_scratch_guard out_guard(q, d_out);
 
         sycl::event _ds4_prof_ev103 = q.memcpy(d_x, x, (size_t)x_bytes);
-        _ds4_prof_ev103.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev103);
         ds4_sycl_profile_record_named("moe_test_q8k_quantize_setup", _ds4_prof_ev103);
         sycl_moe_q8_k_quantize(q, d_out, d_x, in_dim, n_rows);
         sycl::event _ds4_prof_ev104 = q.memcpy(out_bytes, d_out, (size_t)out_elem_bytes);
-        _ds4_prof_ev104.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev104);
         ds4_sycl_profile_record_named("moe_test_q8k_quantize_setup", _ds4_prof_ev104);
         return 1;
     } catch (const sycl::exception &e) {
@@ -2132,7 +2131,7 @@ extern "C" int ds4_sycl_moe_test_subgroup_sum(int width, const float *in,
         sycl_device_scratch_guard in_guard(q, d_in);
         sycl_device_scratch_guard out_guard(q, d_out);
         sycl::event _ds4_prof_ev105 = q.memcpy(d_in, in, n_in * sizeof(float));
-        _ds4_prof_ev105.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev105);
         ds4_sycl_profile_record_named("moe_test_subgroup_sum_setup", _ds4_prof_ev105);
         if (width == 8) {
             sycl_moe_test_subgroup_sum8(q, d_in, n_groups, d_out);
@@ -2140,7 +2139,7 @@ extern "C" int ds4_sycl_moe_test_subgroup_sum(int width, const float *in,
             sycl_moe_test_subgroup_sum16(q, d_in, n_groups, d_out);
         }
         sycl::event _ds4_prof_ev106 = q.memcpy(out, d_out, (size_t)n_groups * sizeof(float));
-        _ds4_prof_ev106.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev106);
         ds4_sycl_profile_record_named("moe_test_subgroup_sum_setup", _ds4_prof_ev106);
         return 1;
     } catch (const sycl::exception &e) {
@@ -2176,7 +2175,7 @@ extern "C" int ds4_sycl_moe_test_sum(int mode, const void *down, uint32_t out_di
         sycl_device_scratch_guard down_guard(q, d_down);
         sycl_device_scratch_guard out_guard(q, d_out);
         sycl::event _ds4_prof_ev107 = q.memcpy(d_down, down, n_down * elem_size);
-        _ds4_prof_ev107.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev107);
         ds4_sycl_profile_record_named("moe_test_sum_setup", _ds4_prof_ev107);
         if (mode == 0) {
             sycl_moe_sum(q, d_out, (const float *)d_down, out_dim, n_expert, n_tokens);
@@ -2188,7 +2187,7 @@ extern "C" int ds4_sycl_moe_test_sum(int mode, const void *down, uint32_t out_di
                                n_tokens);
         }
         sycl::event _ds4_prof_ev108 = q.memcpy(out, d_out, n_out * sizeof(float));
-        _ds4_prof_ev108.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev108);
         ds4_sycl_profile_record_named("moe_test_sum_setup", _ds4_prof_ev108);
         return 1;
     } catch (const sycl::exception &e) {
@@ -2244,14 +2243,14 @@ extern "C" int ds4_sycl_moe_test_q2k_down_direct(
         q.memcpy(d_down, down_bytes, (size_t)down_bytes_total);
         q.memcpy(d_midq, midq_bytes, (size_t)midq_bytes_total);
         sycl::event _ds4_prof_ev109 = q.memcpy(d_sel, selected, (size_t)sel_bytes);
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("moe_test_q2k_down_direct_setup", _ds4_prof_ev109);
 
         sycl_moe_q2k_down_direct(q, d_out, (const char *)d_down, (const sycl_block_q8_K *)d_midq,
                                  d_sel, down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
                                  n_expert, n_tokens);
         sycl::event _ds4_prof_ev110 = q.memcpy(out, d_out, (size_t)out_bytes);
-        _ds4_prof_ev110.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev110);
         ds4_sycl_profile_record_named("moe_test_q2k_down_direct_setup", _ds4_prof_ev110);
         return 1;
     } catch (const sycl::exception &e) {
@@ -2318,7 +2317,7 @@ extern "C" int ds4_sycl_moe_test_mxfp4_gate_up_mid_decode(
         q.memcpy(x_dev, x, (size_t)x_bytes);
         q.memcpy(sel_dev, selected, (size_t)sel_bytes);
         sycl::event _ds4_prof_ev111 = q.memcpy(w_dev, weights, (size_t)w_bytes);
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("moe_test_mxfp4_gate_up_mid_decode_setup", _ds4_prof_ev111);
 
         sycl_moe_q8_k_quantize(q, xq_dev, x_dev, in_dim, n_tokens);
@@ -2326,7 +2325,7 @@ extern "C" int ds4_sycl_moe_test_mxfp4_gate_up_mid_decode(
                                           xq_dev, sel_dev, w_dev, gate_expert_bytes, gate_row_bytes,
                                           xq_blocks, mid_dim, n_expert, (uint32_t)pair_count, clamp);
         sycl::event _ds4_prof_ev112 = q.memcpy(mid_out, mid_dev, (size_t)mid_bytes);
-        _ds4_prof_ev112.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev112);
         ds4_sycl_profile_record_named("moe_test_mxfp4_gate_up_mid_decode_setup", _ds4_prof_ev112);
         return 1;
     } catch (const sycl::exception &e) {
@@ -2382,7 +2381,7 @@ extern "C" int ds4_sycl_moe_test_mxfp4_down_sum6(
         q.memcpy(down_dev, down_model, (size_t)table_bytes);
         q.memcpy(mid_dev, mid, (size_t)mid_bytes);
         sycl::event _ds4_prof_ev113 = q.memcpy(sel_dev, selected, (size_t)sel_bytes);
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("moe_test_mxfp4_down_sum6_setup", _ds4_prof_ev113);
 
         sycl_moe_q8_k_quantize(q, midq_dev, mid_dev, mid_dim, (uint32_t)pair_count);
@@ -2390,7 +2389,7 @@ extern "C" int ds4_sycl_moe_test_mxfp4_down_sum6(
                                  down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
                                  n_expert, n_tokens);
         sycl::event _ds4_prof_ev114 = q.memcpy(out, out_dev, (size_t)out_bytes);
-        _ds4_prof_ev114.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev114);
         ds4_sycl_profile_record_named("moe_test_mxfp4_down_sum6_setup", _ds4_prof_ev114);
         return 1;
     } catch (const sycl::exception &e) {
@@ -2443,14 +2442,14 @@ extern "C" int ds4_sycl_moe_test_iq2_down_direct(
         q.memcpy(d_down, down_bytes, (size_t)down_bytes_total);
         q.memcpy(d_midq, midq_bytes, (size_t)midq_bytes_total);
         sycl::event _ds4_prof_ev115 = q.memcpy(d_sel, selected, (size_t)sel_bytes);
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("moe_test_iq2_down_direct_setup", _ds4_prof_ev115);
 
         sycl_moe_iq2_down_direct(q, d_out, (const char *)d_down, (const sycl_block_q8_K *)d_midq,
                                  d_sel, down_expert_bytes, down_row_bytes, midq_blocks, out_dim,
                                  n_expert, n_tokens);
         sycl::event _ds4_prof_ev116 = q.memcpy(out, d_out, (size_t)out_bytes);
-        _ds4_prof_ev116.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev116);
         ds4_sycl_profile_record_named("moe_test_iq2_down_direct_setup", _ds4_prof_ev116);
         return 1;
     } catch (const sycl::exception &e) {

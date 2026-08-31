@@ -62,7 +62,7 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(
              * every one of the n_hc rows receives the same values. */
             o[gid] = (float)sycl::bit_cast<sycl::half>(drow[e]);
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev33);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_token_hc failed: %s\n",
@@ -119,7 +119,7 @@ static int ds4_sycl_embed_token_hc_q8_0(ds4_gpu_tensor *out_hc,
             const size_t e = gid % e_stride;
             o[gid] = sycl_q8_0_dequant(drow, (uint32_t)e);
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev34);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_token_hc_q8_0 failed: %s\n",
@@ -206,7 +206,7 @@ extern "C" int ds4_gpu_embed_tokens_hc_tensor(
             if (tk >= vocab) tk = 0u;
             o[gid] = (float)sycl::bit_cast<sycl::half>(dtab[(size_t)tk * e_stride + d]);
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev35);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_tokens_hc failed: %s\n",
@@ -271,7 +271,7 @@ static int ds4_sycl_embed_tokens_hc_q8_0(ds4_gpu_tensor *out_hc,
             if (tk >= vocab) tk = 0u;
             o[gid] = sycl_q8_0_dequant(dtab + (size_t)tk * rb, (uint32_t)d);
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev36);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_tokens_hc_q8_0 failed: %s\n",

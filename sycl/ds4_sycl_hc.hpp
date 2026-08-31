@@ -212,7 +212,7 @@ extern "C" int ds4_gpu_hc_split_sinkhorn_tensor(
         /* Wait kept -- this function's only kernel, and
          * scale_guard/base_guard may each own scratch this function frees
          * on return. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("hc_split_sinkhorn", _ds4_prof_ev41);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_sinkhorn failed: %s\n", e.what());
@@ -1161,7 +1161,7 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
         }
         /* Wait kept -- this function's only kernel, and dw_guard
          * may own scratch this function frees on return. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("matmul_q8_0_hc_expand_labeled", _ds4_prof_ev52);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s failed: %s\n",
@@ -1376,7 +1376,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_tensor(
         /* Wait kept -- this function's only kernel, and
          * scale_guard/base_guard may each own scratch this function frees
          * on return. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("hc_split_weighted_sum", _ds4_prof_ev53);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_weighted_sum failed: %s\n", e.what());
@@ -1495,7 +1495,7 @@ extern "C" int ds4_gpu_hc_split_weighted_sum_norm_tensor(
         /* Wait kept -- this function's only kernel, and
          * scale_guard/base_guard/norm_w_guard may each own scratch this
          * function frees on return. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("hc_split_weighted_sum_norm", _ds4_prof_ev54);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "hc_split_weighted_sum_norm failed: %s\n", e.what());

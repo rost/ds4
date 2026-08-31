@@ -194,7 +194,7 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
                     psc[(uint64_t)t * w + j] +
                     sycl_ape_value_dev(dape, type, w, pos_mod, j);
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("compressor_store_batch", _ds4_prof_ev19);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor_store failed: %s\n", e.what());
@@ -368,7 +368,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
             }
             out[d] = den != 0.0f ? acc / den : 0.0f;
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("compressor_update_pool", _ds4_prof_ev20);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor_update pool launch failed: %s\n", e.what());
@@ -404,7 +404,7 @@ extern "C" int ds4_gpu_compressor_update_tensor(
                 skv[half + i] = v;
                 ssc[half + i] = s;
             });
-            q.wait_and_throw();
+            sycl_batch_wait(q);
             ds4_sycl_profile_record_named("compressor_update_ratio4_shift", _ds4_prof_ev21);
         } catch (const sycl::exception &e) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor ratio4 shift launch failed: %s\n", e.what());
@@ -525,12 +525,12 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
          * function comment above. */
         const uint64_t state_n = (uint64_t)state_rows * width;
         sycl::event _ds4_prof_ev22 = q.memset(skv, 0, (size_t)(state_n * sizeof(float)));
-        _ds4_prof_ev22.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev22);
         ds4_sycl_profile_record_named("compressor_prefill_reset_ring_memset", _ds4_prof_ev22);
         sycl::event _ds4_prof_ev23 = q.parallel_for(sycl::range<1>((size_t)state_n), [=](sycl::id<1> gid) {
             ssc[gid[0]] = -INFINITY;
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("compressor_prefill_reset_scores", _ds4_prof_ev23);
 
         /* Step 2: seed the tail rows over an arbitrary contiguous source
@@ -551,7 +551,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
                         psc[(uint64_t)src * w + j] +
                         sycl_ape_value_dev(dape, type, w, phase, j);
             });
-            q.wait_and_throw();
+            sycl_batch_wait(q);
             ds4_sycl_profile_record_named("compressor_prefill_seed_rows", _ds4_prof_ev24);
         };
 
@@ -644,7 +644,7 @@ extern "C" int ds4_gpu_compressor_prefill_tensor(
                 }
                 comp[(uint64_t)c * hd + d] = den != 0.0f ? acc / den : 0.0f;
             });
-            q.wait_and_throw();
+            sycl_batch_wait(q);
             ds4_sycl_profile_record_named("compressor_prefill_pool", _ds4_prof_ev25);
         }
     } catch (const sycl::exception &e) {
@@ -839,7 +839,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
             }
             comp[(uint64_t)c * hd + d] = den != 0.0f ? acc / den : 0.0f;
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("compressor_prefill_ratio4_replay_seed", _ds4_prof_ev26);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor_replay pool launch failed: %s\n", e.what());
@@ -882,12 +882,12 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
 
         const uint64_t state_n = (uint64_t)state_rows * width;
         sycl::event _ds4_prof_ev27 = q.memset(skv, 0, (size_t)(state_n * sizeof(float)));
-        _ds4_prof_ev27.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev27);
         ds4_sycl_profile_record_named("compressor_prefill_ratio4_replay_reset_memset", _ds4_prof_ev27);
         sycl::event _ds4_prof_ev28 = q.parallel_for(sycl::range<1>((size_t)state_n), [=](sycl::id<1> gid) {
             ssc[gid[0]] = -INFINITY;
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("compressor_prefill_ratio4_replay_pool", _ds4_prof_ev28);
 
         const uint32_t prev_start = n_tokens - ratio;
@@ -902,7 +902,7 @@ extern "C" int ds4_gpu_compressor_prefill_ratio4_replay_tensor(
                     psc[(uint64_t)src * w + j] +
                     sycl_ape_value_dev(dape, type, w, phase, j);
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("compressor_prefill_ratio4_replay_finalize", _ds4_prof_ev29);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor_replay state seed failed: %s\n", e.what());
@@ -974,12 +974,12 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
 
         const uint64_t state_n = (uint64_t)state_rows * width;
         sycl::event _ds4_prof_ev30 = q.memset(skv, 0, (size_t)(state_n * sizeof(float)));
-        _ds4_prof_ev30.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev30);
         ds4_sycl_profile_record_named("compressor_prefill_state_ratio4_reset_memset", _ds4_prof_ev30);
         sycl::event _ds4_prof_ev31 = q.parallel_for(sycl::range<1>((size_t)state_n), [=](sycl::id<1> gid) {
             ssc[gid[0]] = -INFINITY;
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("compressor_prefill_state_ratio4_pool", _ds4_prof_ev31);
 
         const uint64_t n = (uint64_t)ratio * w;
@@ -992,7 +992,7 @@ extern "C" int ds4_gpu_compressor_prefill_state_ratio4_tensor(
                     psc[(uint64_t)rr * w + j] +
                     sycl_ape_value_dev(dape, type, w, phase, j);
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("compressor_prefill_state_ratio4_finalize", _ds4_prof_ev32);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor state seed failed: %s\n", e.what());

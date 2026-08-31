@@ -252,6 +252,14 @@ static void sycl_stream_teardown_all(void);
  * queue it was recorded against. */
 static void sycl_readback_teardown(void);
 
+/* Defined in sycl/ds4_sycl_graph.hpp, included at the end of this file;
+ * forward-declared here for the same reason as sycl_readback_teardown
+ * above. A batch left recording (a token that failed between
+ * ds4_gpu_begin_commands and ds4_gpu_end_commands) still holds a graph
+ * bound to a queue g_devices.clear() is about to destroy, plus the
+ * device scratch whose free it deferred. */
+static void sycl_graph_teardown(void);
+
 /* Defined in sycl/ds4_sycl_placement.hpp, included at the end of this
  * file; forward-declared here for the same reason as
  * sycl_stream_teardown_all above: the per-device selective weight cache's
@@ -423,6 +431,7 @@ extern "C" void ds4_gpu_cleanup(void) {
      * (rocm/ds4_rocm_runtime.cuh:5873). Must run before g_devices.clear()
      * below destroys the queues. */
     if (!g_devices.empty()) sycl_stream_teardown_all();
+    sycl_graph_teardown();
     sycl_readback_teardown();
     if (!g_devices.empty()) sycl_placement_teardown_all();
     if (!g_devices.empty()) sycl_model_cache_teardown_all();

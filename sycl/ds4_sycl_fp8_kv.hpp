@@ -172,7 +172,7 @@ extern "C" int ds4_gpu_dsv4_fp8_kv_quantize_tensor(ds4_gpu_tensor *x,
                     }
                 });
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("dsv4_fp8_kv_quantize", _ds4_prof_ev37);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "dsv4_fp8_kv_quantize failed: %s\n",
@@ -236,7 +236,7 @@ extern "C" int ds4_sycl_test_sycl_half_encode_bits(float f, uint16_t *out_bits) 
                 dout[0] = sycl::bit_cast<uint16_t>((sycl::half)f);
             });
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("fp8_kv_test_half_encode_bits", _ds4_prof_ev38);
         *out_bits = dout[0];
     } catch (const sycl::exception &e) {
@@ -313,7 +313,7 @@ extern "C" int ds4_gpu_store_raw_kv_batch_tensor(ds4_gpu_tensor *raw_cache,
                 sycl_store_raw_kv_batch_kernel(gid_id, praw, pkv, raw_cap, pos0, head_dim);
             });
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("store_raw_kv_batch", _ds4_prof_ev39);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "store_raw_kv_batch failed: %s\n",
@@ -433,7 +433,7 @@ extern "C" int ds4_gpu_kv_fp8_store_raw_decode_rows_tensor(
                         (float)sycl::bit_cast<sycl::half>(hb);
             });
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("kv_fp8_store_raw_decode_rows", _ds4_prof_ev40);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX

@@ -302,7 +302,7 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
         });
         /* Wait kept -- this function's only kernel, and
          * sinks_guard may own scratch this function frees on return. */
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("attn_decode_mixed_one_fast_oldhip", _ds4_prof_ev1);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode oldhip fast launch failed: %s\n",
@@ -826,7 +826,7 @@ static int sycl_attention_decode_batch_launch(
         /* Wait kept -- this function's only kernel (one of two
          * mutually exclusive branches), and sinks_guard may own scratch
          * this function frees on return. */
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("attn_decode_mixed_batch", _ds4_prof_ev2);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode batch launch failed: %s\n",
@@ -1584,7 +1584,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             });
             /* Wait kept -- this branch's only kernel, and
              * sinks_guard may own scratch this function frees on return. */
-            dq.wait_and_throw();
+            sycl_batch_wait(dq);
             ds4_sycl_profile_record_named("attn_decode_indexed_mixed_one_fast_oldhip", _ds4_prof_ev3);
             return 1;
         }
@@ -1635,7 +1635,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
             /* Wait kept -- covers this kernel and the sort above,
              * and sinks_guard/sorted_guard may each own scratch this
              * function frees on return. */
-            dq.wait_and_throw();
+            sycl_batch_wait(dq);
             ds4_sycl_profile_record_named("attn_indexed_mixed_heads8_online", _ds4_prof_ev5);
             return 1;
         }
@@ -1661,7 +1661,7 @@ extern "C" int ds4_gpu_attention_indexed_mixed_batch_heads_tensor(
         /* Wait kept -- covers this kernel and the sort above, and
          * sinks_guard/sorted_guard may each own scratch this function
          * frees on return. */
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("attn_indexed_mixed", _ds4_prof_ev6);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention indexed mixed launch failed: %s\n",
@@ -1935,7 +1935,7 @@ extern "C" int ds4_gpu_attention_decode_rows_rope_tensor(
         /* Wait kept -- this function's only kernel, and
          * sinks_guard/rows_guard may each own scratch this function frees
          * on return. */
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("attn_decode_rows_rope", _ds4_prof_ev7);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode rows launch failed: %s\n",
@@ -2192,7 +2192,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
             });
             /* Wait kept -- this branch's only kernel, and
              * sinks_guard may own scratch this function frees on return. */
-            dq.wait_and_throw();
+            sycl_batch_wait(dq);
             ds4_sycl_profile_record_named("attn_static_mixed_heads8_online", _ds4_prof_ev8);
             return 1;
         }
@@ -2264,7 +2264,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
             /* Wait kept -- covers ev1, the softmax kernel, ev2 and
              * this unpack kernel, and sinks_guard/scores_guard/out_guard
              * may each own scratch this function frees on return. */
-            dq.wait_and_throw();
+            sycl_batch_wait(dq);
             return 1;
         }
 
@@ -2284,7 +2284,7 @@ extern "C" int ds4_gpu_attention_prefill_raw_heads_tensor(
         });
         /* Wait kept -- this branch's only kernel, and sinks_guard
          * may own scratch this function frees on return. */
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("attn_prefill_raw_scalar", _ds4_prof_ev10);
     } catch (const std::exception &e) {
         /* std::exception, not sycl::exception: oneMKL's own exceptions
@@ -2664,7 +2664,7 @@ static int sycl_attention_prefill_mixed_cublas_tiled(
         sycl_attention_prefill_unpack_heads_launch(
                 dq, pheads + (uint64_t)t0 * n_head * head_dim, out_tmp, nt, n_head, head_dim);
     }
-    dq.wait_and_throw();
+    sycl_batch_wait(dq);
     return 1;
 }
 
@@ -2734,7 +2734,7 @@ static int sycl_attention_prefill_mixed_launch(
                                 n_tokens, n_comp, window, ratio, n_head, head_dim);
                     });
         });
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("attn_static_mixed_heads8_online", _ds4_prof_ev12);
         return 1;
     }
@@ -2818,7 +2818,7 @@ static int sycl_attention_prefill_mixed_launch(
 
         sycl_attention_prefill_unpack_heads_launch(dq, pheads, out_tmp, n_tokens, n_head,
                                                    head_dim);
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         return 1;
     }
 
@@ -2853,7 +2853,7 @@ static int sycl_attention_prefill_mixed_launch(
      * whether the caller launches anything else afterward, so it cannot
      * assume a later wait will cover this kernel; it must leave with the
      * GPU already caught up. */
-    dq.wait_and_throw();
+    sycl_batch_wait(dq);
     ds4_sycl_profile_record_named("attn_prefill_mixed_scalar", _ds4_prof_ev14);
     return 1;
 }

@@ -289,6 +289,18 @@ static inline float sycl_q4_0_dequant(const unsigned char *row, uint32_t col) {
     return d * ((float)nib - 8.0f);
 }
 
+/* Command-graph capture hooks, defined in sycl/ds4_sycl_graph.hpp.
+ * Declared here because the two pieces of shared infrastructure that must
+ * behave differently while a batch is recording -- the scratch guard just
+ * below and sycl_batch_wait further down -- both live in this header,
+ * while how a batch is built and submitted is that header's business
+ * alone. Capture is off unless DS4_SYCL_GRAPH is set, and with it off
+ * sycl_graph_batch_recording is constantly false, so every use below
+ * collapses to exactly the un-captured behaviour it had before. */
+static bool sycl_graph_batch_recording(void);
+static void sycl_graph_batch_defer_free(sycl::queue &q, void *p);
+static bool sycl_graph_batch_flush(void);
+
 namespace {
 
 /* Frees a sycl::malloc_device allocation when it goes out of scope, on
@@ -334,6 +346,17 @@ struct sycl_device_scratch_guard {
          * no meaningful recovery from a failed free during unwinding, so
          * log and swallow rather than let it propagate. */
         if (!p || !owns) return;
+        /* Freeing here is safe only because the kernels reading this
+         * scratch have already completed by the time the guard goes out of
+         * scope -- every entry point that stages scratch waits before
+         * returning. A recording batch breaks that assumption: its
+         * commands have been recorded but not yet run, so the batch takes
+         * the pointer and frees it once the submission that reads it has
+         * completed (sycl/ds4_sycl_graph.hpp). */
+        if (sycl_graph_batch_recording()) {
+            sycl_graph_batch_defer_free(q, p);
+            return;
+        }
         try {
             sycl::free(p, q);
         } catch (const sycl::exception &e) {
@@ -344,6 +367,35 @@ struct sycl_device_scratch_guard {
     sycl_device_scratch_guard(const sycl_device_scratch_guard &) = delete;
     sycl_device_scratch_guard &operator=(const sycl_device_scratch_guard &) = delete;
 };
+
+/* The wait every kernel entry performs before its scratch guards free.
+ *
+ * With capture off this is exactly the wait_and_throw it replaces. With a
+ * batch recording it flushes instead: a queue in the recording state
+ * throws on any wait, so the commands recorded so far are submitted and
+ * waited on, which is what the caller actually asked for. Because every
+ * tier's queue is in_order, waiting for the whole batch is strictly
+ * stronger than waiting for one event inside it, so the substitution can
+ * only over-synchronize.
+ *
+ * Call sites keep naming their own event even though the batch path
+ * ignores it: the event still documents which kernel the wait belongs to,
+ * and it is what the un-captured path waits on. */
+static inline void sycl_batch_wait(sycl::queue &q) {
+    if (sycl_graph_batch_recording()) {
+        sycl_graph_batch_flush();
+        return;
+    }
+    q.wait_and_throw();
+}
+
+static inline void sycl_batch_wait(const sycl::event &ev) {
+    if (sycl_graph_batch_recording()) {
+        sycl_graph_batch_flush();
+        return;
+    }
+    const_cast<sycl::event &>(ev).wait_and_throw();
+}
 
 /* True when `ptr` is already a sycl::usm::alloc::device allocation on
  * `q`'s context -- e.g. a weight range the model-range cache
@@ -583,7 +635,12 @@ static inline void sycl_copy_host_to_device_paged_safe(
         const uint64_t n = bytes - done < kChunk ? bytes - done : kChunk;
         memcpy(stage.data(), src + done, (size_t)n);
         sycl::event _ds4_prof_ev18 = q.memcpy(dst + done, stage.data(), (size_t)n);
-        _ds4_prof_ev18.wait_and_throw();
+        /* Genuinely load-bearing, not a scratch-lifetime wait: `stage` is
+         * one host buffer reused by every chunk, so the copy out of it
+         * must have completed before the next iteration overwrites it.
+         * Under command-graph capture this is the one wait shape that must
+         * still force a real flush rather than be deferred. */
+        sycl_batch_wait(_ds4_prof_ev18);
         ds4_sycl_profile_record(_ds4_prof_ev18);
     }
 }

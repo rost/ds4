@@ -22,11 +22,23 @@
  * single kernel is ever dispatched. */
 
 #include "ds4_sycl_common.hpp"
+#include "ds4_sycl_graph.hpp"
 
-/* No encoder object exists in this backend, matching both structural
- * references exactly (rocm/ds4_rocm_runtime.cuh:6050,
- * ds4_cuda.cu:3683: `return 1;`). Trivial, unconditional success. */
-extern "C" int ds4_gpu_begin_commands(void) { return 1; }
+/* Opens the batch. With command-graph capture off (the default) there is
+ * still no encoder object and this is the same trivial, unconditional
+ * success as both structural references (rocm/ds4_rocm_runtime.cuh:6050,
+ * ds4_cuda.cu:3683: `return 1;`).
+ *
+ * With capture armed (DS4_SYCL_GRAPH), this is where recording starts:
+ * ds4.c brackets a whole decode token's encode in this entry and
+ * ds4_gpu_end_commands below, which is exactly the run of commands a
+ * graph wants to capture. Failing to start recording is not an error --
+ * the batch simply runs un-captured, which is what every caller already
+ * expects -- so this still returns success either way. */
+extern "C" int ds4_gpu_begin_commands(void) {
+    if (!g_devices.empty()) (void)g_sycl_graph_batch.begin(ds4_sycl_current_queue());
+    return 1;
+}
 
 /* Never reports an outstanding batch: with no encoder object there is
  * nothing to be active. Matches both structural references exactly
@@ -63,6 +75,18 @@ extern "C" int ds4_gpu_commands_active(void) { return 0; }
  * must fail gracefully here instead of crashing the process. */
 static int ds4_sycl_wait_current_tier(const char *label) {
     if (g_devices.empty()) return 0;
+    /* Ends any recording first: the commands a captured batch holds have
+     * not run yet, so draining the queue without submitting them would
+     * report completion of work that never happened. This also covers the
+     * error paths that reach ds4_gpu_synchronize without knowing whether a
+     * batch was ever opened, and the mid-layer ds4_gpu_flush_commands
+     * splits, both of which must see every command issued so far actually
+     * finished. */
+    if (!g_sycl_graph_batch.end()) {
+        fprintf(stderr, DS4_GPU_LOG_PREFIX "%s failed: command-graph batch\n",
+                label);
+        return 0;
+    }
     try {
         ds4_sycl_current_queue().wait_and_throw();
         return 1;

@@ -337,7 +337,7 @@ static int sycl_indexer_scores_launch(
                         });
             });
         }
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named(
                 (n_tokens == 1u && head_dim == 128u && n_head == 64u)
                         ? "indexer_scores_direct" : "indexer_scores_general",
@@ -794,7 +794,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
                                    candidate_stride);
                        });
     });
-    dq.wait_and_throw();
+    sycl_batch_wait(dq);
     ds4_sycl_profile_record_named("indexer_topk_chunk_pow2", _ds4_prof_ev56);
 
     /* Tree levels: fold merge_group consecutive candidate sets together
@@ -822,7 +822,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
                                 prev_sets, merge_group, prev_stride, next_stride);
                     });
         });
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("indexer_topk_tree_merge_pow2", _ds4_prof_ev57);
         cur = next;
         n_sets = next_sets;
@@ -849,7 +849,7 @@ static int sycl_indexer_topk_tree_launch(sycl::queue &dq, uint32_t *psel, const 
         });
     }
 
-    dq.wait_and_throw();
+    sycl_batch_wait(dq);
     ds4_sycl_profile_record_named("indexer_topk_merge_pow2_final", _ds4_prof_ev58);
     return 1;
 }
@@ -961,7 +961,7 @@ static int sycl_indexer_topk_launch(ds4_gpu_tensor *selected, const ds4_gpu_tens
             });
             _ds4_prof_ev59_name = "indexer_topk_brute_force";
         }
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         if (_ds4_prof_ev59_name) {
             ds4_sycl_profile_record_named(_ds4_prof_ev59_name, _ds4_prof_ev59);
         } else {
@@ -1019,7 +1019,7 @@ extern "C" int ds4_sycl_test_indexed_topk_sort_512_asc(ds4_gpu_tensor *dst,
                                                                      n_tokens);
                            });
         });
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("indexer_test_topk_sort_512_asc", _ds4_prof_ev60);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexed topk sort 512 asc failed: %s\n", e.what());
@@ -1118,7 +1118,7 @@ extern "C" int ds4_gpu_argmax_tensor(ds4_gpu_tensor *out_idx,
                         if (tid == 0u) *pout = (int32_t)sm_idx[0];
                     });
         });
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("indexer_argmax", _ds4_prof_ev61);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "argmax launch failed: %s\n", e.what());
@@ -1211,7 +1211,7 @@ extern "C" int ds4_gpu_indexer_top1_value_tensor(
                         }
                     });
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("indexer_top1_value", _ds4_prof_ev62);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer_top1_value launch failed: %s\n", e.what());
@@ -1351,7 +1351,7 @@ extern "C" int ds4_gpu_dsv4_topk_mask_tensor(ds4_gpu_tensor *mask,
                         pmask[gid] = v;
                     });
         });
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("indexer_topk_mask", _ds4_prof_ev63);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "topk mask launch failed: %s\n", e.what());
@@ -1386,7 +1386,7 @@ extern "C" int ds4_gpu_dsv4_indexer_qat_tensor(ds4_gpu_tensor *x,
                                                          n_rows, head_dim);
                     });
         });
-        dq.wait_and_throw();
+        sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("indexer_qat_hadamard_fp4", _ds4_prof_ev64);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "indexer qat launch failed: %s\n", e.what());

@@ -221,7 +221,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                     q, (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                     dwg, dwu, (const float *)x->ptr, (uint32_t)(in_dim >> 5u),
                     (uint32_t)out_dim, row_bytes, clamp);
-            q.wait_and_throw();
+            sycl_batch_wait(q);
             ds4_sycl_profile_record_named("shared_expert_gate_up_swiglu_q8_0_w32", ev);
             g_sycl_shared_fast_path_hits++;
         } catch (const sycl::exception &e) {
@@ -459,9 +459,8 @@ extern "C" int ds4_gpu_shared_mid_swiglu_q8_0_decode_exact_tensor(
             const int sel_dev = selected->device_id >= 0 ? selected->device_id
                                                           : g_current_tier;
             int32_t sel_host[6];
-            ds4_sycl_queue(sel_dev)
-                    .memcpy(sel_host, selected->ptr, sizeof(sel_host))
-                    .wait_and_throw();
+            sycl_batch_wait(ds4_sycl_queue(sel_dev)
+                    .memcpy(sel_host, selected->ptr, sizeof(sel_host)));
             uint32_t home_count = 0u, peer_count = 0u;
             for (uint32_t i = 0; i < 6u; i++) {
                 const int32_t expert = sel_host[i];
@@ -705,7 +704,7 @@ static int sycl_shared_gate_up_swiglu_q8_0_batch(
                         }
                     });
         });
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("shared_gate_up_swiglu_q8_0_batch", _ds4_prof_ev147);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX

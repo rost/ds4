@@ -264,7 +264,7 @@ static void sycl_router_select_launch(
                     }
                 });
     });
-    q.wait_and_throw();
+    sycl_batch_wait(q);
     ds4_sycl_profile_record_named("router_select", _ds4_prof_ev145);
 }
 

@@ -205,7 +205,7 @@ static void sycl_moe_q4k_gate_up_mid_decode_owned(
                  }
              });
      });
-     _ds4_prof_ev118.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev118);
      ds4_sycl_profile_record(_ds4_prof_ev118);
 }
 
@@ -269,7 +269,7 @@ static void sycl_moe_lut_gate_up_mid_decode_owned(
                  }
              });
      });
-     _ds4_prof_ev119.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev119);
      ds4_sycl_profile_record(_ds4_prof_ev119);
 }
 
@@ -332,7 +332,7 @@ static void sycl_moe_q8_k_quantize_owned(sycl::queue &q, sycl_block_q8_K *out, c
                  if (tid == 0) yb->d = 1.0f / iscale;
              });
      });
-     _ds4_prof_ev120.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev120);
      ds4_sycl_profile_record(_ds4_prof_ev120);
 }
 
@@ -374,7 +374,7 @@ static void sycl_moe_q4k_down_owned_slots(
                  if (row_ok && lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
              });
      });
-     _ds4_prof_ev121.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev121);
      ds4_sycl_profile_record(_ds4_prof_ev121);
 }
 
@@ -414,7 +414,7 @@ static void sycl_moe_lut_down_owned_slots(
                  if (row_ok && lane == 0u) down_out[(uint64_t)slot * out_dim + row] = acc;
              });
      });
-     _ds4_prof_ev122.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev122);
      ds4_sycl_profile_record(_ds4_prof_ev122);
 }
 
@@ -473,7 +473,7 @@ static void sycl_moe_q4k_down_owned_packed(
                  if (row_ok && lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
              });
      });
-     _ds4_prof_ev123.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev123);
      ds4_sycl_profile_record(_ds4_prof_ev123);
 }
 
@@ -528,7 +528,7 @@ static void sycl_moe_lut_down_owned_packed(
                  if (row_ok && lane == 0u) packed_out[(uint64_t)packed_slot * out_dim + row] = packed;
              });
      });
-     _ds4_prof_ev124.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev124);
      ds4_sycl_profile_record(_ds4_prof_ev124);
 }
 
@@ -625,7 +625,7 @@ static int sycl_routed_moe_one_owned_dispatch(
 
         int32_t sel_host[6];
         sycl::event _ds4_prof_ev125 = q.memcpy(sel_host, selected->ptr, sizeof(sel_host));
-        _ds4_prof_ev125.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev125);
         ds4_sycl_profile_record(_ds4_prof_ev125);
 
         std::vector<int32_t> unique_ids;
@@ -843,7 +843,7 @@ extern "C" int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
              }
              out_ptr[gid] = acc;
          });
-         _ds4_prof_ev126.wait_and_throw();
+         sycl_batch_wait(_ds4_prof_ev126);
          ds4_sycl_profile_record(_ds4_prof_ev126);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_owned_slots_combine_rows failed: %s\n",
@@ -887,7 +887,7 @@ extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
              const uint32_t row = (uint32_t)id[0];
              out_ptr[row] = sycl_moe_owned_packed_combine_row(hs, pp, sel, row, od, split);
          });
-         _ds4_prof_ev127.wait_and_throw();
+         sycl_batch_wait(_ds4_prof_ev127);
          ds4_sycl_profile_record(_ds4_prof_ev127);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_owned_packed_combine failed: %s\n",
@@ -938,7 +938,7 @@ extern "C" int ds4_gpu_moe_handoff_pack_tensor(ds4_gpu_tensor *packed,
                  *(float *)(dst + w_off + (uint64_t)i * sizeof(float)) = w[i];
              }
          });
-         _ds4_prof_ev128.wait_and_throw();
+         sycl_batch_wait(_ds4_prof_ev128);
          ds4_sycl_profile_record(_ds4_prof_ev128);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "moe_handoff_pack failed: %s\n", e.what());
@@ -974,7 +974,7 @@ static void sycl_moe_filter_owned_pairs(sycl::queue &q, int32_t *selected, float
              weights[pair] = 0.0f;
          }
      });
-     _ds4_prof_ev129.wait_and_throw();
+     sycl_batch_wait(_ds4_prof_ev129);
      ds4_sycl_profile_record(_ds4_prof_ev129);
 }
 

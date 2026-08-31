@@ -193,7 +193,7 @@ extern "C" int ds4_gpu_rms_norm_weight_rows_tensor(
          * commands against each other, never a host-side sycl::free
          * against a kernel still in flight, so removing this wait would
          * be spec 6g's use-after-free on every uncached call. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("rms_norm_weight_rows", _ds4_prof_ev131);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rms_norm_weight failed: %s\n",
@@ -344,7 +344,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         /* Wait kept, same reasoning as
          * ds4_gpu_rms_norm_weight_rows_tensor above -- dqw_guard and
          * dkvw_guard can each own scratch this function frees on return. */
-        sq.wait_and_throw();
+        sycl_batch_wait(sq);
         ds4_sycl_profile_record_named("dsv4_qkv_rms_norm_rows", _ds4_prof_ev132);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "dsv4_qkv_rms_norm_rows failed: %s\n",
@@ -555,7 +555,7 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
         /* Wait kept, same reasoning as
          * ds4_gpu_rms_norm_weight_rows_tensor above -- dqw_guard and
          * dkvw_guard can each own scratch this function frees on return. */
-        sq.wait_and_throw();
+        sycl_batch_wait(sq);
         ds4_sycl_profile_record_named("dsv4_qkv_rms_norm_rows_kv_rope", _ds4_prof_ev133);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -999,7 +999,7 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
         /* Wait kept, same reasoning as
          * ds4_gpu_rms_norm_weight_rows_tensor above -- pos_guard can own
          * scratch this function frees on return. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("rope_tail_decode_rows", _ds4_prof_ev137);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "rope_tail_decode_rows failed: %s\n",

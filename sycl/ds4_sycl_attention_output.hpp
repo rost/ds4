@@ -366,7 +366,7 @@ static int sycl_attention_output_a_stage(sycl::queue &q, float *low_ptr,
     ds4_sycl_profile_record_named("attn_output_quantize_q8_0_rows", ev_q);
     sycl::event ev_p = sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim,
                                     rank, n_groups, blocks_a, low_dim, n_tokens);
-    q.wait_and_throw();
+    sycl_batch_wait(q);
     ds4_sycl_profile_record_named("attn_output_grouped_q8_0_a_preq", ev_p);
     return 1;
 }
@@ -400,7 +400,7 @@ static int sycl_attention_output_a_stage_rows_exact(
      * before this quantize kernel completes. */
     sycl_grouped_q8_0_a_preq_launch(q, low_ptr, w_ptr, xq, xscale, group_dim, rank, group_cnt,
                                     blocks_a, low_dim, n_rows);
-    q.wait_and_throw();
+    sycl_batch_wait(q);
     return 1;
 }
 
@@ -426,7 +426,7 @@ extern "C" int ds4_sycl_test_quantize_q8_0_rows(ds4_gpu_tensor *xq,
         sycl::queue &q = ds4_sycl_queue(xq->device_id);
         sycl_quantize_q8_0_rows_launch(q, (int8_t *)xq->ptr, (float *)xscale->ptr,
                                        (const float *)x->ptr, in_dim, blocks, n_rows);
-        q.wait_and_throw();
+        sycl_batch_wait(q);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "test_quantize_q8_0_rows failed: %s\n", e.what());
         return 0;
@@ -463,7 +463,7 @@ extern "C" int ds4_sycl_test_grouped_q8_0_a_preq(ds4_gpu_tensor *low,
                                         (const int8_t *)xq->ptr,
                                         (const float *)xscale->ptr, group_dim, rank,
                                         n_groups, blocks, low_dim, n_tokens);
-        q.wait_and_throw();
+        sycl_batch_wait(q);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "test_grouped_q8_0_a_preq failed: %s\n", e.what());
         return 0;
@@ -862,7 +862,7 @@ extern "C" int ds4_gpu_attention_output_q8_batch_f16_tensor(
         sycl::event _ds4_prof_ev16 = q.parallel_for(sycl::range<1>((size_t)out_elems), [=](sycl::id<1> gid) {
              out_bits[gid[0]] = sycl_f32_to_f16_bits_hip_round(out_f32[gid[0]]);
          });
-         _ds4_prof_ev16.wait_and_throw();
+         sycl_batch_wait(_ds4_prof_ev16);
          ds4_sycl_profile_record_named("attn_output_test_quantize_q8_0_rows", _ds4_prof_ev16);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_q8_batch_f16 failed: %s\n",
@@ -1011,7 +1011,7 @@ extern "C" int ds4_gpu_attention_output_low_q4_K_slice_tensor(
         sycl::event ev = sycl_grouped_q4_k_a_launch(q, (float *)low->ptr, (const unsigned char *)w_guard.p,
                                    (const float *)heads->ptr, (uint32_t)group_dim, rank,
                                    group_cnt, row_bytes, low_dim, 1u);
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("attn_output_grouped_q4_k_a", ev);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_low_q4_K_slice failed: %s\n",
@@ -1090,7 +1090,7 @@ extern "C" int ds4_gpu_attention_output_q4_K_batch_tensor(
         sycl::event ev = sycl_grouped_q4_k_a_launch(q, (float *)low->ptr, (const unsigned char *)w_guard.p,
                                    (const float *)heads->ptr, (uint32_t)group_dim, rank,
                                    n_groups, row_bytes, low_dim, n_tokens);
-        q.wait_and_throw();
+        sycl_batch_wait(q);
         ds4_sycl_profile_record_named("attn_output_grouped_q4_k_a", ev);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention_output_q4_K_batch A-stage failed: %s\n",

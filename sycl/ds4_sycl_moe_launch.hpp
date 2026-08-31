@@ -451,7 +451,7 @@ static bool sycl_moe_build_expert_compaction(sycl::queue &q, const int32_t *sel_
                                              std::vector<int32_t> *remap) {
     std::vector<int32_t> sel_host((size_t)pair_count);
     sycl::event _ds4_prof_ev117 = q.memcpy(sel_host.data(), sel_dev, (size_t)pair_count * sizeof(int32_t));
-    _ds4_prof_ev117.wait_and_throw();
+    sycl_batch_wait(_ds4_prof_ev117);
     ds4_sycl_profile_record_named("moe_build_expert_compaction_readback", _ds4_prof_ev117);
 
     std::vector<int32_t> id_to_slot((size_t)n_total_expert, -1);
@@ -797,7 +797,7 @@ static int sycl_routed_moe_launch(
          * Kept anyway because the race it closes is real independent of
          * that unrelated defect, and removing it would silently reopen
          * it. */
-        q.wait_and_throw();
+        sycl_batch_wait(q);
 
         /* gate_w/up_w/down_w point into model_map, ordinary host memory (or
          * a plain host-backed test fixture): a SYCL kernel cannot
