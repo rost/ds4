@@ -1691,10 +1691,13 @@ not use a live Sysman query for the reason above. It reports a static ceiling
 committed on that tier, so it is honest by construction: it only ever reports
 what it knows was not spent, and it decreases exactly as caches admit.
 
-`--cuda-tensor-parallel` is refused outright on this backend: DeepSeek's
-tensor/expert-parallel decode path is CUDA-only work that nothing here
-implements, and the refusal fires at startup rather than letting the run
-reach an unimplemented kernel mid-decode.
+`--cuda-tensor-parallel` is accepted on this backend, but narrowly. The owned
+expert-parallel decode kernels exist for two routed-expert format pairs only,
+`(Q4_K gate/up, Q4_K down)` and `(IQ2_XXS gate/up, Q2_K down)`; a model with a
+routed layer in any other format is refused at startup rather than allowed to
+reach an unimplemented kernel mid-decode. Expert-parallel decode has never run
+on more than one card. See `SYCL.md` for the mechanism, and for why this is not
+the Metal `tp_world == 2` path.
 
 ### Known limitations
 
