@@ -264,7 +264,11 @@ static void sycl_router_select_launch(
                     }
                 });
     });
-    sycl_batch_wait(q);
+    /* No wait: q is in_order (ds4_sycl.cpp), so the MoE dispatch that
+     * reads `selected`/`weights` is already ordered behind this kernel.
+     * The bias/hash table this kernel reads is staged by the caller, not
+     * here, so it is the caller that decides whether its guard has
+     * anything to keep alive (sycl_any_scratch_frees). */
     ds4_sycl_profile_record_named("router_select", _ds4_prof_ev145);
 }
 
@@ -399,6 +403,7 @@ extern "C" int ds4_gpu_router_select_tensor(
                     active_n_expert_used, active_scale,
                     (has_bias && !hash_mode) ? 1 : 0, hash_mode ? 1 : 0);
         }
+        if (sycl_any_scratch_frees(scratch_guard)) sycl_batch_wait(q);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "router_select launch failed: %s\n", e.what());
         return 0;
@@ -493,6 +498,7 @@ extern "C" int ds4_gpu_router_select_batch_tensor(
                     active_n_expert_used, active_scale,
                     (has_bias && !hash_mode) ? 1 : 0, hash_mode ? 1 : 0);
         }
+        if (sycl_any_scratch_frees(scratch_guard)) sycl_batch_wait(q);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "router_select_batch launch failed: %s\n", e.what());
         return 0;

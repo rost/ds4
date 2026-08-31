@@ -352,6 +352,12 @@ struct sycl_device_scratch_guard {
         other.p = nullptr;
         other.owns = false;
     }
+    /* Whether going out of scope will actually release device memory.
+     * The kernel-entry wait that keeps scratch alive until its reader
+     * finishes is needed exactly when this is true, so both the
+     * destructor below and sycl_any_scratch_frees ask the same question
+     * of the same predicate rather than each spelling it out. */
+    bool frees() const { return p != nullptr && owns; }
     ~sycl_device_scratch_guard() {
         /* Destructors are implicitly noexcept: if sycl::free throws while
          * we are already unwinding from another exception (e.g. the
@@ -359,11 +365,13 @@ struct sycl_device_scratch_guard {
          * std::terminate instead of surfacing a clean failure.  There is
          * no meaningful recovery from a failed free during unwinding, so
          * log and swallow rather than let it propagate. */
-        if (!p || !owns) return;
+        if (!frees()) return;
         /* Freeing here is safe only because the kernels reading this
          * scratch have already completed by the time the guard goes out of
          * scope -- every entry point that stages scratch waits before
-         * returning. A recording batch breaks that assumption: its
+         * returning whenever a guard of its own reaches this branch
+         * (sycl_any_scratch_frees below). A recording batch breaks that
+         * assumption: its
          * commands have been recorded but not yet run, so the batch takes
          * the pointer and frees it once the submission that reads it has
          * completed (sycl/ds4_sycl_graph.hpp). */
@@ -382,7 +390,26 @@ struct sycl_device_scratch_guard {
     sycl_device_scratch_guard &operator=(const sycl_device_scratch_guard &) = delete;
 };
 
-/* The wait every kernel entry performs before its scratch guards free.
+/* True when at least one of `guards` will release device memory when the
+ * entry point holding them returns.
+ *
+ * A kernel entry that stages host bytes into device scratch must drain
+ * its queue before returning, or the guard frees that scratch out from
+ * under a kernel still reading it. That drain is the entry's only reason
+ * to wait: it computes nothing the host reads, and the in_order queue
+ * already orders it against whatever the caller submits next. Since
+ * sycl_stage_host_bytes started handing back a non-owning guard for any
+ * weight range the model-range cache had already made device-resident,
+ * the common decode case frees nothing at all, and the drain buys nothing
+ * while costing the dispatch latency of the next kernel, which the queue
+ * would otherwise have overlapped with this one. Guard the wait with this
+ * and a fully cache-resident decode stops draining after every kernel. */
+template <typename... Guards>
+static inline bool sycl_any_scratch_frees(const Guards &...guards) {
+    return (... || guards.frees());
+}
+
+/* The wait a kernel entry performs before scratch guards free under it.
  *
  * With capture off this is exactly the wait_and_throw it replaces. With a
  * batch recording it flushes instead: a queue in the recording state

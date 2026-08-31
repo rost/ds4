@@ -62,7 +62,9 @@ extern "C" int ds4_gpu_embed_token_hc_tensor(
              * every one of the n_hc rows receives the same values. */
             o[gid] = (float)sycl::bit_cast<sycl::half>(drow[e]);
         });
-        sycl_batch_wait(q);
+        /* Wait only for drow_guard's free, as in
+         * sycl_q8_0_matmul_general. */
+        if (sycl_any_scratch_frees(drow_guard)) sycl_batch_wait(q);
         ds4_sycl_profile_record(_ds4_prof_ev33);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "embed_token_hc failed: %s\n",

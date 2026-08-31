@@ -300,9 +300,9 @@ extern "C" int ds4_gpu_attention_decode_heads_tensor(
                                 use_mask, n_head, head_dim, use_vec4);
                     });
         });
-        /* Wait kept -- this function's only kernel, and
-         * sinks_guard may own scratch this function frees on return. */
-        sycl_batch_wait(dq);
+        /* Wait only for sinks_guard's free, as in
+         * sycl_q8_0_matmul_general. */
+        if (sycl_any_scratch_frees(sinks_guard)) sycl_batch_wait(dq);
         ds4_sycl_profile_record_named("attn_decode_mixed_one_fast_oldhip", _ds4_prof_ev1);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "attention decode oldhip fast launch failed: %s\n",

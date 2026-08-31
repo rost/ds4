@@ -533,9 +533,10 @@ static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
                 : sycl_q8_0_matmul_launch(
                         q, (float *)out->ptr, dw, (const float *)x->ptr,
                         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, row_bytes);
-        /* Wait kept -- this function's only kernel, and dw_guard
-         * may own scratch this function frees on return. */
-        sycl_batch_wait(q);
+        /* The only reason to wait is dw_guard's free; when the weight
+         * range came back device-resident there is nothing to free, and q
+         * is in_order so the caller's next kernel is ordered anyway. */
+        if (sycl_any_scratch_frees(dw_guard)) sycl_batch_wait(q);
         ds4_sycl_profile_record_named("matmul_q8_0", ev);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "matmul_q8_0 failed: %s\n", e.what());

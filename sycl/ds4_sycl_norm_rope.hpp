@@ -552,10 +552,9 @@ extern "C" int ds4_gpu_dsv4_qkv_rms_norm_rows_kv_rope_tensor(
                     }
                 });
         });
-        /* Wait kept, same reasoning as
-         * ds4_gpu_rms_norm_weight_rows_tensor above -- dqw_guard and
-         * dkvw_guard can each own scratch this function frees on return. */
-        sycl_batch_wait(sq);
+        /* Wait only for the scratch guards' frees, as in
+         * sycl_q8_0_matmul_general. */
+        if (sycl_any_scratch_frees(dqw_guard, dkvw_guard)) sycl_batch_wait(sq);
         ds4_sycl_profile_record_named("dsv4_qkv_rms_norm_rows_kv_rope", _ds4_prof_ev133);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX
