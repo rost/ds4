@@ -208,6 +208,50 @@ static inline float sycl_q8_0_dequant(const unsigned char *row, uint32_t col) {
     return scale * (float)qv;
 }
 
+/* Dot-products one whole Q8_0 block against the activations at
+ * xs[base .. base+n), returning scale * sum.  n is 32 for every block but
+ * the last one of an in_dim that is not a multiple of 32.
+ *
+ * This exists because sycl_q8_0_dequant above, called once per element
+ * from a matmul inner loop, re-reads the block's 2-byte F16 scale and
+ * re-converts it to F32 for every one of the block's 32 values, and gives
+ * the compiler no wide load to form for the int8 payload: consecutive
+ * columns belong to consecutive lanes there, so each lane issues one
+ * single-byte load per multiply-add.  Reading a whole block per lane
+ * instead converts the scale once and lets the 32 int8 codes arrive as
+ * one 32-byte copy.  Measured on an A770 (sycl_q8_0_matmul_*, n_tok 1,
+ * out_dim 4096, ms per call, per-element against per-block): in_dim 4096
+ * 0.0907 against 0.0829, in_dim 7168 0.1792 against 0.1279.
+ *
+ * The payload copy is a __builtin_memcpy and NOT a uint32_t reinterpret
+ * cast: blocks start at 34*b, so a block is only 2-byte aligned and half
+ * of them are 2 mod 4.  memcpy states the real alignment and lets the
+ * compiler pick loads the device can actually issue; a reinterpret cast
+ * would assert an alignment the layout does not have.
+ *
+ * XAcc is anything indexable by a uint32_t -- a raw activation pointer or
+ * a local_accessor -- so the same helper serves kernels that read the
+ * activation row from global memory and kernels that stage it in local
+ * memory. */
+template <typename XAcc>
+static inline float sycl_q8_0_block_dot(const unsigned char *bp, const XAcc &xs,
+                                        uint32_t base, uint32_t n) {
+    uint16_t raw;
+    __builtin_memcpy(&raw, bp, sizeof(raw));
+    const float scale = (float)sycl::bit_cast<sycl::half>(raw);
+    float acc = 0.0f;
+    if (n == 32u) {
+        signed char qv[32];
+        __builtin_memcpy(qv, bp + 2, sizeof(qv));
+        for (uint32_t i = 0; i < 32u; i++) acc += xs[base + i] * (float)qv[i];
+    } else {
+        for (uint32_t i = 0; i < n; i++) {
+            acc += xs[base + i] * (float)(signed char)bp[2 + i];
+        }
+    }
+    return scale * acc;
+}
+
 /* Q4_K row layout: cuda_block_q4_K, ds4_rocm.cu:72-77 (also the routed-MoE's
  * own sycl_block_q4_K in ds4_sycl_moe.hpp before this move): 256-value
  * superblock, F16 scale `d` and F16 min `dmin`, 12 bytes of packed 6-bit

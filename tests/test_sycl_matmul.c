@@ -15,6 +15,7 @@
 #include "test_sycl_harness.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* No SYCL half type is available in a plain C test, so weights are built
@@ -258,6 +259,118 @@ static void oracle_matmul_q8_0(float *out, const float *x,
             out[t * out_dim + o] = (float)sum;
         }
     }
+}
+
+/* As test_encode_q8_0_row, but with the block scale bounded instead of
+ * growing with the block index, so a row thousands of blocks long still
+ * sums to a magnitude float32 holds with headroom.  The (o, k) product
+ * interaction term in the int8 payload is kept, so a kernel that mixed up
+ * rows or dropped the block stride still shows it. */
+static void test_encode_q8_0_row_wide(unsigned char *row, uint32_t in_dim,
+                                      uint32_t o) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        unsigned char *bp = row + (size_t)blk * 34u;
+        const uint16_t braw =
+                test_float_to_half(0.001f * (float)(((o + blk) % 17u) + 1u));
+        bp[0] = (unsigned char)(braw & 0xFFu);
+        bp[1] = (unsigned char)((braw >> 8) & 0xFFu);
+        for (uint32_t idx = 0; idx < 32u; idx++) {
+            const uint32_t k = blk * 32u + idx;
+            /* Padding past in_dim is deliberately NOT zero here (unlike
+             * test_encode_q8_0_row above): the contract is in_dim columns,
+             * and a kernel that reads a whole 32-value block without
+             * bounding it to in_dim would silently agree with the oracle
+             * if the bytes it over-read happened to be zero. */
+            const int qv = (k < in_dim)
+                    ? (int)(((o + 1u) * (k + 3u)) % 13u) - 6
+                    : 5;
+            bp[2 + idx] = (unsigned char)(signed char)qv;
+        }
+    }
+}
+
+/* Wide-in_dim Q8_0 dense matmul.  in_dim here is large enough that
+ * staging the activation row would cost more than a fifth of the device's
+ * local memory, so sycl_q8_0_matmul_general (sycl/ds4_sycl_matmul.hpp)
+ * takes its block-per-lane kernel rather than the local-memory-staged
+ * tile kernel that every other Q8_0 case in this file exercises; nothing
+ * else here reaches that kernel at all.  8231 * 4 = 32924 bytes puts the
+ * choice on the same side of both local-memory sizes this backend sees
+ * (65536 on Xe1, 131072 on Xe2), and 8231 is not a multiple of 32, so the
+ * partially-filled last Q8_0 block is exercised on that path too.
+ *
+ * The out_dim values cover what the block-per-lane kernel's clamped row
+ * index has to survive: a single output row, where 15 of the 16
+ * sub-groups in the one work-group address no row at all; an out_dim that
+ * is not a multiple of the 16 rows a work-group covers; and an exact
+ * multiple.  Those out-of-range sub-groups still have to reach the
+ * sub-group reduction's shuffles, which are only defined with the whole
+ * sub-group converged, so an early return there would corrupt the rows
+ * that do exist rather than simply skipping the ones that do not. */
+static int test_matmul_q8_0_wide_in_dim(void) {
+    enum { IN_DIM = 8231, MAX_OUT_DIM = 33, MAX_N_TOK = 2 };
+    static const struct { uint32_t out_dim; uint32_t n_tok; } cases[] = {
+        { 1u,  1u },
+        { 19u, 1u },
+        { 32u, 1u },
+        { 33u, 2u },
+    };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+
+    unsigned char *weights = (unsigned char *)malloc((size_t)MAX_OUT_DIM * row_bytes);
+    float *x    = (float *)malloc((size_t)MAX_N_TOK * IN_DIM * sizeof(float));
+    float *want = (float *)malloc((size_t)MAX_N_TOK * MAX_OUT_DIM * sizeof(float));
+    float *got  = (float *)malloc((size_t)MAX_N_TOK * MAX_OUT_DIM * sizeof(float));
+    CHECK(weights != NULL && x != NULL && want != NULL && got != NULL,
+          "matmul_q8_0_wide: host allocation failed");
+
+    for (uint32_t o = 0; o < MAX_OUT_DIM; o++) {
+        test_encode_q8_0_row_wide(weights + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t t = 0; t < MAX_N_TOK; t++) {
+        for (uint32_t k = 0; k < IN_DIM; k++) {
+            x[t * IN_DIM + k] = (float)(((t + 1) * (k + 2)) % 9) - 4.0f;
+        }
+    }
+
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const uint32_t out_dim = cases[c].out_dim;
+        const uint32_t n_tok   = cases[c].n_tok;
+        const uint64_t weight_bytes = (uint64_t)out_dim * row_bytes;
+        const size_t   out_bytes    = (size_t)n_tok * out_dim * sizeof(float);
+
+        oracle_matmul_q8_0(want, x, weights, IN_DIM, out_dim, n_tok, row_bytes);
+
+        ds4_gpu_tensor *tx =
+                ds4_gpu_tensor_alloc((size_t)n_tok * IN_DIM * sizeof(float));
+        ds4_gpu_tensor *tout = ds4_gpu_tensor_alloc(out_bytes);
+        CHECK(tx != NULL && tout != NULL, "matmul_q8_0_wide: allocation failed");
+        CHECK(ds4_gpu_tensor_write(tx, 0, x,
+                                   (size_t)n_tok * IN_DIM * sizeof(float)) != 0,
+              "matmul_q8_0_wide: write x");
+        CHECK(ds4_gpu_matmul_q8_0_tensor(tout, weights, weight_bytes, 0,
+                                         IN_DIM, out_dim, tx, n_tok) != 0,
+              "matmul_q8_0_wide: call");
+        CHECK(ds4_gpu_tensor_read(tout, 0, got, out_bytes) != 0,
+              "matmul_q8_0_wide: read out");
+
+        for (uint32_t i = 0; i < n_tok * out_dim; i++) {
+            CHECK_CLOSE(got[i], want[i], fabs((double)want[i]) * 1e-5 + 1e-3,
+                        "matmul_q8_0_wide: out mismatch");
+        }
+
+        ds4_gpu_tensor_free(tx);
+        ds4_gpu_tensor_free(tout);
+    }
+
+    free(weights);
+    free(x);
+    free(want);
+    free(got);
+    fprintf(stderr, "  test_matmul_q8_0_wide_in_dim OK\n");
+    return 0;
 }
 
 /* in_dim deliberately not a multiple of 32 so the last Q8_0 block is only
@@ -1572,6 +1685,7 @@ int main(void) {
     if (test_matmul_f16_pair() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_f16_pair_compressor_store() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0_wide_in_dim() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_kslice_rows() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_kslice() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_decode_mpp() != 0) { ds4_gpu_cleanup(); return 1; }

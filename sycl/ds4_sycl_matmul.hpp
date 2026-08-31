@@ -341,69 +341,42 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
     return 1;
 }
 
-/* Submits (without waiting) out[t][o] = sum_k x[t][k] * dequant(w[o][k])
- * for one Q8_0-quantised weight table, row-major out_dim rows of row_bytes
- * bytes each (blocks of 32 values, 34 bytes per block; see
- * sycl_q8_0_dequant in ds4_sycl_common.hpp).  One work-item per
- * (token, out_row) pair, covering every n_tok with no shape gating.
+/* The two Q8_0 dense matmul kernels below share a shape: one output row
+ * per kQ8_0TileSubgroup-wide sub-group, the row split across the
+ * sub-group's lanes and reduced with a shuffle (sycl_subgroup_sum,
+ * ds4_sycl_common.hpp), kQ8_0TileRowsPerGroup rows to a work-group.  They
+ * differ only in where the token's activation row is read from, which is
+ * what sycl_q8_0_matmul_general picks between; see that decision's own
+ * comment for the measurements behind it.  Both mirror the shape of
+ * ds4_sycl_moe.hpp's Q4_K tile kernels (e.g.
+ * sycl_moe_q4k_gate_up_mid_tile8), the established pattern for
+ * quantised-weight tile kernels here.
  *
- * This scalar form is kept only as the fallback
- * sycl_q8_0_matmul_general uses when a row is too wide for the tiled
- * kernel's local-memory activation stage below (see that kernel's own
- * comment); every call this backend's dense weight shapes actually reach
- * takes the tiled path instead, which measured faster on the real
- * layer-eval. */
-static sycl::event sycl_q8_0_matmul_launch(sycl::queue &q, float *out,
-                                    const unsigned char *w, const float *x,
-                                    uint32_t in_dim, uint32_t out_dim,
-                                    uint32_t n_tok, uint64_t row_bytes) {
-    const uint64_t n = (uint64_t)n_tok * out_dim;
-    return q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> gid) {
-        const uint32_t o  = (uint32_t)(gid % out_dim);
-        const uint32_t t  = (uint32_t)(gid / out_dim);
-        const float         *xr = x + (uint64_t)t * in_dim;
-        const unsigned char *wr = w + (uint64_t)o * row_bytes;
-        float sum = 0.0f;
-        for (uint32_t k = 0; k < in_dim; k++) {
-            sum += xr[k] * sycl_q8_0_dequant(wr, k);
-        }
-        out[gid] = sum;
-    });
-}
-
-/* Tiled Q8_0 dense matmul: replaces
- * sycl_q8_0_matmul_launch's one-work-item-per-output-element shape, which
- * profiling showed dominating this backend's real per-layer
- * kernel time (matmul_q8_0 ranked #1 in that measurement).
- * That kernel has a single work-item serially walk the whole in_dim for
- * one output element; this one instead gives every output row a
- * kSubgroup-wide sub-group to split the row across, reducing with a
- * shuffle (sycl_subgroup_sum, ds4_sycl_common.hpp), and stages the
- * token's activation row into local memory once per work-group so every
- * output row the group computes reads it from local memory instead of
- * global. Mirrors the shape of ds4_sycl_moe.hpp's Q4_K tile kernels
- * (e.g. sycl_moe_q4k_gate_up_mid_tile8): local-memory activation staging
- * plus a sub-group cooperative reduction, one work-group per output tile,
- * matching the established pattern for quantised-weight tile kernels.
- *
- * kSubgroup is 16, already in kRequiredSubGroupWidths
+ * kQ8_0TileSubgroup is 16, already in kRequiredSubGroupWidths
  * (ds4_sycl_common.hpp), so ds4_gpu_init's device-capability guard already
- * checks it; no change needed there.
- *
- * The activation row is staged in full (in_dim floats) rather than in a
- * bounded sub-tile: every dense Q8_0 weight table in the DeepSeek V4
- * Flash/Pro shapes has in_dim <= 4096 (16 KiB), comfortably inside Arc's
- * local-memory budget, so this is not a partial-tile scheme. The caller
- * (sycl_q8_0_matmul_general) checks the row fits the device's actual
- * reported local-memory size before choosing this kernel over the scalar
- * fallback above, so an unexpectedly wide in_dim degrades to a working
- * (if slower) kernel instead of an oversized local_accessor allocation
- * failing at submission time. */
+ * checks it; no change needed there.  Width 8 is deliberately not used:
+ * Xe2 (Battlemage) does not support it. */
 static constexpr int      kQ8_0TileSubgroup     = 16;
 static constexpr uint32_t kQ8_0TileGroupSize    = 256u;
 static constexpr uint32_t kQ8_0TileRowsPerGroup =
         kQ8_0TileGroupSize / (uint32_t)kQ8_0TileSubgroup;
 
+/* Tiled Q8_0 dense matmul, activation row staged in local memory: the
+ * work-group loads the token's in_dim floats once and every output row it
+ * computes then reads them from local memory instead of global.  Costs
+ * in_dim*4 bytes of the work-group's local-memory budget, which is what
+ * bounds how many work-groups a sub-slice can hold at once, so it only
+ * pays while the row is small relative to the device's local memory --
+ * sycl_q8_0_matmul_general's kernel choice.
+ *
+ * The inner loop keeps the per-element sycl_q8_0_dequant: with columns
+ * handed out one per lane, the sub-group's 16 byte loads are 16
+ * consecutive bytes of one Q8_0 block, which is already a single
+ * coalesced request.  Reading a whole block per lane here instead
+ * (sycl_q8_0_block_dot) makes each lane stride 32 floats through local
+ * memory, and the resulting bank collisions cost more than the repeated
+ * scale decode saves: 0.115 ms against 0.090 ms per call on an A770 at
+ * 4096x4096, n_tok 1. */
 static sycl::event sycl_q8_0_matmul_tiled_launch(sycl::queue &q, float *out,
                                     const unsigned char *w, const float *x,
                                     uint32_t in_dim, uint32_t out_dim,
@@ -454,6 +427,61 @@ static sycl::event sycl_q8_0_matmul_tiled_launch(sycl::queue &q, float *out,
     });
 }
 
+/* Block-per-lane Q8_0 dense matmul, activation row read straight from
+ * global memory.  Each lane of a row's sub-group owns whole 32-value Q8_0
+ * blocks instead of single columns, so the block's F16 scale is decoded
+ * once per 32 multiply-adds instead of once per multiply-add and the 32
+ * int8 codes arrive as one wide copy (sycl_q8_0_block_dot,
+ * ds4_sycl_common.hpp).
+ *
+ * Not staging the activation row is the point of this kernel, not an
+ * omission: the staged row is what limits how many work-groups a
+ * sub-slice can hold, and past roughly a fifth of the device's local
+ * memory that crowding costs more than the staging saves.  Re-reading the
+ * row from global memory is cheap because every work-group reads the same
+ * in_dim floats, which stay in cache.
+ *
+ * The out_dim guard is a clamped row index plus a guard on the store, not
+ * an early return: sycl_subgroup_sum's shuffles are only defined with the
+ * whole sub-group converged, and clamping keeps that true for any
+ * out_dim, without depending on whole sub-groups happening to share a
+ * row. */
+static sycl::event sycl_q8_0_matmul_blockrow_launch(sycl::queue &q, float *out,
+                                    const unsigned char *w, const float *x,
+                                    uint32_t in_dim, uint32_t out_dim,
+                                    uint32_t n_tok, uint64_t row_bytes) {
+    const uint32_t row_blocks =
+            (out_dim + kQ8_0TileRowsPerGroup - 1u) / kQ8_0TileRowsPerGroup;
+    const uint32_t n_blocks = (in_dim + 31u) / 32u;
+    return q.parallel_for(
+            sycl::nd_range<2>(
+                    sycl::range<2>((size_t)row_blocks * kQ8_0TileGroupSize, n_tok),
+                    sycl::range<2>(kQ8_0TileGroupSize, 1u)),
+            [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kQ8_0TileSubgroup)]] {
+                const uint32_t tok = (uint32_t)it.get_group(1);
+                const uint32_t lid = (uint32_t)it.get_local_id(0);
+                const sycl::sub_group sg = it.get_sub_group();
+                const uint32_t lane = (uint32_t)sg.get_local_id()[0];
+                const uint32_t row_in_group = lid / (uint32_t)kQ8_0TileSubgroup;
+                const uint32_t row = (uint32_t)it.get_group(0) * kQ8_0TileRowsPerGroup
+                                    + row_in_group;
+                const uint32_t row_clamped = sycl::min(row, out_dim - 1u);
+
+                const float         *xr = x + (uint64_t)tok * in_dim;
+                const unsigned char *wr = w + (uint64_t)row_clamped * row_bytes;
+                float sum = 0.0f;
+                for (uint32_t b = lane; b < n_blocks; b += (uint32_t)kQ8_0TileSubgroup) {
+                    const uint32_t base = b * 32u;
+                    sum += sycl_q8_0_block_dot(wr + (size_t)b * 34u, xr, base,
+                                               sycl::min(32u, in_dim - base));
+                }
+                sum = sycl_subgroup_sum<kQ8_0TileSubgroup>(sg, sum);
+                if (lane == 0u && row < out_dim) {
+                    out[(uint64_t)tok * out_dim + row] = sum;
+                }
+            });
+}
+
 /* Core Q8_0 dense matmul: out[t][o] = sum_k x[t][k] * dequant(w[o][k]) for
  * one weight table.  Validation and shared kernel selection ported from
  * ROCm's cuda_matmul_q8_0_tensor_labeled (rocm/ds4_rocm_matmul.cuh:311-524),
@@ -487,8 +515,9 @@ static sycl::event sycl_q8_0_matmul_tiled_launch(sycl::queue &q, float *out,
  *   vendor performance tuning with no correctness difference from the
  *   general path; the dp4a branch additionally assumes an NVIDIA/AMD
  *   dot-product-of-4-int8 instruction with no direct SYCL equivalent worth
- *   chasing for a first port.  This helper always uses the shape-ungated
- *   kernel form (sycl_q8_0_matmul_launch above), for every n_tok. */
+ *   chasing for a first port.  Both kernels above are shape-ungated and
+ *   accept every n_tok; the choice between them is a local-memory
+ *   occupancy question, not a shape gate. */
 static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
                                     uint64_t model_size, uint64_t weight_offset,
                                     uint64_t in_dim, uint64_t out_dim,
@@ -519,24 +548,41 @@ static int sycl_q8_0_matmul_general(ds4_gpu_tensor *out, const void *model_map,
         unsigned char *dw = (unsigned char *)dw_guard.p;
         if (!dw) return 0;
 
-        /* The tiled kernel stages one in_dim-wide activation row into
-         * local memory per work-group; fall back to the scalar kernel
-         * (no local memory needed) rather than risk an oversized
-         * local_accessor allocation on a device or shape this margin does
-         * not anticipate. 4096 bytes of headroom for whatever else the
-         * runtime reserves per work-group, checked against this specific
-         * device rather than assumed, since local memory size is not
-         * uniform across every SYCL device this backend might run on. */
+        /* Staging the activation row costs in_dim*4 bytes of local memory
+         * per work-group, and local memory per sub-slice is what bounds
+         * how many work-groups can be resident at once.  While enough
+         * work-groups still fit, staging wins; once the row crowds them
+         * out, reading the row from global memory and giving each lane a
+         * whole Q8_0 block instead wins by more than the staging ever
+         * saved.  Measured on an A770 (65536 bytes of local memory,
+         * out_dim 4096, ms per call, staged tile kernel against
+         * block-per-lane kernel):
+         *
+         *   n_tok 1: in_dim 2048 0.0500/0.0530, 3072 0.0646/0.0680,
+         *            4096 0.0907/0.0829, 5120 0.1324/0.0982,
+         *            7168 0.1792/0.1279
+         *   n_tok 4: in_dim 4096 0.2000/0.2583, 7168 0.6258/0.4381
+         *
+         * so the crossover sits at 5 resident work-groups for single-token
+         * decode and at 3 once several tokens share the weight read.  The
+         * test is written against the device's reported local memory
+         * rather than a bare in_dim threshold so a device with a larger
+         * local-memory budget (Xe2 reports 131072) keeps the staged kernel
+         * across the range where it still wins.  Both branches accept any
+         * shape, so this is purely a performance choice; the block-per-lane
+         * kernel needs no local memory at all and is the safe side of it. */
         const uint64_t x_local_bytes = (uint64_t)in_dim * sizeof(float);
         const uint64_t local_mem_size =
                 (uint64_t)q.get_device().get_info<sycl::info::device::local_mem_size>();
-        const bool use_tiled = x_local_bytes + 4096u <= local_mem_size;
+        const uint64_t min_resident_groups = (n_tok == 1u) ? 5u : 3u;
+        const bool stage_activation_row =
+                x_local_bytes * min_resident_groups <= local_mem_size;
 
-        sycl::event ev = use_tiled
+        sycl::event ev = stage_activation_row
                 ? sycl_q8_0_matmul_tiled_launch(
                         q, (float *)out->ptr, dw, (const float *)x->ptr,
                         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, row_bytes)
-                : sycl_q8_0_matmul_launch(
+                : sycl_q8_0_matmul_blockrow_launch(
                         q, (float *)out->ptr, dw, (const float *)x->ptr,
                         (uint32_t)in_dim, (uint32_t)out_dim, (uint32_t)n_tok, row_bytes);
         /* The only reason to wait is dw_guard's free; when the weight
@@ -1130,9 +1176,9 @@ extern "C" int ds4_gpu_matmul_f32_tensor(
  * always a capture-less lambda below) rather than a runtime function
  * pointer so the SYCL device compiler sees a direct, statically resolved
  * call inside the kernel body rather than an indirect one. One level more
- * general than sycl_q8_0_matmul_launch/sycl_matmul_f32_launch above, which
- * this could replace but does not, to keep this change scoped to the new
- * entries it actually needs. */
+ * general than sycl_matmul_f32_launch above, which this could replace but
+ * does not, to keep this change scoped to the new entries it actually
+ * needs. */
 template <typename Dequant>
 static sycl::event sycl_dense_quant_matmul_launch(sycl::queue &q, float *out,
                                            const unsigned char *w, const float *x,
