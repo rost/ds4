@@ -226,11 +226,13 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     if (g_initialised) ds4_gpu_cleanup();
 
-    /* See the identical call in ds4_gpu_init (ds4_sycl.cpp): must run
-     * before the first Level Zero enumeration, which ds4_sycl_enumerate_gpus
-     * immediately below performs. This entry point is a distinct process
-     * startup path from ds4_gpu_init, so it needs its own call rather than
-     * relying on that one having already run. */
+    /* Must run before the first Level Zero enumeration, which
+     * ds4_sycl_enumerate_gpus immediately below performs: Sysman cannot be
+     * armed retroactively on an already-initialised loader. Overwrite is 0
+     * so an operator's own exported value is respected. This is the single
+     * init path now (ds4_gpu_init is a shim over it), but
+     * ds4_gpu_args_probe_auto_cuda below can still reach Sysman first when
+     * CLI parsing runs before any init, and sets the same variable. */
     setenv("ZES_ENABLE_SYSMAN", "1", 0);
 
     try {
@@ -253,6 +255,12 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
          * g_devices.size() == wanted.size() on return here. */
         ds4_sycl_build_devices(wanted, &g_devices);
 
+        /* Before anything else touches these devices, and before the peer
+         * probes below spend time on them: refuse any card that cannot
+         * honour a required sub-group width.  Defined in ds4_sycl.cpp,
+         * which includes this header after it. */
+        if (!sycl_verify_subgroup_widths()) return 0;
+
         g_n_gpus = cfg->n_gpus;
         for (int i = 0; i < g_n_gpus; i++) {
             g_gpu[i].device_id    = cfg->device_indices[i];
@@ -264,9 +272,9 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
          * always reaches its own memory), every other ordered pair runs
          * the full validation protocol (sycl_validate_peer_pair, defined
          * above this function) and defaults to 0 (bounce-only) on any
-         * failure. On this single-device box only the diagonal ever
-         * executes; the i != j branch requires a second physical device to
-         * run for real (see the report on testability). */
+         * failure.  The i != j branch needs a second physical device to
+         * run for real, and now gets one: 0->1 and 1->0 both validate on a
+         * 14-device Arc Pro B60 host. */
         for (int i = 0; i < g_n_gpus; i++) {
             for (int j = 0; j < g_n_gpus; j++) {
                 g_gpu_peer_ok[i][j] = (i == j) ? 1 : (sycl_validate_peer_pair(i, j) ? 1 : 0);
@@ -276,9 +284,10 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
         g_current_tier = 0;
         g_initialised  = true;
         fprintf(stderr, DS4_GPU_LOG_PREFIX
-                "init_multi: %d device(s) on a shared context per SYCL "
-                "platform\n",
-                g_n_gpus);
+                "%d device(s) on a shared context per SYCL platform, "
+                "using %s\n",
+                g_n_gpus,
+                g_devices[0].dev.get_info<sycl::info::device::name>().c_str());
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "init_multi failed: %s\n", e.what());

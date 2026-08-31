@@ -51,11 +51,22 @@ extern int ds4_sycl_test_peer_bytecheck(int tier, int corrupt,
         }                                                                   \
     } while (0)
 
+/* How many GPUs the machine actually has.  ds4_gpu_init +
+ * ds4_sycl_device_count does NOT answer this: ds4_gpu_init is a
+ * single-device shim (matching ds4_cuda.cu:2769), so that pair always
+ * reports 1 and every two-device test below would silently skip itself on
+ * a 14-GPU host -- which is exactly where they are worth running.
+ * probe_auto is the enumeration --gpu-vram auto itself performs, so it
+ * sees the same devices a real multi-GPU startup would. */
 static int physical_device_count(void) {
-    if (!ds4_gpu_init()) return 0;
-    int n = ds4_sycl_device_count();
-    ds4_gpu_cleanup();
-    return n;
+    ds4_gpu_config cfg;
+    char errbuf[256];
+    memset(&cfg, 0, sizeof(cfg));
+    errbuf[0] = '\0';
+    if (ds4_gpu_args_probe_auto_cuda(NULL, 0, &cfg, 0, errbuf, sizeof(errbuf)) != 0) {
+        return 0;
+    }
+    return cfg.n_gpus;
 }
 
 /* ---- ds4_gpu_init_multi ------------------------------------------------ */

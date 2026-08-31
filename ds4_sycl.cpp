@@ -317,128 +317,78 @@ sycl::queue &ds4_sycl_current_queue(void) {
     return ds4_sycl_queue(g_current_tier);
 }
 
-extern "C" int ds4_gpu_init(void) {
-    if (g_initialised) return 1;
+/* Refuses any device that cannot honour every width in
+ * kRequiredSubGroupWidths, clearing the partially-built state so the caller
+ * can just return failure.  1 = every device in g_devices is usable.
+ *
+ * Per spec 6m, [[sycl::reqd_sub_group_size(N)]] is not enforced by the
+ * driver on this stack: a device that cannot honour N silently runs a
+ * different width instead of failing the kernel launch, and every kernel
+ * carrying that annotation then reduces over the wrong number of lanes for
+ * a plausible, wrong, answer with no error anywhere.
+ *
+ * Checked against every device, not just tier 0, since the target hardware
+ * is many independent cards and any one of them can be the one missing a
+ * width.  BOTH init entry points must call this.  It lived inline in
+ * ds4_gpu_init until that became a shim, which meant every
+ * --gpu-devices/--gpu-vram startup -- the only way to reach more than one
+ * GPU, and so the only startup where "any one card" is more than
+ * hypothetical -- went through ds4_gpu_init_multi and was never checked at
+ * all. */
+static int sycl_verify_subgroup_widths(void) {
+    for (const ds4_sycl_device &d : g_devices) {
+        std::vector<size_t> raw = d.dev.get_info<sycl::info::device::sub_group_sizes>();
+        std::vector<uint32_t> widths;
+        widths.reserve(raw.size());
+        for (size_t w : raw) widths.push_back((uint32_t)w);
 
-    /* Must run before the first Level Zero platform/device enumeration
-     * (ds4_sycl_enumerate_gpus, immediately below): Sysman cannot be armed
-     * retroactively on an already-initialised Level Zero loader. Overwrite
-     * is 0 so an operator's own exported value is respected; harmless when
-     * Sysman is never queried (sycl_zes_free_bytes, ds4_sycl_common.hpp).
-     * ds4_gpu_args_probe_auto_cuda (sycl/ds4_sycl_mgpu.hpp) sets the same
-     * variable for the case where CLI argument parsing runs first and
-     * reaches Sysman before this function ever does. */
-    setenv("ZES_ENABLE_SYSMAN", "1", 0);
+        uint32_t missing = ds4_sycl_missing_required_subgroup_width(
+                widths.data(), (int)widths.size());
+        if (missing == 0) continue;
 
-    try {
-        std::vector<sycl::device> chosen = ds4_sycl_enumerate_gpus();
-
-        if (chosen.empty()) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX "no SYCL GPU device found\n");
-            return 0;
+        std::string reported;
+        for (size_t i = 0; i < widths.size(); i++) {
+            if (i) reported += ", ";
+            reported += std::to_string(widths[i]);
         }
-
-        ds4_sycl_build_devices(chosen, &g_devices);
-
-        /* Keep g_n_gpus and g_gpu[].device_id in step with what was just
-         * enumerated: ds4.c reads these directly (see ds4.c's engine setup
-         * and multi-tier dispatch) and would otherwise still see the
-         * single-tier default declared below even when g_devices holds
-         * every physical GPU on the box.
-         *
-         * Only device_id is set here.  budget_bytes is filled in by
-         * ds4_gpu_init_multi (ds4_sycl_mgpu.hpp) from the caller's
-         * --gpu-vram/--gpu-devices config, and leaving it zero on this path
-         * is harmless: ds4.c never reads g_gpu[].budget_bytes, because
-         * layer placement carries its own per-tier budgets.  The remaining
-         * ds4_gpu_ctx fields are CUDA-shaped and unused by this backend. */
-        size_t n = g_devices.size();
-        if (n > (size_t)DS4_MAX_GPUS) {
-            fprintf(stderr, DS4_GPU_LOG_PREFIX
-                    "%zu devices found, clamping to DS4_MAX_GPUS=%d\n", n,
-                    DS4_MAX_GPUS);
-            n = (size_t)DS4_MAX_GPUS;
-        }
-        g_n_gpus = (int)n;
-        for (int i = 0; i < g_n_gpus; i++) {
-            g_gpu[i].device_id = i;
-        }
-
-        /* No multi-GPU warning here any more.  This used to print that
-         * multi-GPU execution was "not yet implemented", on the grounds
-         * that the tensor-alloc and current-device entries were failing
-         * stubs; all of them are implemented now, and the whole SYCL suite
-         * passes on a 14-device host.
-         *
-         * One difference from CUDA is worth knowing and is deliberately
-         * left as-is rather than silently changed: ds4_gpu_mgpu.h describes
-         * ds4_gpu_init as "a thin shim that builds a single-device config
-         * for device 0", which is exactly what ds4_cuda.cu:2769 does.  This
-         * backend instead exposes every enumerated device as a tier, so
-         * g_n_gpus > 1 on a multi-GPU host even when the caller asked for
-         * nothing, which arms ds4.c's _on(tier) allocation paths.  Those
-         * paths are implemented and tested, so this is not known to be
-         * wrong -- but it is a real behavioural difference from CUDA, and
-         * it cannot show up on a single-GPU host. */
-
-        /* Per spec 6m, [[sycl::reqd_sub_group_size(N)]] is not enforced by
-         * the driver on this stack: a device that cannot honour N silently
-         * runs a different width instead of failing the kernel launch, and
-         * every kernel using that annotation then reduces over the wrong
-         * number of lanes for a plausible, wrong, answer with no error
-         * anywhere (see kRequiredSubGroupWidths, ds4_sycl_common.hpp).
-         * Checked against every device, not just tier 0, since the target
-         * hardware is many independent cards and any one of them can be the
-         * one missing a width. */
-        for (const ds4_sycl_device &d : g_devices) {
-            std::vector<size_t> raw = d.dev.get_info<sycl::info::device::sub_group_sizes>();
-            std::vector<uint32_t> widths;
-            widths.reserve(raw.size());
-            for (size_t w : raw) widths.push_back((uint32_t)w);
-
-            uint32_t missing = ds4_sycl_missing_required_subgroup_width(
-                    widths.data(), (int)widths.size());
-            if (missing != 0) {
-                std::string reported;
-                for (size_t i = 0; i < widths.size(); i++) {
-                    if (i) reported += ", ";
-                    reported += std::to_string(widths[i]);
-                }
-                fprintf(stderr, DS4_GPU_LOG_PREFIX
-                        "device \"%s\" does not report required sub-group width "
-                        "%u (reports: %s); refusing to start. Per spec 6m, "
-                        "[[sycl::reqd_sub_group_size(%u)]] is not enforced by the "
-                        "driver on this stack, so continuing would not fail the "
-                        "kernel launch -- it would silently run a different "
-                        "hardware sub-group width and return wrong numbers with "
-                        "no error\n",
-                        d.dev.get_info<sycl::info::device::name>().c_str(), missing,
-                        reported.empty() ? "(none)" : reported.c_str(), missing);
-                g_devices.clear();
-                g_n_gpus       = 0;
-                g_current_tier = 0;
-                g_initialised  = false;
-                return 0;
-            }
-        }
-
-        g_current_tier = 0;
-        g_initialised  = true;
-
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "%zu device(s), using %s\n",
-                g_devices.size(),
-                g_devices[0].dev.get_info<sycl::info::device::name>()
-                    .c_str());
-        return 1;
-    } catch (const sycl::exception &e) {
-        fprintf(stderr, DS4_GPU_LOG_PREFIX "device init failed: %s\n",
-                e.what());
+        fprintf(stderr, DS4_GPU_LOG_PREFIX
+                "device \"%s\" does not report required sub-group width "
+                "%u (reports: %s); refusing to start. Per spec 6m, "
+                "[[sycl::reqd_sub_group_size(%u)]] is not enforced by the "
+                "driver on this stack, so continuing would not fail the "
+                "kernel launch -- it would silently run a different "
+                "hardware sub-group width and return wrong numbers with "
+                "no error\n",
+                d.dev.get_info<sycl::info::device::name>().c_str(), missing,
+                reported.empty() ? "(none)" : reported.c_str(), missing);
         g_devices.clear();
         g_n_gpus       = 0;
         g_current_tier = 0;
         g_initialised  = false;
         return 0;
     }
+    return 1;
+}
+
+/* Single-device init: builds a one-device config for device 0 and hands it
+ * to ds4_gpu_init_multi, which is exactly what ds4_cuda.cu:2769 does and
+ * what ds4_gpu_mgpu.h:102-105 says this entry point is.
+ *
+ * It used to enumerate every GPU on the box and expose them all as tiers,
+ * so g_n_gpus was > 1 on a multi-GPU host even when the caller had asked
+ * for nothing, silently arming ds4.c's _on(tier) allocation paths.  That
+ * divergence could not show up on a single-GPU development box.  Multi-GPU
+ * is opt-in: --gpu-devices/--gpu-vram build a real config that reaches
+ * ds4_gpu_init_multi through ds4.c's multi-tier startup (gated there on
+ * e->multi_tier). */
+extern "C" int ds4_gpu_init(void) {
+    if (g_initialised) return 1;
+
+    ds4_gpu_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.n_gpus            = 1;
+    cfg.device_indices[0] = 0;
+    return ds4_gpu_init_multi(&cfg);
 }
 
 /* Ordering contract: every ds4_gpu_tensor allocated through this backend
