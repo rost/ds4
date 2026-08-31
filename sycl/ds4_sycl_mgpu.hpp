@@ -455,7 +455,7 @@ static int sycl_xdev_host_bounce(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
     int ok = 1;
     try {
         sycl::event _ds4_prof_ev75 = sq.memcpy(host, src->ptr, bytes);
-        _ds4_prof_ev75.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev75);
         ds4_sycl_profile_record(_ds4_prof_ev75);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_copy_xdev: bounce d2h failed: %s\n",
@@ -464,7 +464,7 @@ static int sycl_xdev_host_bounce(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
     }
     if (ok) {
         try {
-            ds4_sycl_queue(dd).memcpy(dst->ptr, host, bytes).wait_and_throw();
+            sycl_batch_wait(ds4_sycl_queue(dd).memcpy(dst->ptr, host, bytes));
         } catch (const sycl::exception &e) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_copy_xdev: bounce h2d failed: %s\n",
                     e.what());
@@ -489,7 +489,25 @@ extern "C" int ds4_sycl_test_xdev_bounce_calls(void) { return g_sycl_xdev_bounce
  * destination's queue for destination-side ordering. Honors
  * DS4_FORCE_HOST_BOUNCE=1 per ds4_gpu_mgpu.h:131. Any exception here falls
  * back to the host bounce rather than propagating: a pair that validated
- * at init can still be worth a fallback rather than a hard failure. */
+ * at init can still be worth a fallback rather than a hard failure.
+ *
+ * The peer copy does not block the host, and that is the whole point of
+ * this entry rather than an optimisation on top of it. Expert parallelism
+ * exchanges a partial block output with the paired tier on every routed
+ * layer, so a decode token performs on the order of two of these per
+ * layer; blocking the host on each one cost more than splitting the
+ * experts saved, and measured slower than not splitting them at all.
+ *
+ * Correctness comes from two barriers rather than a wait, which is what
+ * CUDA's cudaMemcpyPeerAsync plus its per-tier boundary event does
+ * (ds4_cuda.cu:3350-3367). The first orders the copy after everything the
+ * SOURCE tier has already submitted, since the copy runs on the
+ * destination queue and in_order says nothing across queues. The second
+ * puts the source queue behind the copy, so a later write to src cannot
+ * overtake the read this copy has not performed yet. Destination-side
+ * ordering needs nothing extra: the copy is submitted on the destination
+ * queue, which is in_order. DS4_SYCL_SYNC_XDEV=1 restores the blocking
+ * form, for isolating this entry when a multi-GPU run misbehaves. */
 extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
                                         uint64_t bytes) {
     if (!dst || !src) return 0;
@@ -503,7 +521,18 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tenso
                          g_gpu_peer_ok[sd][dd] != 0;
     if (peer_ok && getenv("DS4_FORCE_HOST_BOUNCE") == nullptr) {
         try {
-            ds4_sycl_queue(dd).memcpy(dst->ptr, src->ptr, bytes).wait_and_throw();
+            sycl::queue &sq = ds4_sycl_queue(sd);
+            sycl::queue &dq = ds4_sycl_queue(dd);
+            if (getenv("DS4_SYCL_SYNC_XDEV") != nullptr) {
+                sycl_batch_wait(dq.memcpy(dst->ptr, src->ptr, bytes));
+                return 1;
+            }
+            sycl::event src_ready = sq.ext_oneapi_submit_barrier();
+            sycl::event copied = dq.submit([&](sycl::handler &h) {
+                h.depends_on(src_ready);
+                h.memcpy(dst->ptr, src->ptr, bytes);
+            });
+            sq.ext_oneapi_submit_barrier({copied});
             return 1;
         } catch (const sycl::exception &e) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -515,24 +544,23 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tenso
     return sycl_xdev_host_bounce(dst, src, bytes, sd, dd);
 }
 
-/* SYCL has no default-stream concept distinct from a device's own queue:
- * every queue in this backend is already used synchronously (every
- * operation here ends in wait_and_throw() before returning), so there is
- * no separate "default stream" ordering domain for this entry to
- * distinguish from ds4_gpu_tensor_copy_xdev. Delegates, matching ROCm's
- * own shape (ds4_rocm_compat.cu:93-97), the structural reference for the
- * whole copy_xdev family. */
+/* SYCL has no default-stream concept distinct from a device's own queue,
+ * so there is no separate "default stream" ordering domain for this entry
+ * to distinguish from ds4_gpu_tensor_copy_xdev. Delegates, matching
+ * ROCm's own shape (ds4_rocm_compat.cu:93-97), the structural reference
+ * for the whole copy_xdev family. */
 extern "C" int ds4_gpu_tensor_copy_xdev_default(ds4_gpu_tensor *dst,
                                                 const ds4_gpu_tensor *src,
                                                 uint64_t bytes) {
     return ds4_gpu_tensor_copy_xdev(dst, src, bytes);
 }
 
-/* Every copy in this backend already blocks until complete before
- * returning, so a call reaching this entry is always ordered after
- * everything previously submitted to the destination queue: there is no
- * outstanding work left to order against. Delegates for the same reason
- * ROCm does (ds4_rocm_compat.cu:99-103). */
+/* The copy this delegates to is submitted on the destination tier's own
+ * queue, which is in_order, so it is already ordered after everything
+ * previously submitted there and this entry has nothing to add. That
+ * remains true now that the copy no longer blocks the host: what orders
+ * it was never the wait. Delegates for the same reason ROCm does
+ * (ds4_rocm_compat.cu:99-103). */
 extern "C" int ds4_gpu_tensor_copy_xdev_ordered(ds4_gpu_tensor *dst,
                                                 const ds4_gpu_tensor *src,
                                                 uint64_t bytes) {
@@ -602,27 +630,20 @@ extern "C" int ds4_gpu_tensor_wait_xdev_default(const ds4_gpu_tensor *src, int d
  * only orders commands within that one queue; it says
  * nothing about ordering between a command on tier A's queue and a
  * command on tier B's queue, which is the case that matters here (out
- * and remote_tmp can live on different tiers). This entry does not need
- * cross-queue ordering either, because every operation in this backend's
- * cross-device path already
- * blocks before returning: ds4_gpu_tensor_copy_xdev above ends every one
- * of its branches (same-device copy, validated-peer copy, host bounce)
- * in wait_and_throw() before returning 1, and the add kernel below ends
- * in the same q.wait_and_throw(). Combined with this whole backend's
- * standing convention that every GPU-touching entry point runs
- * synchronously from the caller's perspective (grep wait_and_throw across
- * every sycl header in this tree: every kernel launch and every memcpy in
- * this codebase already does this), submission order and completion order
- * coincide by
- * construction: by the time ds4_gpu_tensor_copy_xdev returns, remote_tmp
- * is fully populated and visible to any subsequent operation, so the add
- * kernel below is correctly ordered after it with no event, fence or
- * in_order queue property required. This is the "ordering discipline"
- * that was said to be missing: it does not need a new mechanism,
- * it needs every new TP entry to keep following the mechanism every
- * existing entry in this backend already follows, and to never launch a
- * kernel that reads a cross-device copy's destination before that copy's
- * own wait_and_throw() has returned.
+ * and remote_tmp can live on different tiers). What orders the two is
+ * that ds4_gpu_tensor_copy_xdev submits its copy on the DESTINATION
+ * tier's queue, and remote_tmp is required above to live on out's tier,
+ * so the copy and the add kernel below are two commands on one in_order
+ * queue and need no event, fence or wait between them.
+ *
+ * That is the ordering argument, and it is deliberately not "the copy
+ * blocked before returning". It used to be: every branch of
+ * ds4_gpu_tensor_copy_xdev ended in wait_and_throw, and this entry ended
+ * in one of its own. Expert parallelism calls this primitive on every
+ * routed layer of every token, so those host round trips were measured
+ * costing more than splitting the experts saved. The waits are gone and
+ * the ordering is unchanged, because the waits were never what provided
+ * it.
  *
  * The reverse discipline failure -- reading remote_tmp before the copy
  * lands, or freeing it before the add kernel that reads it has finished --
@@ -676,7 +697,9 @@ extern "C" int ds4_gpu_add_xdev_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor
         sycl::event _ds4_prof_ev76 = q.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
             o[i] = pl[i] + pr[i];
         });
-        q.wait_and_throw();
+        /* No wait: q is in_order, so whatever reads `out` next is already
+         * ordered behind this kernel, nothing here is staged scratch to
+         * keep alive, and the host reads nothing back. */
         ds4_sycl_profile_record(_ds4_prof_ev76);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "add_xdev failed: %s\n", e.what());
