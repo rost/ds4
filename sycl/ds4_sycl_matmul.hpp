@@ -377,17 +377,52 @@ static constexpr uint32_t kQ8_0TileRowsPerGroup =
  * memory, and the resulting bank collisions cost more than the repeated
  * scale decode saves: 0.115 ms against 0.090 ms per call on an A770 at
  * 4096x4096, n_tok 1. */
+/* DPC++ rejects a kernel whose global range does not fit in an int
+ * ("Provided range and/or offset does not fit in int"), unless the whole
+ * translation unit is built with -fno-sycl-id-queries-fit-in-int, which
+ * would widen index arithmetic in every kernel in this backend to buy
+ * this one case. The row dimension alone is out_dim/kQ8_0TileRowsPerGroup
+ * work-groups of kQ8_0TileGroupSize, so the vocabulary head (129280 rows)
+ * crossed with a full prefill chunk (4096 tokens) is billions of work
+ * items and throws before a single row is computed. Found by prefilling a
+ * 16665-token prompt, which failed outright on this entry.
+ *
+ * Splitting the token dimension keeps every launch inside the limit and
+ * leaves the kernels untouched, since a chunk is expressed by offsetting
+ * the activation and output base pointers. Decode passes n_tok == 1 and
+ * never splits. */
+static inline uint32_t sycl_q8_0_matmul_token_chunk(uint64_t row_items) {
+    if (row_items == 0u) return 1u;
+    const uint64_t limit = (uint64_t)INT32_MAX / row_items;
+    return limit == 0u ? 1u : (limit > UINT32_MAX ? UINT32_MAX : (uint32_t)limit);
+}
+
+/* Test-only view of the split above. The arithmetic is the whole point of
+ * the helper and the shapes that overflow are far too large to allocate in
+ * a test, so the property is asserted directly instead. */
+extern "C" uint32_t ds4_sycl_test_q8_0_token_chunk(uint64_t row_items) {
+    return sycl_q8_0_matmul_token_chunk(row_items);
+}
+
 static sycl::event sycl_q8_0_matmul_tiled_launch(sycl::queue &q, float *out,
                                     const unsigned char *w, const float *x,
                                     uint32_t in_dim, uint32_t out_dim,
                                     uint32_t n_tok, uint64_t row_bytes) {
     const uint32_t row_blocks =
             (out_dim + kQ8_0TileRowsPerGroup - 1u) / kQ8_0TileRowsPerGroup;
-    return q.submit([&](sycl::handler &h) {
+    const uint64_t row_items = (uint64_t)row_blocks * kQ8_0TileGroupSize;
+    const uint32_t tok_chunk = sycl_q8_0_matmul_token_chunk(row_items);
+    sycl::event ev;
+    for (uint32_t tok_base = 0; tok_base < n_tok; tok_base += tok_chunk) {
+    const uint32_t tok_take =
+            (n_tok - tok_base) < tok_chunk ? (n_tok - tok_base) : tok_chunk;
+    const float *x_chunk = x + (uint64_t)tok_base * in_dim;
+    float       *out_chunk = out + (uint64_t)tok_base * out_dim;
+    ev = q.submit([&](sycl::handler &h) {
         sycl::local_accessor<float, 1> x_local(sycl::range<1>(in_dim), h);
         h.parallel_for(
                 sycl::nd_range<2>(
-                        sycl::range<2>((size_t)row_blocks * kQ8_0TileGroupSize, n_tok),
+                        sycl::range<2>((size_t)row_items, tok_take),
                         sycl::range<2>(kQ8_0TileGroupSize, 1u)),
                 [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kQ8_0TileSubgroup)]] {
                     const uint32_t tok = (uint32_t)it.get_group(1);
@@ -401,7 +436,7 @@ static sycl::event sycl_q8_0_matmul_tiled_launch(sycl::queue &q, float *out,
                      * by some lane before the barrier (spec 6b: an idle
                      * lane must never be the reason a local-memory slot
                      * goes unwritten). */
-                    const float *xr = x + (uint64_t)tok * in_dim;
+                    const float *xr = x_chunk + (uint64_t)tok * in_dim;
                     for (uint32_t i = lid; i < in_dim; i += group_size) {
                         x_local[i] = xr[i];
                     }
@@ -421,10 +456,12 @@ static sycl::event sycl_q8_0_matmul_tiled_launch(sycl::queue &q, float *out,
                     }
                     sum = sycl_subgroup_sum<kQ8_0TileSubgroup>(sg, sum);
                     if (lane == 0u) {
-                        out[(uint64_t)tok * out_dim + row] = sum;
+                        out_chunk[(uint64_t)tok * out_dim + row] = sum;
                     }
                 });
     });
+    }
+    return ev;
 }
 
 /* Block-per-lane Q8_0 dense matmul, activation row read straight from
@@ -453,9 +490,17 @@ static sycl::event sycl_q8_0_matmul_blockrow_launch(sycl::queue &q, float *out,
     const uint32_t row_blocks =
             (out_dim + kQ8_0TileRowsPerGroup - 1u) / kQ8_0TileRowsPerGroup;
     const uint32_t n_blocks = (in_dim + 31u) / 32u;
-    return q.parallel_for(
+    const uint64_t row_items = (uint64_t)row_blocks * kQ8_0TileGroupSize;
+    const uint32_t tok_chunk = sycl_q8_0_matmul_token_chunk(row_items);
+    sycl::event ev;
+    for (uint32_t tok_base = 0; tok_base < n_tok; tok_base += tok_chunk) {
+    const uint32_t tok_take =
+            (n_tok - tok_base) < tok_chunk ? (n_tok - tok_base) : tok_chunk;
+    const float *x_chunk = x + (uint64_t)tok_base * in_dim;
+    float       *out_chunk = out + (uint64_t)tok_base * out_dim;
+    ev = q.parallel_for(
             sycl::nd_range<2>(
-                    sycl::range<2>((size_t)row_blocks * kQ8_0TileGroupSize, n_tok),
+                    sycl::range<2>((size_t)row_items, tok_take),
                     sycl::range<2>(kQ8_0TileGroupSize, 1u)),
             [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(kQ8_0TileSubgroup)]] {
                 const uint32_t tok = (uint32_t)it.get_group(1);
@@ -467,7 +512,7 @@ static sycl::event sycl_q8_0_matmul_blockrow_launch(sycl::queue &q, float *out,
                                     + row_in_group;
                 const uint32_t row_clamped = sycl::min(row, out_dim - 1u);
 
-                const float         *xr = x + (uint64_t)tok * in_dim;
+                const float         *xr = x_chunk + (uint64_t)tok * in_dim;
                 const unsigned char *wr = w + (uint64_t)row_clamped * row_bytes;
                 float sum = 0.0f;
                 for (uint32_t b = lane; b < n_blocks; b += (uint32_t)kQ8_0TileSubgroup) {
@@ -477,9 +522,11 @@ static sycl::event sycl_q8_0_matmul_blockrow_launch(sycl::queue &q, float *out,
                 }
                 sum = sycl_subgroup_sum<kQ8_0TileSubgroup>(sg, sum);
                 if (lane == 0u && row < out_dim) {
-                    out[(uint64_t)tok * out_dim + row] = sum;
+                    out_chunk[(uint64_t)tok * out_dim + row] = sum;
                 }
             });
+    }
+    return ev;
 }
 
 /* Core Q8_0 dense matmul: out[t][o] = sum_k x[t][k] * dequant(w[o][k]) for

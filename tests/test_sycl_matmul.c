@@ -18,6 +18,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* sycl/ds4_sycl_matmul.hpp test-only hook; not part of the ABI. */
+extern unsigned int ds4_sycl_test_q8_0_token_chunk(unsigned long long row_items);
+
 /* No SYCL half type is available in a plain C test, so weights are built
  * by hand-encoding IEEE754 binary16 bit patterns.  This does plain
  * truncation of the mantissa, not round-to-nearest, so it is not a general
@@ -1680,7 +1683,41 @@ static int test_matmul_quant_kslice_q4_k(void) {
     return 0;
 }
 
+/* The token split that keeps a Q8_0 matmul launch inside DPC++'s
+ * fits-in-int range check (sycl_q8_0_matmul_token_chunk).
+ *
+ * This is asserted on the arithmetic rather than by launching, because the
+ * shapes that overflow cannot be allocated in a test: the case that found
+ * the bug was the 129280-row vocabulary head crossed with a 4096-token
+ * prefill chunk, which is billions of work items. A 16665-token prompt
+ * failed outright on this entry before the split existed. */
+static int test_q8_0_token_chunk_bounds(void) {
+    const uint64_t vocab_row_items = 129280ull / 16ull * 256ull;
+    const uint64_t shapes[] = {
+        0ull, 1ull, 256ull, 4096ull, 65536ull, vocab_row_items,
+        2147483647ull, 4000000000ull,
+    };
+    for (size_t i = 0; i < sizeof(shapes) / sizeof(shapes[0]); i++) {
+        const uint64_t row_items = shapes[i];
+        const uint32_t chunk = ds4_sycl_test_q8_0_token_chunk(row_items);
+        CHECK(chunk >= 1u, "token chunk must always let at least one token through");
+        if (row_items != 0ull) {
+            CHECK((uint64_t)chunk * row_items <= 2147483647ull ||
+                          row_items > 2147483647ull,
+                  "a chunk times the row work-items must fit in an int");
+        }
+    }
+    CHECK(ds4_sycl_test_q8_0_token_chunk(4000000000ull) == 1u,
+          "a row dimension that alone exceeds the limit must still emit one token "
+          "per launch rather than zero, which would loop forever");
+    CHECK(ds4_sycl_test_q8_0_token_chunk(1ull) > 1000000u,
+          "a tiny row dimension must not be split into needless launches");
+    fprintf(stderr, "  test_q8_0_token_chunk_bounds OK\n");
+    return 0;
+}
+
 int main(void) {
+    if (test_q8_0_token_chunk_bounds() != 0) return 1;
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_matmul_f16_pair() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_f16_pair_compressor_store() != 0) { ds4_gpu_cleanup(); return 1; }
