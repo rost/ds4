@@ -499,7 +499,7 @@ static void sycl_moe_test_subgroup_sum16(sycl::queue &q, const float *in,
                  sycl::sub_group sg = it.get_sub_group();
                  const uint32_t gid = (uint32_t)it.get_group(0);
                  const uint32_t lane = (uint32_t)sg.get_local_id()[0];
-                 float v = in[gid * 16u + lane];
+                 float v = in[(uint64_t)gid * 16u + lane];
                  v = sycl_moe_subgroup_sum<16>(sg, v);
                  if (lane == 0u) out[gid] = v;
              });

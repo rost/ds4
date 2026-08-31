@@ -13,6 +13,11 @@
 
 #include "test_sycl_harness.h"
 
+/* sycl/ds4_sycl_norm_rope.hpp test-only hook; not part of the ABI. */
+extern unsigned long long ds4_sycl_test_rope_tail_pair_count(unsigned int n_rows,
+                                                             unsigned int n_head,
+                                                             unsigned int n_rot);
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1045,7 +1050,39 @@ static int test_head_rms_norm_rope_tail(void) {
     return 0;
 }
 
+/* The rope-tail pair count (sycl_rope_tail_pair_count), which is both the
+ * launch's grid extent and the kernel's own `gid >= pairs` bound.
+ *
+ * All three factors are runtime dimensions, so computing the product in
+ * 32 bits wrapped silently: the grid and the in-kernel bound would then
+ * agree on the same wrapped value and most rotation pairs would simply
+ * never be rotated, with no exception and no out-of-bounds read, just
+ * unrotated Q and K feeding attention. The shapes that wrap cannot be
+ * allocated on any development machine (at Flash's n_head 64 and n_rot 64
+ * the wrap needs n_tok >= 2097152, an 800 GiB tensor), so the widening is
+ * asserted on the arithmetic directly. */
+static int test_rope_tail_pair_count_is_64_bit(void) {
+    CHECK(ds4_sycl_test_rope_tail_pair_count(4096u, 64u, 64u) == 8388608ull,
+          "rope tail pair count wrong at a real prefill shape");
+    CHECK(ds4_sycl_test_rope_tail_pair_count(1u, 1u, 2u) == 1ull,
+          "rope tail pair count wrong at the smallest live shape");
+    CHECK(ds4_sycl_test_rope_tail_pair_count(0u, 64u, 64u) == 0ull,
+          "rope tail pair count must be zero when there are no rows");
+    CHECK(ds4_sycl_test_rope_tail_pair_count(1u, 64u, 1u) == 0ull,
+          "n_rot below 2 rotates no pairs");
+    /* 2097152 * 64 * 32 is exactly 2^32: the first shape whose 32-bit
+     * product is zero rather than merely truncated, so a narrow
+     * computation would launch nothing at all and report success. */
+    CHECK(ds4_sycl_test_rope_tail_pair_count(2097152u, 64u, 64u) == 4294967296ull,
+          "rope tail pair count must not wrap where the 32-bit product is zero");
+    CHECK(ds4_sycl_test_rope_tail_pair_count(3000000u, 128u, 128u) == 24576000000ull,
+          "rope tail pair count must not wrap well past 32 bits");
+    fprintf(stderr, "  test_rope_tail_pair_count_is_64_bit OK\n");
+    return 0;
+}
+
 int main(void) {
+    if (test_rope_tail_pair_count_is_64_bit() != 0) return 1;
     CHECK(ds4_gpu_init() != 0, "ds4_gpu_init failed");
     if (test_rms_norm_plain() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_rms_norm_plain_rows() != 0) { ds4_gpu_cleanup(); return 1; }

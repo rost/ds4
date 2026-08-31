@@ -760,6 +760,39 @@ extern "C" int ds4_gpu_head_rms_norm_rope_tail_tensor(
     return 1;
 }
 
+/* Rotation pairs one rope-tail launch covers: n_rows x n_head x n_rot/2,
+ * which is both the grid extent and the kernel's own `gid >= pairs` bound.
+ *
+ * 64-bit BEFORE the multiply, and shared by both callers rather than
+ * spelled out at each, because all three factors are runtime dimensions:
+ * the 32-bit product this replaces wrapped silently, and the grid and the
+ * in-kernel bound would then agree on the same wrapped value, so most
+ * rotation pairs would simply never be rotated. No exception, no
+ * out-of-bounds read, just unrotated Q and K feeding attention.
+ * sycl_tensor_has_elems3's own validation is fully 64-bit and does not
+ * constrain this product, so it offered no protection either.
+ *
+ * Not reachable today on the stride caller: at Flash's n_head 64 and
+ * n_rot 64 the wrap needs n_tok >= 2097152, and the launch's own
+ * fits-in-int range check throws first at n_tok >= 1048576. The decode-rows
+ * caller is bounded tighter still, by DS4_GPU_ATTENTION_DECODE_BATCH_MAX.
+ * Widened anyway: this is the one place in either rope entry where an
+ * index is formed by a 32-bit product of runtime dimensions, and it is one
+ * shape change away from mattering. */
+static inline uint64_t sycl_rope_tail_pair_count(uint32_t n_rows, uint32_t n_head,
+                                                 uint32_t n_rot) {
+    return (uint64_t)n_rows * n_head * (n_rot / 2u);
+}
+
+/* Test-only view of the count above. The shape that would wrap it in 32
+ * bits is far too large to allocate, so the widening is asserted on the
+ * arithmetic directly, the same way the launch split's own bound is
+ * (tests/test_sycl_matmul.c). Not part of the ABI. */
+extern "C" uint64_t ds4_sycl_test_rope_tail_pair_count(uint32_t n_rows, uint32_t n_head,
+                                                       uint32_t n_rot) {
+    return sycl_rope_tail_pair_count(n_rows, n_head, n_rot);
+}
+
 /* Flat pair-parallel DeepSeek partial RoPE with no reduction, matching
  * ROCm's rope_tail_kernel (rocm/ds4_rocm_norm_rope.cuh:251-300) and its
  * stride-aware launcher cuda_rope_tail_stride_tensor
@@ -785,7 +818,7 @@ static int sycl_rope_tail_stride_tensor(
         !sycl_tensor_has_elems3(x, n_tok, n_head, head_dim, sizeof(float))) {
         return 0;
     }
-    const uint32_t pairs = n_tok * n_head * (n_rot / 2u);
+    const uint64_t pairs = sycl_rope_tail_pair_count(n_tok, n_head, n_rot);
     if (pairs == 0u) return 1;
     if (g_devices.empty()) return 0;
 
@@ -793,7 +826,7 @@ static int sycl_rope_tail_stride_tensor(
         sycl::queue &q = ds4_sycl_queue(x->device_id);
         float       *px    = (float *)x->ptr;
         const size_t group = kRmsNormGroup;
-        const size_t grid  = ((size_t)pairs + group - 1) / group * group;
+        const size_t grid  = (size_t)((pairs + group - 1) / group * group);
 
         sycl::event _ds4_prof_ev136 = q.submit([&](sycl::handler &h) {
             h.parallel_for(
@@ -801,13 +834,13 @@ static int sycl_rope_tail_stride_tensor(
                                   sycl::range<1>(group)),
                 [=](sycl::nd_item<1> it) {
                     const size_t gid = it.get_global_id(0);
-                    if (gid >= (size_t)pairs) return;
+                    if (gid >= pairs) return;
 
                     const uint32_t half   = n_rot / 2u;
-                    const uint32_t pair   = (uint32_t)gid % half;
-                    const uint32_t tmp    = (uint32_t)gid / half;
-                    const uint32_t h      = tmp % n_head;
-                    const uint32_t t      = tmp / n_head;
+                    const uint32_t pair   = (uint32_t)(gid % half);
+                    const uint64_t tmp    = gid / half;
+                    const uint32_t h      = (uint32_t)(tmp % n_head);
+                    const uint32_t t      = (uint32_t)(tmp / n_head);
                     const uint32_t n_nope = head_dim - n_rot;
                     const uint32_t i      = pair * 2u;
 
@@ -924,7 +957,7 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
         !sycl_tensor_has_elems3(x, n_rows, n_head, head_dim, sizeof(float))) {
         return 0;
     }
-    const uint32_t pairs = n_rows * n_head * (n_rot / 2u);
+    const uint64_t pairs = sycl_rope_tail_pair_count(n_rows, n_head, n_rot);
     if (pairs == 0u) return 1;
     if (g_devices.empty()) return 0;
 
@@ -939,7 +972,7 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
         const uint32_t *ppos  = (const uint32_t *)pos_guard.p;
         float           *px   = (float *)x->ptr;
         const size_t     group = kRmsNormGroup;
-        const size_t     grid  = ((size_t)pairs + group - 1) / group * group;
+        const size_t     grid  = (size_t)((pairs + group - 1) / group * group);
 
         sycl::event _ds4_prof_ev137 = q.submit([&](sycl::handler &h) {
             h.parallel_for(
@@ -947,13 +980,13 @@ extern "C" int ds4_gpu_rope_tail_decode_rows_tensor(
                                   sycl::range<1>(group)),
                 [=](sycl::nd_item<1> it) {
                     const size_t gid = it.get_global_id(0);
-                    if (gid >= (size_t)pairs) return;
+                    if (gid >= pairs) return;
 
                     const uint32_t half   = n_rot / 2u;
-                    const uint32_t pair   = (uint32_t)gid % half;
-                    const uint32_t tmp    = (uint32_t)gid / half;
-                    const uint32_t h      = tmp % n_head;
-                    const uint32_t row    = tmp / n_head;
+                    const uint32_t pair   = (uint32_t)(gid % half);
+                    const uint64_t tmp    = gid / half;
+                    const uint32_t h      = (uint32_t)(tmp % n_head);
+                    const uint32_t row    = (uint32_t)(tmp / n_head);
                     const uint32_t n_nope = head_dim - n_rot;
                     const uint32_t i      = pair * 2u;
 
