@@ -113,6 +113,37 @@ static void sycl_placement_teardown_all(void) {
 /* The registered host model map: set only by ds4_gpu_register_model_map_
  * no_copy below, read only by ds4_gpu_device_cache_tensors. */
 static const void *g_placement_host_base = nullptr;
+
+/* Resolves a model-mmap range to the device copy ds4_gpu_device_cache_
+ * tensors already installed on the current tier, or nullptr.
+ *
+ * This cache and ds4_gpu_cache_model_range's (sycl/ds4_sycl_model_cache.hpp)
+ * are separate stores filled by separate entry points, and only the other
+ * one used to be consulted when the MoE path resolved a weight pointer.
+ * On a multi-GPU run that meant every lookup missed and every weight was
+ * re-staged from the host mmap per call, per layer, per token, with the
+ * already-resident copy sitting unused in VRAM the whole time.
+ *
+ * Ranges are offsets into the registered model map, so a caller asking
+ * about any other host pointer cannot match by construction.  The
+ * returned pointer is owned by this cache and freed with the tier's slab;
+ * callers must treat it as borrowed (sycl_stage_host_bytes does: it
+ * passes it through with owns=false). */
+static const char *sycl_placement_cache_resolve(const void *model_map,
+                                                uint64_t offset, uint64_t bytes) {
+    if (!model_map || bytes == 0 || model_map != g_placement_host_base) return nullptr;
+    const int tier = ds4_sycl_current_tier();
+    if (tier < 0 || (size_t)tier >= g_placement_tier.size()) return nullptr;
+    const uint64_t end = offset + bytes; /* caller already overflow-checked */
+    const sycl_placement_tier_cache &c = g_placement_tier[(size_t)tier];
+    for (const sycl_placement_cache_range &r : c.ranges) {
+        if (offset >= r.source_offset && end >= offset &&
+            end <= r.source_offset + r.bytes) {
+            return (const char *)(r.device_ptr + (offset - r.source_offset));
+        }
+    }
+    return nullptr;
+}
 static uint64_t    g_placement_host_size = 0;
 
 /* uint64_t return, no failure-value convention to match (there is no

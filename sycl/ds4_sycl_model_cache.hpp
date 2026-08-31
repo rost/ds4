@@ -119,20 +119,36 @@ static const char *sycl_model_cache_resolve(const void *model_map,
                                             uint64_t offset, uint64_t bytes) {
     if (!model_map || bytes == 0) return nullptr;
     const int tier = ds4_sycl_current_tier();
-    if (tier < 0 || (size_t)tier >= g_sycl_model_cache_tier.size()) {
+    if (tier < 0) {
         g_sycl_model_cache_miss_count++;
         return nullptr;
     }
     const uint64_t end = offset + bytes; /* caller already overflow-checked */
-    const sycl_model_cache_tier &c = g_sycl_model_cache_tier[(size_t)tier];
-    for (const sycl_model_cache_range &r : c.ranges) {
-        if (r.host_base == model_map && offset >= r.offset && end >= offset &&
-            end <= r.offset + r.bytes) {
-            g_sycl_model_cache_hit_count++;
-            return (const char *)(r.device_ptr + (offset - r.offset) +
-                                  g_sycl_model_cache_test_wrong_delta);
+
+    /* An empty tier vector here is not "no cache": the multi-GPU path
+     * fills the placement cache instead, checked below.  Bounds-check
+     * rather than returning early, or that path is never reached. */
+    if ((size_t)tier < g_sycl_model_cache_tier.size()) {
+        const sycl_model_cache_tier &c = g_sycl_model_cache_tier[(size_t)tier];
+        for (const sycl_model_cache_range &r : c.ranges) {
+            if (r.host_base == model_map && offset >= r.offset && end >= offset &&
+                end <= r.offset + r.bytes) {
+                g_sycl_model_cache_hit_count++;
+                return (const char *)(r.device_ptr + (offset - r.offset) +
+                                      g_sycl_model_cache_test_wrong_delta);
+            }
         }
     }
+
+    /* Second store, same question: ds4_gpu_device_cache_tensors installed
+     * these (see sycl_placement_cache_resolve's own comment for why there
+     * are two).  Counted as a hit because that is what it is -- the range
+     * is device-resident and the caller must not stage it again. */
+    if (const char *placed = sycl_placement_cache_resolve(model_map, offset, bytes)) {
+        g_sycl_model_cache_hit_count++;
+        return placed + g_sycl_model_cache_test_wrong_delta;
+    }
+
     g_sycl_model_cache_miss_count++;
     return nullptr;
 }

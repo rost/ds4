@@ -35,6 +35,9 @@
 
 /* sycl/ds4_sycl_placement.hpp test-only hooks; not part of the ABI. */
 extern int      ds4_sycl_device_count(void);
+extern int      ds4_sycl_test_model_range_is_cached(const void *model_map,
+                                                   uint64_t model_size,
+                                                   uint64_t offset, uint64_t bytes);
 extern uint64_t ds4_sycl_test_placement_cache_bytes(int tier);
 extern int      ds4_sycl_test_placement_read_back(int tier, uint64_t source_offset,
                                                    uint64_t bytes, void *out);
@@ -112,6 +115,48 @@ static int test_tier_free_vram_decreases_with_real_admission(void) {
 
     free(host);
     ds4_gpu_cleanup();
+    return 0;
+}
+
+/* Weight resolution must find a range installed by
+ * ds4_gpu_device_cache_tensors, not only one installed by
+ * ds4_gpu_cache_model_range.  Those are two separate per-tier caches, and
+ * resolution used to consult only the second: on the multi-GPU path,
+ * which fills the first, every lookup therefore missed and every weight
+ * was re-staged from the host mmap per call, per layer, per token, while
+ * the resident copy sat unused in VRAM.  A profiled 14-GPU run measured
+ * hits=0 misses=1434 per forward pass with 86% of all device time going
+ * to those redundant copies. */
+static int test_device_cached_range_resolves(void) {
+    ds4_gpu_cleanup();
+    CHECK(ds4_gpu_init() != 0, "ds4_gpu_init for placement resolve test");
+
+    unsigned char *host = malloc(4096);
+    CHECK(host != NULL, "host buffer alloc");
+    memset(host, 0xCD, 4096);
+    CHECK(ds4_gpu_register_model_map_no_copy(host, 4096) != 0,
+          "register_model_map_no_copy for placement resolve test");
+
+    CHECK(ds4_sycl_test_model_range_is_cached(host, 4096, 0, 4096) == 0,
+          "range must not resolve before it is installed");
+
+    ds4_tensor_range r;
+    r.source_offset = 0;
+    r.bytes = 4096;
+    r.target_device = 0;
+    CHECK(ds4_gpu_device_cache_tensors(0, &r, 1) == 0,
+          "device_cache_tensors admits the range");
+
+    CHECK(ds4_sycl_test_model_range_is_cached(host, 4096, 0, 4096) == 1,
+          "an installed range must resolve as device-resident");
+    CHECK(ds4_sycl_test_model_range_is_cached(host, 4096, 1024, 512) == 1,
+          "a sub-range wholly inside it must resolve too");
+    CHECK(ds4_sycl_test_model_range_is_cached(host, 4096, 2048, 4096) == 0,
+          "a range running past the installed end must not resolve");
+
+    free(host);
+    ds4_gpu_cleanup();
+    fprintf(stderr, "  test_device_cached_range_resolves OK\n");
     return 0;
 }
 
@@ -381,6 +426,7 @@ static int test_classify_accepts_tier_free_vram_config(void) {
 int main(void) {
     if (test_tier_free_vram_bounds()) return 1;
     if (test_tier_free_vram_decreases_with_real_admission()) return 1;
+    if (test_device_cached_range_resolves()) return 1;
     if (test_register_model_map_no_copy_args()) return 1;
     if (test_device_cache_tensors_arg_validation()) return 1;
     if (test_device_cache_tensors_admission_and_readback()) return 1;

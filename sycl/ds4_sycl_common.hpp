@@ -154,6 +154,20 @@ static inline int sycl_model_range_fits(uint64_t model_size, uint64_t offset,
 static const char *sycl_model_cache_resolve(const void *model_map,
                                             uint64_t offset, uint64_t bytes);
 
+/* The multi-GPU placement path installs its per-tier weights in a
+ * SEPARATE cache from ds4_gpu_cache_model_range's (see
+ * sycl/ds4_sycl_placement.hpp): ds4.c's multi-tier startup calls
+ * ds4_gpu_device_cache_tensors, which fills g_placement_tier, while
+ * ds4_gpu_cache_model_range fills g_sycl_model_cache_tier.  Resolution
+ * has to consult both or every multi-GPU run re-stages, per call, weights
+ * that are already resident -- which is exactly what it did: a profiled
+ * 14-GPU run reported model-cache hits=0 misses=1434 per forward pass,
+ * with 86% of all device time going to the redundant staging copies.
+ * Defined in ds4_sycl_placement.hpp, which owns the memory it hands back
+ * and frees it itself; nothing here takes ownership. */
+static const char *sycl_placement_cache_resolve(const void *model_map,
+                                                uint64_t offset, uint64_t bytes);
+
 static inline const char *sycl_model_range_ptr(const void *model_map,
                                                uint64_t offset, uint64_t bytes,
                                                uint64_t model_size,
