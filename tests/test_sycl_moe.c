@@ -1817,6 +1817,129 @@ static int test_q4k_owned_decode_composes_ownership_with_compaction(void) {
     return 0;
 }
 
+/* Expert parallelism's actual steady state: this rank's owned half of the
+ * routed experts is already device-resident, so the owned decode has
+ * nothing to stage and nothing to compact.
+ *
+ * This is not a hypothetical configuration, it is the only one a real
+ * --cuda-tensor-parallel decode ever reaches. Keeping each rank's owned
+ * experts resident is the entire point of the split, so from the second
+ * token onward every routed layer calls the owned decode with all three
+ * weight pointers already on the device. Until this test existed, every
+ * owned-decode test drove host fixtures and so only ever exercised
+ * compaction, which is why the resident path could reach a real
+ * multi-GPU run without ever having run: it failed on the first token
+ * against sycl_moe_stage_selected_experts's deliberate refusal to
+ * host-memcpy from device memory, that refusal being the only thing that
+ * turned a would-be undefined read into a clean failure.
+ *
+ * A device pointer is passed as `model_map` directly rather than by
+ * installing a placement cache. sycl_model_range_ptr adds the offset and
+ * hands the result to the same sycl_ptr_is_device_resident check either
+ * way, so the code path under test is identical, and the fixture stays
+ * self-contained.
+ *
+ * The staged-count assertion is the load-bearing one. Matching the oracle
+ * proves the resident table is addressed correctly, but a regression that
+ * silently went back to staging this rank's whole owned half would still
+ * match the oracle while moving 32 experts per layer per token across
+ * PCIe, which is the cost expert parallelism exists to avoid. */
+static int test_q4k_owned_decode_uses_resident_weights_directly(void) {
+    rm_model m = rm_build_model_n(RM_OWNED_N_TOTAL_EXPERT, RM_Q4K_BLOCK_BYTES, RM_Q4K_BLOCK_BYTES);
+    q4k_fill_model(&m, RM_OWNED_N_TOTAL_EXPERT, RM_EXPERT_MID_DIM, RM_OUT_DIM);
+
+    /* Same straddling selection as the compaction test above, so the two
+     * assert the same combined result over the same routing. */
+    const int32_t sel[RM_OWNED_N_EXPERT_USED] = {2, 40, 9, 55, 17, 33};
+    float w[RM_OWNED_N_EXPERT_USED];
+    for (uint32_t s = 0; s < RM_OWNED_N_EXPERT_USED; s++) w[s] = 0.5f + 0.25f * (float)(s % 3u);
+    float x[RM_EXPERT_IN_DIM];
+    q4k_fill_x_row(x, RM_EXPERT_IN_DIM, /*tok=*/0);
+
+    ds4_gpu_tensor *model_dev = ds4_gpu_tensor_alloc(m.model_size);
+    ds4_gpu_tensor *selected = ds4_gpu_tensor_alloc(sizeof(sel));
+    ds4_gpu_tensor *weights = ds4_gpu_tensor_alloc(sizeof(w));
+    ds4_gpu_tensor *xt = ds4_gpu_tensor_alloc(sizeof(x));
+    CHECK(model_dev && selected && weights && xt, "owned resident: fixture allocation");
+    ds4_gpu_tensor_write(model_dev, 0, m.model, m.model_size);
+    ds4_gpu_tensor_write(selected, 0, sel, sizeof(sel));
+    ds4_gpu_tensor_write(weights, 0, w, sizeof(w));
+    ds4_gpu_tensor_write(xt, 0, x, sizeof(x));
+
+    ds4_gpu_tensor *out = ds4_gpu_tensor_alloc((uint64_t)RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *gate =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *up =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *mid =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_EXPERT_MID_DIM * sizeof(float));
+    ds4_gpu_tensor *home_down =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_OUT_DIM * sizeof(float));
+    ds4_gpu_tensor *partner_down =
+            ds4_gpu_tensor_alloc((uint64_t)RM_OWNED_N_EXPERT_USED * RM_OUT_DIM * sizeof(float));
+    CHECK(out && gate && up && mid && home_down && partner_down,
+          "owned resident: tensor allocation");
+
+    const void *resident_map = (const void *)model_dev->ptr;
+
+    CHECK(ds4_gpu_routed_moe_one_owned_tensor(
+              out, gate, up, mid, home_down, resident_map, m.model_size, m.gate_offset,
+              m.up_offset, m.down_offset, 12u, 12u, m.gate_expert_bytes, m.gate_row_bytes,
+              m.down_expert_bytes, m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM,
+              RM_OUT_DIM, selected, weights, RM_OWNED_N_TOTAL_EXPERT, RM_OWNED_N_EXPERT_USED,
+              /*resident_expert_base=*/0u, /*resident_expert_count=*/RM_OWNED_EXPERT_SPLIT, 0.0f,
+              xt, /*down_output=*/NULL, /*pack_fixed3=*/false, /*shared_prequant=*/NULL) != 0,
+          "owned resident: home rank call failed");
+    CHECK(ds4_sycl_moe_test_last_staged_expert_count() == 0,
+          "owned resident: home rank must stage nothing when its owned experts are resident");
+    CHECK(ds4_sycl_moe_test_last_staged_bytes() == 0,
+          "owned resident: home rank must move no weight bytes to the device");
+
+    CHECK(ds4_gpu_routed_moe_one_owned_tensor(
+              out, gate, up, mid, partner_down, resident_map, m.model_size, m.gate_offset,
+              m.up_offset, m.down_offset, 12u, 12u, m.gate_expert_bytes, m.gate_row_bytes,
+              m.down_expert_bytes, m.down_row_bytes, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM,
+              RM_OUT_DIM, selected, weights, RM_OWNED_N_TOTAL_EXPERT, RM_OWNED_N_EXPERT_USED,
+              /*resident_expert_base=*/RM_OWNED_EXPERT_SPLIT,
+              /*resident_expert_count=*/RM_OWNED_N_TOTAL_EXPERT - RM_OWNED_EXPERT_SPLIT, 0.0f, xt,
+              /*down_output=*/NULL, /*pack_fixed3=*/true, /*shared_prequant=*/NULL) != 0,
+          "owned resident: partner rank call failed");
+    CHECK(ds4_sycl_moe_test_last_staged_expert_count() == 0,
+          "owned resident: partner rank must stage nothing when its owned experts are resident");
+    CHECK(ds4_sycl_moe_test_last_staged_bytes() == 0,
+          "owned resident: partner rank must move no weight bytes to the device");
+
+    CHECK(ds4_gpu_routed_moe_owned_packed_combine_tensor(out, home_down, partner_down, selected,
+                                                         RM_OUT_DIM, RM_OWNED_EXPERT_SPLIT) != 0,
+          "owned resident: packed combine failed");
+
+    float want[RM_OUT_DIM];
+    oracle_q4k_one_token(&m, RM_EXPERT_IN_DIM, RM_EXPERT_MID_DIM, RM_OUT_DIM,
+                         RM_OWNED_N_EXPERT_USED, sel, w, x, 0.0f, want);
+    float got[RM_OUT_DIM];
+    ds4_gpu_tensor_read(out, 0, got, sizeof(got));
+    for (int i = 0; i < RM_OUT_DIM; i++) {
+        CHECK_CLOSE(got[i], want[i], fabs(want[i]) * 1e-3 + 1e-4,
+                    "owned resident: combined output must match the unsplit oracle");
+    }
+
+    ds4_gpu_tensor_free(out);
+    ds4_gpu_tensor_free(gate);
+    ds4_gpu_tensor_free(up);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(home_down);
+    ds4_gpu_tensor_free(partner_down);
+    ds4_gpu_tensor_free(selected);
+    ds4_gpu_tensor_free(weights);
+    ds4_gpu_tensor_free(xt);
+    ds4_gpu_tensor_free(model_dev);
+    free(m.model);
+    fprintf(stderr,
+            "  test_q4k_owned_decode_uses_resident_weights_directly OK "
+            "(both ranks staged 0 experts, 0 bytes)\n");
+    return 0;
+}
+
 /* The two sub-branches of sycl_moe_owned_packed_component's
  * prefix-pair path (ds4_sycl_moe_owned.hpp:62) that
  * test_q4k_owned_decode_composes_ownership_with_compaction's fixture above
@@ -3838,6 +3961,7 @@ int main(void) {
     if (test_q4k_scratch_precondition_failure() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q4k_decode_stages_only_selected() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q4k_owned_decode_composes_ownership_with_compaction() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_q4k_owned_decode_uses_resident_weights_directly() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q4k_owned_decode_packed_prefix_pair() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q4k_batch_wide_union_falls_back() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_q4k_batch_compaction_with_sorted_pairs() != 0) { ds4_gpu_cleanup(); return 1; }

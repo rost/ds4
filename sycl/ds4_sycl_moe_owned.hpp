@@ -628,24 +628,26 @@ static int sycl_routed_moe_one_owned_dispatch(
         sycl_batch_wait(_ds4_prof_ev125);
         ds4_sycl_profile_record(_ds4_prof_ev125);
 
+        /* Ownership first, independently of how the weights will be
+         * addressed: `local_of_slot` is this rank's expert_base-relative
+         * id for each of the six slots, or -1 for a slot the peer owns.
+         * `unique_ids` is the distinct set of those locals, which is what
+         * compaction would stage. */
         std::vector<int32_t> unique_ids;
-        int32_t remap_host[6];
+        int32_t local_of_slot[6];
         for (uint32_t slot = 0; slot < 6u; slot++) {
             uint32_t local = 0;
             if (!sycl_moe_owned_local_expert(sel_host[slot], resident_expert_base,
                                              resident_expert_count, &local)) {
-                remap_host[slot] = -1;
+                local_of_slot[slot] = -1;
                 continue;
             }
-            int32_t pos = -1;
+            local_of_slot[slot] = (int32_t)local;
+            bool seen = false;
             for (size_t i = 0; i < unique_ids.size(); i++) {
-                if (unique_ids[i] == (int32_t)local) { pos = (int32_t)i; break; }
+                if (unique_ids[i] == (int32_t)local) { seen = true; break; }
             }
-            if (pos < 0) {
-                pos = (int32_t)unique_ids.size();
-                unique_ids.push_back((int32_t)local);
-            }
-            remap_host[slot] = pos;
+            if (!seen) unique_ids.push_back((int32_t)local);
         }
         if (unique_ids.empty()) {
             /* Nothing this rank owns among the six selected experts: no
@@ -663,30 +665,108 @@ static int sycl_routed_moe_one_owned_dispatch(
                                                   down_bytes, model_size, "moe_owned_down");
         if (!gate_w || !up_w || !down_w) return 0;
 
+        /* Which of the two addressings the kernels below will use. Both
+         * reach a row as `base + id * expert_bytes + row * row_bytes`; the
+         * only question is what `id` counts in.
+         *
+         * Compaction packs just the distinct owned experts and `id` is a
+         * position in that packed table. It is the right choice when the
+         * weights must cross to the device anyway, since it stages about
+         * three experts instead of this rank's whole owned half.
+         *
+         * It is the wrong choice, and in fact impossible, once the
+         * placement cache has already made this rank's owned range
+         * device-resident: sycl_moe_stage_selected_experts gathers rows
+         * with a host std::memcpy and refuses a device pointer outright
+         * rather than read device memory from the host. That refusal is
+         * not hypothetical here. Expert parallelism exists precisely to
+         * keep each rank's owned experts resident, so on a real
+         * --cuda-tensor-parallel decode all three pointers are resident
+         * and this was the path taken; the refusal fired on the first
+         * token. The resident table already holds every expert of this
+         * rank's half at its expert_base-relative id, so `id` is simply
+         * the local id and nothing needs staging or packing at all.
+         *
+         * A partial residency (one or two of the three cached) takes the
+         * same local-id addressing and lets sycl_stage_host_bytes stage
+         * only the pointers that are not resident yet, mirroring
+         * sycl_routed_moe_launch's own three-way dispatch. */
+        const bool any_resident = sycl_ptr_is_device_resident(q, gate_w) ||
+                                  sycl_ptr_is_device_resident(q, up_w) ||
+                                  sycl_ptr_is_device_resident(q, down_w);
+
         void *gate_dev = nullptr, *up_dev = nullptr, *down_dev = nullptr, *remap_dev = nullptr;
+        bool gate_owned = true, up_owned = true, down_owned = true;
+        int32_t remap_host[6];
         const uint32_t unique_count = (uint32_t)unique_ids.size();
-        if (!sycl_moe_stage_selected_experts(q, gate_w, up_w, down_w, unique_ids.data(),
-                                             unique_count, gate_expert_bytes, down_expert_bytes,
-                                             remap_host, 6u, &gate_dev, &up_dev, &down_dev,
-                                             &remap_dev)) {
-            return 0;
+        if (any_resident) {
+            for (uint32_t slot = 0; slot < 6u; slot++) remap_host[slot] = local_of_slot[slot];
+            if (!sycl_moe_stage_weights(q, gate_w, up_w, down_w, gate_bytes, down_bytes,
+                                        &gate_dev, &up_dev, &down_dev,
+                                        &gate_owned, &up_owned, &down_owned)) {
+                return 0;
+            }
+            /* Through sycl_stage_host_bytes, not a bare q.memcpy: the
+             * copy it performs completes before it returns, which is what
+             * lets remap_host stay a plain stack array here. The same
+             * reason sycl_moe_stage_selected_experts stages its own
+             * remap and its packed tables out of function-local
+             * std::vectors. */
+            sycl_device_scratch_guard staged_remap =
+                    sycl_stage_host_bytes(q, remap_host, sizeof(remap_host));
+            if (!staged_remap.p) {
+                if (gate_owned) sycl::free(gate_dev, q);
+                if (up_owned) sycl::free(up_dev, q);
+                if (down_owned) sycl::free(down_dev, q);
+                return 0;
+            }
+            remap_dev = staged_remap.p;
+            staged_remap.p = nullptr;
+        } else {
+            for (uint32_t slot = 0; slot < 6u; slot++) {
+                remap_host[slot] = -1;
+                if (local_of_slot[slot] < 0) continue;
+                for (size_t i = 0; i < unique_ids.size(); i++) {
+                    if (unique_ids[i] == local_of_slot[slot]) {
+                        remap_host[slot] = (int32_t)i;
+                        break;
+                    }
+                }
+            }
+            if (!sycl_moe_stage_selected_experts(q, gate_w, up_w, down_w, unique_ids.data(),
+                                                 unique_count, gate_expert_bytes,
+                                                 down_expert_bytes, remap_host, 6u, &gate_dev,
+                                                 &up_dev, &down_dev, &remap_dev)) {
+                return 0;
+            }
         }
-        sycl_device_scratch_guard gate_guard(q, gate_dev);
-        sycl_device_scratch_guard up_guard(q, up_dev);
-        sycl_device_scratch_guard down_guard(q, down_dev);
+        sycl_device_scratch_guard gate_guard(q, gate_dev, gate_owned);
+        sycl_device_scratch_guard up_guard(q, up_dev, up_owned);
+        sycl_device_scratch_guard down_guard(q, down_dev, down_owned);
         sycl_device_scratch_guard remap_guard(q, remap_dev);
         const int32_t *remap = (const int32_t *)remap_dev;
 
         /* Same test-only counters sycl_routed_moe_launch updates
          * (ds4_sycl_moe_launch.hpp), read back by
          * ds4_sycl_moe_test_last_staged_expert_count/_bytes. This is the
-         * number that matters: how many experts this
-         * call staged after composing ownership with compaction, not just
-         * how many this rank owns. */
-        g_sycl_moe_last_staged_expert_count = unique_count;
+         * number that matters: how many experts this call staged, which
+         * is the distinct owned set under compaction and this rank's
+         * whole owned half for whichever of the three tables was not
+         * already resident. It is zero when all three were, which is the
+         * steady state expert parallelism is built to reach. */
+        const uint32_t staged_experts =
+                any_resident ? ((gate_owned || up_owned || down_owned) ? resident_expert_count
+                                                                       : 0u)
+                             : unique_count;
+        g_sycl_moe_last_staged_expert_count = staged_experts;
         g_sycl_moe_last_staged_bytes =
-                2ull * (uint64_t)unique_count * gate_expert_bytes +
-                (uint64_t)unique_count * down_expert_bytes;
+                any_resident
+                        ? (((gate_owned ? 1ull : 0ull) + (up_owned ? 1ull : 0ull)) *
+                                   (uint64_t)resident_expert_count * gate_expert_bytes +
+                           (down_owned ? 1ull : 0ull) * (uint64_t)resident_expert_count *
+                                   down_expert_bytes)
+                        : (2ull * (uint64_t)unique_count * gate_expert_bytes +
+                           (uint64_t)unique_count * down_expert_bytes);
 
         /* down->ptr doubles as the Q8_K activation scratch, then as the
          * final per-slot output once xq is no longer needed; gate->ptr
