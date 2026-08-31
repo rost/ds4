@@ -742,8 +742,17 @@ static int sycl_routed_moe_one_owned_dispatch(
     }
 
     if (g_devices.empty()) return 0;
+    /* The tier the timeline attributes this half of the layer to. Taken
+     * from the output tensor rather than g_current_tier because that is
+     * what selects the queue below, and the two diverge for exactly the
+     * call this measurement exists for: ds4.c issues the partner half
+     * with the partner tier current and the home half with the home tier
+     * current, so a timeline keyed on anything else would show both
+     * halves on one tier. */
+    sycl_timeline_owned_span tl_span(out->device_id);
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
+        tl_span.device_begin(q);
         g_sycl_moe_owned_decode_readbacks = 0;
 
         const char *gate_w = sycl_model_range_ptr(model_map, gate_offset + gate_shift,
@@ -1045,6 +1054,7 @@ extern "C" int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
         return 0;
     }
     if (g_devices.empty()) return 0;
+    sycl_timeline_record(kSyclTimelineCombineEnter, out->device_id, -1);
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
         float *out_ptr = (float *)out->ptr;
@@ -1077,8 +1087,10 @@ extern "C" int ds4_gpu_routed_moe_owned_slots_combine_rows_tensor(
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_owned_slots_combine_rows failed: %s\n",
                 e.what());
+        sycl_timeline_record(kSyclTimelineCombineExit, out->device_id, -1);
         return 0;
     }
+    sycl_timeline_record(kSyclTimelineCombineExit, out->device_id, -1);
     return 1;
 }
 
@@ -1104,6 +1116,7 @@ extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
         return 0;
     }
     if (g_devices.empty()) return 0;
+    sycl_timeline_record(kSyclTimelineCombineEnter, out->device_id, -1);
     try {
         sycl::queue &q = ds4_sycl_queue(out->device_id);
         float *out_ptr = (float *)out->ptr;
@@ -1121,8 +1134,10 @@ extern "C" int ds4_gpu_routed_moe_owned_packed_combine_tensor(
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "routed_moe_owned_packed_combine failed: %s\n",
                 e.what());
+        sycl_timeline_record(kSyclTimelineCombineExit, out->device_id, -1);
         return 0;
     }
+    sycl_timeline_record(kSyclTimelineCombineExit, out->device_id, -1);
     return 1;
 }
 

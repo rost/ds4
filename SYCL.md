@@ -445,6 +445,32 @@ more than any single one of them:
 2. decode graph capture, since `wait()` throws during graph recording
 3. about 38 percent of decode wall time, the 3.26 ms non-kernel remainder
 
+### Measuring whether the two tiers actually overlap
+
+Expert parallelism only pays if the home and partner tiers compute at the
+same time, and on a real 8-GPU Flash run it does not: prefill goes 3.55 ->
+7.10 t/s, but generation goes 4.27 -> 2.73 t/s and has never moved from 2.73
+to 2.82 across five code states.
+
+`DS4_SYCL_TIMELINE` (`sycl/ds4_sycl_timeline.hpp`) measures the prior
+question rather than guessing at mechanisms. `=1` records a bounded ring of
+host timestamps at the tier switch, the owned decode entry and exit, the
+cross-device copy, the combine, and the one place the host really blocks
+(`ds4_sycl_wait_current_tier`). `=2` adds one `single_task` before and after
+each owned decode that publishes its tier's busy flag in a shared host USM
+word and snapshots the other tiers'; a marker that saw another tier's flag
+set caught that tier mid-decode. Both dump at `ds4_gpu_cleanup`.
+
+**Do not reach for `DS4_SYCL_PROFILE` for this.** It sets
+`property::queue::enable_profiling`, and on a full-size run that exhausted
+the Level Zero event pool (`UR_RESULT_ERROR_OUT_OF_RESOURCES`, then
+`UR_RESULT_ERROR_DEVICE_LOST`, then nearly three hours at 100% CPU without
+exiting) at roughly 1,900 kernel launches per decode token. It also cannot
+answer this question even when it survives: `ds4_sycl_profile_record` calls
+`get_profiling_info`, which blocks on an incomplete event and so silently
+restores every host wait this backend spent months removing. The timeline
+allocates no events at all.
+
 ### The handoff, and the thing to check first on real hardware
 
 `ds4_gpu_tensor_copy_xdev` (`sycl/ds4_sycl_mgpu.hpp:443-497`) does a real

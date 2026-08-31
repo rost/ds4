@@ -435,6 +435,12 @@ extern "C" void ds4_gpu_cleanup(void) {
     sycl_readback_teardown();
     if (!g_devices.empty()) sycl_placement_teardown_all();
     if (!g_devices.empty()) sycl_model_cache_teardown_all();
+    /* Same ordering reason as every teardown above: the timeline's device
+     * marker buffer is host USM owned by tier 0's context, so it must be
+     * freed while that queue is still alive. The dump comes first because
+     * the teardown is what releases the buffer it reads. */
+    sycl_timeline_dump();
+    sycl_timeline_teardown();
     g_devices.clear();
     g_n_gpus       = 0;
     g_current_tier = 0;

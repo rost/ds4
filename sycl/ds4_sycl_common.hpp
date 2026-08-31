@@ -11,6 +11,15 @@
 
 #include "ds4_gpu_mgpu.h"
 
+/* The per-tier timeline recorder. Included here rather than from
+ * ds4_sycl.cpp's trailing include block because its record points are
+ * spread across ds4_sycl_mgpu.hpp, ds4_sycl_moe_owned.hpp and
+ * ds4_sycl_commands.hpp, and every one of those already reaches this
+ * header. It depends on nothing defined in ds4_sycl.cpp: the two
+ * entry points that need a queue or the device list take them as
+ * parameters for exactly that reason. */
+#include "ds4_sycl_timeline.hpp"
+
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 
 #include <level_zero/zes_api.h>

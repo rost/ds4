@@ -87,13 +87,22 @@ static int ds4_sycl_wait_current_tier(const char *label) {
                 label);
         return 0;
     }
+    /* The one place on the decode path where the host actually blocks on
+     * the GPU, so it is where a token's wall clock lands once the
+     * per-entry drains are gone. The timeline needs it: a host submission
+     * timeline that shows home and partner issued back to back explains
+     * nothing on its own unless it also shows where the time went
+     * instead. */
+    sycl_timeline_record(kSyclTimelineWaitEnter, g_current_tier, -1);
+    int ok = 1;
     try {
         ds4_sycl_current_queue().wait_and_throw();
-        return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "%s failed: %s\n", label, e.what());
-        return 0;
+        ok = 0;
     }
+    sycl_timeline_record(kSyclTimelineWaitExit, g_current_tier, -1);
+    return ok;
 }
 
 extern "C" int ds4_gpu_end_commands(void) {

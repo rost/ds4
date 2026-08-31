@@ -283,6 +283,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
 
         g_current_tier = 0;
         g_initialised  = true;
+        sycl_timeline_init(g_devices);
         fprintf(stderr, DS4_GPU_LOG_PREFIX
                 "%d device(s) on a shared context per SYCL platform, "
                 "using %s\n",
@@ -347,6 +348,7 @@ extern "C" int ds4_sycl_test_tier_for_device_id(int device_id) {
  * its cached device on failure either. */
 extern "C" int ds4_gpu_set_current_device(int logical_tier) {
     if (logical_tier < 0 || (size_t)logical_tier >= g_devices.size()) return 1;
+    sycl_timeline_record(kSyclTimelineTierSwitch, logical_tier, g_current_tier);
     g_current_tier = logical_tier;
     return 0;
 }
@@ -363,6 +365,7 @@ extern "C" int ds4_gpu_set_current_device_fenced(int logical_tier) {
     try {
         sycl::event fence = ds4_sycl_queue(g_current_tier).ext_oneapi_submit_barrier();
         ds4_sycl_queue(logical_tier).ext_oneapi_submit_barrier({fence});
+        sycl_timeline_record(kSyclTimelineTierSwitchFenced, logical_tier, g_current_tier);
         g_current_tier = logical_tier;
         return 0;
     } catch (const sycl::exception &e) {
@@ -492,7 +495,7 @@ extern "C" int ds4_sycl_test_xdev_bounce_calls(void) { return g_sycl_xdev_bounce
  * at init can still be worth a fallback rather than a hard failure.
  *
  * The peer copy does not block the host, and that is the whole point of
- * this entry rather than an optimisation on top of it. Expert parallelism
+ * ds4_gpu_tensor_copy_xdev rather than an optimisation on top of it. Expert parallelism
  * exchanges a partial block output with the paired tier on every routed
  * layer, so a decode token performs on the order of two of these per
  * layer; blocking the host on each one cost more than splitting the
@@ -508,15 +511,8 @@ extern "C" int ds4_sycl_test_xdev_bounce_calls(void) { return g_sycl_xdev_bounce
  * ordering needs nothing extra: the copy is submitted on the destination
  * queue, which is in_order. DS4_SYCL_SYNC_XDEV=1 restores the blocking
  * form, for isolating this entry when a multi-GPU run misbehaves. */
-extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
-                                        uint64_t bytes) {
-    if (!dst || !src) return 0;
-    if (bytes > dst->bytes || bytes > src->bytes) return 0;
-    if (bytes == 0) return 1;
-    const int sd = src->device_id >= 0 ? src->device_id : g_current_tier;
-    const int dd = dst->device_id >= 0 ? dst->device_id : g_current_tier;
-    if (sd == dd) return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
-
+static int sycl_xdev_copy_validated(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+                                     uint64_t bytes, int sd, int dd) {
     const bool peer_ok = sd >= 0 && dd >= 0 && sd < DS4_MAX_GPUS && dd < DS4_MAX_GPUS &&
                          g_gpu_peer_ok[sd][dd] != 0;
     if (peer_ok && getenv("DS4_FORCE_HOST_BOUNCE") == nullptr) {
@@ -571,6 +567,26 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tenso
         }
     }
     return sycl_xdev_host_bounce(dst, src, bytes, sd, dd);
+}
+
+/* Argument validation, tier resolution and the same-tier short circuit,
+ * separated from the copy itself above so the cross-tier transfer has one
+ * entry and one exit for the timeline recorder to bracket. Only a real
+ * cross-tier copy is recorded: a same-tier call is an ordinary
+ * ds4_gpu_tensor_copy and says nothing about whether two tiers overlap. */
+extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tensor *src,
+                                        uint64_t bytes) {
+    if (!dst || !src) return 0;
+    if (bytes > dst->bytes || bytes > src->bytes) return 0;
+    if (bytes == 0) return 1;
+    const int sd = src->device_id >= 0 ? src->device_id : g_current_tier;
+    const int dd = dst->device_id >= 0 ? dst->device_id : g_current_tier;
+    if (sd == dd) return ds4_gpu_tensor_copy(dst, 0, src, 0, bytes);
+
+    sycl_timeline_record(kSyclTimelineXdevEnter, dd, sd);
+    const int ok = sycl_xdev_copy_validated(dst, src, bytes, sd, dd);
+    sycl_timeline_record(kSyclTimelineXdevExit, dd, sd);
+    return ok;
 }
 
 /* SYCL has no default-stream concept distinct from a device's own queue,
