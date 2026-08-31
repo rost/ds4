@@ -923,24 +923,41 @@ extern "C" int ds4_gpu_hc_expand_add_split_half_add_tensor(
  * cooperation over K and no local-memory staging of the shared activation
  * row, so every one of those out_dim work-items re-reads it from global
  * memory. This mirrors sycl_q8_0_matmul_tiled_launch's shape in
- * ds4_sycl_matmul.hpp exactly -- local-memory activation staging once per
- * work-group, a kHcExpandTileSubgroup-wide sub-group cooperative
- * reduction per output row -- and keeps every post-matmul step (the
- * block_out write, the owned/add combine, and the HC-expand loop) on lane
- * 0 of the row's sub-group, unchanged from the scalar kernel: those steps
- * are already O(1) or O(n_hc) per row, not O(in_dim), so they were never
- * the cost this rewrite targets.
+ * ds4_sycl_matmul.hpp exactly: a kHcExpandTileSubgroup-wide sub-group
+ * cooperative reduction per output row, with the post-matmul steps left
+ * on lane 0 of that sub-group.
  *
  * kHcExpandTileSubgroup is 16, already in kRequiredSubGroupWidths
  * (ds4_sycl_common.hpp) because sycl_q8_0_matmul_tiled_launch already
  * requires it, so ds4_gpu_init's device-capability guard already checks
  * it; no change needed there (spec 6m: an unchecked width silently runs a
- * different one and corrupts output). */
+ * different one and corrupts output).
+ *
+ * StageActivation selects between the two ways of feeding that reduction,
+ * exactly as sycl_q8_0_matmul_general picks between its own two Q8_0
+ * matmul kernels and for the same measured reason:
+ *
+ * - true stages the shared activation row in local memory and hands each
+ *   lane single columns, so the sub-group's 16 byte loads are 16
+ *   consecutive bytes of one Q8_0 block.
+ * - false reads the activation row from global memory and hands each lane
+ *   whole 32-value Q8_0 blocks (sycl_q8_0_block_dot,
+ *   ds4_sycl_common.hpp), decoding the block scale once per 32
+ *   multiply-adds instead of once per multiply-add.
+ *
+ * Staging costs in_d*4 bytes of a work-group's local-memory budget, which
+ * is what bounds how many work-groups a sub-slice holds at once; past
+ * roughly a fifth of the device's local memory that crowding costs more
+ * than the staging saves.  Measured for the same dot product in
+ * sycl/ds4_sycl_matmul.hpp on an A770 (65536 bytes of local memory, ms
+ * per call, staged against block-per-lane): in_dim 3072 0.0646/0.0680,
+ * 4096 0.0907/0.0829, 7168 0.1792/0.1279. */
 static constexpr int      kHcExpandTileSubgroup     = 16;
 static constexpr uint32_t kHcExpandTileGroupSize    = 256u;
 static constexpr uint32_t kHcExpandTileRowsPerGroup =
         kHcExpandTileGroupSize / (uint32_t)kHcExpandTileSubgroup;
 
+template <bool StageActivation>
 static sycl::event sycl_matmul_q8_0_hc_expand_tiled_launch(
         sycl::queue &q, float *bo, float *ohc, const unsigned char *dw,
         const float *xp, const float *ba, const float *ba2,
@@ -950,42 +967,65 @@ static sycl::event sycl_matmul_q8_0_hc_expand_tiled_launch(
         uint64_t rbytes, bool has_owned, bool has_add) {
     const uint32_t row_blocks =
             (out_d + kHcExpandTileRowsPerGroup - 1u) / kHcExpandTileRowsPerGroup;
+    const uint32_t n_blocks = (in_d + 31u) / 32u;
     return q.submit([&](sycl::handler &h) {
-        sycl::local_accessor<float, 1> x_local(sycl::range<1>(in_d), h);
+        /* Zero-length local_accessors are not portable, so the
+         * unstaged instantiation asks for one element and never reads it. */
+        sycl::local_accessor<float, 1> x_local(
+                sycl::range<1>(StageActivation ? in_d : 1u), h);
         h.parallel_for(
                 sycl::nd_range<1>(sycl::range<1>((size_t)row_blocks * kHcExpandTileGroupSize),
                                   sycl::range<1>(kHcExpandTileGroupSize)),
                 [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kHcExpandTileSubgroup)]] {
                     const uint32_t lid = (uint32_t)it.get_local_id(0);
-                    const uint32_t group_size = (uint32_t)it.get_local_range(0);
 
-                    /* Stage the shared activation row once per work-group;
-                     * every lane participates in this strided fill
-                     * regardless of which output row it will later help
-                     * compute, so every element up to in_d is written by
-                     * some lane before the barrier (spec 6b: an idle lane
-                     * must never be the reason a local-memory slot goes
-                     * unwritten). */
-                    for (uint32_t i = lid; i < in_d; i += group_size) {
-                        x_local[i] = xp[i];
+                    if constexpr (StageActivation) {
+                        const uint32_t group_size = (uint32_t)it.get_local_range(0);
+                        /* Stage the shared activation row once per
+                         * work-group; every lane participates in this
+                         * strided fill regardless of which output row it
+                         * will later help compute, so every element up to
+                         * in_d is written by some lane before the barrier
+                         * (spec 6b: an idle lane must never be the reason
+                         * a local-memory slot goes unwritten). */
+                        for (uint32_t i = lid; i < in_d; i += group_size) {
+                            x_local[i] = xp[i];
+                        }
+                        it.barrier(sycl::access::fence_space::local_space);
                     }
-                    it.barrier(sycl::access::fence_space::local_space);
 
                     const sycl::sub_group sg = it.get_sub_group();
                     const uint32_t lane = (uint32_t)sg.get_local_id()[0];
                     const uint32_t row_in_group = lid / (uint32_t)kHcExpandTileSubgroup;
                     const uint32_t d = (uint32_t)it.get_group(0) * kHcExpandTileRowsPerGroup
                                       + row_in_group;
-                    if (d >= out_d) return;
+                    /* Clamped row index plus a guard on the writes, not an
+                     * early return: sycl_subgroup_sum's shuffles are only
+                     * defined with the whole sub-group converged. */
+                    const uint32_t d_clamped = sycl::min(d, out_d - 1u);
 
-                    const unsigned char *wr = dw + (uint64_t)d * rbytes;
+                    const unsigned char *wr = dw + (uint64_t)d_clamped * rbytes;
                     float sum = 0.0f;
-                    for (uint32_t k = lane; k < in_d; k += (uint32_t)kHcExpandTileSubgroup) {
-                        sum += x_local[k] * sycl_q8_0_dequant(wr, k);
+                    if constexpr (StageActivation) {
+                        for (uint32_t k = lane; k < in_d; k += (uint32_t)kHcExpandTileSubgroup) {
+                            sum += x_local[k] * sycl_q8_0_dequant(wr, k);
+                        }
+                    } else {
+                        for (uint32_t b = lane; b < n_blocks;
+                             b += (uint32_t)kHcExpandTileSubgroup) {
+                            const uint32_t base = b * 32u;
+                            sum += sycl_q8_0_block_dot(wr + (size_t)b * 34u, xp, base,
+                                                       sycl::min(32u, in_d - base));
+                        }
                     }
                     sum = sycl_subgroup_sum<kHcExpandTileSubgroup>(sg, sum);
-                    if (lane != 0u) return;
+                    if (lane != 0u || d >= out_d) return;
 
+                    /* Every post-matmul step (the block_out write, the
+                     * owned/add combine, the HC-expand loop) stays on lane
+                     * 0 of the row's sub-group: they are O(1) or O(n_hc)
+                     * per row, not O(in_d), so they were never the cost
+                     * either inner loop above targets. */
                     bo[d] = sum;
                     float block_v = sum;
                     if (has_owned) {
@@ -1115,50 +1155,30 @@ static int sycl_matmul_q8_0_hc_expand_labeled(
         const uint64_t rbytes = row_bytes;
         const bool has_add = block_add != nullptr;
 
-        /* Prefer the tiled sub-group-cooperative kernel
-         * above; fall back to the original scalar one-work-item-per-row
-         * kernel only when in_d's activation row would not fit local
-         * memory, exactly the guard sycl_q8_0_matmul_general uses for the
-         * plain Q8_0 matmul's own tiled/scalar choice. Checked against
-         * this device's actual reported local-memory size rather than
-         * assumed, since it is not uniform across every SYCL device this
-         * backend might run on. */
+        /* Stage the shared activation row only while it leaves room for
+         * enough work-groups to stay resident, exactly the choice (and
+         * the same measured crossover of 5 resident work-groups at one
+         * token) sycl_q8_0_matmul_general makes for the plain Q8_0
+         * matmul; see sycl_matmul_q8_0_hc_expand_tiled_launch's own
+         * comment.  Checked against this device's actual reported
+         * local-memory size rather than assumed, since it is not uniform
+         * across every SYCL device this backend might run on.  Both
+         * instantiations accept any in_d, so this is purely a performance
+         * choice; the unstaged one needs no local memory at all. */
         const uint64_t x_local_bytes = (uint64_t)in_d * sizeof(float);
         const uint64_t local_mem_size =
                 (uint64_t)q.get_device().get_info<sycl::info::device::local_mem_size>();
-        const bool use_tiled = x_local_bytes + 4096u <= local_mem_size;
+        const bool stage_activation_row = x_local_bytes * 5u <= local_mem_size;
 
-        sycl::event _ds4_prof_ev52;
-        if (use_tiled) {
-            _ds4_prof_ev52 = sycl_matmul_q8_0_hc_expand_tiled_launch(
-                    q, bo, ohc, dw, xp, ba, ba2, ohs, opp, osel, osplit,
-                    post, comb, res, in_d, out_d, embd, hc, mix_hc, rbytes,
-                    has_owned, has_add);
-        } else {
-            _ds4_prof_ev52 = q.parallel_for(sycl::range<1>(out_d), [=](sycl::id<1> gid_id) {
-                const uint32_t d = (uint32_t)gid_id[0];
-                const unsigned char *wr = dw + (uint64_t)d * rbytes;
-                float acc = 0.0f;
-                for (uint32_t k = 0; k < in_d; k++) {
-                    acc += xp[k] * sycl_q8_0_dequant(wr, k);
-                }
-                bo[d] = acc;
-                float block_v = acc;
-                if (has_owned) {
-                    block_v += sycl_moe_owned_packed_combine_row(ohs, opp, osel, d, out_d, osplit);
-                } else if (has_add) {
-                    float add_v = ba[d];
-                    if (ba2) add_v += ba2[d];
-                    block_v += add_v;
-                }
-                for (uint32_t dst_hc = 0; dst_hc < hc; dst_hc++) {
-                    const float v = sycl_hc_expand_general(block_v, post, comb, res,
-                                                           embd, hc, mix_hc, mix_hc,
-                                                           0u, dst_hc, d);
-                    ohc[(uint64_t)dst_hc * embd + d] = v;
-                }
-            });
-        }
+        sycl::event _ds4_prof_ev52 = stage_activation_row
+                ? sycl_matmul_q8_0_hc_expand_tiled_launch<true>(
+                        q, bo, ohc, dw, xp, ba, ba2, ohs, opp, osel, osplit,
+                        post, comb, res, in_d, out_d, embd, hc, mix_hc, rbytes,
+                        has_owned, has_add)
+                : sycl_matmul_q8_0_hc_expand_tiled_launch<false>(
+                        q, bo, ohc, dw, xp, ba, ba2, ohs, opp, osel, osplit,
+                        post, comb, res, in_d, out_d, embd, hc, mix_hc, rbytes,
+                        has_owned, has_add);
         /* Wait only for dw_guard's free, as in sycl_q8_0_matmul_general. */
         sycl_scratch_release_wait(q, dw_guard);
         ds4_sycl_profile_record_named("matmul_q8_0_hc_expand_labeled", _ds4_prof_ev52);

@@ -1155,6 +1155,113 @@ static int test_matmul_q8_0_hc_expand(void) {
     return 0;
 }
 
+/* As hc_test_encode_q8_0_row above, but with the block scale bounded
+ * instead of growing with the block index, so a row of hundreds of blocks
+ * still sums to a magnitude float32 holds with headroom.  Padding past
+ * in_dim is deliberately NOT zero: the contract is in_dim columns, and a
+ * kernel that read a whole 32-value block without bounding it to in_dim
+ * would silently agree with the oracle if the bytes it over-read happened
+ * to be zero. */
+static void hc_test_encode_q8_0_row_wide(unsigned char *row, uint32_t in_dim,
+                                         uint32_t o) {
+    const uint32_t blocks = (in_dim + 31u) / 32u;
+    for (uint32_t blk = 0; blk < blocks; blk++) {
+        unsigned char *bp = row + (size_t)blk * 34u;
+        const uint16_t braw =
+                hc_test_float_to_half(0.001f * (float)(((o + blk) % 17u) + 1u));
+        bp[0] = (unsigned char)(braw & 0xFFu);
+        bp[1] = (unsigned char)((braw >> 8) & 0xFFu);
+        for (uint32_t idx = 0; idx < 32u; idx++) {
+            const uint32_t k = blk * 32u + idx;
+            const int qv = (k < in_dim) ? (int)(((o + 1u) * (k + 5u)) % 11u) - 5 : 4;
+            bp[2 + idx] = (unsigned char)(signed char)qv;
+        }
+    }
+}
+
+/* The wide-in_dim counterpart of test_matmul_q8_0_hc_expand above.  in_dim
+ * here is large enough that staging the shared activation row would cost
+ * more than a fifth of the device's local memory, so
+ * sycl_matmul_q8_0_hc_expand_labeled (sycl/ds4_sycl_hc.hpp) instantiates
+ * its fused kernel with StageActivation false -- the block-per-lane inner
+ * loop, which no other case in this file reaches.  8231 * 4 = 32924 bytes
+ * puts the choice on the same side of both local-memory sizes this
+ * backend sees (65536 on Xe1, 131072 on Xe2), and 8231 is not a multiple
+ * of 32, so that path's partially-filled last Q8_0 block is exercised too.
+ * N_HC_EXPAND_EMBD is 12, fewer than the 16 rows a work-group covers, so
+ * the sub-groups that address no row at all still have to reach the
+ * sub-group reduction's shuffles. */
+static int test_matmul_q8_0_hc_expand_wide_in_dim(void) {
+    enum { IN_DIM = 8231 };
+    const uint64_t blocks = (IN_DIM + 31u) / 32u;
+    const uint64_t row_bytes = blocks * 34u;
+    const uint64_t weight_bytes = (uint64_t)N_HC_EXPAND_EMBD * row_bytes;
+
+    float block_want[N_HC_EXPAND_EMBD];
+    float residual[N_HC * N_HC_EXPAND_EMBD];
+    float split[MIX_HC];
+    float hc_want[N_HC * N_HC_EXPAND_EMBD];
+    float block_got[N_HC_EXPAND_EMBD];
+    float hc_got[N_HC * N_HC_EXPAND_EMBD];
+
+    unsigned char *weights = (unsigned char *)malloc((size_t)weight_bytes);
+    float *x = (float *)malloc((size_t)IN_DIM * sizeof(float));
+    CHECK(weights != NULL && x != NULL,
+          "matmul_q8_0_hc_expand_wide: host allocation failed");
+
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        hc_test_encode_q8_0_row_wide(weights + (size_t)o * row_bytes, IN_DIM, o);
+    }
+    for (uint32_t k = 0; k < IN_DIM; k++) x[k] = (float)((k * 3u) % 9u) - 4.0f;
+    for (uint32_t o = 0; o < N_HC_EXPAND_EMBD; o++) {
+        block_want[o] = hc_oracle_q8_0_dot(x, weights + (size_t)o * row_bytes, IN_DIM);
+    }
+    for (int h = 0; h < N_HC; h++) {
+        for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+            residual[h * N_HC_EXPAND_EMBD + i] = fill_val((uint32_t)h, (uint32_t)i) + 3.0f;
+        }
+    }
+    for (int i = 0; i < MIX_HC; i++) split[i] = fill_val(9u, (uint32_t)i + 40) * 0.5f;
+    oracle_hc_post_one(hc_want, block_want, residual, split + N_HC, split + 2 * N_HC,
+                       N_HC_EXPAND_EMBD, N_HC);
+
+    ds4_gpu_tensor *tx     = alloc_write(x, (size_t)IN_DIM * sizeof(float));
+    ds4_gpu_tensor *tres   = alloc_write(residual, sizeof(residual));
+    ds4_gpu_tensor *tsplit = alloc_write(split, sizeof(split));
+    ds4_gpu_tensor *tblock = ds4_gpu_tensor_alloc(sizeof(block_want));
+    ds4_gpu_tensor *tout   = ds4_gpu_tensor_alloc(sizeof(hc_want));
+    CHECK(tx && tres && tsplit && tblock && tout,
+          "matmul_q8_0_hc_expand_wide: alloc failed");
+
+    CHECK(ds4_gpu_matmul_q8_0_hc_expand_tensor(
+              tout, tblock, weights, weight_bytes, 0, IN_DIM,
+              N_HC_EXPAND_EMBD, tx, tres, tsplit, N_HC_EXPAND_EMBD, N_HC) != 0,
+          "matmul_q8_0_hc_expand_wide: call");
+    CHECK(ds4_gpu_tensor_read(tblock, 0, block_got, sizeof(block_got)) != 0,
+          "matmul_q8_0_hc_expand_wide: read block_out");
+    CHECK(ds4_gpu_tensor_read(tout, 0, hc_got, sizeof(hc_got)) != 0,
+          "matmul_q8_0_hc_expand_wide: read out_hc");
+    for (int i = 0; i < N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(block_got[i], block_want[i],
+                    fabs((double)block_want[i]) * 1e-5 + 1e-3,
+                    "matmul_q8_0_hc_expand_wide: block_out mismatch");
+    }
+    for (int i = 0; i < N_HC * N_HC_EXPAND_EMBD; i++) {
+        CHECK_CLOSE(hc_got[i], hc_want[i], fabs((double)hc_want[i]) * 1e-5 + 1e-3,
+                    "matmul_q8_0_hc_expand_wide: out_hc mismatch");
+    }
+
+    ds4_gpu_tensor_free(tx);
+    ds4_gpu_tensor_free(tres);
+    ds4_gpu_tensor_free(tsplit);
+    ds4_gpu_tensor_free(tblock);
+    ds4_gpu_tensor_free(tout);
+    free(weights);
+    free(x);
+    fprintf(stderr, "  test_matmul_q8_0_hc_expand_wide_in_dim OK\n");
+    return 0;
+}
+
 /* As hc_oracle_q8_0_dot above, but restricted to [in_start, in_start+
  * in_count) of the row addressed in the FULL row's block layout -- the
  * k-slice matmul's own dequant contract. */
@@ -1748,6 +1855,7 @@ int main(void) {
     if (test_hc_split_weighted_sum_norm() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_hc_split_weighted_sum_norm_stress() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_hc_expand() != 0) { ds4_gpu_cleanup(); return 1; }
+    if (test_matmul_q8_0_hc_expand_wide_in_dim() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_matmul_q8_0_kslice_hc_expand_add() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_shared_down_hc_expand_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
     if (test_shared_down_hc_expand_add_q8_0() != 0) { ds4_gpu_cleanup(); return 1; }
