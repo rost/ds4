@@ -194,7 +194,7 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
                     psc[(uint64_t)t * w + j] +
                     sycl_ape_value_dev(dape, type, w, pos_mod, j);
         });
-        sycl_batch_wait(q);
+        sycl_scratch_release_wait(q, dape_guard);
         ds4_sycl_profile_record_named("compressor_store_batch", _ds4_prof_ev19);
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "compressor_store failed: %s\n", e.what());

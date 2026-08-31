@@ -324,8 +324,12 @@ extern "C" int ds4_gpu_matmul_f16_pair_tensor(
          * is the one wait this function needs: it runs before
          * dwa_guard/dwb_guard/wa32_guard/wb32_guard free their scratch at
          * scope exit, and it covers everything submitted to q before it,
-         * ev_a and both converts included. */
-        sycl_batch_wait(ev_b);
+         * ev_a and both converts included. Keeping that scratch alive is
+         * the drain's only purpose, so it goes through
+         * sycl_scratch_release_wait: nothing to wait for when every range
+         * was already resident, and nothing under capture either, where a
+         * recording batch defers the frees past the submission. */
+        sycl_scratch_release_wait(q, dwa_guard, dwb_guard, wa32_guard, wb32_guard);
         ds4_sycl_profile_record_named("matmul_f16", ev_a);
         ds4_sycl_profile_record_named("matmul_f16", ev_b);
     } catch (const std::exception &e) {

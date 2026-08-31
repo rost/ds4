@@ -221,7 +221,7 @@ extern "C" int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
                     q, (float *)gate->ptr, (float *)up->ptr, (float *)mid->ptr,
                     dwg, dwu, (const float *)x->ptr, (uint32_t)(in_dim >> 5u),
                     (uint32_t)out_dim, row_bytes, clamp);
-            sycl_batch_wait(q);
+            sycl_scratch_release_wait(q, dwg_guard, dwu_guard);
             ds4_sycl_profile_record_named("shared_expert_gate_up_swiglu_q8_0_w32", ev);
             g_sycl_shared_fast_path_hits++;
         } catch (const sycl::exception &e) {
