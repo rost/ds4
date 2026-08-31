@@ -683,7 +683,7 @@ extern "C" int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset,
         sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
                                                               : g_current_tier);
         sycl::event _ds4_prof_ev154 = q.memcpy((char *)tensor->ptr + offset, data, bytes);
-        _ds4_prof_ev154.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev154);
         ds4_sycl_profile_record(_ds4_prof_ev154);
         return 1;
     } catch (const sycl::exception &e) {
@@ -707,7 +707,7 @@ extern "C" int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset
         sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
                                                               : g_current_tier);
         sycl::event _ds4_prof_ev155 = q.memcpy(data, (const char *)tensor->ptr + offset, bytes);
-        _ds4_prof_ev155.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev155);
         ds4_sycl_profile_record(_ds4_prof_ev155);
         return 1;
     } catch (const sycl::exception &e) {
@@ -748,7 +748,7 @@ extern "C" int ds4_gpu_tensor_copy(ds4_gpu_tensor *dst, uint64_t dst_offset,
         sycl::queue &q = ds4_sycl_queue(dst_tier);
         sycl::event _ds4_prof_ev159 = q.memcpy((char *)dst->ptr + dst_offset,
                  (const char *)src->ptr + src_offset, bytes);
-        _ds4_prof_ev159.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev159);
         ds4_sycl_profile_record(_ds4_prof_ev159);
         return 1;
     } catch (const sycl::exception &e) {
@@ -772,7 +772,7 @@ extern "C" int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value,
         sycl::queue &q = ds4_sycl_queue(tensor->device_id >= 0 ? tensor->device_id
                                                               : g_current_tier);
         sycl::event _ds4_prof_ev156 = q.fill((float *)tensor->ptr, value, (size_t)count);
-        _ds4_prof_ev156.wait_and_throw();
+        sycl_batch_wait(_ds4_prof_ev156);
         ds4_sycl_profile_record(_ds4_prof_ev156);
         return 1;
     } catch (const sycl::exception &e) {
