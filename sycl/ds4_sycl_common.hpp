@@ -720,6 +720,126 @@ static inline float sycl_subgroup_sum(sycl::sub_group sg, float v) {
     return v;
 }
 
+/* ---- Batched launches that would exceed DPC++'s fits-in-int range ------
+ *
+ * DPC++ refuses a launch whose global range does not fit in an int:
+ * "Provided range and/or offset does not fit in int. Pass
+ * `-fno-sycl-id-queries-fit-in-int' to remove this limit."  The check
+ * (sycl/detail/id_queries_fit_in_int.hpp) is on the LINEARISED global
+ * size, not on each dimension: a 1D range's single value, and for 2D and
+ * 3D the PRODUCT of every dimension, with the local range not checked at
+ * all.  So a launch whose every dimension looks modest still throws once
+ * they multiply past INT32_MAX.
+ *
+ * Two entries did exactly that on a real 16665-token prompt.  The Q8_0
+ * dense matmul (ds4_sycl_matmul.hpp) crosses the limit at the vocabulary
+ * head, 129280/16 work-groups of 256 against a 4096-token prefill chunk.
+ * ds4_gpu_indexer_scores_prefill_tensor (ds4_sycl_indexer.hpp) launches
+ * (n_comp * 256) x n_tokens, which at 4096 tokens crosses once n_comp
+ * passes 2048, i.e. once the prompt passes 8192 positions at compress
+ * ratio 4; that is why the failure moved two layers further along after
+ * the matmul was fixed, layers 0 and 1 being Flash's two uncompressed
+ * ones.
+ *
+ * Building the whole translation unit with
+ * -fno-sycl-id-queries-fit-in-int would remove the check, but the check is
+ * a loud, clean failure and is not the only thing standing in the way: it
+ * also widens every id query in every kernel here, so any kernel still
+ * computing an index in 32 bits would wrap SILENTLY instead of failing.
+ * Splitting the launch keeps both properties, and leaves the kernels
+ * untouched.
+ */
+
+/* How many work-groups one launch may carry along the dimension being
+ * split, so that the whole global range stays inside the limit.
+ * `items_per_group` is what one such group contributes to the linearised
+ * size: its own local size along that dimension times the global size of
+ * every other dimension.
+ *
+ * Never returns zero.  Zero would make the caller's loop make no progress
+ * and spin forever; a single group that alone exceeds the limit is emitted
+ * anyway and throws, which is the same clean failure as before and far
+ * better than a hang. */
+static inline uint32_t sycl_range_split_max_groups(uint64_t items_per_group) {
+    if (items_per_group == 0u) return 1u;
+    const uint64_t limit = (uint64_t)INT32_MAX / items_per_group;
+    if (limit == 0u) return 1u;
+    return limit > UINT32_MAX ? UINT32_MAX : (uint32_t)limit;
+}
+
+/* Test-only override of the split above: nonzero forces that many
+ * work-groups per launch regardless of the real limit.  The shapes that
+ * genuinely overflow cannot be allocated on any development machine, so
+ * without this the split loop only ever runs one iteration and the seam
+ * between two chunks is never executed.  Same precedent, and the same
+ * reason, as ds4_sycl_attention.hpp's `forced_tile_tokens`: force the
+ * split directly at a small, fast shape rather than leave the loop
+ * unexercised.  Zero (the default) is the production path. */
+static uint32_t g_sycl_range_split_forced_groups = 0;
+
+/* How many launches the most recent split emitted.  A seam test that
+ * forces a small chunk is worthless if the forcing silently stops working
+ * -- it would then run one launch, see the right answers and pass while
+ * testing nothing, which is the exact failure mode SYCL.md's ablation
+ * section catalogues.  Asserting this counter is what makes the seam test
+ * notice. */
+static uint64_t g_sycl_range_split_last_chunks = 0;
+
+extern "C" void ds4_sycl_test_range_split_force_groups(uint32_t groups) {
+    g_sycl_range_split_forced_groups = groups;
+}
+
+extern "C" uint64_t ds4_sycl_test_range_split_last_chunks(void) {
+    return g_sycl_range_split_last_chunks;
+}
+
+extern "C" uint32_t ds4_sycl_test_range_split_max_groups(uint64_t items_per_group) {
+    return sycl_range_split_max_groups(items_per_group);
+}
+
+/* Submits `full` as one launch when its global range already fits in an
+ * int, and as consecutive slices along `split_dim` when it does not.
+ *
+ * `submit(chunk, group_base, group_count)` receives one slice's own
+ * nd_range plus which work-groups along `split_dim` it covers.  Every
+ * other dimension, and the local range, are exactly the caller's own, so
+ * a kernel's [[sycl::reqd_sub_group_size]] and its local-memory shape
+ * carry across a split unchanged.  Callers express a slice by offsetting
+ * their base pointers by `group_base`, which is the first token for every
+ * caller here since each token owns one work-group along the split
+ * dimension; the kernel bodies need no change at all.
+ *
+ * Returns the last slice's event.  Every tier's queue is in_order
+ * (ds4_sycl.cpp), so that one event completing means all the slices have,
+ * which is what lets callers keep their single trailing wait. */
+template <int Dims, typename Submit>
+static inline sycl::event sycl_launch_range_split(const sycl::nd_range<Dims> &full,
+                                                  int split_dim, Submit submit) {
+    const sycl::range<Dims> global = full.get_global_range();
+    const sycl::range<Dims> local = full.get_local_range();
+    const uint64_t group_size = local[split_dim];
+    uint64_t items_per_group = group_size;
+    for (int d = 0; d < Dims; d++) {
+        if (d != split_dim) items_per_group *= global[d];
+    }
+    const uint64_t n_groups = group_size ? global[split_dim] / group_size : 0u;
+    const uint64_t max_groups = g_sycl_range_split_forced_groups != 0u
+                                        ? (uint64_t)g_sycl_range_split_forced_groups
+                                        : (uint64_t)sycl_range_split_max_groups(items_per_group);
+
+    sycl::event ev;
+    uint64_t chunks = 0;
+    for (uint64_t base = 0; base < n_groups; base += max_groups) {
+        const uint64_t take = n_groups - base < max_groups ? n_groups - base : max_groups;
+        sycl::range<Dims> chunk = global;
+        chunk[split_dim] = (size_t)(take * group_size);
+        ev = submit(sycl::nd_range<Dims>(chunk, local), base, take);
+        chunks++;
+    }
+    g_sycl_range_split_last_chunks = chunks;
+    return ev;
+}
+
 /* Test/report-only instrumentation: cumulative bytes actually
  * copied host-to-device by sycl_stage_host_bytes below (never incremented
  * on its pass-through branch). Since an audit confirmed every

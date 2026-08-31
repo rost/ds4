@@ -37,6 +37,13 @@
 extern float ds4_sycl_test_e2m1fn_value(int code);
 extern float ds4_sycl_test_e2m1fn_dequant(float x);
 
+/* sycl/ds4_sycl_common.hpp test-only hook; not part of the ABI. Forces
+ * sycl_launch_range_split to emit that many work-groups per launch, so a
+ * shape a development machine can actually allocate still crosses a chunk
+ * seam. Zero restores the production limit. */
+extern void ds4_sycl_test_range_split_force_groups(unsigned int groups);
+extern unsigned long long ds4_sycl_test_range_split_last_chunks(void);
+
 #define CHECK(cond, msg)                                                    \
     do {                                                                    \
         if (!(cond)) {                                                      \
@@ -337,6 +344,79 @@ static int test_scores_decode_batch_matches_oracle(void) {
     ds4_gpu_tensor_free(tic);
     ds4_gpu_tensor_free(tscores);
     fprintf(stderr, "  test_scores_decode_batch_matches_oracle OK\n");
+    return 0;
+}
+
+/* The fits-in-int launch split (sycl_launch_range_split,
+ * sycl/ds4_sycl_common.hpp) applied to the scoring entry that first hit
+ * the limit for real: ds4_gpu_indexer_scores_prefill_tensor launches
+ * (n_comp * 256) x n_tokens work items, which a 16665-token prompt pushed
+ * past INT32_MAX at a 4096-token prefill chunk.
+ *
+ * The shapes that overflow cannot be allocated here, so the split is
+ * forced to three work-groups per launch instead, which at N_TOKENS == 8
+ * cuts the token dimension into chunks of 3, 3 and 2. That puts a seam
+ * between tokens 2 and 3 and again between 5 and 6, exactly where a
+ * mis-offset base pointer or a pos0 that failed to advance with the chunk
+ * would show up: every one of the three per-token tensors (scores, q,
+ * weights) is offset per chunk, while index_comp is shared and must not
+ * be, and the causal bound is derived from pos0 + t. The oracle is
+ * computed once over the whole batch, so an answer that is merely
+ * self-consistent per chunk still fails.
+ *
+ * POS0 is nonzero and RATIO is 4 so the causal visibility bound differs
+ * from token to token across the seams rather than being uniform, which
+ * an unadvanced pos0 would otherwise reproduce by accident. */
+static int test_scores_prefill_split_seam_matches_oracle(void) {
+    enum { N_TOKENS = 8, N_HEAD = 3, HEAD_DIM = 16, N_COMP = 9, RATIO = 4, POS0 = 12 };
+    float q[N_TOKENS * N_HEAD * HEAD_DIM];
+    float weights[N_TOKENS * N_HEAD];
+    float index_comp[N_COMP * HEAD_DIM];
+    fill_scores_data(q, weights, index_comp, N_TOKENS, N_HEAD, HEAD_DIM, N_COMP, 23);
+    const float scale = 0.15f;
+
+    float want[N_TOKENS * N_COMP];
+    oracle_indexer_scores(want, q, weights, index_comp, N_COMP, N_TOKENS, POS0, N_HEAD,
+                          HEAD_DIM, RATIO, scale, 1);
+
+    ds4_gpu_tensor *tq = ds4_gpu_tensor_alloc(sizeof(q));
+    ds4_gpu_tensor *tw = ds4_gpu_tensor_alloc(sizeof(weights));
+    ds4_gpu_tensor *tic = ds4_gpu_tensor_alloc(sizeof(index_comp));
+    ds4_gpu_tensor *tscores = ds4_gpu_tensor_alloc(sizeof(want));
+    CHECK(tq && tw && tic && tscores, "scores_split_seam: alloc");
+    CHECK(ds4_gpu_tensor_write(tq, 0, q, sizeof(q)) != 0, "scores_split_seam: write q");
+    CHECK(ds4_gpu_tensor_write(tw, 0, weights, sizeof(weights)) != 0,
+          "scores_split_seam: write w");
+    CHECK(ds4_gpu_tensor_write(tic, 0, index_comp, sizeof(index_comp)) != 0,
+          "scores_split_seam: write index_comp");
+
+    ds4_sycl_test_range_split_force_groups(3u);
+    const int ok = ds4_gpu_indexer_scores_decode_batch_tensor(
+            tscores, tq, tw, tic, N_COMP, N_TOKENS, POS0, N_HEAD, HEAD_DIM, RATIO, scale);
+    const unsigned long long chunks = ds4_sycl_test_range_split_last_chunks();
+    ds4_sycl_test_range_split_force_groups(0u);
+    CHECK(ok != 0, "scores_split_seam: call");
+    CHECK(chunks == 3ull,
+          "scores_split_seam: the split must have run 3 launches over 8 tokens at 3 "
+          "work-groups each, or this test passes while crossing no seam at all");
+
+    float got[N_TOKENS * N_COMP];
+    CHECK(ds4_gpu_tensor_read(tscores, 0, got, sizeof(got)) != 0, "scores_split_seam: read");
+    for (int i = 0; i < N_TOKENS * N_COMP; i++) {
+        char msg[80];
+        snprintf(msg, sizeof(msg), "scores_split_seam: mismatch at token %d comp %d",
+                 i / N_COMP, i % N_COMP);
+        if (isinf(want[i])) {
+            CHECK(isinf(got[i]) && got[i] < 0.0f, msg);
+        } else {
+            CHECK_CLOSE(got[i], want[i], 5.0e-3, msg);
+        }
+    }
+    ds4_gpu_tensor_free(tq);
+    ds4_gpu_tensor_free(tw);
+    ds4_gpu_tensor_free(tic);
+    ds4_gpu_tensor_free(tscores);
+    fprintf(stderr, "  test_scores_prefill_split_seam_matches_oracle OK\n");
     return 0;
 }
 
@@ -1216,6 +1296,7 @@ int main(void) {
 
     failures += test_scores_prefill_causal_matches_oracle();
     failures += test_scores_decode_batch_matches_oracle();
+    failures += test_scores_prefill_split_seam_matches_oracle();
     failures += test_score_one_direct_path_matches_oracle();
     failures += test_score_one_generic_path_matches_oracle();
     failures += test_scores_rejections();

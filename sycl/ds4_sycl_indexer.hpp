@@ -323,18 +323,41 @@ static int sycl_indexer_scores_launch(
                         });
             });
         } else {
-            _ds4_prof_ev55 = dq.submit([&](sycl::handler &h) {
-                sycl::local_accessor<float, 1> partial(sycl::range<1>(256), h);
-                h.parallel_for(
-                        sycl::nd_range<2>(
-                                sycl::range<2>((size_t)n_comp * 256u, n_tokens),
-                                sycl::range<2>(256, 1)),
-                        [=](sycl::nd_item<2> it) {
-                            sycl_indexer_scores_kernel(
-                                    it, partial, pscores, pq, pweights,
-                                    pindex_comp, n_comp, n_tokens, pos0, n_head,
-                                    head_dim, ratio, scale, causal_i);
-                        });
+            /* (n_comp * 256) x n_tokens work items, which is a product
+             * DPC++'s fits-in-int global range refuses once n_comp passes
+             * 2048 at a full 4096-token prefill chunk, i.e. once the
+             * prompt passes 8192 positions at compress ratio 4. Found by
+             * prefilling a 16665-token prompt: it failed here two layers
+             * past the Q8_0 dense matmul that had just been split the same
+             * way, layers 0 and 1 being Flash's two uncompressed ones and
+             * layer 2 therefore the first to reach this entry at all.
+             *
+             * A slice owns a contiguous run of tokens, so it is expressed
+             * by offsetting every per-token tensor (scores, q, weights)
+             * and advancing pos0, which is exactly what the kernel's own
+             * causal bound is written against ((pos0 + t + 1) / ratio).
+             * index_comp is shared by every token and is not offset. The
+             * kernel is unchanged. */
+            const sycl::nd_range<2> full(
+                    sycl::range<2>((size_t)n_comp * 256u, n_tokens),
+                    sycl::range<2>(256, 1));
+            _ds4_prof_ev55 = sycl_launch_range_split(
+                    full, /*split_dim=*/1,
+                    [&](sycl::nd_range<2> chunk, uint64_t t0, uint64_t nt) {
+                float         *scores_chunk  = pscores + t0 * n_comp;
+                const float   *q_chunk       = pq + t0 * n_head * head_dim;
+                const float   *weights_chunk = pweights + t0 * n_head;
+                const uint32_t chunk_tokens  = (uint32_t)nt;
+                const uint32_t chunk_pos0    = pos0 + (uint32_t)t0;
+                return dq.submit([&](sycl::handler &h) {
+                    sycl::local_accessor<float, 1> partial(sycl::range<1>(256), h);
+                    h.parallel_for(chunk, [=](sycl::nd_item<2> it) {
+                        sycl_indexer_scores_kernel(
+                                it, partial, scores_chunk, q_chunk, weights_chunk,
+                                pindex_comp, n_comp, chunk_tokens, chunk_pos0,
+                                n_head, head_dim, ratio, scale, causal_i);
+                    });
+                });
             });
         }
         sycl_batch_wait(dq);
