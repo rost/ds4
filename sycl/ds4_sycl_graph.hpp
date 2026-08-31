@@ -138,6 +138,30 @@ public:
      * token. */
     bool resume(sycl::queue &q) { return open(q); }
 
+    /* Ends the batch around a region that cannot be recorded, and picks
+     * recording back up afterwards on the same queue.
+     *
+     * Distinct from flush(), and the distinction is the whole point:
+     * flush() submits what it has and immediately begins recording again,
+     * so the queue is still in the recording state when it returns. A
+     * caller that needs recording to actually be OFF for a moment -- a
+     * cross-device copy, whose barrier event a graph will not accept as a
+     * dependency for another device's queue -- gets nothing from flush()
+     * but the cost of a submission. That mistake measured as a 2.7x
+     * prefill regression before it was understood. */
+    bool suspend() {
+        if (!recording()) return true;
+        suspended_on_ = q_;
+        return end();
+    }
+
+    bool resume_suspended() {
+        if (!suspended_on_) return true;
+        sycl::queue *q = suspended_on_;
+        suspended_on_ = nullptr;
+        return open(*q);
+    }
+
     /* Ends the batch: submits whatever is still recorded and waits for it.
      * Safe to call with no batch in progress, which is what makes it usable
      * from the error paths that call ds4_gpu_synchronize without knowing
@@ -194,6 +218,7 @@ public:
         }
         graph_.reset();
         q_ = nullptr;
+        suspended_on_ = nullptr;
         drain_deferred();
         submissions_ = 0;
         total_nodes_ = 0;
@@ -328,6 +353,7 @@ private:
     std::optional<sycl_graph_ext::command_graph<
             sycl_graph_ext::graph_state::modifiable>> graph_;
     sycl::queue                     *q_ = nullptr;
+    sycl::queue                     *suspended_on_ = nullptr;
     std::vector<sycl_deferred_free>  deferred_;
     bool                             armed_ = getenv("DS4_SYCL_GRAPH") != nullptr;
     bool                             blas_warm_ = false;
@@ -354,6 +380,14 @@ static void sycl_graph_batch_defer_free(sycl::queue &q, void *p) {
 
 static bool sycl_graph_batch_flush(void) {
     return g_sycl_graph_batch.flush();
+}
+
+static bool sycl_graph_batch_suspend(void) {
+    return g_sycl_graph_batch.suspend();
+}
+
+static bool sycl_graph_batch_resume(void) {
+    return g_sycl_graph_batch.resume_suspended();
 }
 
 /* Drops an unsubmitted recording before g_devices.clear() destroys the

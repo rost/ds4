@@ -388,6 +388,8 @@ static inline float sycl_q4_0_dequant(const unsigned char *row, uint32_t col) {
 static bool sycl_graph_batch_recording(void);
 static void sycl_graph_batch_defer_free(sycl::queue &q, void *p);
 static bool sycl_graph_batch_flush(void);
+static bool sycl_graph_batch_suspend(void);
+static bool sycl_graph_batch_resume(void);
 
 namespace {
 

@@ -543,21 +543,25 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tenso
              * always relied on: destination ordering comes from the
              * destination queue being in_order, and the source-side
              * hazard the second barrier closes was equally open then.
-             * Suspending the recording instead was tried and measured
-             * far worse (prefill 9.93 t/s down to 3.70 t/s), because
-             * prefill crosses tiers often enough that ending and
-             * restarting a graph per crossing costs more than the capture
-             * saves. */
-            if (sycl_graph_batch_recording()) {
-                dq.memcpy(dst->ptr, src->ptr, bytes);
-                return 1;
-            }
+             * The batch is therefore SUSPENDED around the copy, not
+             * flushed: flush() resumes recording immediately, so the
+             * barrier below would still be rejected and this entry would
+             * still bounce, having paid for a submission on the way.
+             * Suspending also bounds how large a recorded graph gets,
+             * which matters: leaving the copy inside the recording
+             * instead measured prefill at 3.73 t/s against 9.98 t/s with
+             * the graph ending at each crossing, since a prefill that
+             * never breaks records one enormous graph whose finalize cost
+             * swamps what capture saves. */
+            const bool suspended = sycl_graph_batch_recording();
+            if (suspended) sycl_graph_batch_suspend();
             sycl::event src_ready = sq.ext_oneapi_submit_barrier();
             sycl::event copied = dq.submit([&](sycl::handler &h) {
                 h.depends_on(src_ready);
                 h.memcpy(dst->ptr, src->ptr, bytes);
             });
             sq.ext_oneapi_submit_barrier({copied});
+            if (suspended) sycl_graph_batch_resume();
             return 1;
         } catch (const sycl::exception &e) {
             fprintf(stderr, DS4_GPU_LOG_PREFIX
@@ -640,18 +644,11 @@ extern "C" int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier)
          * data that may not be written yet: a silent wrong answer, which
          * is the one outcome worse than a failure. Fail instead, which is
          * what a captured run does today anyway, and say why once. */
-        if (sycl_graph_batch_recording()) {
-            static bool reported = false;
-            if (!reported) {
-                reported = true;
-                fprintf(stderr, DS4_GPU_LOG_PREFIX
-                        "cross-device ordering cannot be recorded into a command "
-                        "graph; run this placement without DS4_SYCL_GRAPH\n");
-            }
-            return 0;
-        }
+        const bool suspended = sycl_graph_batch_recording();
+        if (suspended) sycl_graph_batch_suspend();
         sycl::event ready = ds4_sycl_queue(sd).ext_oneapi_submit_barrier();
         ds4_sycl_queue(dst_tier).ext_oneapi_submit_barrier({ready});
+        if (suspended) sycl_graph_batch_resume();
         return 1;
     } catch (const sycl::exception &e) {
         fprintf(stderr, DS4_GPU_LOG_PREFIX "tensor_wait_xdev failed: %s\n", e.what());
