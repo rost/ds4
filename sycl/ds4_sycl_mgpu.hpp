@@ -527,19 +527,6 @@ extern "C" int ds4_gpu_tensor_copy_xdev(ds4_gpu_tensor *dst, const ds4_gpu_tenso
                 sycl_batch_wait(dq.memcpy(dst->ptr, src->ptr, bytes));
                 return 1;
             }
-            /* Close any recording first. A command graph belongs to one
-             * device, so the source-queue barrier below is rejected as a
-             * dependency for a submission to another device's queue
-             * ("Cannot submit to a queue with a dependency from a graph
-             * that is associated with a different device"), and this
-             * entry would then fall back to the host bounce for every
-             * cross-tier handoff. Measured on a real 8-GPU Flash decode,
-             * that fallback cost more than capture saved: 4.34 t/s
-             * uncaptured against 3.05 t/s captured. Flushing here instead
-             * ends the graph at the tier boundary, which is where a
-             * pipeline placement changes queues anyway, so the run that
-             * was being recorded was about to end regardless. */
-            if (sycl_graph_batch_recording()) sycl_graph_batch_flush();
             sycl::event src_ready = sq.ext_oneapi_submit_barrier();
             sycl::event copied = dq.submit([&](sycl::handler &h) {
                 h.depends_on(src_ready);
@@ -617,11 +604,6 @@ extern "C" int ds4_gpu_tensor_wait_xdev(const ds4_gpu_tensor *src, int dst_tier)
     const int sd = src->device_id >= 0 ? src->device_id : g_current_tier;
     if (sd == dst_tier) return 1;
     try {
-        /* Same graph-affinity constraint ds4_gpu_tensor_copy_xdev above
-         * documents: a barrier event from a queue that is recording into
-         * a command graph cannot be a dependency for another device's
-         * queue, so end the recording before crossing tiers. */
-        if (sycl_graph_batch_recording()) sycl_graph_batch_flush();
         sycl::event ready = ds4_sycl_queue(sd).ext_oneapi_submit_barrier();
         ds4_sycl_queue(dst_tier).ext_oneapi_submit_barrier({ready});
         return 1;
