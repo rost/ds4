@@ -772,32 +772,30 @@ static int sycl_routed_moe_launch(
         sycl_block_q8_K *xq = (sycl_block_q8_K *)down->ptr;
         sycl_block_q8_K *midq = (sycl_block_q8_K *)gate->ptr;
         sycl_moe_q8_k_quantize(q, xq, (const float *)x->ptr, expert_in_dim, n_tokens);
-        /* This backend's queues are out-of-order raw-USM queues (spec 6t):
-         * a kernel reading xq/midq has no SYCL-tracked dependency on the
-         * quantise kernel above, since both address raw pointers rather
-         * than buffers/accessors. Previously, every path (compaction
-         * AND full-table staging) unconditionally called sycl_moe_build_
-         * expert_compaction, whose own q.memcpy(selected...).wait_and_
-         * throw() -- for an entirely unrelated tensor -- happened to also
-         * drain this queue's earlier submissions, including the quantise
-         * kernel, as an incidental side effect. Skipping that call
-         * whenever any weight table is already resident (below) removes
-         * that incidental fence along with it, so this wait is added back
-         * explicitly: a genuine cross-kernel data dependency must never
-         * depend on an unrelated call happening to also flush the queue.
-         * It stays regardless of whether any table below is staged,
-         * compacted or read resident. Investigated as the suspected cause
-         * when tests/test_sycl_gguf_load.c (a real 256-expert GGUF file)
-         * first turned up all-zero MoE output with the model-range cache
-         * active: adding this wait alone did not fix that failure, so it
-         * was not the defect that test exposed (see sycl_copy_host_to_
-         * device_paged_safe, ds4_sycl_common.hpp, for the one that was:
-         * an unrelated DMA-vs-unfaulted-mmap-page defect in how the cache
-         * itself copied bytes in, upstream of this function entirely).
-         * Kept anyway because the race it closes is real independent of
-         * that unrelated defect, and removing it would silently reopen
-         * it. */
-        sycl_batch_wait(q);
+        /* No wait. The dependency this used to guard is real -- a kernel
+         * reading xq/midq must not start before the quantise kernel above
+         * has written them, and raw USM carries no buffer/accessor
+         * tracking to say so -- but q is in_order (ds4_sycl.cpp,
+         * ds4_sycl_queue_properties), and submission order on an in_order
+         * queue is exactly that guarantee.
+         *
+         * A wait sat here for a while on the grounds that these were
+         * out-of-order queues, which was true when it was written and
+         * stopped being true when the backend moved to in_order. It was
+         * added when skipping sycl_moe_build_expert_compaction for
+         * resident tables removed that function's own unrelated readback,
+         * which had been draining this queue as an incidental side
+         * effect; the reasoning that a genuine data dependency must not
+         * rest on an unrelated call happening to flush the queue was
+         * right, and in_order is what discharges it properly. Worth
+         * recording because this was also investigated as the suspected
+         * cause when tests/test_sycl_gguf_load.c first turned up all-zero
+         * MoE output with the model-range cache active: adding the wait
+         * did not fix that failure, and the real defect was elsewhere
+         * entirely (sycl_copy_host_to_device_paged_safe,
+         * ds4_sycl_common.hpp, a DMA-versus-unfaulted-mmap-page defect in
+         * how the cache copied bytes in). On a real Flash decode this
+         * site drained the queue once per routed layer per token. */
 
         /* gate_w/up_w/down_w point into model_map, ordinary host memory (or
          * a plain host-backed test fixture): a SYCL kernel cannot
